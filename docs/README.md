@@ -18,6 +18,7 @@ an environment to receiving the first generated response. The
 | [Cache and scheduling features](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
 | [Prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
 | [PD refactoring draft](pd_refactoring.md) | M9 ownership, handoff contracts, migration dependencies, and validation plan for RFC #32 |
+| [PD walkthrough](pd_walkthrough.md) | M9 baseline, code evidence, current state machine, findings, and validation gaps |
 | [HTTP serving](serving.md) | Completions API, streaming, and service lifecycle |
 | [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
 | [Ouro-Thinking recipe](recipes/ouro_thinking.md) | Shared 1.4B/2.6B setup, JSON/SSE client, budgets and validation limits |
