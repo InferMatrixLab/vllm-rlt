@@ -21,7 +21,7 @@ def test_cuda_graph_validation():
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("backend", ["triton", "flash_attn"])
+@pytest.mark.parametrize("backend", ["triton", "flash_attn", "flashinfer"])
 @pytest.mark.parametrize("mode", ["sync", "async", "multi"])
 @pytest.mark.parametrize("layout", ["last_exited", "shared"])
 @pytest.mark.parametrize("static", [False, True])
@@ -71,7 +71,8 @@ def test_graph_replay_matches_eager_and_reuses_requests(backend, mode, layout, s
 
 
 @pytest.mark.gpu
-def test_graph_cache_limit_fallback_and_abort():
+@pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+def test_graph_cache_limit_fallback_and_abort(backend):
     torch.manual_seed(19)
     model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
     engine = LLMEngine(
@@ -87,7 +88,7 @@ def test_graph_cache_limit_fallback_and_abort():
             async_scheduling=True,
         ),
         exit_config=ExitConfig("ouro_delayed"),
-        attention_backend="triton",
+        attention_backend=backend,
     )
     for count in [1, 2, 3]:
         for i in range(count):

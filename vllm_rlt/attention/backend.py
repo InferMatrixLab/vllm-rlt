@@ -56,6 +56,18 @@ def backend_capabilities(implementation) -> BackendCapabilities:
     return implementation.capabilities
 
 
+def _auto_flashinfer_supported(device) -> bool:
+    """Gate automatic FlashInfer selection to the validated SM120 target.
+
+    Other architectures the kernel accepts remain reachable through explicit
+    `--attention-backend flashinfer` opt-in; auto keeps its pre-FlashInfer
+    fallback behavior everywhere else.
+    """
+    if device.type != "cuda" or torch.version.hip:
+        return False
+    return torch.cuda.get_device_capability(device)[0] == 12
+
+
 def validate_backend_name(backend: str) -> None:
     if backend not in {"auto", "torch", "triton", "flashinfer", *FLASH_BACKENDS}:
         raise ValueError("unknown attention backend")
@@ -90,7 +102,8 @@ def create_backend(
     *,
     required_capabilities: BackendCapabilities = BackendCapabilities(),
 ) -> AttentionBackend:
-    """Explicit choices fail without fallback; auto tries FA4/3/2, FlashInfer, Triton, then Torch.
+    """Explicit choices fail without fallback; auto tries FA4/3/2, FlashInfer
+    (SM120 only), Triton, then Torch.
 
     Each candidate validates hardware/configuration and imports its implementation.
     Only compatibility and import failures permit auto to try the next candidate;
@@ -104,6 +117,13 @@ def create_backend(
         candidates = ("torch",)
         skipped.append(f"{device.type.upper()} uses Torch reference attention")
     for candidate in candidates:
+        if (
+            backend == "auto"
+            and candidate == "flashinfer"
+            and not _auto_flashinfer_supported(device)
+        ):
+            skipped.append("flashinfer: automatic selection is validated on SM120 only")
+            continue
         try:
             implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
             missing = [

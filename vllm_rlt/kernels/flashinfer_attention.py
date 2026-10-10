@@ -10,7 +10,6 @@ directory on LD_LIBRARY_PATH.
 import importlib
 import logging
 from importlib.metadata import PackageNotFoundError, version
-from types import SimpleNamespace
 
 import torch
 
@@ -76,11 +75,6 @@ class FlashInferPagedAttention:
             version=package_version,
             kernel="xqa",
             page_size=block_size,
-        )
-        # Mirrors the capability names of the attention contract so a later
-        # migration only touches registration, not this kernel adapter.
-        self.capabilities = SimpleNamespace(
-            packed_prefill=False, cuda_graphs=True, async_scheduling=True
         )
         logging.getLogger(__name__).warning("Attention implementation: %s", self.info)
 

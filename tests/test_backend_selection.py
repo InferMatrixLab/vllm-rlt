@@ -87,6 +87,15 @@ def test_cpu_auto_reports_torch_and_runs_reference_attention(caplog):
             "flash_attn_2",
         ),
         ((10, 0), torch.bfloat16, 128, 16, (), "flash_attn_4"),
+        (
+            (9, 0),
+            torch.bfloat16,
+            128,
+            16,
+            ("flash_attn.cute", "flash_attn_3.flash_attn_interface"),
+            "triton",
+        ),
+        ((10, 0), torch.bfloat16, 128, 16, ("flash_attn.cute",), "triton"),
         ((12, 0), torch.bfloat16, 128, 16, (), "flashinfer"),
         ((12, 0), torch.bfloat16, 128, 16, ("flashinfer",), "triton"),
         ((7, 5), torch.float16, 128, 256, (), "torch"),
@@ -102,6 +111,18 @@ def test_auto_selection_constraints(
     assert selected.info["selection_reason"]
     if expected == "flash_attn_4":
         assert backend_capabilities(selected).packed_prefill
+
+
+def test_explicit_flashinfer_opt_in_outside_sm120(packages, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="vllm_rlt.kernels.flashinfer_attention")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    selected = create_backend("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
+    assert selected.info["selected_backend"] == "flashinfer"
+    assert selected.capabilities.cuda_graphs and selected.capabilities.async_scheduling
+    assert not selected.capabilities.packed_prefill
+    assert "unvalidated" in caplog.text
 
 
 def test_rocm_auto_uses_triton(packages, monkeypatch):

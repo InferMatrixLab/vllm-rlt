@@ -5,6 +5,7 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.kernels.flashinfer_attention import FlashInferPagedAttention
 from vllm_rlt.kernels.paged_attention import torch_paged_attention
@@ -72,13 +73,15 @@ def test_backend_contract_anchors():
     assert attention.info["package"] == "flashinfer-python"
     assert attention.info["page_size"] == 16
     assert attention.info["kernel"] == "xqa"
-    assert attention.capabilities.packed_prefill is False
-    assert attention.capabilities.cuda_graphs is True
-    assert attention.capabilities.async_scheduling is True
-    # Absence is the contract: the FA4 packed-prefill gates in the engine and
-    # model runner key off a missing generation attribute staying missing.
+    # Absence is the contract: capability declarations live only in the
+    # attention registration layer, and the FA4 packed-prefill gates key off
+    # a missing generation attribute staying missing.
+    assert not hasattr(attention, "capabilities")
     assert not hasattr(attention, "generation")
     assert not hasattr(attention, "prefill")
+    wrapper = create_backend("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
+    assert wrapper.info["selected_backend"] == "flashinfer"
+    assert wrapper.capabilities == BackendCapabilities(cuda_graphs=True, async_scheduling=True)
 
 
 @pytest.mark.gpu
