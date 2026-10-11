@@ -1,0 +1,305 @@
+{
+  "schema_version": 1,
+  "tested_source_revision": "e8aa1ee57734bc5c1118c143ebdb68d0b53210a1",
+  "production_delta_since_task0": false,
+  "h100_fixed_work": {
+    "hardware": "one H100",
+    "cuda_version": "13.0",
+    "dependencies": {
+      "python": "3.12.1",
+      "torch": "2.12.1+cu130",
+      "triton": "3.7.1",
+      "transformers": "4.54.1",
+      "tokenizers": "0.21.4",
+      "safetensors": "0.8.0",
+      "huggingface-hub": "0.35.3",
+      "numpy": "2.4.6",
+      "host_compiler": "GCC 11.5.0"
+    },
+    "model": "ByteDance/Ouro-1.4B",
+    "model_revision": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1",
+    "source_sha": "e8aa1ee57734bc5c1118c143ebdb68d0b53210a1",
+    "dtype": "float32",
+    "attention_backend": "triton",
+    "prefill_depth": 4,
+    "B": 16,
+    "initial_total_C": 32,
+    "actual_A": 16,
+    "actual_S": 16,
+    "P": 512,
+    "F": 128,
+    "fresh_processes": 6,
+    "warmups_per_process": 5,
+    "measurements_per_process": 5,
+    "trials": 60,
+    "requests": 1920,
+    "output_tokens": 245760,
+    "measured_requests": 960,
+    "measured_output_tokens": 122880,
+    "order": "ABC/CBA with A=D4 off, B=D3 off, C=D3 guided",
+    "rows": {
+      "D4 true off": {
+        "mean_TPS": 179.2798970731368,
+        "mean_TTFT_ms": 9133.832768897173,
+        "mean_TPOT_ms": 63.18140338326404,
+        "mean_native_latency_ms": 17157.870998571707,
+        "mean_native_ITL_p99_ms": 303.6823431029916,
+        "matched_fresh_TPS_ratios_vs_D4": [
+          1.0,
+          1.0
+        ],
+        "mean_TPS_gain_percent_vs_D4": 0.0,
+        "peak_reference_bytes": 0,
+        "peak_allocated_delta_vs_D4_bytes": 0,
+        "peak_reserved_delta_vs_D4_bytes": 0
+      },
+      "D3 true off": {
+        "mean_TPS": 212.989612611624,
+        "mean_TTFT_ms": 8191.6508564029755,
+        "mean_TPOT_ms": 49.251064304719584,
+        "mean_native_latency_ms": 14446.536023102362,
+        "mean_native_ITL_p99_ms": 241.91237840568647,
+        "matched_fresh_TPS_ratios_vs_D4": [
+          1.1826452043318265,
+          1.1934382505108443
+        ],
+        "mean_TPS_gain_percent_vs_D4": 18.802841862819353,
+        "peak_reference_bytes": 0,
+        "peak_allocated_delta_vs_D4_bytes": 0,
+        "peak_reserved_delta_vs_D4_bytes": 0
+      },
+      "D3 guided ref1 w0.3": {
+        "mean_TPS": 207.10076799059408,
+        "mean_TTFT_ms": 8371.483820582307,
+        "mean_TPOT_ms": 51.022023927212494,
+        "mean_native_latency_ms": 14851.280859338294,
+        "mean_native_ITL_p99_ms": 246.3158268976258,
+        "matched_fresh_TPS_ratios_vs_D4": [
+          1.156436304849139,
+          1.1539199043585666
+        ],
+        "mean_TPS_gain_percent_vs_D4": 15.518120755116138,
+        "peak_reference_bytes": 131072,
+        "peak_allocated_delta_vs_D4_bytes": 131072,
+        "peak_reserved_delta_vs_D4_bytes": 2097152
+      }
+    },
+    "mean_TPS_scope": "Arithmetic mean of the two fresh process means; each contains five measured equal-work trials, five warmup trials retained separately",
+    "speed_gain_formula": "(arm_mean_TPS / D4_mean_TPS - 1) * 100",
+    "fresh_ratio_scope": "Each candidate fresh process divided by matching fresh D4 mean; range of two fresh ratios, not a confidence interval"
+  },
+  "h100_fp32_qualification": {
+    "cases": 12,
+    "readouts": 108,
+    "forced_continuation_inputs": 96,
+    "ownership_checks": 21,
+    "key_checks": 82944,
+    "value_checks": 82944,
+    "max_abs": {
+      "state": 6.29425048828125e-05,
+      "key": 3.0994415283203125e-05,
+      "value": 1.0848045349121094e-05,
+      "logits": 5.698204040527344e-05,
+      "selected_lp": 2.86102294921875e-05,
+      "readout_state": 0.0
+    },
+    "atol": 0.0001,
+    "rtol": 0.0001
+  },
+  "h100_quality_confirmation": {
+    "required_outputs": 1959,
+    "complete_outputs": 1827,
+    "not_run_budget_outputs": 132,
+    "generation_counts": [
+      {
+        "arm_id": "A_P4D4_off",
+        "task": "gsm8k",
+        "required_n": 505,
+        "complete_n": 505,
+        "not_run_budget_n": 0
+      },
+      {
+        "arm_id": "A_P4D4_off",
+        "task": "humanevalplus",
+        "required_n": 148,
+        "complete_n": 148,
+        "not_run_budget_n": 0
+      },
+      {
+        "arm_id": "D_P4D3_on",
+        "task": "gsm8k",
+        "required_n": 505,
+        "complete_n": 505,
+        "not_run_budget_n": 0
+      },
+      {
+        "arm_id": "D_P4D3_on",
+        "task": "humanevalplus",
+        "required_n": 148,
+        "complete_n": 148,
+        "not_run_budget_n": 0
+      },
+      {
+        "arm_id": "C_P4D3_off",
+        "task": "gsm8k",
+        "required_n": 505,
+        "complete_n": 505,
+        "not_run_budget_n": 0
+      },
+      {
+        "arm_id": "C_P4D3_off",
+        "task": "humanevalplus",
+        "required_n": 148,
+        "complete_n": 16,
+        "not_run_budget_n": 132
+      }
+    ],
+    "mathematics": {
+      "denominator": 505,
+      "arms": [
+        {
+          "arm_id": "A_P4D4_off",
+          "n": 505,
+          "completed": 505,
+          "missing_or_unrun": 0,
+          "correct": 316,
+          "accuracy": 0.6257425742574257,
+          "hit_max_tokens": 0,
+          "status": "COMPLETE"
+        },
+        {
+          "arm_id": "D_P4D3_on",
+          "n": 505,
+          "completed": 505,
+          "missing_or_unrun": 0,
+          "correct": 301,
+          "accuracy": 0.596039603960396,
+          "hit_max_tokens": 4,
+          "status": "COMPLETE"
+        },
+        {
+          "arm_id": "C_P4D3_off",
+          "n": 505,
+          "completed": 505,
+          "missing_or_unrun": 0,
+          "correct": 287,
+          "accuracy": 0.5683168316831683,
+          "hit_max_tokens": 2,
+          "status": "COMPLETE"
+        }
+      ],
+      "comparisons": [
+        {
+          "candidate": "D_P4D3_on",
+          "baseline": "A_P4D4_off",
+          "n": 505,
+          "wins": 31,
+          "losses": 46,
+          "family_comparisons": 2,
+          "difference": -0.0297029702970297,
+          "lower": -0.09008988535465567,
+          "upper": 0.031290344982920076,
+          "status": "UNCERTAIN",
+          "scope": "primary mathematics confirmation; frozen family M2"
+        },
+        {
+          "candidate": "D_P4D3_on",
+          "baseline": "C_P4D3_off",
+          "n": 505,
+          "wins": 44,
+          "losses": 30,
+          "family_comparisons": 2,
+          "difference": 0.027722772277227723,
+          "lower": -0.03222355049747422,
+          "upper": 0.08709923492766208,
+          "status": "UNCERTAIN",
+          "scope": "exploratory same-depth attribution; not an additional confirmatory claim"
+        }
+      ]
+    },
+    "code": {
+      "denominator": 148,
+      "arms": [
+        {
+          "arm_id": "A_P4D4_off",
+          "n": 148,
+          "generated": 148,
+          "scored": 148,
+          "correct": 1,
+          "status": "COMPLETE"
+        },
+        {
+          "arm_id": "D_P4D3_on",
+          "n": 148,
+          "generated": 148,
+          "scored": 148,
+          "correct": 0,
+          "status": "COMPLETE"
+        },
+        {
+          "arm_id": "C_P4D3_off",
+          "n": 148,
+          "generated": 16,
+          "scored": 0,
+          "correct": null,
+          "status": "NOT_RUN"
+        }
+      ],
+      "comparisons": [
+        {
+          "candidate": "D_P4D3_on",
+          "baseline": "A_P4D4_off",
+          "n": 148,
+          "scope": "primary code confirmation; frozen family M2",
+          "status": "UNCERTAIN",
+          "interval": {
+            "n": 148,
+            "wins": 0,
+            "losses": 1,
+            "family_comparisons": 2,
+            "difference": -0.006756756756756757,
+            "lower": -0.0474900317031247,
+            "upper": 0.03366805626254722
+          }
+        },
+        {
+          "candidate": "D_P4D3_on",
+          "baseline": "C_P4D3_off",
+          "n": 148,
+          "scope": "exploratory same-depth attribution; no additional confirmation claim",
+          "status": "INCOMPLETE",
+          "interval": null
+        }
+      ],
+      "execution": "Original cooperative20M opcodes/5s per call; complete canonical reference; no repairs; not official EvalPlus timeout execution"
+    },
+    "noninferiority_margin": 0.01
+  },
+  "h20_fixed_work": {
+    "policies": [
+      "D4_off",
+      "D3_off",
+      "D3_guided"
+    ],
+    "mean_tokens_per_second": [
+      144.177,
+      167.121,
+      164.701
+    ],
+    "mean_paired_speed_ratio_vs_D4": [
+      1.0,
+      1.159342,
+      1.142596
+    ],
+    "guided_vs_same_depth_paired_throughput_change_percent": -1.436,
+    "comparison_estimator": "mean of ten matched elapsed-time ratios; separate device profile"
+  },
+  "scope": {
+    "full_model_C64_C128": false,
+    "HTTP": false,
+    "engine_async": false,
+    "quality_noninferiority_established": false,
+    "VRAM_saving_established": false,
+    "whole_task_complete": false
+  }
+}

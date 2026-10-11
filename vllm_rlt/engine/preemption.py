@@ -5,9 +5,12 @@ Full-depth replay of generated tokens is deliberately avoided: it changes RLT
 semantics. Snapshots are bounded by the admitted request population.
 """
 
+from dataclasses import replace
+
 import torch
 
 from vllm_rlt.request import Stage
+from vllm_rlt.worker.loopcd import preemption_reference
 
 
 class PreemptionManager:
@@ -84,8 +87,14 @@ class PreemptionManager:
         e = self.engine
         e.model_runner.synchronize()
         cache = e.cache_manager
+        reference = preemption_reference(
+            victim, victim.stage, e.model_runner.loopcd_references.get(victim.request_id)
+        )
         snapshot = dict(
             stage=victim.stage,
+            loopcd_reference=None
+            if reference is None
+            else replace(reference, hidden=reference.hidden.cpu().clone()),
             kv=cache.snapshot(victim.request_id),
             hidden=None if victim.hidden_state is None else victim.hidden_state.cpu().clone(),
             token=None
@@ -115,6 +124,7 @@ class PreemptionManager:
         if state is None:
             return None
         e, cache = self.engine, self.engine.cache_manager
+        reference = preemption_reference(request, state["stage"], state["loopcd_reference"])
         kv = state["kv"]
         frontier = min(kv.max_tokens, kv.pages * cache.block_size)
         if not cache.allocate(request.request_id, kv.max_tokens, initial_tokens=frontier):
@@ -124,6 +134,10 @@ class PreemptionManager:
         request.input_token_tensor = (
             None if state["token"] is None else state["token"].to(cache.device)
         )
+        if reference is not None:
+            e.model_runner.loopcd_references[request.request_id] = replace(
+                reference, hidden=reference.hidden.to(cache.device)
+            )
         # Restored buffers become visible to every runner stream before resumption.
         if cache.device.type == "cuda":
             torch.cuda.current_stream(cache.device).synchronize()

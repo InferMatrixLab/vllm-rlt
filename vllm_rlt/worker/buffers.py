@@ -5,6 +5,7 @@ import math
 import torch
 
 from vllm_rlt.core.kv_cache_manager import _PreparedKVBatch
+from vllm_rlt.worker.loopcd import reserved_bytes
 
 
 def execution_buffer_bytes(config, scheduler, cache, execution, element_size):
@@ -13,7 +14,7 @@ def execution_buffer_bytes(config, scheduler, cache, execution, element_size):
         rows = 1 << (rows - 1).bit_length()
     width = math.ceil(config.max_position_embeddings / cache.block_size)
     hidden = config.hidden_size * element_size
-    total = 0
+    total = reserved_bytes(config, scheduler, execution, element_size)
     if execution.static_buffers:
         # Existing prefill/eager workspaces remain separate from async banks.
         total += 4 * rows * (hidden + 4 * width + 36) + scheduler.max_num_seqs * hidden

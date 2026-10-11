@@ -108,9 +108,14 @@ class ExecutionConfig:
     cuda_graph_max_graphs: int = 16
     cuda_graph_memory_reserve_bytes: int = 1024**3
     prefill_uva: bool = False
+    loopcd: bool = False
+    prefill_depth: int | None = None
 
     def __post_init__(self):
+        if self.prefill_depth is not None:
+            _positive("prefill_depth", self.prefill_depth)
         for name in (
+            "loopcd",
             "prefill_uva",
             "async_scheduling",
             "multi_stream",
