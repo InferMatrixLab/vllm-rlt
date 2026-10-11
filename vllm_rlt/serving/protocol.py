@@ -111,7 +111,7 @@ class CompletionRequest:
             if type(include_usage) is not bool:
                 raise ValueError("include_usage must be a boolean")
         params = {key: body[key] for key in params_keys & body.keys()}
-        for key in ("temperature", "top_p", "exit_threshold"):
+        for key in ("temperature", "top_p", "exit_threshold", "repetition_penalty"):
             if key in params and (
                 type(params[key]) not in (int, float) or not math.isfinite(params[key])
             ):

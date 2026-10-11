@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from vllm_rlt.sampling_params import SamplingParams
-from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.sampler import Sampler, apply_repetition_penalty, probabilities
 
 
 def draw(sampler, logits, params, generator=None, count=1):
@@ -126,3 +126,60 @@ def test_generator_is_reused_and_advanced_across_calls():
     _, same_generator = draw(sampler, logits, params, generator=generator)
     assert same_generator is generator
     assert not torch.equal(generator.get_state(), state)
+
+
+def test_repetition_penalty_scales_positive_and_negative_logits():
+    logits = torch.tensor([2.0, -2.0, 1.0])
+    penalized = apply_repetition_penalty(logits.clone(), 2.0, [0, 1])
+    assert torch.allclose(penalized, torch.tensor([1.0, -4.0, 1.0]))
+
+
+def test_repetition_penalty_with_empty_or_neutral():
+    logits = torch.tensor([2.0, -2.0, 1.0])
+    assert torch.equal(apply_repetition_penalty(logits.clone(), 1.0, [0, 1]), logits)
+    assert torch.equal(apply_repetition_penalty(logits.clone(), 2.0, []), logits)
+
+
+def test_repetition_penalty_greedy_in_sampler():
+    sampler = Sampler(torch.device("cpu"))
+    # Token 1 has highest logit initially (3.0 > 2.0 > 0.0)
+    logits = torch.tensor([2.0, 3.0, 0.0])
+    params = SamplingParams(temperature=0.0, repetition_penalty=2.0)
+    tok_clean, gen = sampler.sample(logits, params, None)
+    assert tok_clean.item() == 1
+    assert gen is None
+    # With token 1 penalized: token 1 logit becomes 3.0 / 2.0 = 1.5 < 2.0 (token 0)
+    tok_penalized, gen = sampler.sample(logits, params, None, token_ids=[1])
+    assert tok_penalized.item() == 0
+    assert gen is None
+
+
+def test_dynamic_depth_temperature_distribution():
+    # At temperature 1.0, depth 1 (loops_done=1) cools down (0.7), sharpening the mode.
+    # Depth 4 (loops_done=4) heats up (1.2), flattening the distribution.
+    logits = torch.tensor([2.0, 0.0])
+    params = SamplingParams(temperature=1.0, dynamic_depth_temp=True)
+    p_base = probabilities(logits, params, temperature=1.0)
+    p_cold = probabilities(logits, params, temperature=max(params.temperature * 0.7, 0.1))
+    p_hot = probabilities(logits, params, temperature=params.temperature * 1.2)
+    assert p_cold[0] > p_base[0] > p_hot[0]
+
+
+def test_dynamic_depth_temp_in_sampler():
+    sampler = Sampler(torch.device("cpu"))
+    logits = torch.tensor([2.0, 0.0])
+    params = SamplingParams(temperature=1.0, dynamic_depth_temp=True, seed=42)
+
+    # Verify that dynamic depth temperature preserves generator threading across steps
+    _, gen = sampler.sample(logits, params, None, loops_done=1)
+    assert gen is not None
+    state = gen.get_state().clone()
+    _, gen_next = sampler.sample(logits, params, gen, loops_done=2)
+    assert gen_next is gen
+    assert not torch.equal(gen.get_state(), state)
+
+    # In greedy mode, dynamic_depth_temp is ignored and creates no generator
+    greedy_params = SamplingParams(temperature=0.0, dynamic_depth_temp=True)
+    tok, gen_greedy = sampler.sample(logits, greedy_params, None, loops_done=1)
+    assert tok.item() == 0
+    assert gen_greedy is None

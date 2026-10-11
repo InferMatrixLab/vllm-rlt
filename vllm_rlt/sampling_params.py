@@ -14,6 +14,8 @@ class SamplingParams:
     exit_threshold: float = 1.0
     ignore_eos: bool = False
     priority: int = 0
+    repetition_penalty: float = 1.0
+    dynamic_depth_temp: bool = False
 
     def __post_init__(self):
         if type(self.priority) is not int:
@@ -34,5 +36,9 @@ class SamplingParams:
             raise ValueError("top_k must be -1 or positive")
         if not 0 <= self.exit_threshold <= 1:
             raise ValueError("exit_threshold must be in [0, 1]")
+        if not math.isfinite(self.repetition_penalty) or self.repetition_penalty < 1.0:
+            raise ValueError("repetition_penalty must be finite and >= 1.0")
+        if type(self.dynamic_depth_temp) is not bool:
+            raise ValueError("dynamic_depth_temp must be a boolean")
         if type(self.seed) is not int or not 0 <= self.seed < 2**63:
             raise ValueError("seed must be an integer in [0, 2**63)")

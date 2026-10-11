@@ -85,6 +85,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--dynamic-depth-temp", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
@@ -148,6 +150,8 @@ def main():
         top_k=args.top_k,
         top_p=args.top_p,
         seed=args.seed,
+        repetition_penalty=args.repetition_penalty,
+        dynamic_depth_temp=args.dynamic_depth_temp,
         ignore_eos=args.toy,
     )
     try:

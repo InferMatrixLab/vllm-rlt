@@ -2,21 +2,18 @@
 
 import torch
 
+from vllm_rlt.worker.sampler import (
+    apply_repetition_penalty,
+    probabilities,
+)
 
-def probabilities(logits, params):
-    if params.temperature == 0:
-        raise ValueError("greedy decoding has no temperature-scaled distribution")
-    logits = logits.float() / params.temperature
-    if params.top_k > 0:
-        threshold = logits.topk(min(params.top_k, logits.numel())).values[-1]
-        logits = logits.masked_fill(logits < threshold, -torch.inf)
-    if params.top_p < 1:
-        sorted_logits, indices = logits.sort(descending=True)
-        remove = sorted_logits.softmax(-1).cumsum(-1) > params.top_p
-        remove[1:] = remove[:-1].clone()
-        remove[0] = False
-        logits = logits.scatter(0, indices, sorted_logits.masked_fill(remove, -torch.inf))
-    return logits.softmax(-1)
+__all__ = [
+    "apply_repetition_penalty",
+    "draw",
+    "generator_for",
+    "probabilities",
+    "rejection_sample",
+]
 
 
 def generator_for(request, device):
@@ -27,14 +24,6 @@ def generator_for(request, device):
 
 def draw(probs, generator):
     return torch.multinomial(probs, 1, generator=generator).squeeze(0)
-
-
-def sample_logits(logits, request):
-    if request.sampling_params.temperature == 0:
-        return logits.argmax()
-    return draw(
-        probabilities(logits, request.sampling_params), generator_for(request, logits.device)
-    )
 
 
 def rejection_sample(candidate, target, proposal, generator):

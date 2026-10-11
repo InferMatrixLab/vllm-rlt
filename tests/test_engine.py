@@ -324,3 +324,22 @@ def test_finish_reason_preserves_public_string_values(reason):
     output = RequestOutput.from_request(request)
     assert output.finished and type(output.finish_reason) is str
     assert output.finish_reason == reason.value
+
+
+def test_repetition_penalty_and_dynamic_depth_temp():
+    with pytest.raises(ValueError):
+        SamplingParams(repetition_penalty=0.0)
+    with pytest.raises(ValueError):
+        SamplingParams(repetition_penalty=-1.0)
+    with pytest.raises(ValueError):
+        SamplingParams(repetition_penalty=0.5)
+    with pytest.raises(ValueError):
+        SamplingParams(dynamic_depth_temp="invalid")
+
+    model = tiny_model()
+    p_default = SamplingParams(max_tokens=4, repetition_penalty=1.0, ignore_eos=True)
+    p_penalized = SamplingParams(max_tokens=4, repetition_penalty=5.0, ignore_eos=True)
+    out_default = LLM(model).generate([[1, 2]], p_default)[0]
+    out_penalized = LLM(model).generate([[1, 2]], p_penalized)[0]
+    assert out_default.token_ids == [9, 27, 27, 39]
+    assert out_penalized.token_ids == [9, 27, 15, 43]

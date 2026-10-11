@@ -596,6 +596,12 @@ class ModelRunner:
     def _sample_tensor(self, logits: torch.Tensor, request: Request):
         # Thin delegate kept for the async path and for tests that monkeypatch
         # this method; the algorithm lives in Sampler.
-        token, generator = self.sampler.sample(logits, request.sampling_params, request.generator)
+        token, generator = self.sampler.sample(
+            logits,
+            request.sampling_params,
+            request.generator,
+            token_ids=request.prompt_token_ids + request.generated_token_ids,
+            loops_done=request.loops_done,
+        )
         request.generator = generator
         return token
