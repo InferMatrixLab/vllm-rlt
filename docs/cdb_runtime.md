@@ -107,6 +107,96 @@ The same flags work with the single-device server. A streaming event may contain
 multiple committed tokens. See [RFC #43](https://github.com/ThinkFlowLab/vllm-rlt/issues/43)
 for the design.
 
+### Alternate-branch experiment (PR #59)
+
+[PR #59](https://github.com/ThinkFlowLab/vllm-rlt/pull/59) tested whether drafting
+one alternate suffix could reduce generation time. Small gains at concurrency 1
+did not extend to concurrency 4 or 8, so the maintainers recommended stopping
+this approach and keeping standard speculation. The implementation was not
+merged; the results are recorded here for future work.
+
+The gate reads the shallow full-softmax top two probabilities `p1` and `p2` of
+the draft logits. Two policies were evaluated: an original policy that forks
+when `p1 - p2 <= 0.2`, and a revised policy that additionally requires
+`p1 + p2 >= 0.4`. A fork opens a private alternate KV stem and candidate
+suffix, drafted alongside the primary chain. The alternate is verified at the
+same full target depth as the primary, inside the same packed verification
+batch, and is committed only when the first primary rejection lands exactly at
+the fork and the target's corrected token matches the stored alternate;
+otherwise it is discarded at round end.
+
+#### L40S results (contributor)
+
+Source: [public PR #59 comment](https://github.com/ThinkFlowLab/vllm-rlt/pull/59#issuecomment-6096514596);
+raw runs in the linked [results.zip](https://github.com/prettygirlisnotme/vllm-rlt/releases/download/pr59-review-evidence-20261010/results.zip),
+profiles in the linked [profiles.zip](https://github.com/prettygirlisnotme/vllm-rlt/releases/download/pr59-review-evidence-20261010/profiles.zip).
+The tests used Ouro-1.4B at `574fa66` and runtime `07bf8cb` (based on main
+`ecb1f8b`): BF16/Triton, synchronous eager, greedy, target depth 4, four draft
+tokens, and 64 fixed prompts (32 GSM8K + 32 HumanEval). Each request generated
+128 tokens with EOS ignored. After warmup, plain and branch runs alternated
+for five repeats. E2E throughput below is mean ± SD in tokens/s, including
+queuing, prefill and decoding for 64 simultaneously submitted requests.
+
+| Draft / concurrency | E2E plain | E2E original gap policy |
+| --- | ---: | ---: |
+| d1 / 1 | 38.06 ± 0.99 | 39.75 ± 1.21 |
+| d1 / 4 | 138.54 ± 1.35 | 134.34 ± 2.04 |
+| d1 / 8 | 252.38 ± 3.88 | 231.09 ± 1.94 |
+| d2 / 1 | 29.83 ± 0.33 | 30.61 ± 0.42 |
+| d2 / 4 | 109.46 ± 0.82 | 109.23 ± 1.19 |
+| d2 / 8 | 195.85 ± 1.71 | 191.72 ± 1.47 |
+
+Gains were confined to low concurrency and reversed at C8. The d2/C8
+decode-only gain was +6.76% (cohort-bootstrap 95% CI: +1.20% to +14.55%), while the same
+condition's E2E was -2.11%. Decode-only and E2E are different workloads, so
+that gap is not evidence that queuing or prefill caused the reversal.
+Full-quality runs gave identical task scores for plain and branch (GSM8K
+61.71%/62.09%, HumanEval 69.51% at d1/d2), but equal scores on these finite
+datasets do not establish BF16 losslessness; the separate BF16 diagnostics
+retain sequence divergences.
+
+#### B300 results (maintainer)
+
+Source: [maintainer comment](https://github.com/ThinkFlowLab/vllm-rlt/pull/59#issuecomment-6139829875).
+Ouro-1.4B on a single B300, BF16, target depth 4, draft depths 1/2 with 4 draft
+tokens, 64 requests (32 GSM8K + 32 HumanEval), and 128 output tokens each. The
+table reports median throughput in tokens/s across five runs, including
+queuing, prefill and decoding but excluding HTTP/network overhead. The source
+comment does not specify code/checkpoint revisions or backend/execution mode;
+these are separate measurements, not a controlled comparison with the L40S.
+
+| Draft / concurrency | No branch | Original policy | Revised policy |
+| --- | ---: | ---: | ---: |
+| d1 / 1 | 65.46 | 67.91 | 66.36 |
+| d1 / 4 | 234.49 | 225.29 | 226.66 |
+| d1 / 8 | 393.05 | 361.17 | 364.84 |
+| d2 / 1 | 49.48 | 50.95 | 50.46 |
+| d2 / 4 | 185.05 | 184.02 | 181.43 |
+| d2 / 8 | 322.17 | 317.81 | 310.24 |
+
+The revised policy also increased request completion p95 in five of six
+configurations compared with the original policy.
+
+#### Why this was stopped
+
+- Fewer speculative rounds do not mean less total work. On B300 at d1/concurrency 8, the
+  original policy cut rounds from 2,109 to 1,983 but raised verification token
+  rows from 10,396 to 12,568.
+- A small gap does not predict a useful branch: earlier draft tokens may be
+  rejected before the fork, rejection may fall elsewhere, or the target may not
+  pick the second candidate. The alternate token is itself an ordinary target
+  correction, so a higher hit rate is not saved work.
+- The revised policy raised the hit rate from 21.1% to 29.7% but reduced
+  selected branches from 193 to 131 and increased rounds from 1,983 to 2,041.
+- Maintaining an alternate suffix adds drafting, verification and KV copies;
+  the gate also requires CPU readbacks. In the L40S C8 ops-only profile window,
+  stream synchronizations rose from 2 to 261, with about 59.4 MB of
+  device-to-device copies versus zero. The profiles show extra operations, but
+  do not isolate their contribution to unprofiled runtime.
+
+This is a negative result for the two tested policies on these workloads, not a
+general impossibility claim about tree or multi-branch decoding.
+
 ## SHARED prefill semantics
 
 SHARED is not equivalent to LAST-EXITED. A later token reads every earlier token's final KV at all depths. To make that meaning independent of chunk boundaries, the shared prefill runner completes all loops for one position before advancing that request. Different requests can still be batched at each position wave. This is a correctness-oriented implementation and can be slower than packed depth-major prefill. It is not a claim to reproduce an unpublished optimized shared-prefill kernel.
