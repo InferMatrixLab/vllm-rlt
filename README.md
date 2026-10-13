@@ -89,9 +89,9 @@ for supported combinations and limitations.
 - **Depth-aware paged KV cache.** LAST-EXITED and SHARED layouts, automatic
   CUDA cache sizing, and optional prefix caching, incremental page allocation,
   priority scheduling, and preemption with CPU state snapshots.
-- **Configurable GPU execution.** Triton and FlashAttention backends, asynchronous
-  scheduling, multiple CUDA streams, reusable buffers, and CUDA Graph capture
-  of decode recurrent cores.
+- **Configurable GPU execution.** Triton, FlashAttention, and FlashInfer backends,
+  asynchronous scheduling, multiple CUDA streams, reusable buffers, and CUDA Graph
+  capture of decode recurrent cores.
 - **Offline and online inference.** A Python API, a command-line interface,
   and an OpenAI-compatible completions endpoint with streaming, greedy decoding,
   and seeded top-k/top-p sampling.

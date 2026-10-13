@@ -26,6 +26,7 @@ pd = ["nixl==1.4.1"]
 serve = []
 flash-attn = ["flash-attn>=2.8.3"]
 flash-attn4 = ["flash-attn-4==4.0.0b30"]
+flashinfer = ["flashinfer-python>=0.7.0"]
 triton = []
 dev = ["pytest>=8", "ruff>=0.9"]
 

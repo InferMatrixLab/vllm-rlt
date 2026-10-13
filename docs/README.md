@@ -15,6 +15,7 @@ an environment to receiving the first generated response. The
 | [Runtime configuration](cdb_runtime.md) | Exit policies, KV layouts, execution options, and CUDA Graphs |
 | [Asynchronous scheduling](https://github.com/hsliuustc0106/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
 | [FlashAttention](https://github.com/hsliuustc0106/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
+| [FlashInfer](flashinfer.md) | XQA decode kernels for SM120: installation, environment, and scope |
 | [Cache and scheduling features](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
 | [Prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
 | [HTTP serving](serving.md) | Completions API, streaming, and service lifecycle |
@@ -29,7 +30,8 @@ asynchronous execution, and speculative decoding are rejected. Its CUDA Graphs
 capture the recurrent decode core and coda, including the LM head.
 CPU execution provides a Torch
 reference backend. FlashAttention hardware validation is currently documented
-for FA4 on B300; FA2/FA3 require validation on their target devices. Disaggregated
+for FA4 on B300; FA2/FA3 require validation on their target devices. FlashInfer
+decode is validated on RTX 5090 (SM120). Disaggregated
 serving currently targets multiple GPUs on a single host.
 
 `ouro_delayed` reuses the trained Ouro gate with a one-loop delay; it changes

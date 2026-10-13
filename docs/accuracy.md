@@ -164,6 +164,25 @@ counts as `identical_context` when the two runs chose different depths for a pos
 whose preceding tokens were still identical. These fields are diagnostic; the accuracy
 gate does not use them.
 
+## Attention-backend runs
+
+`run --backend native` selects the attention kernel with `--attention-backend`
+(`triton` by default, recorded in the run metadata):
+
+```bash
+python -m benchmarks.gsm8k run --backend native --attention-backend flashinfer \
+  --protocol /path/to/gsm8k-87-protocol.json --output /path/to/native-flashinfer
+```
+
+On RTX 5090 (SM120) the frozen default case scored **Triton 61/87 and FlashInfer
+58/87** against the stored HF baseline of 59/87: 64 of the 87 generations were
+token-identical between the kernels, the divergent ones flipped near-tied greedy
+choices at scattered positions, and exit depths never differed. This is the
+expected single-pass greedy variation between BF16 kernels with different
+accumulation orders — see the [FlashInfer accuracy
+note](flashinfer.md#accuracy-note-gsm8k-87-single-greedy-pass) before treating a
+one-question delta from a backend swap as a regression.
+
 Dataset: [GSM8K](https://huggingface.co/datasets/openai/gsm8k).
 The [Ouro evaluation settings](https://arxiv.org/html/2510.25741v5#A3.T16) do not
 pin the exact harness revision, demonstrations or token limits, so the settings

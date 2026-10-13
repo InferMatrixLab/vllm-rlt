@@ -80,7 +80,9 @@ class ReleaseExitHooks:
 
 
 class Generator:
-    def __init__(self, backend, model_path, tokenizer, max_length, exit_policy):
+    def __init__(
+        self, backend, model_path, tokenizer, max_length, exit_policy, attention_backend="triton"
+    ):
         self.backend, self.tokenizer, self.exit = backend, tokenizer, exit_policy
         # Full depth, taken from the protocol (the checkpoint's total_ut_steps).
         loops = exit_policy["max_loops"]
@@ -113,7 +115,7 @@ class Generator:
                 model_path,
                 device="cuda",
                 dtype=torch.bfloat16,
-                attention_backend="triton",
+                attention_backend=attention_backend,
                 # last_exited KV keeps one plane per loop.
                 cache_config=CacheConfig(num_blocks=loops * ((max_length + 15) // 16)),
                 scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=128),

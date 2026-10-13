@@ -70,6 +70,7 @@ def main():
             "auto",
             "torch",
             "triton",
+            "flashinfer",
             "flash_attn",
             "flash_attn_2",
             "flash_attn_3",

@@ -439,6 +439,7 @@ def run(args):
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
         "backend": args.backend,
+        "attention_backend": args.attention_backend,
         "protocol_sha256": file_digest(args.protocol),
         "source": source(),
         "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
@@ -456,7 +457,10 @@ def run(args):
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
     task = make_task(protocol["task_config"])
     start = time.monotonic()
-    generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"], exit_policy)
+    generator = Generator(
+        args.backend, str(model), tokenizer, protocol["max_length"], exit_policy,
+        attention_backend=args.attention_backend,
+    )
     load_seconds = time.monotonic() - start
     rows = []
     with (output / "samples.jsonl").open("x", buffering=1) as stream:
@@ -619,6 +623,12 @@ def main():
     p.add_argument("--backend", choices=["transformers", "native"], required=True)
     p.add_argument("--protocol", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument(
+        "--attention-backend",
+        choices=["torch", "triton", "flashinfer"],
+        default="triton",
+        help="Native engine attention kernel; recorded in the run metadata",
+    )
     p.add_argument("--exit-mode", choices=["ouro", "ouro_delayed"], default="ouro")
     p.add_argument(
         "--exit-threshold",
