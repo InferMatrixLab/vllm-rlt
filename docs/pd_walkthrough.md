@@ -1,11 +1,11 @@
 # M9 — PD and KV transfer walkthrough
 
 Module review for the prefill/decode (PD) disaggregation runtime and its NIXL
-KV transfer path, prepared against RFC #32 (module M9). It pins a reproducible
-baseline, maps the current code onto the three RFC subcomponents, documents the
-handoff state machine and failure/cancellation cleanup, records evidence-backed
-findings, and proposes a migration target that replaces private-state access
-with explicit contracts.
+KV transfer path, prepared against RFC #32 (module M9) and the M9 contract
+discussion in #111. It pins a reproducible baseline, maps the current code onto
+the three RFC subcomponents, documents the handoff state machine and
+failure/cancellation cleanup, records evidence-backed findings, and proposes a
+migration target that replaces private-state access with explicit contracts.
 
 This is a structural review. It does not claim that tests or performance
 regressions have passed, and it does not change runtime behavior.
@@ -15,14 +15,15 @@ regressions have passed, and it does not change runtime behavior.
 ### Pinned baseline
 
 - Repository: `ThinkFlowLab/vllm-rlt`
-- Base commit: `3314c1b` (Merge PR #44, `feat: add synchronous fixed-loop
-  self-speculative decoding`)
+- Base commit: `9d601ce` (Merge PR #123; first baseline covering the M4 public
+  KV views from #57, PD profiling from #72, Nanbeige PD from #77, and the
+  ready-handoff pacing fix from #122)
 - Files in scope:
 
 | File | Lines | Role |
 | --- | --- | --- |
-| `vllm_rlt/pd/engine.py` | 467 | Coordinator: `PDEngine`, `Peer`, `Pending` |
-| `vllm_rlt/pd/worker.py` | 391 | Engine owner thread + embedded scheduler-side connector logic: `PDWorker`, `Work`, `worker_main` |
+| `vllm_rlt/pd/engine.py` | 641 | Coordinator: `PDEngine`, `Peer`, `Pending`, `PDModelInfo`, profiling session control |
+| `vllm_rlt/pd/worker.py` | 444 | Engine owner thread + embedded scheduler-side connector logic: `PDWorker`, `Work`, `worker_main` |
 | `vllm_rlt/pd/transport.py` | 176 | Worker-side transport: `NixlConnector`, `Transfer`, `kv_segments`, `partition_segments` |
 | `vllm_rlt/pd/config.py` | 45 | `PDConfig` |
 
@@ -34,14 +35,20 @@ regressions have passed, and it does not change runtime behavior.
   `close`, but also reads `engine.scheduler.requests` and
   `engine.cache_manager.num_used_blocks` directly (see finding F2).
 - Local engine (M2/M5): each `PDWorker` owns a full `LLMEngine`
-  (`worker.py:79`), its `Scheduler`, `KVCacheManager`, and `ModelRunner`. PD
-  reaches into their private members (findings F1, F3).
-- Logical KV (M4): `PDWorker` and `NixlConnector` read
-  `cache._get_allocation`, `cache._allocations`, `cache.key_cache`,
-  `cache.value_cache`, `cache.storage_depths` directly. Transfer leases use the
+  (`worker.py:58`), its `Scheduler`, `KVCacheManager`, and `ModelRunner`. PD
+  reaches into their private members (findings F1, F3). Models load through
+  `AutoModelForCausalLM` (`worker.py:53-61`), so PD is no longer Ouro-specific.
+- Logical KV (M4): `PDWorker` now reads block tables through the public
+  `plane_block_tables` and `has_allocation` views added in #57
+  (`worker.py:115,156,256`); `NixlConnector` still reads `cache.key_cache` /
+  `cache.value_cache` / `cache.storage_depths` directly. Transfer leases use the
   public `pin_transfer` / `unpin_transfer` / `mark_imported_prefix` interface.
 - Scheduler (M3): `PDWorker` mutates `scheduler.queues`, calls
   `scheduler._take()`, and mutates `Request` stage/progress fields directly.
+- Profiling: `PDEngine` routes `profile_start` / `profile_stop` /
+  `profile_status` session control to all workers and aggregates per-rank
+  results into a manifest (`engine.py:453-585`), consuming
+  `vllm_rlt/profiling.py` and `vllm_rlt/profiling_artifacts.py`.
 
 ### Subcomponent mapping (target)
 
@@ -49,13 +56,20 @@ The RFC defines three subcomponents. The current mapping is uneven:
 
 | RFC subcomponent | Current home | Status |
 | --- | --- | --- |
-| Coordinator | `PDEngine` (`pd/engine.py`) | Exists, but fakes scheduler/cache for the frontend (F2) |
+| Coordinator | `PDEngine` (`pd/engine.py`) | Exists, but fakes scheduler/cache for the frontend (F2) and also routes profiling sessions |
 | Scheduler-side connector | Inline in `PDWorker` (`pd/worker.py`) | Not a separate class; reaches into scheduler private state (F1, F3) |
 | Worker-side connector / transport | `NixlConnector` (`pd/transport.py`) | Exists and is the cleanest of the three; still couples to `cache.key_cache`/`value_cache` geometry (F4) |
 
 ## 2. Classes and state
 
-### `PDEngine` (coordinator, `pd/engine.py:57`)
+### `PDModelInfo` (coordinator, `pd/engine.py:27-33`)
+
+Typed model metadata (vocab size, loop count, context length) adopted from the
+workers' `ready` reports. It replaces the previous `SimpleNamespace` model and
+lets the coordinator validate requests without loading weights or assuming
+Ouro (`engine.py:161-165`).
+
+### `PDEngine` (coordinator, `pd/engine.py:69`)
 
 Fields and authoritative writers:
 
@@ -68,9 +82,10 @@ Fields and authoritative writers:
 | `cache_manager` | `SimpleNamespace` | `__init__`, `_message` | Synthetic, exposes `.num_used_blocks` for the frontend (F2) |
 | `outputs` | `deque` | `_message`, `step` | Decoded outputs waiting for the frontend to drain |
 | `metrics` | `deque(maxlen=1024)` | `_message` | Per-completed-transfer timing record |
+| `_profile_session` and companions | str / dicts / bool | profiling methods | Session ID, per-control reply collection, per-rank statuses, manifest state |
 | `closed`, `failure` | bool / str | `close`, `step`, `_terminate` | Liveness/failure state |
 
-Authoritative transfer state lives in `Pending` (`pd/engine.py:38`). Its `phase`
+Authoritative transfer state lives in `Pending` (`pd/engine.py:51`). Its `phase`
 field is a string enum without a typed representation:
 
 ```
@@ -79,12 +94,12 @@ waiting -> reserving -> prefill -> decode -> (released)
 
 `cancelled` is an independent boolean that can be set in any phase via
 `abort_request`. The transfer is deleted only when both `p_released` and
-`d_released` are true (`_message`, `pd/engine.py:355-367`).
+`d_released` are true (`_message`, `pd/engine.py:268-300`).
 
-### `PDWorker` (engine owner + embedded connector, `pd/worker.py:44`)
+### `PDWorker` (engine owner + embedded connector, `pd/worker.py:46`)
 
 Owns the local `LLMEngine`, the per-role `hidden` pool, the `NixlConnector`,
-and the `Work` bookkeeping. `Work` (`pd/worker.py:21`) carries per-transfer
+and the `Work` bookkeeping. `Work` (`pd/worker.py:22`) carries per-transfer
 state that mixes connector concerns with scheduler/Request concerns:
 
 | Field | Concern | RFC subcomponent |
@@ -93,84 +108,104 @@ state that mixes connector concerns with scheduler/Request concerns:
 | `chunks`, `next_sequence`, `received`, `expected`, `committed`, `active`, `acknowledged` | Transfer progress | Scheduler-side + worker-side connector |
 | `cached_tokens`, `target_cached_tokens` | Prefix accounting | Scheduler-side connector |
 | `compute_done`, `compute_released`, `last_event` | Compute lifecycle | Scheduler-side connector |
+| `trace_id` | Observability | Propagated to profiling annotations |
 | `cancelled`, `started` | Control | Coordinator/connector |
 
-The `hidden` pool (`worker.py:70-73`) and `free_slots` are shared between the
+The `hidden` pool (`worker.py:76-79`) and `free_slots` are shared between the
 connector (which copies `request.hidden_state` into `self.hidden[w.slot]` at
-final prefill, `worker.py:263`) and decode activation (which assigns
-`request.hidden_state = self.hidden[w.slot]`, `worker.py:340`). This device
+final prefill, `worker.py:312`) and decode activation (which assigns
+`request.hidden_state = self.hidden[w.slot]`, `worker.py:390`). This device
 state is the M5 `ModelRunner` persistent-state concern, but it is currently
 owned by `PDWorker`.
 
 ### `NixlConnector` (worker-side transport, `pd/transport.py:71`)
 
-Owns the NIXL agent, registered memory (`storage = (key_cache, value_cache,
-hidden)`), and the in-flight transfer queue. `Transfer` (`pd/transport.py:10`)
-is a thin handle wrapper. This class is the most self-contained of the three;
-its public methods (`connect`, `submit`, `poll`, `busy`, `close`) are close to
-the RFC worker-side connector contract.
+Unchanged since the previous baseline. Owns the NIXL agent, registered memory
+(`storage = (key_cache, value_cache, hidden)`), and the in-flight transfer
+queue. `Transfer` (`pd/transport.py:10`) is a thin handle wrapper. This class is
+the most self-contained of the three; its public methods (`connect`, `submit`,
+`poll`, `busy`, `close`) are close to the RFC worker-side connector contract.
 
 ### Resource-credit accounting (coordinator)
 
-`Peer.blocks`, `Peer.slots`, `Peer.compute_slots` (`pd/engine.py:33-35`) are
-coordinator-side credits, incremented in `_admit` (`pd/engine.py:371-374`) and
+`Peer.blocks`, `Peer.slots`, `Peer.compute_slots` (`pd/engine.py:42-44`) are
+coordinator-side credits, incremented in `_admit` (`pd/engine.py:398-401`) and
 decremented in `_message` on `prefill_complete`/`released` events
-(`pd/engine.py:320-321,356-365`). The coordinator holds exact credits; a worker
+(`pd/engine.py:250,276-290`). The coordinator holds exact credits; a worker
 `rejected` message is treated as a state mismatch and raises
-(`pd/engine.py:353`).
+(`pd/engine.py:288`).
 
 ## 3. Functions and arguments
 
 ### Coordinator
 
 - `add_request(request_id, prompt_token_ids, sampling_params=None, *, trace_id=None)`
-  (`pd/engine.py:281`): validates bounds, checks both role pools have a peer
-  with enough `num_blocks`, creates `Pending`, stores it in `transfers` and the
-  request in `requests`. Does not reserve; admission happens later in `_admit`.
-- `_admit()` (`pd/engine.py:328`): bounded FIFO scan of waiting `Pending`
+  (`pd/engine.py:308`): validates bounds against `PDModelInfo`, checks both
+  role pools have a peer with enough `num_blocks`, creates `Pending`, stores it
+  in `transfers` and the request in `requests`. Does not reserve; admission
+  happens later in `_admit`.
+- `_admit()` (`pd/engine.py:355`): bounded FIFO scan of waiting `Pending`
   entries (priority reorders). For each, picks the least-loaded eligible P and
   D peer by KV fraction then slot fraction, reserves credits eagerly, and sends
   `reserve` to D. Age protection breaks the scan after half the request timeout
   for a blocked waiting request.
-- `_message(peer, m)` (`pd/engine.py:181`): the coordinator-side dispatch over
-  worker messages. Drives the `Pending.phase` transitions (see sequence diagram
-  below) and the release accounting.
-- `abort_request(request_id)` (`pd/engine.py:385`): marks `cancelled`, drops
+- `_message(peer, m)` (`pd/engine.py:203`): the coordinator-side dispatch over
+  worker messages. `profile_reply` is handled first, matched by `control_id`
+  and `session_id`, and never enters transfer routing (`engine.py:205-209`).
+  The rest drives the `Pending.phase` transitions (see sequence diagram below)
+  and the release accounting.
+- Profiling session control (`pd/engine.py:453-585`): `start_profile` /
+  `stop_profile` / `profile_status` / `wait_for_profile_artifacts` fan a
+  session-scoped `profile_<action>` command with a fresh `control_id` out to
+  every worker, collect replies with a deadline, write a per-session manifest,
+  and roll back to `stop` on partial start failure.
+- `abort_request(request_id)` (`pd/engine.py:412`): marks `cancelled`, drops
   pending outputs, and sends `cancel` to D plus either `cancel_safe` (if P
   already released) or `cancel` to P. See the cancel sequence diagram.
-- `step()` (`pd/engine.py:405`): polls workers, enforces the request timeout,
+- `step()` (`pd/engine.py:432`): polls workers, enforces the request timeout,
   admits, and drains `outputs`.
-- `_terminate()` (`pd/engine.py:426`): fail-closed shutdown — terminates all
+- `_terminate()` (`pd/engine.py:587`): fail-closed shutdown — records an
+  incomplete profiling manifest if a session was active, then terminates all
   senders (prefill) before receivers (decode), joins with kill fallback, and
   zeroes credits. The order is deliberate: a failed receiver must never reuse a
   page a still-writing sender could touch.
+- `close()` (`pd/engine.py:613`): drains transfers, stops any active profiling
+  session and waits for artifacts, then stops workers in order.
 
 ### Worker
 
-- `accept(command)` (`pd/worker.py:117`): handles `reserve` (D) and `prefill`
+- `accept(command)` (`pd/worker.py:122`): handles `reserve` (D) and `prefill`
   (P). Allocates KV, pins a transfer lease, looks up a local prefix, and either
   replies `reserved` with block tables (D) or starts prefill and replies
-  `prefill_started` (P). This is where the scheduler-side connector logic
-  begins and where most private-state access concentrates (F1).
-- `command(command)` (`pd/worker.py:164`): dispatches control messages:
+  `prefill_started` (P). Block tables are read through the public M4 view
+  `plane_block_tables`. This is where the scheduler-side connector logic begins
+  and where most private-state access concentrates (F1).
+- `command(command)` (`pd/worker.py:171`): dispatches control messages.
+  Session-scoped `profile_*` commands are handled first, validated against the
+  current session ID, and answered with `profile_reply` carrying the same
+  `control_id` (`worker.py:173-211`); transfer-scoped commands follow:
   `connect`, `reserve`/`prefill`, `cancel`, `cancel_safe`, `commit`, `ack`,
   `stop`.
-- `queue_chunk(w, start, end, event, final)` (`pd/worker.py:210`): builds
-  per-chunk NIXL WRITE descriptors between source (`cache._get_allocation`
-  block tables) and target (`peer` tables). Appends the final prompt hidden
-  state as an extra segment when `final` is set.
-- `prefill_step()` (`pd/worker.py:232`): rewrites `scheduler.queues[Stage.PREFILL]`
-  with only eligible tids, calls `scheduler._take()`, submits through
-  `model_runner.submit`, records CUDA events, and queues chunks for each item.
-  Restores the original queue with unused tids. This is the most invasive
-  private-state manipulation (F1).
-- `progress()` (`pd/worker.py:279`): per-tick advancement. Polls NIXL
+- `queue_chunk(w, start, end, event, final)` (`pd/worker.py:254`): builds
+  per-chunk NIXL WRITE descriptors between source (`plane_block_tables`) and
+  target (`peer` tables). Appends the final prompt hidden state as an extra
+  segment when `final` is set.
+- `prefill_step()` (`pd/worker.py:276`): returns early when any queued head
+  chunk's event has fired, so the event loop advances ready handoffs before
+  submitting more compute (#122). Otherwise rewrites
+  `scheduler.queues[Stage.PREFILL]` with only eligible tids, calls
+  `scheduler._take()`, submits through `model_runner.submit`, records CUDA
+  events, and queues chunks for each item. Restores the original queue with
+  unused tids. Returns whether work was submitted so `run()` can advance the
+  profiler schedule. This is the most invasive private-state manipulation (F1).
+- `progress()` (`pd/worker.py:329`): per-tick advancement. Polls NIXL
   completions, records received sequences on D, and for each `Work` either
   drives P-side release/commit/ack or D-side activation (`mark_imported_prefix`
   + `publish_prefix` + `unpin_transfer` + enqueue CODA).
-- `run()` (`pd/worker.py:345`): the worker main loop. Polls control messages,
-  calls `progress`, runs `prefill_step` (P) or `engine.step()` (D when active),
-  and emits `output`/`released`.
+- `run()` (`pd/worker.py:395`): the worker main loop. Polls control messages,
+  calls `progress`, runs `prefill_step` (P, advancing the profiler schedule
+  when a batch was submitted) or `engine.step()` (D when active), and emits
+  `output`/`released`.
 
 ### Transport
 
@@ -197,8 +232,11 @@ The detailed review covers the executable logic that drives handoff, cleanup,
 and transfer geometry. Auxiliary helpers (`_send`, `_wait`, `_poll`,
 `_blocks`, `send`) are summarized rather than line-by-line.
 
-### `PDEngine._message` (`pd/engine.py:181-274`)
+### `PDEngine._message` (`pd/engine.py:203-301`)
 
+- `kind == "profile_reply"`: matched by `control_id` and the active
+  `session_id`, collected for `_profile_control`, and returned before any
+  transfer lookup. Session control never touches transfer state.
 - `kind == "fatal"`: raises with the worker traceback. Any worker fatality
   propagates as a coordinator failure, which `_terminate` then converts to a
   fail-closed shutdown.
@@ -230,7 +268,7 @@ and transfer geometry. Auxiliary helpers (`_send`, `_wait`, `_poll`,
 - `kind == "rejected"`: raises — the coordinator holds exact credits, so a
   rejection is a bug, not a backpressure signal.
 
-### `PDEngine._admit` (`pd/engine.py:328-383`)
+### `PDEngine._admit` (`pd/engine.py:355-410`)
 
 - Bounded scan: `waiting = list(self.transfers.values())[:max_pending_requests]`.
   Priority policy reorders by `(priority, created)`.
@@ -246,7 +284,7 @@ and transfer geometry. Auxiliary helpers (`_send`, `_wait`, `_poll`,
   half the request timeout, break the scan so a blocked long request is not
   hidden by continuous small arrivals.
 
-### `PDWorker.accept` (`pd/worker.py:117-162`)
+### `PDWorker.accept` (`pd/worker.py:122-169`)
 
 - D role: `actual_params = params` (D owns all sampling/RNG). P role:
   `actual_params = replace(params, max_tokens=1)` — P never samples, it only
@@ -260,18 +298,33 @@ and transfer geometry. Auxiliary helpers (`_send`, `_wait`, `_poll`,
   On failure, `scheduler.abort(tid)` and `rejected`.
 - `self.cache.pin_transfer(tid, tid)`: the transfer ID is also used as the lease
   ID. The lease defers `free` until `unpin_transfer`.
-- D replies `reserved` with `cache._get_allocation(tid).block_tables` (private
-  allocation access — F1) and `slot`.
+- D replies `reserved` with `cache.plane_block_tables(tid)` (the public M4 view
+  added in #57) and `slot`.
 - P sets `target_tables`/`target_slot` from the command, sets
   `request.num_prefilled_tokens = hit`, and if the local prefix extends past
   the target's `cached_tokens`, queues a chunk for the delta immediately
   (prefill can start draining prefix KV before compute). Enqueues PREFILL and
   replies `prefill_started`.
 
-### `PDWorker.prefill_step` (`pd/worker.py:232-277`)
+### `PDWorker.command` profiling branch (`pd/worker.py:173-211`)
+
+- `profile_start` builds a `ProfileConfig` and starts the engine profiler with
+  the session ID, capture timestamp, and assigned rank; `managed_manifest=False`
+  because the coordinator owns the session manifest.
+- `profile_stop` / `profile_status` first verify the active session ID matches
+  the command; a mismatch is an error, so a late command cannot affect a newer
+  session.
+- Every outcome is answered with `profile_reply(control_id, session_id, ...)`,
+  including failures, so the coordinator can aggregate per-rank results.
+
+### `PDWorker.prefill_step` (`pd/worker.py:276-327`)
 
 This is the single most invasive private-state manipulation site.
 
+- Ready-handoff pacing (#122): if any request's head chunk event has already
+  fired, return without submitting more compute. GPU submission can block the
+  owner thread on CUDA launch backpressure, so ready transfers are drained
+  before new prefill work is packed.
 - Eligibility filter: a tid is eligible if it has no queued chunks and its
   `last_event` (if any) has fired. This bounds both posted network work and
   unsubmitted data to one outstanding chunk per request.
@@ -288,9 +341,11 @@ This is the single most invasive private-state manipulation site.
   records a CUDA event, calls `queue_chunk`, and `publish_prefix` with the
   event. Re-enqueues PREFILL if not final.
 - `del ticket`: the prefill ticket carries no readback slot; its events are
-  retained by `model_runner.events` and `w.last_event`.
+  retained by `model_runner.events` and `w.last_event`. The method returns
+  whether a batch was submitted so `run()` advances the profiler schedule only
+  for real work.
 
-### `PDWorker.progress` (`pd/worker.py:279-343`)
+### `PDWorker.progress` (`pd/worker.py:329-393`)
 
 - `self.cache.poll_prefixes()` then `_, notifications = self.connector.poll()`.
 - For each notification `(peer, tid, sequence)`: drops it if `w is None or
@@ -311,11 +366,12 @@ This is the single most invasive private-state manipulation site.
   total_ut_steps`, `request.hidden_state = self.hidden[w.slot]`, enqueue CODA,
   set `active`, and send `activated`.
 
-### `PDWorker.remove` (`pd/worker.py:106-115`)
+### `PDWorker.remove` (`pd/worker.py:111-120`)
 
 Releases the runner slot, aborts the scheduler request, frees + unpins the KV
-allocation, recycles the slot, deletes `Work`, and sends `released`. This is
-the single cleanup path for both P and D, reached from cancel, cancel_safe,
+allocation (checking existence through the public `has_allocation` view),
+recycles the slot, deletes `Work`, and sends `released`. This is the single
+cleanup path for both P and D, reached from cancel, cancel_safe,
 ack-completion, and fatal paths.
 
 ### `kv_segments` (`pd/transport.py:18-47`)
@@ -364,7 +420,7 @@ RFC, not necessarily runtime defects.
 ### F1 — `PDWorker` manipulates scheduler private queues and `_take()`
 
 - **Priority:** high
-- **Location:** `pd/worker.py:108-109,130-131,161,180,212,233-251,275,341`
+- **Location:** `pd/worker.py:111-120,122-169,213-228,254,276-327,387-391`
 - **Trigger:** every prefill and activation tick.
 - **Impact:** the RFC M9 section states "Direct PD-worker manipulation of
   queues, Request objects, and `_take()` should migrate to explicit
@@ -382,8 +438,8 @@ RFC, not necessarily runtime defects.
 ### F2 — `PDEngine` fakes `scheduler` and `cache_manager` with `SimpleNamespace`
 
 - **Priority:** high
-- **Location:** `pd/engine.py:96-97`; `cache_manager.num_used_blocks` maintained
-  by hand at `pd/engine.py:367`.
+- **Location:** `pd/engine.py:110-111`; `cache_manager.num_used_blocks`
+  maintained by hand at `pd/engine.py:301`.
 - **Trigger:** frontend reads `engine.scheduler.requests` or
   `engine.cache_manager.num_used_blocks`.
 - **Impact:** the RFC M6 contract states "PD should not need synthetic
@@ -392,6 +448,8 @@ RFC, not necessarily runtime defects.
   `engine.cache_manager`; `PDEngine` satisfies this by exposing empty
   namespaces. `num_used_blocks` is a coordinator-maintained aggregate that
   hides per-peer pressure and can drift from worker reality between messages.
+  Note the model side improved since the previous baseline: request validation
+  now uses the typed `PDModelInfo` instead of a `SimpleNamespace` model.
 - **Recommendation:** expose a stable engine interface (resource stats, active
   requests, outputs) as methods on `PDEngine`, and migrate the frontend off
   `engine.scheduler`/`engine.cache_manager` (M1 dependency). Remove the
@@ -400,7 +458,7 @@ RFC, not necessarily runtime defects.
 ### F3 — `PDWorker` mutates `Request` device and progress fields directly
 
 - **Priority:** high
-- **Location:** `pd/worker.py:145,156,260,263,306,338-340`.
+- **Location:** `pd/worker.py:152-163,308-312,356,388-391`.
 - **Trigger:** D-side accept sets `request.stage = RECEIVING`; prefill advances
   `request.num_prefilled_tokens`; activation sets `num_prefilled_tokens`,
   `loops_done`, and `request.hidden_state = self.hidden[w.slot]`; P-side release
@@ -416,41 +474,43 @@ RFC, not necessarily runtime defects.
 
 ### F4 — Worker-side transport reads KV tensor geometry from `KVCacheManager`
 
-- **Priority:** medium
-- **Location:** `pd/transport.py:77-85` (`NixlConnector.__init__` reads
-  `cache.key_cache`/`value_cache` strides and data pointers);
-  `pd/worker.py:149,212` (`cache._get_allocation(...).block_tables`).
+- **Priority:** medium (partially addressed since the previous baseline)
+- **Location:** `pd/transport.py:77-97` (`NixlConnector.__init__` reads
+  `cache.key_cache`/`value_cache` strides and data pointers). Block-table reads
+  now go through the public `plane_block_tables` / `has_allocation` views from
+  #57 (`pd/worker.py:115,156,256`).
 - **Trigger:** connector construction and every `queue_chunk`.
 - **Impact:** RFC principle 3 puts device KV storage under M5 and logical block
-  tables under M4. The transport currently depends on both the physical tensor
-  layout (M5 concern) and the private `_Allocation` structure (M4 concern) to
-  build segment descriptors. This blocks the M4/M5 split.
+  tables under M4. The M4 side of this finding is resolved for PD's read path;
+  the transport still depends on the physical tensor layout (M5 concern) to
+  build segment descriptors.
 - **Recommendation:** define a small KV geometry descriptor (data pointers,
-  strides, block size, depths, device) owned by M5 and a public block-table
-  accessor owned by M4. `NixlConnector` consumes both through stable views
-  rather than private fields.
+  strides, block size, depths, device) owned by M5. `NixlConnector` consumes it
+  through a stable view rather than reading cache fields.
 
 ### F5 — Handoff contract is implicit and undocumented
 
 - **Priority:** medium
 - **Location:** protocol spread across `_message`, `accept`, `progress`,
-  `command`.
-- **Trigger:** any change to the handoff flow.
+  `command`, plus the profiling session control added in #72.
+- **Trigger:** any change to the handoff or control flow.
 - **Impact:** the RFC requires an explicit handoff contract: valid KV ranges
   per depth, destination block mappings, final prompt hidden state with
   coda/sampling by D, transfer generation/sequence/commit/receive-completion/
   ack, safe release ordering under cancel/timeout/worker failure, and
-  prefix/in-flight/preemption constraints. The current implementation honors
-  these (see the sequence diagrams below), but they are not written down, so
-  reviewers and future contributors must re-derive them from code.
+  prefix/in-flight/preemption constraints. Since #72, the contract must also
+  distinguish transfer-scoped messages from session-scoped control:
+  `profile_*` commands carry `control_id` + `session_id`, are validated against
+  the active session, and bypass transfer routing entirely. The current
+  implementation honors these (see the sequence diagrams below), but they are
+  not written down outside this document and #111.
 - **Recommendation:** keep the sequence diagrams and contract list in this
-  document as the reference; promote them into a `docs/pd_handoff_contract.md`
-  once the M9 boundary is agreed.
+  document as the reference; the normative wording is being agreed in #111.
 
 ### F6 — `Pending.phase` is an untyped string
 
 - **Priority:** low
-- **Location:** `pd/engine.py:44` (`phase: str = "waiting"`).
+- **Location:** `pd/engine.py:58` (`phase: str = "waiting"`).
 - **Trigger:** state transitions in `_message`.
 - **Impact:** the M3 review called out the same pattern (strings hiding finite
   state) and introduced enums. `phase` has four reachable values and a terminal
@@ -489,6 +549,11 @@ follows the stable M1 interface once available; until then the
 `SimpleNamespace` shims remain as a compatibility adapter (F2) rather than
 being replaced by an M9-defined facade.
 
+Since the previous baseline, M4 has delivered the first public views (#57), and
+PD's block-table reads already consume them. The remaining private access is
+the scheduler queue/`_take` manipulation (F1), direct `Request` mutation (F3),
+and KV tensor geometry (F4).
+
 ### Target structure
 
 ```
@@ -500,14 +565,17 @@ PDEngine (coordinator)
   |     receive-wait state, handoff plan after allocation,
   |     completion feedback, activation conditions, deferred release
   |     consumes M3 scheduler public protocol (no queues/_take)
-  |     consumes M4 KV lease public API (pin/unpin/mark_imported)
+  |     consumes M4 KV lease public API (pin/unpin/mark_imported/views)
   |
   +-- WorkerSideConnector (NixlConnector + thin wrapper)
         memory registration, KV/hidden movement, CUDA events,
         NIXL handles, completion notifications, deregistration
-        consumes M5 KV geometry descriptor + M4 block-table accessor
+        consumes M5 KV geometry descriptor + M4 block-table views
         hidden pool / slot lifecycle delegated to M5 ModelRunner/Worker
 ```
+
+Session-scoped control (profiling today) stays coordinator-routed with its own
+session identity, separate from transfer-scoped messages.
 
 ### Migration sequence
 
@@ -531,9 +599,10 @@ not implemented ahead of it with an M9-owned substitute.
    and `model_runner.submit` orchestration into the M5 worker. The connector
    reports completion events; it does not assign `Request.hidden_state`. M9
    does not define a new device-state interface. Coordinate with the M5 owner.
-4. **Replace KV geometry access** (depends on M4/M5): consume the M5 KV
-   geometry descriptor and M4 public block-table accessor in `NixlConnector`
-   and `queue_chunk`. M9 does not define its own KV layout or allocation API.
+4. **Replace KV geometry access** (depends on M5; block tables already public
+   via #57): consume an M5 KV geometry descriptor in `NixlConnector` and keep
+   using the M4 public views in `queue_chunk`. M9 does not define its own KV
+   layout or allocation API.
 5. **Remove `SimpleNamespace` shims** (depends on M1): follow the stable M1
    frontend engine interface once available; expose `resource_stats()` /
    `active_requests()` only if M1 owns them, otherwise consume them from M1.
@@ -547,7 +616,7 @@ must not coexist.
 
 ### Existing coverage
 
-`tests/test_pd.py` covers:
+`tests/test_pd.py` (586 lines) covers:
 
 - Transfer lease defers `free` until the last reader
   (`test_transfer_lease_defers_free_until_last_reader`).
@@ -555,12 +624,19 @@ must not coexist.
   (`test_receive_publishes_all_depths_only_after_commit`).
 - Segment ranges cover only valid tokens and all layers/depths
   (`test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths`).
-- Request-ID reuse after cancel
-  (`test_pd_reuses_request_id_after_cancel`).
-- Cancel during execution and close with a live request
-  (`test_pd_cancel_during_execution_and_close_with_live_request`).
+- Request-ID reuse after cancel and cancel during execution with a live close
+  (`test_pd_generation_refill_cancel_and_reuse_matches_local`,
+  `test_pd_cancel_during_execution_and_close_with_live_request`).
+- Coordinator typed metadata and Nanbeige checkpoint loading / 1P1D parity /
+  cancel-reuse-close / EOS-after-handoff
+  (`test_pd_coordinator_stores_typed_metadata`, `test_pd_nanbeige_*`).
 - Coordinator no-progress and receiving-state handling
   (the `Mock`-based engine tests).
+
+Draft PR #119 adds a real-checkpoint P→D agreement harness against a colocated
+reference at matched prefill geometry. Its measured finding: bf16 kernels are
+not bitwise batch- or chunk-invariant, so equality claims must be scoped to
+equal forward geometry; concurrent-load runs check liveness and invariants.
 
 ### Unverified areas
 
@@ -570,16 +646,17 @@ must not coexist.
 - The hidden-state handoff at final prefill, depth-specific KV validity at each
   destination depth, and first-token semantics are only exercised end-to-end on
   GPU. A behavior-preserving refactor must compare outputs and exit depths
-  against the current implementation on the same model and seed.
+  against the current implementation on the same model and seed, at equal
+  forward geometry.
 - Cancel during an in-flight transfer, worker failure during transfer, and
   resource reclamation after failure are covered by unit tests for the lease
   path but not by a multi-process failure-injection test.
 - PD + preemption interaction is not tested and is an open question (F7).
 
 When implementation PRs land, the relevant checks are: changed-file Ruff and
-format, the CPU regression suite (baseline: 245 passed, 114 skipped as of PR
-#50), and a GPU PD comparison on a controlled configuration for throughput,
-TTFT, ITL/TPOT, and transfer bytes under unchanged settings.
+format, the CPU regression suite, and a GPU PD comparison on a controlled
+configuration for throughput, TTFT, ITL/TPOT, and transfer bytes under
+unchanged settings.
 
 ## Appendix: handoff sequence diagrams
 
@@ -616,6 +693,15 @@ sequenceDiagram
     D-->>C: released (D side)
     C->>C: del transfers[tid] (both released)
 ```
+
+Since #122, the P worker drains ready transfer chunks before submitting more
+prefill compute (`prefill_step` returns early when a head chunk's event has
+fired); the message order above is unchanged.
+
+Session-scoped profiling control runs on a parallel path:
+`C->>all workers: profile_start/stop/status(control_id, session_id)` and each
+worker replies `profile_reply(control_id, session_id)`; these messages never
+carry a `tid` and never touch transfer state.
 
 ### Cancel and safe-release ordering
 
