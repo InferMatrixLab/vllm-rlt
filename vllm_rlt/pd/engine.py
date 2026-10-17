@@ -20,6 +20,13 @@ from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
 from vllm_rlt.sampling_params import SamplingParams
 
 from .config import PDConfig
+from .protocol import (
+    PROFILE_ACTION_COMMANDS,
+    CommandKind,
+    EventKind,
+    PendingPhase,
+    ProfileAction,
+)
 from .worker import worker_main
 
 
@@ -55,7 +62,7 @@ class Pending:
     created: float = field(default_factory=time.monotonic)
     p: str | None = None
     d: str | None = None
-    phase: str = "waiting"
+    phase: PendingPhase = PendingPhase.WAITING
     p_blocks: int = 0
     d_blocks: int = 0
     cancelled: bool = False
@@ -167,7 +174,7 @@ class PDEngine:
             for peer in self.peers.values():
                 self._send(
                     peer.name,
-                    "connect",
+                    CommandKind.CONNECT,
                     peers=[p.info["info"] for p in self.peers.values() if p.role != peer.role],
                 )
             self._wait(lambda: all(p.connected for p in self.peers.values()), deadline)
@@ -175,8 +182,8 @@ class PDEngine:
             self._terminate()
             raise
 
-    def _send(self, destination, kind, **fields):
-        self.peers[destination].channel.send(dict(kind=kind, **fields))
+    def _send(self, destination, kind: CommandKind, **fields):
+        self.peers[destination].channel.send(dict(kind=kind.value, **fields))
 
     def _wait(self, condition, deadline):
         while not condition():
@@ -202,20 +209,20 @@ class PDEngine:
 
     def _message(self, peer, m):
         kind = m["kind"]
-        if kind == "profile_reply":
+        if kind == EventKind.PROFILE_REPLY:
             pending = self._profile_replies.get(m.get("control_id"))
             if pending is not None and m.get("session_id") == self._profile_session:
                 pending[peer.name] = m
             return
-        if kind == "fatal":
+        if kind == EventKind.FATAL:
             raise RuntimeError(f"PD {peer.role} failed:\n{m['error']}")
-        if kind == "ready":
+        if kind == EventKind.READY:
             peer.info, peer.ready = m, True
             return
-        if kind == "connected":
+        if kind == EventKind.CONNECTED:
             peer.connected = True
             return
-        if kind == "stopped":
+        if kind == EventKind.STOPPED:
             peer.stopped = True
             self.worker_metrics[peer.name] = m
             return
@@ -225,15 +232,15 @@ class PDEngine:
         if peer.name not in (w.p, w.d):
             raise RuntimeError("PD response from wrong worker")
         now = time.monotonic() - w.created
-        if kind == "reserved":
+        if kind == EventKind.RESERVED:
             w.timings["d_reserved"] = now
             if w.cancelled:
-                self._send(w.d, "cancel_safe", tid=w.tid)
+                self._send(w.d, CommandKind.CANCEL_SAFE, tid=w.tid)
                 return
-            w.phase = "prefill"
+            w.phase = PendingPhase.PREFILL
             self._send(
                 w.p,
-                "prefill",
+                CommandKind.PREFILL,
                 tid=w.tid,
                 tokens=w.request.prompt_token_ids,
                 params=w.request.sampling_params,
@@ -243,22 +250,22 @@ class PDEngine:
                 slot=m["slot"],
                 cached_tokens=m.get("cached_tokens", 0),
             )
-        elif kind == "prefill_started":
+        elif kind == EventKind.PREFILL_STARTED:
             w.timings["prefill_started"] = now
-        elif kind == "prefill_complete":
+        elif kind == EventKind.PREFILL_COMPLETE:
             if not w.p_compute_released:
                 peer.compute_slots -= 1
                 w.p_compute_released = True
             w.timings["prefill_compute_completed"] = now
-        elif kind == "commit":
+        elif kind == EventKind.COMMIT:
             w.timings["prefill_submitted"] = now
             if not w.cancelled:
-                self._send(w.d, "commit", tid=w.tid, count=m["count"])
-        elif kind == "activated":
-            w.phase = "decode"
+                self._send(w.d, CommandKind.COMMIT, tid=w.tid, count=m["count"])
+        elif kind == EventKind.ACTIVATED:
+            w.phase = PendingPhase.DECODE
             w.timings["d_activated"] = now
-            self._send(w.p, "ack", tid=w.tid)
-        elif kind == "output":
+            self._send(w.p, CommandKind.ACK, tid=w.tid)
+        elif kind == EventKind.OUTPUT:
             if not w.cancelled:
                 output = replace(m["output"], request_id=w.request.request_id)
                 w.request.generated_token_ids = list(output.token_ids)
@@ -269,7 +276,7 @@ class PDEngine:
                     w.finished = True
                     w.timings["finished"] = now
                     self.requests.pop(w.request.request_id, None)
-        elif kind == "released":
+        elif kind == EventKind.RELEASED:
             if peer.role == "prefill" and not w.p_released:
                 w.p_released = True
                 if not w.p_compute_released:
@@ -278,12 +285,12 @@ class PDEngine:
                 peer.slots -= 1
                 peer.blocks -= w.p_blocks
                 if w.cancelled and not w.d_released:
-                    self._send(w.d, "cancel_safe", tid=w.tid)
+                    self._send(w.d, CommandKind.CANCEL_SAFE, tid=w.tid)
             elif peer.role == "decode" and not w.d_released:
                 w.d_released = True
                 peer.slots -= 1
                 peer.blocks -= w.d_blocks
-        elif kind == "rejected":
+        elif kind == EventKind.REJECTED:
             # Coordinator holds exact credits; rejection indicates a state mismatch.
             raise RuntimeError("PD reserved capacity rejected by worker")
         else:
@@ -360,7 +367,7 @@ class PDEngine:
         if self.scheduling_policy == "priority":
             waiting.sort(key=lambda w: (w.request.sampling_params.priority, w.created))
         for w in waiting:
-            if w.cancelled or w.phase != "waiting":
+            if w.cancelled or w.phase != PendingPhase.WAITING:
                 continue
             candidates = {}
             for role in ("prefill", "decode"):
@@ -397,11 +404,11 @@ class PDEngine:
             p.slots += 1
             p.compute_slots += 1
             d.slots += 1
-            w.phase = "reserving"
+            w.phase = PendingPhase.RESERVING
             w.timings["admitted"] = time.monotonic() - w.created
             self._send(
                 d.name,
-                "reserve",
+                CommandKind.RESERVE,
                 tid=w.tid,
                 tokens=w.request.prompt_token_ids,
                 params=w.request.sampling_params,
@@ -414,14 +421,14 @@ class PDEngine:
         w = next(w for w in self.transfers.values() if w.request is request)
         w.cancelled = True
         self.outputs = deque(o for o in self.outputs if o.request_id != request_id)
-        if self.closed or w.phase == "waiting":
+        if self.closed or w.phase == PendingPhase.WAITING:
             del self.transfers[w.tid]
         else:
-            self._send(w.d, "cancel", tid=w.tid)
+            self._send(w.d, CommandKind.CANCEL, tid=w.tid)
             if w.p_released:
-                self._send(w.d, "cancel_safe", tid=w.tid)
+                self._send(w.d, CommandKind.CANCEL_SAFE, tid=w.tid)
             else:
-                self._send(w.p, "cancel", tid=w.tid)
+                self._send(w.p, CommandKind.CANCEL, tid=w.tid)
         request.stage = Stage.FINISHED
         request.finish_reason = FinishReason.ABORT
         return RequestOutput.from_request(request)
@@ -477,7 +484,7 @@ class PDEngine:
             )
         return result
 
-    def _profile_control(self, action, *, timeout=None, **fields):
+    def _profile_control(self, action: ProfileAction, *, timeout=None, **fields):
         if self.closed:
             raise RuntimeError("PD engine is closed")
         control_id = uuid.uuid4().hex
@@ -488,7 +495,7 @@ class PDEngine:
             for rank, name in enumerate(self.peers):
                 self._send(
                     name,
-                    "profile_" + action,
+                    PROFILE_ACTION_COMMANDS[action],
                     control_id=control_id,
                     session_id=self._profile_session,
                     rank=rank,
@@ -540,7 +547,7 @@ class PDEngine:
         self._profile_recording = True
         try:
             return self._profile_control(
-                "start",
+                ProfileAction.START,
                 config=asdict(config),
                 scheduled=scheduled,
                 capture_time=self._profile_timestamp,
@@ -549,7 +556,7 @@ class PDEngine:
             self._profile_errors.append(str(exc))
             self._profile_recording = False
             try:
-                self._profile_control("stop", timeout=self.config.shutdown_timeout)
+                self._profile_control(ProfileAction.STOP, timeout=self.config.shutdown_timeout)
             except Exception:
                 pass  # Preserve the original failure; per-rank failures remain in manifest.
             raise
@@ -557,7 +564,7 @@ class PDEngine:
     def stop_profile(self):
         if not self._profile_session:
             return {"recording": False, "ranks": {}}
-        self._profile_control("stop")
+        self._profile_control(ProfileAction.STOP)
         self._profile_recording = False
         return self._profile_manifest()
 
@@ -566,7 +573,7 @@ class PDEngine:
             return {"recording": False, "ranks": {}}
         if self.closed:
             return self._profile_manifest()
-        return self._profile_control("status")
+        return self._profile_control(ProfileAction.STATUS)
 
     def wait_for_profile_artifacts(self, timeout=None):
         if self._profile_session:
@@ -576,7 +583,7 @@ class PDEngine:
         deadline = None if timeout is None else time.monotonic() + timeout
         while self._profile_session:
             remaining = None if deadline is None else max(0, deadline - time.monotonic())
-            result = self._profile_control("status", timeout=remaining)
+            result = self._profile_control(ProfileAction.STATUS, timeout=remaining)
             if all(s.get("artifacts_complete", False) for s in self._profile_statuses.values()):
                 return result
             if deadline is not None and time.monotonic() >= deadline:
@@ -622,7 +629,7 @@ class PDEngine:
                 self.stop_profile()
                 self.wait_for_profile_artifacts(max(0, deadline - time.monotonic()))
             for peer in self.peers.values():
-                self._send(peer.name, "stop")
+                self._send(peer.name, CommandKind.STOP)
             self._wait(lambda: all(p.stopped for p in self.peers.values()), deadline)
             for peer in self.peers.values():
                 peer.process.join(max(0, deadline - time.monotonic()))

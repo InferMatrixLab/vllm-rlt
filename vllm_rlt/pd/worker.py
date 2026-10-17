@@ -15,6 +15,7 @@ from vllm_rlt.models import AutoModelForCausalLM, OuroConfig, OuroForCausalLM
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.request import Stage
 
+from .protocol import PROFILE_COMMANDS, CommandKind, EventKind, ProfileAction
 from .transport import NixlConnector, kv_segments, partition_segments
 
 
@@ -93,7 +94,7 @@ class PDWorker:
             ).encode()
         ).hexdigest()
         self.send(
-            "ready",
+            EventKind.READY,
             info=self.connector.info,
             fingerprint=self.fingerprint,
             model=asdict(self.model.config),
@@ -105,8 +106,8 @@ class PDWorker:
             watermark_blocks=self.cache.watermark_blocks,
         )
 
-    def send(self, kind, **fields):
-        self.channel.send(dict(kind=kind, **fields))
+    def send(self, kind: EventKind, **fields):
+        self.channel.send(dict(kind=kind.value, **fields))
 
     def remove(self, w):
         self.engine.model_runner.release(w.tid)
@@ -117,14 +118,14 @@ class PDWorker:
             self.cache.unpin_transfer(w.tid, w.tid)
         self.free_slots.append(w.slot)
         del self.work[w.tid]
-        self.send("released", tid=w.tid, role=self.role)
+        self.send(EventKind.RELEASED, tid=w.tid, role=self.role)
 
     def accept(self, command):
         tid = command["tid"]
         if tid in self.work:
             raise RuntimeError("duplicate transfer generation")
         if not self.free_slots:
-            self.send("rejected", tid=tid, role=self.role)
+            self.send(EventKind.REJECTED, tid=tid, role=self.role)
             return
         params = command["params"]
         # P owns only prompt KV and never samples. D owns all sampling/RNG.
@@ -140,7 +141,7 @@ class PDWorker:
         initial = len(command["tokens"]) if self.cache.incremental_allocation else capacity
         if not self.cache.allocate(tid, capacity, initial_tokens=initial, prefix=prefix):
             self.engine.scheduler.abort(tid)
-            self.send("rejected", tid=tid, role=self.role)
+            self.send(EventKind.REJECTED, tid=tid, role=self.role)
             return
         self.cache.pin_transfer(tid, tid)
         w = Work(
@@ -151,7 +152,7 @@ class PDWorker:
         if self.role == "decode":
             request.stage = Stage.RECEIVING
             self.send(
-                "reserved",
+                EventKind.RESERVED,
                 tid=tid,
                 tables=self.cache.plane_block_tables(tid),
                 slot=w.slot,
@@ -166,14 +167,14 @@ class PDWorker:
                 event.record(torch.cuda.current_stream(self.cache.device))
                 self.queue_chunk(w, w.target_cached_tokens, hit, event, False)
             self.engine.scheduler.enqueue(request, Stage.PREFILL)
-            self.send("prefill_started", tid=tid)
+            self.send(EventKind.PREFILL_STARTED, tid=tid)
 
     def command(self, command):
         kind = command["kind"]
-        if kind.startswith("profile_"):
+        action = PROFILE_COMMANDS.get(kind)
+        if action is not None:
             try:
-                action = kind.removeprefix("profile_")
-                if action == "start":
+                if action is ProfileAction.START:
                     result = self.engine.start_profile(
                         ProfileConfig(**command["config"]),
                         scheduled=command["scheduled"],
@@ -187,36 +188,34 @@ class PDWorker:
                     current = self.engine.profile_status().get("session_id")
                     if current is not None and current != command["session_id"]:
                         raise ValueError("profile session ID mismatch")
-                    if action == "stop":
+                    if action is ProfileAction.STOP:
                         result = self.engine.stop_profile()
-                    elif action == "status":
-                        result = self.engine.profile_status()
                     else:
-                        raise ValueError("unknown profile action")
+                        result = self.engine.profile_status()
                 self.send(
-                    "profile_reply",
+                    EventKind.PROFILE_REPLY,
                     control_id=command["control_id"],
                     session_id=command["session_id"],
                     result=result,
                 )
             except Exception as exc:
                 self.send(
-                    "profile_reply",
+                    EventKind.PROFILE_REPLY,
                     control_id=command["control_id"],
                     session_id=command["session_id"],
                     error=str(exc),
                 )
             return
-        if kind == "connect":
+        if kind == CommandKind.CONNECT:
             for peer in command["peers"]:
                 self.connector.connect(peer)
-            self.send("connected")
-        elif kind in ("reserve", "prefill"):
+            self.send(EventKind.CONNECTED)
+        elif kind in (CommandKind.RESERVE, CommandKind.PREFILL):
             self.accept(command)
-        elif kind == "cancel":
+        elif kind == CommandKind.CANCEL:
             w = self.work.get(command["tid"])
             if w is None:
-                self.send("released", tid=command["tid"], role=self.role)
+                self.send(EventKind.RELEASED, tid=command["tid"], role=self.role)
                 return
             w.cancelled = True
             if self.role == "prefill":
@@ -226,13 +225,13 @@ class PDWorker:
                     queue.remove(w.tid)
             elif w.active:
                 self.remove(w)  # All imports ended before decode activation.
-        elif kind == "cancel_safe":
+        elif kind == CommandKind.CANCEL_SAFE:
             w = self.work.get(command["tid"])
             if w is not None:
                 if not w.cancelled:
                     raise RuntimeError("unexpected cancellation acknowledgement")
                 self.remove(w)
-        elif kind == "commit":
+        elif kind == CommandKind.COMMIT:
             w = self.work.get(command["tid"])
             if w is not None and not w.cancelled:
                 if w.expected is not None and w.expected != command["count"]:
@@ -240,11 +239,11 @@ class PDWorker:
                 if type(command["count"]) is not int or command["count"] <= 0:
                     raise RuntimeError("invalid transfer commit count")
                 w.expected = command["count"]
-        elif kind == "ack":
+        elif kind == CommandKind.ACK:
             w = self.work.get(command["tid"])
             if w is not None:
                 w.acknowledged = True
-        elif kind == "stop":
+        elif kind == CommandKind.STOP:
             if self.work or self.connector.pending:
                 raise RuntimeError("stop requested before PD requests drained")
             self.running = False
@@ -355,7 +354,7 @@ class PDWorker:
                     self.engine.model_runner.release(w.tid)
                     w.request.hidden_state = None
                     w.compute_released = True
-                    self.send("prefill_complete", tid=w.tid)
+                    self.send(EventKind.PREFILL_COMPLETE, tid=w.tid)
                 # Round robin: at most one bounded transfer per request per tick.
                 if w.chunks:
                     event, seq, local, remote, size = w.chunks[0]
@@ -365,7 +364,7 @@ class PDWorker:
                         w.chunks.popleft()
                 if w.compute_done and not w.chunks and not w.committed:
                     w.committed = True
-                    self.send("commit", tid=w.tid, count=w.next_sequence)
+                    self.send(EventKind.COMMIT, tid=w.tid, count=w.next_sequence)
                 if w.acknowledged and not self.connector.busy(w.tid):
                     self.remove(w)
             elif not w.cancelled and not w.active and w.expected is not None:
@@ -390,7 +389,7 @@ class PDWorker:
                     w.request.hidden_state = self.hidden[w.slot]
                     self.engine.scheduler.enqueue(w.request, Stage.CODA)
                     w.active = True
-                    self.send("activated", tid=w.tid, seconds=time.monotonic() - w.started)
+                    self.send(EventKind.ACTIVATED, tid=w.tid, seconds=time.monotonic() - w.started)
 
     def run(self):
         while self.running:
@@ -405,18 +404,18 @@ class PDWorker:
                     self.engine.profiling.step()
             elif any(w.active for w in self.work.values()):
                 for output in self.engine.step():
-                    self.send("output", tid=output.request_id, output=output)
+                    self.send(EventKind.OUTPUT, tid=output.request_id, output=output)
                     if output.finished:
                         w = self.work.pop(output.request_id)
                         self.free_slots.append(w.slot)
-                        self.send("released", tid=w.tid, role=self.role)
+                        self.send(EventKind.RELEASED, tid=w.tid, role=self.role)
             if not self.work and not self.channel.poll():
                 time.sleep(0.001)
         self.engine.model_runner.synchronize()
         self.engine.close()
         self.connector.close()
         self.send(
-            "stopped",
+            EventKind.STOPPED,
             prefill_tokens=self.prefill_tokens,
             bytes_sent=self.connector.bytes_sent,
             transfers=self.connector.transfers,
@@ -434,7 +433,9 @@ def worker_main(role, device, name, channel, model_source, options, pd_config):
         owner.run()
     except BaseException:
         try:
-            channel.send(dict(kind="fatal", error=traceback.format_exc(), pid=os.getpid()))
+            channel.send(
+                dict(kind=EventKind.FATAL.value, error=traceback.format_exc(), pid=os.getpid())
+            )
             while True:
                 time.sleep(1)
         except (BrokenPipeError, EOFError):
