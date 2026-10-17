@@ -419,6 +419,218 @@ def test_pd_coordinator_stores_typed_metadata(monkeypatch):
         engine._terminate()
 
 
+def fake_pd_engine(monkeypatch):
+    """Coordinator with mocked processes/pipes; workers report ready immediately."""
+    from unittest.mock import Mock
+
+    from vllm_rlt.pd.engine import PDEngine
+
+    context = Mock()
+    context.Pipe.side_effect = lambda: (Mock(), Mock())
+    monkeypatch.setattr("vllm_rlt.pd.engine.mp.get_context", lambda _: context)
+    config = tiny_ouro_config()
+
+    def ready(engine, condition, deadline):
+        for peer in engine.peers.values():
+            peer.info = dict(
+                fingerprint="same-weights",
+                model=config.to_dict(),
+                info=dict(agent=peer.name),
+                block_size=4,
+                depths=config.total_ut_steps,
+                num_blocks=128,
+                max_seqs=8,
+                active_limit=4,
+                watermark_blocks=0,
+            )
+            peer.ready = peer.connected = True
+            peer.channel.poll.return_value = False
+        assert condition()
+
+    monkeypatch.setattr(PDEngine, "_wait", ready)
+    return PDEngine(config, attention_backend="triton")
+
+
+def pd_peer(engine, role):
+    return next(p for p in engine.peers.values() if p.role == role)
+
+
+def sent_commands(peer, kind=None):
+    messages = [call.args[0] for call in peer.channel.send.call_args_list]
+    return [m for m in messages if kind is None or m["kind"] == kind]
+
+
+def admit_one(engine, request_id="r", tokens=(2, 3, 4, 5)):
+    engine.add_request(request_id, list(tokens), SamplingParams(max_tokens=4, max_loops=4))
+    engine._admit()
+    return next(iter(engine.transfers.values()))
+
+
+def test_pd_coordinator_handoff_state_machine(monkeypatch):
+    """Pin the happy-path protocol: phases, forwarded commands, and credit accounting."""
+    engine = fake_pd_engine(monkeypatch)
+    try:
+        p, d = pd_peer(engine, "prefill"), pd_peer(engine, "decode")
+        w = admit_one(engine)
+        assert w.phase == "reserving"
+        assert (p.blocks, p.slots, p.compute_slots) == (w.p_blocks, 1, 1)
+        assert (d.blocks, d.slots) == (w.d_blocks, 1)
+        assert sent_commands(d, "reserve")[0]["tid"] == w.tid
+
+        engine._message(
+            d, dict(kind="reserved", tid=w.tid, tables=((1,),), slot=2, cached_tokens=0)
+        )
+        assert w.phase == "prefill"
+        prefill = sent_commands(p, "prefill")[0]
+        assert prefill["kind"] == "prefill"
+        assert prefill["tables"] == ((1,),) and prefill["slot"] == 2
+
+        engine._message(p, dict(kind="prefill_started", tid=w.tid))
+        engine._message(p, dict(kind="prefill_complete", tid=w.tid))
+        assert p.compute_slots == 0 and w.p_compute_released
+        assert p.blocks == w.p_blocks  # Transfer drainage still holds the KV credits.
+
+        engine._message(p, dict(kind="commit", tid=w.tid, count=3))
+        assert sent_commands(d, "commit") == [dict(kind="commit", tid=w.tid, count=3)]
+
+        engine._message(d, dict(kind="activated", tid=w.tid))
+        assert w.phase == "decode"
+        assert sent_commands(p, "ack") == [dict(kind="ack", tid=w.tid)]
+
+        from vllm_rlt.request import RequestOutput
+
+        output = RequestOutput(w.tid, [2, 3, 4, 5], [7, 8], [4, 4], True, "length")
+        engine._message(d, dict(kind="output", tid=w.tid, output=output))
+        drained = engine.step()
+        assert [o.request_id for o in drained] == ["r"]
+        assert drained[0].token_ids == [7, 8] and drained[0].finished
+        assert "r" not in engine.requests
+
+        engine._message(p, dict(kind="released", tid=w.tid, role="prefill"))
+        assert (p.blocks, p.slots) == (0, 0) and w.p_released
+        assert w.tid in engine.transfers  # Both sides must release before retirement.
+        # A duplicate release must not return credits twice.
+        engine._message(p, dict(kind="released", tid=w.tid, role="prefill"))
+        assert p.blocks == 0 and p.slots == 0
+        engine._message(d, dict(kind="released", tid=w.tid, role="decode"))
+        assert (d.blocks, d.slots) == (0, 0)
+        assert w.tid not in engine.transfers
+        assert engine.metrics[0]["transfer_id"] == w.tid
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine._terminate()
+
+
+@pytest.mark.parametrize("point", ["waiting", "reserving", "prefill", "decode"])
+def test_pd_coordinator_cancel_message_order(monkeypatch, point):
+    """Pin cancel vs cancel_safe ordering at each protocol point."""
+    engine = fake_pd_engine(monkeypatch)
+    try:
+        p, d = pd_peer(engine, "prefill"), pd_peer(engine, "decode")
+        if point == "waiting":
+            engine.add_request("r", [2, 3], SamplingParams(max_tokens=2))
+            w = next(iter(engine.transfers.values()))
+        else:
+            w = admit_one(engine)
+        if point in ("prefill", "decode"):
+            engine._message(
+                d, dict(kind="reserved", tid=w.tid, tables=((1,),), slot=0, cached_tokens=0)
+            )
+        if point == "decode":
+            engine._message(d, dict(kind="activated", tid=w.tid))
+
+        engine.abort_request("r")
+        d_kinds = [m["kind"] for m in sent_commands(d) if m["kind"] != "connect"]
+        p_kinds = [m["kind"] for m in sent_commands(p) if m["kind"] != "connect"]
+        if point == "waiting":
+            assert w.tid not in engine.transfers
+            assert d_kinds == [] and p_kinds == []
+            return
+        assert d_kinds[-1] == "cancel"
+        assert p_kinds[-1] == "cancel"
+        assert w.cancelled and w.tid in engine.transfers
+
+        if point == "reserving":
+            # A late reservation for a cancelled generation goes down the safe path.
+            engine._message(
+                d, dict(kind="reserved", tid=w.tid, tables=((1,),), slot=0, cached_tokens=0)
+            )
+            assert sent_commands(d)[-1]["kind"] == "cancel_safe"
+            assert sent_commands(p, "prefill") == []  # No prefill dispatched.
+
+        # P releases first; only then may D tear down its receiving allocation.
+        engine._message(p, dict(kind="released", tid=w.tid, role="prefill"))
+        assert sent_commands(d)[-1]["kind"] == "cancel_safe"
+        engine._message(d, dict(kind="released", tid=w.tid, role="decode"))
+        assert w.tid not in engine.transfers
+        assert all(x.blocks == 0 and x.slots == 0 for x in (p, d))
+    finally:
+        engine._terminate()
+
+
+def test_pd_wire_format_snapshot(monkeypatch):
+    """Pin the field sets of coordinator commands; protocol typing must preserve them."""
+    engine = fake_pd_engine(monkeypatch)
+    try:
+        p, d = pd_peer(engine, "prefill"), pd_peer(engine, "decode")
+        w = admit_one(engine)
+        engine._message(
+            d, dict(kind="reserved", tid=w.tid, tables=((1,),), slot=0, cached_tokens=0)
+        )
+        engine._message(p, dict(kind="commit", tid=w.tid, count=1))
+        engine._message(d, dict(kind="activated", tid=w.tid))
+        engine.abort_request("r")
+
+        connect = sent_commands(d, "connect")[0]
+        reserve = sent_commands(d, "reserve")[0]
+        prefill = sent_commands(p, "prefill")[0]
+        commit = sent_commands(d, "commit")[0]
+        ack = sent_commands(p, "ack")[0]
+        cancel, cancel_p = sent_commands(d, "cancel")[0], sent_commands(p, "cancel")[0]
+        assert set(connect) == {"kind", "peers"}
+        assert set(reserve) == {"kind", "tid", "tokens", "params", "trace_id", "peer"}
+        assert set(prefill) == {
+            "kind",
+            "tid",
+            "tokens",
+            "params",
+            "trace_id",
+            "peer",
+            "tables",
+            "slot",
+            "cached_tokens",
+        }
+        assert set(commit) == {"kind", "tid", "count"}
+        assert set(ack) == set(cancel_p) == set(cancel) == {"kind", "tid"}
+    finally:
+        engine._terminate()
+
+
+def test_pd_profile_reply_bypasses_transfer_state(monkeypatch):
+    """Session-scoped profile replies never enter transfer routing."""
+    engine = fake_pd_engine(monkeypatch)
+    try:
+        w = admit_one(engine)
+        d = pd_peer(engine, "decode")
+        engine._message(d, dict(kind="profile_reply", control_id="x", session_id="s"))
+        assert w.phase == "reserving" and not w.cancelled
+
+        engine._profile_session = "s"
+        replies = {}
+        engine._profile_replies["c1"] = replies
+        engine._message(
+            d, dict(kind="profile_reply", control_id="c1", session_id="s", result={"ok": True})
+        )
+        assert list(replies) == [d.name]
+        # A reply from a stale session is ignored.
+        engine._message(d, dict(kind="profile_reply", control_id="c1", session_id="old"))
+        assert len(replies) == 1
+        assert w.phase == "reserving"
+        engine._profile_session = None  # Let _terminate skip the manifest path.
+    finally:
+        engine._terminate()
+
+
 def create_nanbeige_pd(checkpoint):
     pytest.importorskip("nixl")
     from vllm_rlt.pd.engine import PDEngine
