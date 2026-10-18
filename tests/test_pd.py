@@ -184,7 +184,7 @@ def test_pd_generation_refill_cancel_and_reuse_matches_local(graph, layout):
         e.add_request("reuse", prompts[1], params, trace_id="t")
         reference.add_request("reuse", prompts[1], params, trace_id="t")
         assert drain(e) == drain(reference)
-        assert all(p.slots == 0 and p.blocks == 0 for p in e.peers.values())
+        assert all(p.reserved_slots == 0 and p.reserved_blocks == 0 for p in e.peers.values())
     assert all(m["used_blocks"] == 0 for m in e.worker_metrics.values())
     assert sum(m["bytes_sent"] for m in e.worker_metrics.values()) > 0
 
@@ -224,7 +224,7 @@ def test_pd_cancel_during_execution_and_close_with_live_request(phase):
             assert time.monotonic() < deadline
         e.abort_request("cancel")
         assert drain(e) == {}
-        assert all(p.slots == 0 and p.blocks == 0 for p in e.peers.values())
+        assert all(p.reserved_slots == 0 and p.reserved_blocks == 0 for p in e.peers.values())
         e.add_request("live", [2] * 50, params, trace_id="t")
         e.step()
     finally:
@@ -327,7 +327,8 @@ def test_pd_prefix_reuse_reduces_transfers_and_preserves_outputs(p_cache, d_cach
             assert results[0][f"0-{i}"].token_ids == results[1][f"1-{i}"].token_ids
             assert results[0][f"0-{i}"].exit_depths == results[1][f"1-{i}"].exit_depths
         assert all(
-            p.slots == 0 and p.compute_slots == 0 and p.blocks == 0 for p in e.peers.values()
+            p.reserved_slots == 0 and p.reserved_compute_slots == 0 and p.reserved_blocks == 0
+            for p in e.peers.values()
         )
     stats = list(e.worker_metrics.values())
     p = next(x for x in stats if x["prefill_tokens"])
@@ -466,6 +467,91 @@ def admit_one(engine, request_id="r", tokens=(2, 3, 4, 5)):
     return next(iter(engine.transfers.values()))
 
 
+@pytest.mark.parametrize("depths", [1, 4])
+@pytest.mark.parametrize(
+    "prompt_tokens,max_tokens,p_blocks,d_blocks",
+    [(4, 1, 1, 1), (5, 4, 2, 2), (4, 6, 1, 3)],
+)
+def test_pd_coordinator_reserves_full_request_budget(
+    monkeypatch, depths, prompt_tokens, max_tokens, p_blocks, d_blocks
+):
+    engine = fake_pd_engine(monkeypatch)
+    try:
+        p, d = pd_peer(engine, "prefill"), pd_peer(engine, "decode")
+        for peer in (p, d):
+            peer.info["depths"] = depths
+        assert engine._reserved_blocks_total() == 0
+        engine.add_request("r", [2] * prompt_tokens, SamplingParams(max_tokens=max_tokens))
+        engine._admit()
+        w = next(iter(engine.transfers.values()))
+        assert w.phase == "reserving"
+        assert p.reserved_blocks == w.reserved_p_blocks == p_blocks * depths
+        assert d.reserved_blocks == w.reserved_d_blocks == d_blocks * depths
+        assert (p.reserved_slots, p.reserved_compute_slots, d.reserved_slots) == (1, 1, 1)
+        assert d.reserved_compute_slots == 0
+        total = (p_blocks + d_blocks) * depths
+        assert engine._reserved_blocks_total() == total
+        # Preserve the shim's existing refresh point: transfer feedback, not admission.
+        assert engine.cache_manager.num_used_blocks == 0
+        engine._message(d, dict(kind="reserved", tid=w.tid, tables=((1,),), slot=0))
+        assert engine.cache_manager.num_used_blocks == total
+    finally:
+        engine._terminate()
+
+
+@pytest.mark.parametrize(
+    "role,limits",
+    [
+        ("prefill", {"max_seqs": 1}),
+        ("decode", {"max_seqs": 1}),
+        ("prefill", {"active_limit": 1}),
+        ("prefill", {"num_blocks": 4}),
+        ("decode", {"num_blocks": 8}),
+        ("prefill", {"num_blocks": 8, "watermark_blocks": 1}),
+        ("decode", {"num_blocks": 16, "watermark_blocks": 1}),
+    ],
+)
+def test_pd_coordinator_reservations_gate_admission(monkeypatch, role, limits):
+    engine = fake_pd_engine(monkeypatch)
+    try:
+        p, d = pd_peer(engine, "prefill"), pd_peer(engine, "decode")
+        pd_peer(engine, role).info.update(limits)
+        first = admit_one(engine)
+        assert first.phase == "reserving"
+        engine.add_request("next", [2, 3, 4, 5], SamplingParams(max_tokens=4))
+        waiting = next(w for w in engine.transfers.values() if w.request.request_id == "next")
+        engine._admit()
+        assert waiting.phase == "waiting"
+        assert len(sent_commands(d, "reserve")) == 1
+        assert (p.reserved_blocks, d.reserved_blocks) == (4, 8)
+        assert (p.reserved_slots, d.reserved_slots) == (1, 1)
+
+        engine._message(d, dict(kind="reserved", tid=first.tid, tables=((1,),), slot=0))
+        engine._message(p, dict(kind="prefill_complete", tid=first.tid))
+        assert p.reserved_compute_slots == 0
+        engine._admit()
+        # Computation finishing returns only compute capacity, not blocks/request slots.
+        if "active_limit" in limits:
+            assert waiting.phase == "reserving"
+            assert (p.reserved_blocks, d.reserved_blocks) == (8, 16)
+            assert (p.reserved_slots, d.reserved_slots) == (2, 2)
+        else:
+            assert waiting.phase == "waiting"
+            assert (p.reserved_blocks, d.reserved_blocks) == (4, 8)
+            assert (p.reserved_slots, d.reserved_slots) == (1, 1)
+
+        engine.abort_request("r")
+        engine._message(p, dict(kind="released", tid=first.tid, role="prefill"))
+        engine._message(d, dict(kind="released", tid=first.tid, role="decode"))
+        engine._admit()
+        assert waiting.phase == "reserving"
+        assert len(sent_commands(d, "reserve")) == 2
+        assert (p.reserved_blocks, d.reserved_blocks) == (4, 8)
+        assert (p.reserved_slots, p.reserved_compute_slots, d.reserved_slots) == (1, 1, 1)
+    finally:
+        engine._terminate()
+
+
 def test_pd_coordinator_handoff_state_machine(monkeypatch):
     """Pin the happy-path protocol: phases, forwarded commands, and credit accounting."""
     engine = fake_pd_engine(monkeypatch)
@@ -473,8 +559,12 @@ def test_pd_coordinator_handoff_state_machine(monkeypatch):
         p, d = pd_peer(engine, "prefill"), pd_peer(engine, "decode")
         w = admit_one(engine)
         assert w.phase == "reserving"
-        assert (p.blocks, p.slots, p.compute_slots) == (w.p_blocks, 1, 1)
-        assert (d.blocks, d.slots) == (w.d_blocks, 1)
+        assert (p.reserved_blocks, p.reserved_slots, p.reserved_compute_slots) == (
+            w.reserved_p_blocks,
+            1,
+            1,
+        )
+        assert (d.reserved_blocks, d.reserved_slots) == (w.reserved_d_blocks, 1)
         assert sent_commands(d, "reserve")[0]["tid"] == w.tid
 
         engine._message(
@@ -484,11 +574,14 @@ def test_pd_coordinator_handoff_state_machine(monkeypatch):
         prefill = sent_commands(p, "prefill")[0]
         assert prefill["kind"] == "prefill"
         assert prefill["tables"] == ((1,),) and prefill["slot"] == 2
+        assert engine.cache_manager.num_used_blocks == 12
 
         engine._message(p, dict(kind="prefill_started", tid=w.tid))
         engine._message(p, dict(kind="prefill_complete", tid=w.tid))
-        assert p.compute_slots == 0 and w.p_compute_released
-        assert p.blocks == w.p_blocks  # Transfer drainage still holds the KV credits.
+        engine._message(p, dict(kind="prefill_complete", tid=w.tid))  # Duplicate is idempotent.
+        assert p.reserved_compute_slots == 0 and w.p_compute_released
+        assert p.reserved_blocks == w.reserved_p_blocks  # Drainage still holds the KV credits.
+        assert engine.cache_manager.num_used_blocks == 12
 
         engine._message(p, dict(kind="commit", tid=w.tid, count=3))
         assert sent_commands(d, "commit") == [dict(kind="commit", tid=w.tid, count=3)]
@@ -505,15 +598,19 @@ def test_pd_coordinator_handoff_state_machine(monkeypatch):
         assert [o.request_id for o in drained] == ["r"]
         assert drained[0].token_ids == [7, 8] and drained[0].finished
         assert "r" not in engine.requests
+        # Finishing below max_tokens does not shrink the reservation before release.
+        assert (p.reserved_blocks, d.reserved_blocks) == (4, 8)
+        assert engine.cache_manager.num_used_blocks == 12
 
         engine._message(p, dict(kind="released", tid=w.tid, role="prefill"))
-        assert (p.blocks, p.slots) == (0, 0) and w.p_released
+        assert (p.reserved_blocks, p.reserved_slots) == (0, 0) and w.p_released
+        assert engine.cache_manager.num_used_blocks == 8
         assert w.tid in engine.transfers  # Both sides must release before retirement.
         # A duplicate release must not return credits twice.
         engine._message(p, dict(kind="released", tid=w.tid, role="prefill"))
-        assert p.blocks == 0 and p.slots == 0
+        assert p.reserved_blocks == 0 and p.reserved_slots == 0
         engine._message(d, dict(kind="released", tid=w.tid, role="decode"))
-        assert (d.blocks, d.slots) == (0, 0)
+        assert (d.reserved_blocks, d.reserved_slots) == (0, 0)
         assert w.tid not in engine.transfers
         assert engine.metrics[0]["transfer_id"] == w.tid
         assert engine.cache_manager.num_used_blocks == 0
@@ -545,6 +642,8 @@ def test_pd_coordinator_cancel_message_order(monkeypatch, point):
         if point == "waiting":
             assert w.tid not in engine.transfers
             assert d_kinds == [] and p_kinds == []
+            assert engine._reserved_blocks_total() == 0
+            assert all(x.reserved_slots == 0 and x.reserved_compute_slots == 0 for x in (p, d))
             return
         assert d_kinds[-1] == "cancel"
         assert p_kinds[-1] == "cancel"
@@ -563,7 +662,11 @@ def test_pd_coordinator_cancel_message_order(monkeypatch, point):
         assert sent_commands(d)[-1]["kind"] == "cancel_safe"
         engine._message(d, dict(kind="released", tid=w.tid, role="decode"))
         assert w.tid not in engine.transfers
-        assert all(x.blocks == 0 and x.slots == 0 for x in (p, d))
+        assert all(
+            x.reserved_blocks == 0 and x.reserved_slots == 0 and x.reserved_compute_slots == 0
+            for x in (p, d)
+        )
+        assert engine.cache_manager.num_used_blocks == 0
     finally:
         engine._terminate()
 
@@ -674,7 +777,8 @@ def assert_nanbeige_idle(engine):
     assert not engine.requests and not engine.transfers
     assert engine.cache_manager.num_used_blocks == 0
     assert all(
-        p.slots == 0 and p.blocks == 0 and p.compute_slots == 0 for p in engine.peers.values()
+        p.reserved_slots == 0 and p.reserved_blocks == 0 and p.reserved_compute_slots == 0
+        for p in engine.peers.values()
     )
 
 

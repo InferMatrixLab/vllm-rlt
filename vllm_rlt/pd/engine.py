@@ -46,9 +46,12 @@ class Peer:
     process: object
     channel: object
     info: dict = field(default_factory=dict)
-    blocks: int = 0
-    slots: int = 0
-    compute_slots: int = 0
+    # Coordinator reservations, not physical usage. Blocks and request slots
+    # are held from admission until `released`.
+    reserved_blocks: int = 0
+    reserved_slots: int = 0
+    # P compute capacity returns at `prefill_complete` or, on cancellation, `released`.
+    reserved_compute_slots: int = 0
     ready: bool = False
     connected: bool = False
     stopped: bool = False
@@ -63,8 +66,8 @@ class Pending:
     p: str | None = None
     d: str | None = None
     phase: PendingPhase = PendingPhase.WAITING
-    p_blocks: int = 0
-    d_blocks: int = 0
+    reserved_p_blocks: int = 0
+    reserved_d_blocks: int = 0
     cancelled: bool = False
     p_released: bool = False
     p_compute_released: bool = False
@@ -115,6 +118,8 @@ class PDEngine:
         self.requests = {}
         self.transfers = {}
         self.scheduler = SimpleNamespace(requests=self.requests)
+        # Frontend compatibility shim: reservation-derived aggregate,
+        # not physical worker-side allocation.
         self.cache_manager = SimpleNamespace(num_used_blocks=0)
         self.metrics = deque(maxlen=1024)
         self.worker_metrics = {}
@@ -254,7 +259,7 @@ class PDEngine:
             w.timings["prefill_started"] = now
         elif kind == EventKind.PREFILL_COMPLETE:
             if not w.p_compute_released:
-                peer.compute_slots -= 1
+                peer.reserved_compute_slots -= 1
                 w.p_compute_released = True
             w.timings["prefill_compute_completed"] = now
         elif kind == EventKind.COMMIT:
@@ -280,16 +285,16 @@ class PDEngine:
             if peer.role == "prefill" and not w.p_released:
                 w.p_released = True
                 if not w.p_compute_released:
-                    peer.compute_slots -= 1
+                    peer.reserved_compute_slots -= 1
                     w.p_compute_released = True
-                peer.slots -= 1
-                peer.blocks -= w.p_blocks
+                peer.reserved_slots -= 1
+                peer.reserved_blocks -= w.reserved_p_blocks
                 if w.cancelled and not w.d_released:
                     self._send(w.d, CommandKind.CANCEL_SAFE, tid=w.tid)
             elif peer.role == "decode" and not w.d_released:
                 w.d_released = True
-                peer.slots -= 1
-                peer.blocks -= w.d_blocks
+                peer.reserved_slots -= 1
+                peer.reserved_blocks -= w.reserved_d_blocks
         elif kind == EventKind.REJECTED:
             # Coordinator holds exact credits; rejection indicates a state mismatch.
             raise RuntimeError("PD reserved capacity rejected by worker")
@@ -305,7 +310,11 @@ class PDEngine:
                 )
             )
             del self.transfers[w.tid]
-        self.cache_manager.num_used_blocks = sum(p.blocks for p in self.peers.values())
+        self.cache_manager.num_used_blocks = self._reserved_blocks_total()
+
+    def _reserved_blocks_total(self) -> int:
+        """Reservation-derived aggregate exposed via the facade shim."""
+        return sum(p.reserved_blocks for p in self.peers.values())
 
     def _blocks(self, peer, tokens):
         return (
@@ -378,16 +387,20 @@ class PDEngine:
                     p
                     for p in self.peers.values()
                     if p.role == role
-                    and p.slots < p.info["max_seqs"]
-                    and (role != "prefill" or p.compute_slots < p.info["active_limit"])
-                    and p.blocks + self._blocks(p, length)
-                    <= p.info["num_blocks"] - (p.info["watermark_blocks"] if p.slots else 0)
+                    and p.reserved_slots < p.info["max_seqs"]
+                    and (role != "prefill" or p.reserved_compute_slots < p.info["active_limit"])
+                    and p.reserved_blocks + self._blocks(p, length)
+                    <= p.info["num_blocks"]
+                    - (p.info["watermark_blocks"] if p.reserved_slots else 0)
                 ]
                 if not eligible:
                     break
                 candidates[role] = min(
                     eligible,
-                    key=lambda p: (p.blocks / p.info["num_blocks"], p.slots / p.info["max_seqs"]),
+                    key=lambda p: (
+                        p.reserved_blocks / p.info["num_blocks"],
+                        p.reserved_slots / p.info["max_seqs"],
+                    ),
                 )
             if len(candidates) != 2:
                 if time.monotonic() - w.created > self.config.request_timeout / 2:
@@ -395,15 +408,15 @@ class PDEngine:
                 continue
             p, d = candidates["prefill"], candidates["decode"]
             w.p, w.d = p.name, d.name
-            w.p_blocks = self._blocks(p, len(w.request.prompt_token_ids))
-            w.d_blocks = self._blocks(
+            w.reserved_p_blocks = self._blocks(p, len(w.request.prompt_token_ids))
+            w.reserved_d_blocks = self._blocks(
                 d, len(w.request.prompt_token_ids) + w.request.sampling_params.max_tokens - 1
             )
-            p.blocks += w.p_blocks
-            d.blocks += w.d_blocks
-            p.slots += 1
-            p.compute_slots += 1
-            d.slots += 1
+            p.reserved_blocks += w.reserved_p_blocks
+            d.reserved_blocks += w.reserved_d_blocks
+            p.reserved_slots += 1
+            p.reserved_compute_slots += 1
+            d.reserved_slots += 1
             w.phase = PendingPhase.RESERVING
             w.timings["admitted"] = time.monotonic() - w.created
             self._send(
