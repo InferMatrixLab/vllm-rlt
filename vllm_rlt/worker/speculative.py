@@ -28,6 +28,16 @@ class SpeculativeStats:
     verified_rows: int = 0
 
 
+@dataclass
+class _PipelineBranch:
+    """One speculative position and its current recurrent state."""
+
+    item_index: int
+    offset: int
+    hidden: torch.Tensor
+    depth: int = 0
+
+
 def greedy_accept(candidates, targets):
     """Return (tokens, accepted) for one request from host candidate and target IDs.
 
@@ -109,6 +119,11 @@ class SpeculativeRunner:
         """
         return self.rng.acquire(request.request_id, request.sampling_params, logits.device)
 
+    def _core_mixed(self, hidden, ids, positions, depths):
+        """Advance active pipeline branches with one depth per row."""
+        batch = self.cache._prepare_batch(ids, depths, positions)
+        return self._core(hidden, ids, positions, None, batch=batch)
+
     def _coda(self, hidden):
         return (
             self.coda_graphs.run(hidden)
@@ -116,8 +131,217 @@ class SpeculativeRunner:
             else self.model.coda(hidden)
         )
 
+    def _greedy_pruning_enabled(self, items):
+        return bool(getattr(self.config, "early_rejection_pruning", False)) and all(
+            item.request.sampling_params.temperature == 0 for item in items
+        )
+
+    @torch.inference_mode()
+    def _execute_loop_level_greedy_pruned(self, batch):
+        """Run loop-level speculation while pruning rejected greedy suffixes.
+
+        A target row is compared as soon as its coda output is available.  A
+        rejected request is removed before the next mixed-depth core wave, so
+        shallow work already in flight is kept but no later suffix work is
+        started.  This path is greedy-only; sampling retains the common
+        batched verification path so its RNG ordering is unchanged.
+        """
+        items = batch.items
+        accepted = [0] * len(items)
+        draft_counts = [0] * len(items)
+        results = [[] for _ in items]
+        candidates = [{} for _ in items]
+        stopped = [False] * len(items)
+
+        initial = self.cache._stage([item.request.input_token_id for item in items], torch.long)
+        hidden = self.model.prelude(initial)
+        active = [_PipelineBranch(i, 0, hidden[i]) for i in range(len(items))]
+        verified_rows = 0
+
+        while active:
+            ids = [items[branch.item_index].request.request_id for branch in active]
+            positions = [items[branch.item_index].token_start + branch.offset for branch in active]
+            depths = [branch.depth for branch in active]
+            hidden = torch.stack([branch.hidden for branch in active])
+            hidden = self._core_mixed(hidden, ids, positions, depths)
+            for row, branch in enumerate(active):
+                branch.hidden = hidden[row]
+                branch.depth += 1
+
+            draft_ready = [
+                branch
+                for branch in active
+                if branch.depth == self.config.draft_loops
+                and branch.offset + 1 < items[branch.item_index].token_count
+                and not stopped[branch.item_index]
+            ]
+            target_ready = [branch for branch in active if branch.depth == self.config.target_loops]
+            ready = draft_ready + target_ready
+            ready_logits = None
+            ready_ids = None
+            ready_ids_host = None
+            if ready:
+                ready_logits = self._coda(torch.stack([branch.hidden for branch in ready]))
+                # One device-to-host transfer per wave supplies both draft
+                # and target IDs.  Per-row `.item()` here would synchronize
+                # the GPU once for every target and draft branch.
+                ready_ids = ready_logits.argmax(-1)
+                ready_ids_host = ready_ids.tolist()
+
+            # Target rows are handled first.  If a parent is rejected, a draft
+            # row for the same request in this coda batch must not create its
+            # child position.
+            target_start = len(draft_ready)
+            for row, branch in enumerate(target_ready):
+                item_index = branch.item_index
+                item = items[item_index]
+                target = ready_ids_host[target_start + row]
+                verified_rows += 1
+                if branch.offset == item.token_count - 1:
+                    # The final row has no candidate: it is the bonus token.
+                    results[item_index].append(target)
+                    stopped[item_index] = True
+                    continue
+                candidate = candidates[item_index].get(branch.offset)
+                if candidate is None:
+                    raise RuntimeError(
+                        f"missing greedy candidate for item {item_index}, offset {branch.offset}"
+                    )
+                results[item_index].append(target)
+                accepted[item_index] += candidate == target
+                if candidate != target:
+                    stopped[item_index] = True
+
+            # Generate children only for requests that survived target
+            # validation in this wave.  Candidate IDs are selected on-device;
+            # their host values come from the single wave-level readback above.
+            draft_rows = [
+                (row, branch)
+                for row, branch in enumerate(draft_ready)
+                if not stopped[branch.item_index]
+            ]
+            children = []
+            if draft_rows:
+                row_ids = torch.tensor([row for row, _ in draft_rows], device=self.device)
+                child_tokens = ready_ids[: len(draft_ready)].index_select(0, row_ids)
+                child_hidden = self.model.prelude(child_tokens)
+                for child_row, (draft_row, branch) in enumerate(draft_rows):
+                    item_index = branch.item_index
+                    candidate = ready_ids_host[draft_row]
+                    candidates[item_index][branch.offset] = candidate
+                    draft_counts[item_index] += 1
+                    children.append(
+                        _PipelineBranch(item_index, branch.offset + 1, child_hidden[child_row])
+                    )
+
+            active = [
+                branch
+                for branch in active
+                if branch.depth < self.config.target_loops
+                and not stopped[branch.item_index]
+            ]
+            active.extend(children)
+
+        self.stats.rounds += len(items)
+        self.stats.drafted_tokens += sum(draft_counts)
+        self.stats.verified_rows += verified_rows
+        return [
+            SpeculativeResult(results[i], accepted[i], draft_counts[i]) for i in range(len(items))
+        ]
+
+    @torch.inference_mode()
+    def _execute_loop_level(self, batch):
+        """Run a synchronous single-proposal loop-level pipeline.
+
+        Every active branch advances one recurrent depth per step.  Once a
+        branch reaches the draft depth it starts its child position while the
+        parent continues toward the full target depth.  The finite window is
+        fully verified before returning, so the engine keeps its existing
+        atomic commit and KV rollback boundary.
+        """
+        items = batch.items
+        drafted = []
+        proposals = [[] for _ in items]
+        target_logits = [{} for _ in items]
+
+        initial = self.cache._stage([item.request.input_token_id for item in items], torch.long)
+        hidden = self.model.prelude(initial)
+        active = [_PipelineBranch(i, 0, hidden[i]) for i in range(len(items))]
+
+        while active:
+            # Children start draft_loops steps behind their parents. Thus the
+            # earlier position's KV at this row's depth is already complete.
+            # Use independent query rows: adjacent positions here have different
+            # depth planes and must not form one packed prefill sequence.
+            ids = [items[branch.item_index].request.request_id for branch in active]
+            positions = [items[branch.item_index].token_start + branch.offset for branch in active]
+            depths = [branch.depth for branch in active]
+            hidden = torch.stack([branch.hidden for branch in active])
+            hidden = self._core_mixed(hidden, ids, positions, depths)
+            for row, branch in enumerate(active):
+                branch.hidden = hidden[row]
+                branch.depth += 1
+
+            draft_ready = [
+                branch
+                for branch in active
+                if branch.depth == self.config.draft_loops
+                and branch.offset + 1 < items[branch.item_index].token_count
+            ]
+            target_ready = [branch for branch in active if branch.depth == self.config.target_loops]
+            ready = draft_ready + target_ready
+            ready_logits = None
+            if ready:
+                ready_logits = self._coda(torch.stack([branch.hidden for branch in ready]))
+
+            children = []
+            if draft_ready:
+                draft_logits = ready_logits[: len(draft_ready)]
+                child_tokens = draft_logits.argmax(-1)
+                for row, branch in enumerate(draft_ready):
+                    request = items[branch.item_index].request
+                    if request.sampling_params.temperature != 0:
+                        q = Sampler.probabilities(draft_logits[row], request.sampling_params)
+                        proposals[branch.item_index].append(q)
+                        child_tokens[row] = Sampler.draw(
+                            q, self._acquire_generator(request, draft_logits[row])
+                        )
+                drafted.append(([branch.item_index for branch in draft_ready], child_tokens))
+                child_hidden = self.model.prelude(child_tokens)
+                children = [
+                    _PipelineBranch(
+                        branch.item_index,
+                        branch.offset + 1,
+                        child_hidden[row],
+                    )
+                    for row, branch in enumerate(draft_ready)
+                ]
+
+            if target_ready:
+                target_start = len(draft_ready)
+                for row, branch in enumerate(target_ready):
+                    target_logits[branch.item_index][branch.offset] = ready_logits[
+                        target_start + row
+                    ].clone()
+
+            active = [branch for branch in active if branch.depth < self.config.target_loops]
+            active.extend(children)
+
+        logits = torch.stack(
+            [
+                target_logits[i][offset]
+                for i, item in enumerate(items)
+                for offset in range(item.token_count)
+            ]
+        )
+        return self._verify(items, drafted, proposals, logits)
+
     @torch.inference_mode()
     def execute(self, batch):
+        if self.config.loop_level_pipelining:
+            if self._greedy_pruning_enabled(batch.items):
+                return self._execute_loop_level_greedy_pruned(batch)
+            return self._execute_loop_level(batch)
         items = batch.items
         proposals = [[] for _ in items]
         states = [[] for _ in items]
@@ -166,6 +390,10 @@ class SpeculativeRunner:
             packed=True,
         )
         logits = self._coda(hidden)
+        return self._verify(items, drafted, proposals, logits)
+
+    def _verify(self, items, drafted, proposals, logits):
+        """Collect the finite window and apply the common acceptance rule."""
         # One device-to-host read returns every draft ID and, for greedy requests,
         # every verification target argmax.
         greedy = any(item.request.sampling_params.temperature == 0 for item in items)
@@ -213,5 +441,5 @@ class SpeculativeRunner:
             results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
         self.stats.rounds += len(items)
         self.stats.drafted_tokens += sum(len(c) for c in candidates)
-        self.stats.verified_rows += len(ids)
+        self.stats.verified_rows += len(logits)
         return results

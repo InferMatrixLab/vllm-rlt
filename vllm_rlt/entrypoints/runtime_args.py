@@ -18,6 +18,16 @@ def add_runtime_args(parser):
     )
     parser.add_argument("--draft-loops", type=int, default=2)
     parser.add_argument("--target-loops", type=int, default=4)
+    parser.add_argument(
+        "--loop-level-pipelining",
+        action="store_true",
+        help="Batch active speculative branches at different recurrent depths",
+    )
+    parser.add_argument(
+        "--early-rejection-pruning",
+        action="store_true",
+        help="Stop greedy loop-level branches after the first rejected candidate",
+    )
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--incremental-kv", action="store_true")
     parser.add_argument("--kv-watermark", type=float, default=0.0)
@@ -60,11 +70,15 @@ def runtime_configs(args):
     parser = argparse.ArgumentParser(add_help=False)
     add_runtime_args(parser)
     args = SimpleNamespace(**(vars(parser.parse_args([])) | vars(args)))
+    if args.loop_level_pipelining and args.speculative_tokens is None:
+        raise ValueError("--loop-level-pipelining requires --speculative-tokens")
     return dict(
         speculative_config=SpeculativeConfig(
             num_speculative_tokens=args.speculative_tokens,
             draft_loops=args.draft_loops,
             target_loops=args.target_loops,
+            loop_level_pipelining=args.loop_level_pipelining,
+            early_rejection_pruning=args.early_rejection_pruning,
         )
         if args.speculative_tokens is not None
         else None,
