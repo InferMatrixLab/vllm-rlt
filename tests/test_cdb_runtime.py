@@ -5,13 +5,14 @@ from dataclasses import replace
 import pytest
 import torch
 
+from tests.helpers import LocalLLM as LLM
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import LLM, CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import budget_blocks
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestPhase
 from vllm_rlt.worker.model_runner import Submission
 
 
@@ -190,14 +191,14 @@ def test_short_requests_bypass_then_protected_long_request_gets_memory():
     engine.add_request("short", [2], params)  # 4 blocks
     engine.add_request("later", [3], params)
     engine.scheduler._admit()
-    assert engine.scheduler.requests["short"].stage == Stage.PREFILL
-    assert list(engine.scheduler.queues[Stage.WAITING]) == ["long", "later"]
+    assert engine.scheduler.requests["short"].phase == RequestPhase.PREFILL
+    assert list(engine.scheduler.queues[RequestPhase.WAITING]) == ["long", "later"]
     engine.abort_request("short")
     engine.scheduler._admit()
-    assert engine.scheduler.requests["later"].stage == Stage.WAITING
+    assert engine.scheduler.requests["later"].phase == RequestPhase.WAITING
     engine.abort_request("running")
     engine.scheduler._admit()
-    assert engine.scheduler.requests["long"].stage == Stage.PREFILL
+    assert engine.scheduler.requests["long"].phase == RequestPhase.PREFILL
     assert set(drain(engine)) == {"long", "later"}
 
 
@@ -223,20 +224,20 @@ def test_async_submits_next_core_before_collecting_previous_signal(monkeypatch):
         execution_config=ExecutionConfig(async_scheduling=True),
     )
     engine.add_request("a", [1], SamplingParams(max_tokens=2, exit_threshold=0, ignore_eos=True))
-    original_submit, original_collect = engine.model_runner.submit, Submission.collect
+    original_submit, original_collect = engine.executor.submit, Submission.collect
     events = []
 
     def submit(batch):
-        if batch.stage == Stage.RECURRENT:
+        if batch.phase == RequestPhase.RECURRENT:
             events.append("submit")
         return original_submit(batch)
 
     def collect(ticket):
-        if ticket.batch.stage == Stage.RECURRENT:
+        if ticket.batch.phase == RequestPhase.RECURRENT:
             events.append("collect")
         return original_collect(ticket)
 
-    monkeypatch.setattr(engine.model_runner, "submit", submit)
+    monkeypatch.setattr(engine.executor, "submit", submit)
     monkeypatch.setattr(Submission, "collect", collect)
     drain(engine)
     assert events[:3] == ["submit", "submit", "collect"]
@@ -358,7 +359,7 @@ def test_pending_coda_does_not_block_other_recurrent_work(monkeypatch):
     )
     engine.add_request("fast", [1], SamplingParams(max_tokens=3, exit_threshold=0, ignore_eos=True))
     engine.add_request("slow", [2], SamplingParams(max_tokens=3, exit_threshold=1, ignore_eos=True))
-    original = engine.model_runner.submit
+    original = engine.executor.submit
 
     class HeldEvent:
         complete = False
@@ -374,14 +375,14 @@ def test_pending_coda_does_not_block_other_recurrent_work(monkeypatch):
     def submit(batch):
         ticket = original(batch)
         if (
-            batch.stage == Stage.CODA
-            and len(batch.items) == 1
-            and batch.items[0].request.request_id == "fast"
+            batch.phase == RequestPhase.CODA
+            and len(batch.requests) == 1
+            and batch.requests[0].request.request_id == "fast"
         ):
             ticket.event = held
         return ticket
 
-    monkeypatch.setattr(engine.model_runner, "submit", submit)
+    monkeypatch.setattr(engine.executor, "submit", submit)
     for _ in range(20):
         engine.step()
         if any(t.event is held for t in engine._pending_coda):
@@ -391,12 +392,12 @@ def test_pending_coda_does_not_block_other_recurrent_work(monkeypatch):
     engine.step()
     # The pending sample can already re-enter prelude on device. Its next
     # recurrent batch includes BOTH requests, without waiting for CPU delivery.
-    assert engine.last_schedule.stage == Stage.PRELUDE
-    assert engine.last_schedule.items[0].request.request_id == "fast"
+    assert engine.last_schedule.phase == RequestPhase.PRELUDE
+    assert engine.last_schedule.requests[0].request.request_id == "fast"
     assert not held.complete
     engine.step()
-    assert engine.last_schedule.stage == Stage.RECURRENT
-    assert {i.request.request_id for i in engine.last_schedule.items} == {"fast", "slow"}
+    assert engine.last_schedule.phase == RequestPhase.RECURRENT
+    assert {i.request.request_id for i in engine.last_schedule.requests} == {"fast", "slow"}
     assert not held.complete
     held.complete = True
     drain(engine)
@@ -409,13 +410,13 @@ def test_async_failed_submission_reclaims_all_affected_state(monkeypatch):
         execution_config=ExecutionConfig(async_scheduling=True, static_buffers=True),
     )
     engine.add_request("a", [2], SamplingParams(max_tokens=2))
-    original = engine.model_runner.submit
+    original = engine.executor.submit
 
     def fail(batch):
         original(batch)
         raise RuntimeError("failed after a partial submission")
 
-    monkeypatch.setattr(engine.model_runner, "submit", fail)
+    monkeypatch.setattr(engine.executor, "submit", fail)
     with pytest.raises(RuntimeError, match="partial submission"):
         engine.step()
     assert engine.cache_manager.num_used_blocks == 0
@@ -481,6 +482,11 @@ def test_cuda_boundary_and_core_can_overlap(monkeypatch):
         "warm-slow", [2], SamplingParams(max_tokens=3, exit_threshold=1, ignore_eos=True)
     )
     drain(engine)
+    # The mixed warmup can batch the slow request with the next fast token.
+    # Also warm a single-row recurrent batch at the first KV page: loading an
+    # unseen Triton specialization can synchronize the device during the probe.
+    engine.add_request("warm-single", [1], SamplingParams(max_tokens=2, ignore_eos=True))
+    drain(engine)
     original = engine.model_runner._execute
     intervals = {}
     origin = torch.cuda.Event(enable_timing=True)
@@ -489,22 +495,25 @@ def test_cuda_boundary_and_core_can_overlap(monkeypatch):
 
     def execute(batch, prepared=None):
         label = None
-        if batch.stage == Stage.CODA and len(batch.items) == 1:
-            request = batch.items[0].request
+        if batch.phase == RequestPhase.CODA and len(batch.requests) == 1:
+            request = batch.requests[0].request
             if request.request_id == "fast" and len(request.generated_token_ids) == 1:
                 label = "coda"
-        if batch.stage == Stage.RECURRENT:
+        if batch.phase == RequestPhase.RECURRENT:
             if any(
                 i.request.request_id == "slow"
                 and i.request.loops_done == 2
                 and len(i.request.generated_token_ids) == 1
-                for i in batch.items
+                for i in batch.requests
             ):
                 label = "core"
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        if batch.stage == Stage.RECURRENT:
+        # Preparation is outside _execute now. Keep both measured operations
+        # alive long enough to test stream independence, regardless of which
+        # one the host submits first; a tiny coda can finish before core launch.
+        if batch.phase == RequestPhase.RECURRENT or label == "coda":
             torch.cuda._sleep(30_000_000)
         result = original(batch, prepared)
         end.record()
@@ -589,13 +598,39 @@ def test_cuda_dynamic_async_respects_buffers_and_matches_sync(layout, multi_stre
     execution = ExecutionConfig(async_scheduling=True, multi_stream=multi_stream)
     actual = LLM(base, execution_config=execution, **common)
     assert actual.engine.execution_config == execution
-    assert actual.engine.model_runner.workspaces == {}
+    assert actual.engine.model_runner.requestspaces == {}
     assert actual.engine.model_runner.states is actual.engine.model_runner.async_state.hidden
     result = actual.generate(prompts, params)
     assert [(o.token_ids, o.exit_depths) for o in result] == [
         (o.token_ids, o.exit_depths) for o in expected
     ]
     assert actual.engine.cache_manager.num_used_blocks == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("free_mib", [128, 512])
+def test_cuda_graph_reserve_reduces_budget_with_fixed_memory_inputs(monkeypatch, free_mib):
+    from vllm_rlt.core.memory import plan_cache
+
+    base = model().to(device="cuda", dtype=torch.bfloat16)
+    mib = 1024**2
+    # Exercise both driver-free and utilization-limited budgets. Keep the real
+    # model probe, but freeze measurements so allocator history cannot affect
+    # the comparison between graph-enabled and graph-disabled plans.
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free_mib * mib, 512 * mib))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 64 * mib)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 16 * mib)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 24 * mib)
+    cache = CacheConfig(block_size=2, gpu_memory_utilization=0.5, memory_reserve_bytes=0)
+    scheduler = SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=3)
+    execution = ExecutionConfig(cuda_graph_memory_reserve_bytes=32 * mib)
+
+    _, eager = plan_cache(base, cache, scheduler, execution, "triton")
+    _, graphed = plan_cache(base, cache, scheduler, replace(execution, cuda_graphs=True), "triton")
+
+    assert eager["cuda_graph_reserve_bytes"] == 0
+    assert graphed["cuda_graph_reserve_bytes"] == 32 * mib
+    assert eager["kv_budget_bytes"] - graphed["kv_budget_bytes"] == 32 * mib
 
 
 @pytest.mark.gpu

@@ -24,7 +24,7 @@ class AttentionRows:
 class AttentionMetadata:
     """Kernel-ready tensors borrowed for one execution traversal.
 
-    M5 owns storage lifetime when these tensors live in reusable device banks.
+    M5 owns storage lifetime when these tensors live in reusable device buffers.
     """
 
     block_tables: torch.Tensor

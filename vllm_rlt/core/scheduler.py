@@ -1,30 +1,75 @@
-"""CPU scheduling at stage/loop boundaries, independent of model execution."""
+"""CPU scheduling at request-phase/loop boundaries, independent of model execution."""
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 
 from vllm_rlt.config import SchedulerConfig
-from vllm_rlt.core.scheduling_policy import NoRefillPolicy, RefillPolicy, SpeculativePolicy
-from vllm_rlt.request import FinishReason, Request, Stage
+from vllm_rlt.core.scheduling_policy import create_scheduling_policy
+from vllm_rlt.request import FinishReason, Request, RequestPhase
+
+# Items of these phases cover a contiguous span of prompt tokens, so their KV
+# frontier is the span end rather than the request's decode position.
+_SPAN_PHASES = (
+    RequestPhase.PREFILL,
+    RequestPhase.PREFILLING_PRELUDE,
+    RequestPhase.PREFILLING_RECURRENT,
+    RequestPhase.SPECULATIVE,
+)
+# Stages that must reserve KV capacity for that frontier before selection.
+_CAPACITY_PHASES = _SPAN_PHASES + (RequestPhase.PRELUDE, RequestPhase.RECURRENT)
 
 
 @dataclass(frozen=True)
-class ScheduledItem:
+class ScheduledRequest:
     request: Request
     # PREFILL and SPECULATIVE use a contiguous span; ordinary decode uses one row.
     token_start: int = 0
     token_count: int = 1
+    # Recurrence position/depth are snapshotted for both prompt and generation.
+    # The engine must not infer them from mutable request state after submission.
+    depth: int | None = None
+    chunk_start: int | None = None
+    completes_prompt: bool = False
+    phase: RequestPhase | None = None
 
 
 @dataclass(frozen=True)
 class SchedulerOutput:
-    stage: Stage
-    items: list[ScheduledItem]
+    # None means a mixed batch; each scheduled request carries its own phase.
+    phase: RequestPhase | None
+    requests: list[ScheduledRequest]
+
+    @property
+    def is_speculative(self) -> bool:
+        """Execution-mode flag for this batch, not the engine-wide configuration."""
+        return self.phase == RequestPhase.SPECULATIVE
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.phase is None
+
+    def phase_for(self, scheduled_request) -> RequestPhase:
+        phase = scheduled_request.phase or self.phase
+        if phase is None:
+            raise ValueError("mixed batches require a phase on every scheduled request")
+        return phase
 
     @property
     def num_tokens(self) -> int:
-        return sum(item.token_count for item in self.items)
+        return sum(scheduled_request.token_count for scheduled_request in self.requests)
+
+
+@dataclass(frozen=True)
+class PrefillProgress:
+    """Logical host-side progress for a submitted split-prefill request.
+
+    These flags describe request frontiers, not GPU completion. Device work may
+    still be pending when the chunk or prompt becomes logically complete.
+    """
+
+    chunk_complete: bool
+    prompt_complete: bool
 
 
 class ResumeResult(Enum):
@@ -57,36 +102,60 @@ class AdmissionPlan:
 
 
 class Scheduler:
-    def __init__(self, config: SchedulerConfig, cache_manager, speculative_config=None):
+    def __init__(
+        self,
+        config: SchedulerConfig,
+        cache_manager,
+        speculative_config=None,
+        atomic_prefill: bool = True,
+        *,
+        produces_tokens: bool = True,
+    ):
         self.config = config
         self.cache_manager = cache_manager
         self.speculative_config = speculative_config
         self.requests: dict[str, Request] = {}
-        self.queues: dict[Stage, deque[str]] = {s: deque() for s in Stage}
+        self.queues: dict[RequestPhase, deque[str]] = {s: deque() for s in RequestPhase}
         # Bound by Engine when preemption is enabled. These callbacks can copy
-        # device state and mutate queues; they are operations, not predicates.
-        self.preempt_callback = None
+        # device state; queue transitions remain owned by this scheduler.
+        self.suspend_callback = None
         self.resume_callback = None
-        policy_cls = NoRefillPolicy if config.mode == "no_refill" else RefillPolicy
-        self.policy = (SpeculativePolicy if speculative_config else policy_cls)(config)
+        # Optional connector readiness predicate. Never mutates queues or blocks.
+        self.execution_ready = None
+        # One scheduling boundary per chunk (atomic) or per recurrence depth (split).
+        # The policy is derived from the same flag so the two cannot disagree.
+        self.atomic_prefill = atomic_prefill
+        self.policy = create_scheduling_policy(
+            config, speculative_config, atomic_prefill, produces_tokens=produces_tokens
+        )
 
     def add_request(self, request: Request):
         if request.request_id in self.requests:
             raise ValueError(f"duplicate request ID: {request.request_id}")
         self.requests[request.request_id] = request
-        self.queues[Stage.WAITING].append(request.request_id)
+        self.queues[RequestPhase.WAITING].append(request.request_id)
 
-    def enqueue(self, request: Request, stage: Stage):
-        request.stage = stage
-        self.queues[stage].append(request.request_id)
+    def enqueue(self, request: Request, phase: RequestPhase):
+        request.phase = phase
+        self.queues[phase].append(request.request_id)
+
+    def suspend_for_transfer(self, request):
+        """Stop scheduling without freeing resources that a transfer still borrows."""
+        if self.requests.get(request.request_id) is not request:
+            return False
+        for queue in self.queues.values():
+            while request.request_id in queue:
+                queue.remove(request.request_id)
+        request.phase = RequestPhase.TRANSFERRING
+        return True
 
     def finish(self, request: Request, reason: FinishReason):
-        # A delayed EOS can stop a request already queued for its next stage.
+        # A delayed EOS can stop a request already queued for its next phase.
         for queue in self.queues.values():
             while request.request_id in queue:
                 queue.remove(request.request_id)
         self.cache_manager.free(request.request_id)
-        request.stage = Stage.FINISHED
+        request.phase = RequestPhase.FINISHED
         request.finish_reason = reason
         request.hidden_state = None
         request.input_token_tensor = None
@@ -108,21 +177,81 @@ class Scheduler:
 
         Priority is supplied by the caller, not estimated from prompt length.
         Lower values go first: -5, 0, 10. Equal values retain current queue order.
-        FCFS preserves queue order, but admission may still bypass blocked work.
+        FCFS preserves queue order, but admission may still bypass blocked requests.
         """
-        waiting = self.queues[Stage.WAITING]
+        waiting = self.queues[RequestPhase.WAITING]
         if self.config.policy == "priority":
             ordered = sorted(waiting, key=lambda rid: self.requests[rid].sampling_params.priority)
             waiting.clear()
             waiting.extend(ordered)
         return waiting
 
-    def _ensure_active_slot(self, requester: Request, active_count: int) -> int | None:
+    def _is_preemption_candidate(self, request, requesting_request, *, priority_only, excluded):
+        """Check safety before considering a victim's priority.
+
+        Pending outputs, transfer leases and the current batch's selected
+        requests must remain alive. priority_only additionally forbids evicting
+        equal/higher priority requests to admit a new arrival.
+        """
+        if (
+            request is requesting_request
+            or request.phase in (RequestPhase.WAITING, RequestPhase.RECEIVING)
+            or request.num_output_placeholders
+            or request.request_id in excluded
+        ):
+            return False
+        if self.cache_manager.has_transfer_lease(request.request_id):
+            return False
+        return not priority_only or (
+            request.sampling_params.priority > requesting_request.sampling_params.priority
+        )
+
+    def _select_preemption_victim(self, requesting_request, *, priority_only, excluded):
+        """Prefer lower priority, then a larger current-position KV footprint.
+
+        Priority 10 loses to priority 0. The footprint tie-breaker uses
+        required_blocks(position + 1), not exact reclaimable physical pages.
+        Capacity-pressure preemption retains this ranking even in FCFS mode;
+        priority_only restricts eligibility only for priority admission.
+        """
+        candidates = (
+            request
+            for request in self.requests.values()
+            if self._is_preemption_candidate(
+                request, requesting_request, priority_only=priority_only, excluded=excluded
+            )
+        )
+        return max(
+            candidates,
+            key=lambda request: (
+                request.sampling_params.priority,
+                self.cache_manager.required_blocks(request.position + 1),
+            ),
+            default=None,
+        )
+
+    def preempt(self, requesting_request, *, priority_only=False, excluded=frozenset()):
+        """Select and suspend one safe victim, then move it back to admission."""
+        if self.suspend_callback is None:
+            return False
+        victim = self._select_preemption_victim(
+            requesting_request, priority_only=priority_only, excluded=excluded
+        )
+        if victim is None:
+            return False
+        self.suspend_callback(victim)
+        for queue in self.queues.values():
+            while victim.request_id in queue:
+                queue.remove(victim.request_id)
+        self.enqueue(victim, RequestPhase.WAITING)
+        return True
+
+    def _ensure_active_slot(self, request: Request, active_count: int) -> int | None:
         """Return the updated active count, or None when admission must stop.
 
-        A full engine may make room for a higher-priority arrival. The callback
-        suspends another request and moves it to WAITING; it does not admit the
-        requester. This operation can synchronize the runner and copy KV to CPU.
+        A full engine may make room for a higher-priority arrival. Scheduler
+        suspends a selected victim and moves it to WAITING before admitting the
+        arrival. This operation can synchronize the runner and copy KV to CPU.
         Admission runs before any batch is selected, so no request is excluded
         from preemption here.
         """
@@ -130,8 +259,8 @@ class Scheduler:
             return active_count
         if (
             self.config.policy == "priority"
-            and self.preempt_callback is not None
-            and self.preempt_callback(requester, priority_only=True, excluded=frozenset())
+            and self.suspend_callback is not None
+            and self.preempt(request, priority_only=True, excluded=frozenset())
         ):
             return active_count - 1
         return None
@@ -140,13 +269,16 @@ class Scheduler:
         """Translate the existing restoration callback's three-way result.
 
         None: no snapshot, continue fresh admission.
-        True: resources/state restored and the original stage already enqueued.
+        RequestPhase: resources/state restored; enqueue the saved phase.
         False: snapshot exists, but restoration cannot obtain capacity yet.
         """
         restored = self.resume_callback(request) if self.resume_callback is not None else None
         if restored is None:
             return ResumeResult.NOT_PREEMPTED
-        return ResumeResult.RESTORED if restored else ResumeResult.BLOCKED
+        if restored is False:
+            return ResumeResult.BLOCKED
+        self.enqueue(request, restored)
+        return ResumeResult.RESTORED
 
     def _reserved_growth_blocks(self, *, reserve_outputs: bool) -> int:
         """Budget future growth of existing requests without allocating it.
@@ -159,8 +291,14 @@ class Scheduler:
         cache = self.cache_manager
         reserved = 0
         for request in self.requests.values():
-            active = request.stage not in (Stage.WAITING, Stage.RECEIVING)
-            if request.stage != Stage.PREFILL and not (reserve_outputs and active):
+            # Imported/reserved requests already own pages before compute admission.
+            # Without preemption their future decode growth must remain affordable too.
+            has_allocation = cache.has_allocation(request.request_id)
+            if request.phase not in (
+                RequestPhase.PREFILL,
+                RequestPhase.PREFILLING_PRELUDE,
+                RequestPhase.PREFILLING_RECURRENT,
+            ) and not (reserve_outputs and has_allocation):
                 continue
             tokens = len(request.prompt_token_ids)
             if reserve_outputs:
@@ -189,7 +327,7 @@ class Scheduler:
         )
         if not cache.incremental_allocation:
             initial_tokens = capacity
-        reserve_outputs = cache.incremental_allocation and self.preempt_callback is None
+        reserve_outputs = cache.incremental_allocation and self.suspend_callback is None
         budget_tokens = (
             len(request.prompt_token_ids)
             if cache.incremental_allocation and not reserve_outputs
@@ -215,31 +353,67 @@ class Scheduler:
             cached_claim_blocks=cached_claim,
         )
 
-    def _commit_admission(self, request: Request, plan: AdmissionPlan) -> bool:
-        """Allocate pages and enter PREFILL only when the whole budget fits."""
+    def reserve_transfer(self, request: Request) -> AdmissionPlan | None:
+        """Reserve transport KV under the same growth budget as local admission.
+
+        A transfer needs its whole prompt mapped before compute starts. Reserving
+        it must not spend pages already promised to other requests' growth.
+        This operation grants no compute slot and leaves queue ownership unchanged.
+        """
+        occupied = any(self.cache_manager.has_allocation(rid) for rid in self.requests)
+        plan = self._plan_admission(request, int(occupied))
+        if self.cache_manager.incremental_allocation:
+            plan = replace(plan, initial_tokens=len(request.prompt_token_ids))
+        if not self._allocate(request, plan):
+            return None
+        self.cache_manager.pin_transfer(request.request_id, request.request_id)
+        return plan
+
+    def _allocate(self, request: Request, plan: AdmissionPlan) -> bool:
         cache = self.cache_manager
         if plan.total_budget_blocks > cache.num_free_blocks:
             return False
-        if not cache.allocate(
+        return cache.allocate(
             request.request_id,
             plan.capacity_tokens,
             initial_tokens=plan.initial_tokens,
             prefix=plan.prefix_blocks,
-        ):
+        )
+
+    def _commit_admission(self, request: Request, plan: AdmissionPlan) -> bool:
+        """Allocate pages and enter PREFILL only when the whole budget fits."""
+        if not self._allocate(request, plan):
             return False
         request.num_prefilled_tokens = plan.cached_tokens
-        self.enqueue(request, Stage.PREFILL)
+        # A reused prompt prefix is already prefilled at every depth, so the
+        # staged window starts closed at that frontier and opens for the rest.
+        request.num_preluded_tokens = plan.cached_tokens
+        request.prefill_chunk_start = plan.cached_tokens
+        if request.prefill_depth_ranges:
+            request.prefill_depth_ranges[:] = Request.prefill_boundaries(
+                len(request.prompt_token_ids),
+                len(request.prefill_depth_ranges),
+                start=plan.cached_tokens,
+            )
+        self._enter_prefill(request)
         return True
 
+    def _enter_prefill(self, request):
+        if self.atomic_prefill:
+            self.enqueue(request, RequestPhase.PREFILL)
+        else:
+            self.enqueue(request, RequestPhase.PREFILLING_PRELUDE)
+
     def _admit(self):
-        """Admit waiting work: order -> slot -> restore/allocate -> defer/enter.
+        """Admit waiting requests: order -> slot -> restore/allocate -> defer/enter.
 
         A blocked long request may let a short one pass. Each successful fresh
         admission increments earlier blocked requests' bypass counts; reaching
-        the limit stops further bypasses so active work can drain.
+        the limit stops further bypasses so active requests can drain.
         """
         active_count = sum(
-            r.stage not in (Stage.WAITING, Stage.RECEIVING) for r in self.requests.values()
+            r.phase not in (RequestPhase.WAITING, RequestPhase.RECEIVING) and not r.compute_released
+            for r in self.requests.values()
         )
         waiting = self._order_waiting_requests()
         deferred = []
@@ -248,28 +422,39 @@ class Scheduler:
             if not waiting:
                 break
             # Peek before popping: preemption may append its victim to WAITING.
-            requester = self.requests[waiting[0]]
-            available_count = self._ensure_active_slot(requester, active_count)
+            request = self.requests[waiting[0]]
+            available_count = self._ensure_active_slot(request, active_count)
             if available_count is None:
                 break
             active_count = available_count
             request_id = waiting.popleft()
             request = self.requests[request_id]
 
-            resume_result = self._try_resume(request)
-            if resume_result == ResumeResult.RESTORED:
-                active_count += 1
-                continue
-            if resume_result == ResumeResult.BLOCKED:
-                deferred.append(request_id)
-                continue
+            if request.phase == RequestPhase.RECEIVING:
+                # Transfer completion has already made KV and hidden valid.
+                # Imported and local requests compete in this same admission queue.
+                self.cache_manager.unpin_transfer(request_id, request_id)
+                self.enqueue(request, RequestPhase.CODA)
+            elif self.cache_manager.has_allocation(
+                request_id
+            ) and self.cache_manager.has_transfer_lease(request_id):
+                # Outgoing transfer reservation already allocated the prompt KV.
+                self._enter_prefill(request)
+            else:
+                resume_result = self._try_resume(request)
+                if resume_result == ResumeResult.RESTORED:
+                    active_count += 1
+                    continue
+                if resume_result == ResumeResult.BLOCKED:
+                    deferred.append(request_id)
+                    continue
 
-            plan = self._plan_admission(request, active_count)
-            if not self._commit_admission(request, plan):
-                deferred.append(request_id)
-                if request.admission_bypasses >= self.config.max_admission_bypasses:
-                    break
-                continue
+                plan = self._plan_admission(request, active_count)
+                if not self._commit_admission(request, plan):
+                    deferred.append(request_id)
+                    if request.admission_bypasses >= self.config.max_admission_bypasses:
+                        break
+                    continue
 
             active_count += 1
             for blocked_id in deferred:
@@ -282,27 +467,68 @@ class Scheduler:
         # [A, B] deferred must precede the untouched tail in the same order.
         waiting.extendleft(reversed(deferred))
 
-    def _make_scheduled_item(
-        self, request: Request, stage: Stage, token_budget: int
-    ) -> ScheduledItem:
-        """Bound one request's work without advancing its completed progress.
+    def _make_scheduled_request(
+        self, request: Request, phase: RequestPhase, token_budget: int
+    ) -> ScheduledRequest:
+        """Snapshot one request's execution range without advancing its progress.
 
         Prompt length 10, prefilled 4, chunk 4, budget 6 -> range [4, 8).
-        Decode stages contribute one position; its loop may differ by request.
+        Decode phases contribute one position; its loop may differ by request.
         """
-        if stage == Stage.PREFILL:
+        if phase == RequestPhase.PREFILL:
             start = request.num_prefilled_tokens
             count = min(
                 token_budget, self.config.prefill_chunk_size, len(request.prompt_token_ids) - start
             )
-            return ScheduledItem(request, start, count)
-        if stage == Stage.SPECULATIVE:
+            return ScheduledRequest(request, start, count)
+        # The two split phases are unreachable while atomic prefill is enabled.
+        if phase == RequestPhase.PREFILLING_PRELUDE:
+            start = request.num_preluded_tokens
+            count = min(
+                token_budget,
+                self.config.prefill_chunk_size,
+                len(request.prompt_token_ids) - start,
+            )
+            return ScheduledRequest(request, start, count, chunk_start=start)
+        if phase == RequestPhase.PREFILLING_RECURRENT:
+            start = request.num_prefilled_tokens
+            if start >= request.num_preluded_tokens:
+                return ScheduledRequest(
+                    request, start, 0, depth=0, chunk_start=request.prefill_chunk_start
+                )
+            first_token_depth = request.prefill_depth(start)
+            # One run per depth frontier: every token of the run already completed
+            # this depth, and no earlier token is missing a shallower one, so the
+            # plane's causal prefix covers the run. Tokens past num_preluded_tokens
+            # have no resident prelude and cannot run yet.
+            boundary = request.prefill_depth_ranges[first_token_depth]
+            count = min(
+                token_budget,
+                self.config.prefill_chunk_size,
+                request.num_preluded_tokens - start,
+                boundary[1] - start,
+                len(request.prompt_token_ids) - start,
+            )
+            return ScheduledRequest(
+                request,
+                start,
+                count,
+                depth=first_token_depth,
+                chunk_start=request.prefill_chunk_start,
+                completes_prompt=(
+                    first_token_depth == len(request.prefill_depth_ranges) - 1
+                    and start + count == len(request.prompt_token_ids)
+                ),
+            )
+        if phase == RequestPhase.SPECULATIVE:
             # K candidates plus one bonus distribution. At the output limit,
             # K=0 is an ordinary fixed-depth step and needs no extra KV slot.
             remaining = request.sampling_params.max_tokens - request.num_scheduled_outputs
             count = min(self.speculative_config.num_speculative_tokens + 1, remaining, token_budget)
-            return ScheduledItem(request, request.position, count)
-        return ScheduledItem(request)
+            return ScheduledRequest(request, request.position, count)
+        if phase == RequestPhase.RECURRENT:
+            return ScheduledRequest(request, request.position, depth=request.loops_done)
+        return ScheduledRequest(request)
 
     def _ensure_execution_capacity(
         self, request: Request, frontier: int, *, selected: set[str]
@@ -318,64 +544,104 @@ class Scheduler:
         cache = self.cache_manager
         if cache.ensure_capacity(request.request_id, frontier):
             return True
-        if self.preempt_callback is None or not self.preempt_callback(
-            request, excluded=frozenset(selected)
-        ):
+        if not self.preempt(request, excluded=frozenset(selected)):
             return False
         return cache.ensure_capacity(request.request_id, frontier)
 
-    def _take(self, stage: Stage) -> SchedulerOutput | None:
-        """Build a stage batch: describe work -> ensure capacity -> select.
+    def _prelude_window_open(self, request: Request) -> bool:
+        """Whether the next prompt chunk may be staged for this request.
 
-        Requests that cannot grow return to the tail. Scan at most the initial
-        queue length so a blocked request cannot cycle forever in this call.
-        Successful items leave the queue; the engine later updates progress and
-        enqueues their next stage after handling execution results.
-
-        The selection set is local to this one batch construction. Direct
-        callers such as the PD prefill worker, and later scheduling calls, can
-        therefore neither inherit nor accumulate protection from an earlier
-        batch.
+        Split prefill keeps one staged chunk: deeper depths of the current chunk
+        still read its hidden rows, so the next chunk is staged only after the
+        current one reached the last depth. Wavefront chunked prefill widens the
+        window to several chunks, and then this bound becomes a chunk count.
         """
+        return request.num_preluded_tokens == request.num_prefilled_tokens
+
+    def has_ready(self, phase):
+        """A blocked transport queue must not hide another runnable phase."""
+        queue = self.queues[phase]
+        if self.execution_ready is None:
+            return bool(queue)
+        return any(self.execution_ready(self.requests[rid]) for rid in queue)
+
+    def _take(self, phase: RequestPhase) -> SchedulerOutput | None:
+        return self.take_phases((phase,))
+
+    def take_phases(self, phases, *, eligible=None):
+        """Select compatible requests across queues under one budget/reservation set."""
+        eligible = eligible if eligible is not None else self.execution_ready
         token_budget = self.config.max_num_batched_tokens
-        items = []
+        scheduled_requests = []
         selected: set[str] = set()
-        queue = self.queues[stage]
-        remaining = len(queue)
-        while queue and token_budget and len(items) < self.config.max_num_seqs and remaining:
-            remaining -= 1
-            request = self.requests[queue.popleft()]
-            if stage == Stage.SPECULATIVE and (
-                request.num_speculative_rounds >= 2
-                or request.num_scheduled_outputs >= request.sampling_params.max_tokens
+        for phase in phases:
+            queue = self.queues[phase]
+            remaining = len(queue)
+            while (
+                queue
+                and token_budget
+                and len(scheduled_requests) < self.config.max_num_seqs
+                and remaining
             ):
-                queue.append(request.request_id)
-                continue
-            item = self._make_scheduled_item(request, stage, token_budget)
-            if stage in (Stage.PREFILL, Stage.PRELUDE, Stage.RECURRENT, Stage.SPECULATIVE):
-                frontier = (
-                    item.token_start + item.token_count
-                    if stage in (Stage.PREFILL, Stage.SPECULATIVE)
-                    else request.position + 1
-                )
-                if not self._ensure_execution_capacity(request, frontier, selected=selected):
+                remaining -= 1
+                request = self.requests[queue.popleft()]
+                if eligible is not None and not eligible(request):
                     queue.append(request.request_id)
                     continue
-            # Selecting A must prevent B's later capacity check from evicting A.
-            selected.add(request.request_id)
-            items.append(item)
-            token_budget -= item.token_count
-        if not items:
+                if phase == RequestPhase.PREFILLING_PRELUDE and not self._prelude_window_open(
+                    request
+                ):
+                    queue.append(request.request_id)
+                    continue
+                if phase == RequestPhase.SPECULATIVE and (
+                    request.num_speculative_rounds >= 2
+                    or request.num_scheduled_outputs >= request.sampling_params.max_tokens
+                ):
+                    queue.append(request.request_id)
+                    continue
+                scheduled_request = self._make_scheduled_request(request, phase, token_budget)
+                if (
+                    phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+                    and scheduled_request.token_count <= 0
+                ):
+                    queue.append(request.request_id)
+                    continue
+                if phase in _CAPACITY_PHASES:
+                    # A scheduled span declares a prompt frontier; decode phases advance the
+                    # request's own position by one.
+                    frontier = (
+                        scheduled_request.token_start + scheduled_request.token_count
+                        if phase in _SPAN_PHASES
+                        else request.position + 1
+                    )
+                    if not self._ensure_execution_capacity(request, frontier, selected=selected):
+                        queue.append(request.request_id)
+                        continue
+                # Selecting A must prevent B's later capacity check from evicting A.
+                selected.add(request.request_id)
+                scheduled_requests.append(replace(scheduled_request, phase=phase))
+                token_budget -= scheduled_request.token_count
+        if not scheduled_requests:
             return None
-        self.policy.record_batch(stage)
-        return SchedulerOutput(stage, items)
+        # Fairness follows the requests actually selected, including a mixed attempt
+        # whose other queue could not reserve capacity.
+        selected_phases = {scheduled_request.phase for scheduled_request in scheduled_requests}
+        recorded = (
+            RequestPhase.RECURRENT
+            if RequestPhase.RECURRENT in selected_phases
+            else scheduled_requests[0].phase
+        )
+        self.policy.record_batch(recorded)
+        return SchedulerOutput(
+            next(iter(selected_phases)) if len(selected_phases) == 1 else None, scheduled_requests
+        )
 
     def schedule(self, *, prefer_recurrent=False) -> SchedulerOutput | None:
-        """Choose existing work or an admission opportunity, then build a batch.
+        """Choose queued requests or an admission opportunity, then build a batch.
 
         An unfinished request is not necessarily runnable (e.g. PD RECEIVING).
         Conversely, one long active request must not prevent new requests from
-        filling available slots. The stage policy decides when to call _admit;
+        filling available slots. The phase policy decides when to call _admit;
         merely checking whether requests exist must not allocate or preempt.
         """
         if not self.requests:

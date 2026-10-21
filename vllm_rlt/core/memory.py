@@ -102,10 +102,12 @@ def plan_cache(model, cache, scheduler, execution, backend):
         )
     buffers = execution_buffer_bytes(config, scheduler, cache, execution, parameter.element_size())
     # Dynamic metadata at the largest supported context is small but not zero.
-    metadata = (
-        scheduler.max_num_batched_tokens
-        * math.ceil(config.max_position_embeddings / cache.block_size)
-        * 4
+    metadata_width = math.ceil(config.max_position_embeddings / cache.block_size)
+    metadata_rows = scheduler.max_num_batched_tokens
+    wide_capacity = metadata_rows * (config.total_ut_steps + 2)
+    narrow_capacity = metadata_rows * config.total_ut_steps * (metadata_width + 2) + 1
+    metadata = 3 * (
+        (1 << (wide_capacity - 1).bit_length()) * 8 + (1 << (narrow_capacity - 1).bit_length()) * 4
     )
     budget = min(free_before, int(total * cache.gpu_memory_utilization) - reserved)
     concurrent_peak = peak * (2 if execution.async_scheduling and execution.multi_stream else 1)

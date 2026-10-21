@@ -8,14 +8,13 @@ from functools import partial
 import torch
 
 from vllm_rlt.config import SchedulerConfig
-from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.entrypoints.runtime_args import (
     add_runtime_args,
     profile_config_from_args,
     runtime_configs,
 )
 from vllm_rlt.models import (
-    AutoModelForCausalLM,
     load_tokenizer,
     resolve_model_config,
     resolve_model_source,
@@ -41,14 +40,11 @@ def load_engine(args):
         decoder = getattr(getattr(tokenizer, "backend_tokenizer", None), "decoder", None)
         if not isinstance(decoder, ByteLevel):
             raise ValueError("serving requires the Ouro byte-level tokenizer")
-    model = AutoModelForCausalLM.from_pretrained(
+    engine = StageClient(
         source,
         revision=revision,
         device=args.device,
-        dtype=getattr(torch, args.dtype),
-    )
-    engine = LLMEngine(
-        model,
+        dtype=args.dtype,
         **runtime_configs(args),
         scheduler_config=SchedulerConfig(
             policy=getattr(args, "scheduling_policy", "fcfs"),
@@ -99,7 +95,7 @@ def main():
         ],
         default="triton",
     )
-    parser.add_argument("--mode", choices=["refill", "no_refill"], default="refill")
+    parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
     parser.add_argument("--num-blocks", type=int, help="Override automatic KV sizing")
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-num-seqs", type=int, default=8)

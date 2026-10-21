@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1840" viewBox="0 0 2400 1840" role="img" aria-labelledby="title desc"><title id="title">Stage structure: processes, ownership and calls</title><desc id="desc">StageClient lives in the caller process and controls a spawned worker through a Pipe. StageWorker drives its engine and optional connector. StageEngine calls Scheduler and Executor; Scheduler does not invoke the runner. Ordinary and speculative runners share ModelRuntime, model, KV and RNG. Tickets return to engine-owned completion handling.</desc><defs><marker id="arr" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M1 1L8 4.5L1 8" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect width="2400" height="1840" fill="white"/>
+<text x="60" y="66" font-family="Arial,Helvetica,sans-serif" font-size="45" fill="#213951" font-weight="700" text-anchor="start">Inside a stage: who owns, who drives, who executes</text>
+<text x="60" y="112" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#71839a" font-weight="400" text-anchor="start">Process boundaries outside. Component responsibilities inside. Local loops never require a client round trip.</text>
+<rect x="60" y="150" width="1740" height="250" rx="14" fill="#f6f8fc" stroke="#cbd8e7" stroke-width="2"/>
+<text x="90" y="192" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#71839a" font-weight="700" text-anchor="start">CALLER PROCESS</text>
+<rect x="100" y="235" width="430" height="80" rx="14" fill="#e9f1fb" stroke="#326ca8" stroke-width="2"/>
+<text x="315.0" y="284.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#326ca8" font-weight="700" text-anchor="middle">LLM / deployment coordinator</text>
+<rect x="800" y="205" width="950" height="155" rx="14" fill="#e9f1fb" stroke="#326ca8" stroke-width="2"/>
+<text x="830" y="249" font-family="Arial,Helvetica,sans-serif" font-size="32" fill="#326ca8" font-weight="700" text-anchor="start">StageClient</text>
+<text x="830" y="292" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#213951" font-weight="400" text-anchor="start">Worker process handle · control channel · ID mapping</text>
+<text x="830" y="331" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#71839a" font-weight="400" text-anchor="start">step() receives outputs; it does not execute a model loop.</text>
+<path d="M530 275H800" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="665" y="250" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#326ca8" font-weight="400" text-anchor="middle">API calls</text>
+<rect x="1910" y="180" width="380" height="180" rx="14" fill="#fff8ec" stroke="#ae7b27" stroke-width="2"/>
+<text x="2100" y="230" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#ae7b27" font-weight="700" text-anchor="middle">OTHER STAGES</text>
+<text x="2100" y="276" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#ae7b27" font-weight="400" text-anchor="middle">Peer connectors</text>
+<text x="2100" y="320" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#71839a" font-weight="400" text-anchor="middle">KV / hidden transfer</text>
+<rect x="60" y="500" width="2280" height="1170" rx="14" fill="#f6f9fd" stroke="#326ca8" stroke-width="2"/>
+<text x="100" y="550" font-family="Arial,Helvetica,sans-serif" font-size="34" fill="#326ca8" font-weight="700" text-anchor="start">StageWorker · worker process</text>
+<rect x="100" y="590" width="1700" height="125" rx="14" fill="#fff" stroke="#326ca8" stroke-width="2"/>
+<rect x="140" y="615" width="520" height="70" rx="14" fill="#e9f1fb" stroke="#326ca8" stroke-width="2"/>
+<text x="400.0" y="659.0" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#326ca8" font-weight="700" text-anchor="middle">run() drives engine.step()</text>
+<rect x="920" y="615" width="330" height="70" rx="14" fill="#e9f1fb" stroke="#326ca8" stroke-width="2"/>
+<text x="1085.0" y="659.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#326ca8" font-weight="700" text-anchor="middle">Handle commands</text>
+<rect x="1420" y="615" width="330" height="70" rx="14" fill="#e9f1fb" stroke="#326ca8" stroke-width="2"/>
+<text x="1585.0" y="659.0" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#326ca8" font-weight="700" text-anchor="middle">Send outputs / replies</text>
+<text x="680" y="656" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#71839a" font-weight="400" text-anchor="start">local service loop</text>
+<path d="M1050 360V615" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1075" y="449" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#326ca8" font-weight="400" text-anchor="start">commands · Pipe IPC</text>
+<path d="M1550 615V360" fill="none" stroke="#855ca9" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1575" y="449" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#855ca9" font-weight="400" text-anchor="start">outputs / replies</text>
+<path d="M900 360V425H700V500" fill="none" stroke="#71839a" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 7" marker-end="url(#arr)"/>
+<text x="715" y="478" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#71839a" font-weight="400" text-anchor="start">spawn / manage</text>
+<rect x="1910" y="590" width="380" height="520" rx="14" fill="#fff8ec" stroke="#ae7b27" stroke-width="2"/>
+<text x="2100" y="640" font-family="Arial,Helvetica,sans-serif" font-size="31" fill="#ae7b27" font-weight="700" text-anchor="middle">Connector</text>
+<rect x="1940" y="680" width="320" height="70" rx="14" fill="#fff" stroke="#ae7b27" stroke-width="2"/>
+<text x="2100.0" y="724.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#ae7b27" font-weight="700" text-anchor="middle">Transport + staging</text>
+<rect x="1940" y="785" width="320" height="70" rx="14" fill="#fff" stroke="#ae7b27" stroke-width="2"/>
+<text x="2100.0" y="829.0" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#ae7b27" font-weight="700" text-anchor="middle">Readiness / backpressure</text>
+<rect x="1940" y="1010" width="320" height="65" rx="14" fill="#fff" stroke="#ae7b27" stroke-width="2"/>
+<text x="2100.0" y="1051.5" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#ae7b27" font-weight="700" text-anchor="middle">Remote-access lifetime</text>
+<path d="M2070 360V590" fill="none" stroke="#ae7b27" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<path d="M2150 590V360" fill="none" stroke="#ae7b27" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<path d="M1800 650H1910" fill="none" stroke="#ae7b27" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1855" y="625" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#ae7b27" font-weight="400" text-anchor="middle">progress()</text>
+<rect x="100" y="780" width="1700" height="820" rx="14" fill="#fff" stroke="#326ca8" stroke-width="2"/>
+<text x="130" y="822" font-family="Arial,Helvetica,sans-serif" font-size="32" fill="#326ca8" font-weight="700" text-anchor="start">StageEngine</text>
+<path d="M400 685V750H1200V845" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<path d="M1100 685V730H1500V845" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1520" y="765" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#326ca8" font-weight="400" text-anchor="start">control</text>
+<path d="M1620 845V740H1640V685" fill="none" stroke="#855ca9" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1660" y="765" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#855ca9" font-weight="400" text-anchor="start">outputs</text>
+<rect x="800" y="845" width="900" height="150" rx="14" fill="#e9f1fb" stroke="#326ca8" stroke-width="2"/>
+<text x="830" y="886" font-family="Arial,Helvetica,sans-serif" font-size="30" fill="#326ca8" font-weight="700" text-anchor="start">step() · progress / completion</text>
+<text x="830" y="932" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#213951" font-weight="400" text-anchor="start">Schedule → submit → track tickets / collect when needed</text>
+<text x="830" y="972" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#213951" font-weight="400" text-anchor="start">Apply progress · exit / stop · coordinate resource retirement</text>
+<rect x="150" y="845" width="480" height="210" rx="14" fill="#edf3fc" stroke="#326ca8" stroke-width="2"/>
+<text x="180" y="887" font-family="Arial,Helvetica,sans-serif" font-size="31" fill="#326ca8" font-weight="700" text-anchor="start">Scheduler</text>
+<text x="180" y="933" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#213951" font-weight="400" text-anchor="start">Policy · admission · phase queues</text>
+<text x="180" y="978" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#213951" font-weight="400" text-anchor="start">Request registry · loop selection</text>
+<text x="180" y="1021" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#71839a" font-weight="400" text-anchor="start">operation / token range / depth</text>
+<path d="M800 900H630" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="715" y="879" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#326ca8" font-weight="400" text-anchor="middle">schedule()</text>
+<path d="M630 985H800" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="715" y="965" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#326ca8" font-weight="700" text-anchor="middle">batch</text>
+<path d="M1250 995V1070" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1275" y="1045" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#326ca8" font-weight="400" text-anchor="start">submit(batch)</text>
+<rect x="1100" y="1070" width="500" height="70" rx="14" fill="#e9f1fb" stroke="#326ca8" stroke-width="2"/>
+<text x="1350.0" y="1114.0" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#326ca8" font-weight="700" text-anchor="middle">Executor</text>
+<path d="M1100 1105H760V1030H900V995" fill="none" stroke="#855ca9" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="805" y="1081" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#855ca9" font-weight="400" text-anchor="start">ticket</text>
+<path d="M1910 900H1700" fill="none" stroke="#ae7b27" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1805" y="880" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#ae7b27" font-weight="400" text-anchor="middle">ready / import</text>
+<path d="M1700 960H1910" fill="none" stroke="#ae7b27" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1805" y="992" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#ae7b27" font-weight="400" text-anchor="middle">export / retire</text>
+<path d="M1250 1140V1170H1000V1210" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<path d="M1450 1140V1170H1500V1210" fill="none" stroke="#855ca9" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<rect x="800" y="1210" width="400" height="120" rx="14" fill="#e2f2ed" stroke="#28836b" stroke-width="2"/>
+<text x="1000" y="1254" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#28836b" font-weight="700" text-anchor="middle">ModelRunner</text>
+<text x="1000" y="1295" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#28836b" font-weight="400" text-anchor="middle">CPU / GPU prepare · submit</text>
+<rect x="1300" y="1210" width="400" height="120" rx="14" fill="#eee5f7" stroke="#855ca9" stroke-width="2"/>
+<text x="1500" y="1254" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#855ca9" font-weight="700" text-anchor="middle">Speculative controller</text>
+<text x="1500" y="1295" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#855ca9" font-weight="400" text-anchor="middle">Local draft / verify · optional</text>
+<path d="M390 1055V1150" fill="none" stroke="#855ca9" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="415" y="1111" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#855ca9" font-weight="400" text-anchor="start">capacity / reserve</text>
+<rect x="150" y="1150" width="480" height="170" rx="14" fill="#f7f2fb" stroke="#855ca9" stroke-width="2"/>
+<text x="180" y="1193" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#855ca9" font-weight="700" text-anchor="start">KVCacheManager</text>
+<rect x="180" y="1220" width="36" height="35" rx="5" fill="#e9f1fb" stroke="#855ca9" stroke-width="2"/>
+<rect x="227" y="1220" width="36" height="35" rx="5" fill="#e2f2ed" stroke="#855ca9" stroke-width="2"/>
+<rect x="274" y="1220" width="36" height="35" rx="5" fill="#eee5f7" stroke="#855ca9" stroke-width="2"/>
+<rect x="321" y="1220" width="36" height="35" rx="5" fill="#e9f1fb" stroke="#855ca9" stroke-width="2"/>
+<rect x="368" y="1220" width="36" height="35" rx="5" fill="#e2f2ed" stroke="#855ca9" stroke-width="2"/>
+<text x="180" y="1291" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#855ca9" font-weight="400" text-anchor="start">Pages · mappings · validity · pins</text>
+<rect x="150" y="1430" width="220" height="90" rx="14" fill="#f7f2fb" stroke="#855ca9" stroke-width="2"/>
+<text x="260.0" y="1484.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#855ca9" font-weight="700" text-anchor="middle">Shared RNG</text>
+<rect x="410" y="1430" width="220" height="90" rx="14" fill="#f7f2fb" stroke="#855ca9" stroke-width="2"/>
+<text x="520.0" y="1484.0" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#855ca9" font-weight="700" text-anchor="middle">Preemption</text>
+<text x="520" y="1550" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#71839a" font-weight="400" text-anchor="middle">optional manager</text>
+<path d="M260 1430V1370H1000V1330" fill="none" stroke="#71839a" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 7" marker-end="url(#arr)"/>
+<path d="M1000 1370H1500V1330" fill="none" stroke="#71839a" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 7" marker-end="url(#arr)"/>
+<path d="M520 1430V1380Q538 1370 520 1360V1320" fill="none" stroke="white" stroke-width="9"/>
+<path d="M520 1430V1380Q538 1370 520 1360V1320" fill="none" stroke="#71839a" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 7" marker-end="url(#arr)"/>
+<path d="M710 1235V1485" stroke="white" stroke-width="9" fill="none"/>
+<path d="M630 1235H710V1485H800" fill="none" stroke="#71839a" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 7" marker-end="url(#arr)"/>
+<text x="650" y="1410" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#71839a" font-weight="700" text-anchor="start">KV</text>
+<path d="M1000 1330V1410" fill="none" stroke="#28836b" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<path d="M1500 1330V1410" fill="none" stroke="#855ca9" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<rect x="800" y="1410" width="900" height="140" rx="14" fill="#f2faf6" stroke="#28836b" stroke-width="2"/>
+<text x="830" y="1450" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#28836b" font-weight="700" text-anchor="start">Shared ModelRuntime</text>
+<text x="1665" y="1449" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#71839a" font-weight="400" text-anchor="end">model / graph</text>
+<rect x="830" y="1475" width="220" height="50" rx="14" fill="#fff" stroke="#28836b" stroke-width="2"/>
+<text x="940.0" y="1509.0" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#28836b" font-weight="700" text-anchor="middle">PRELUDE</text>
+<rect x="1080" y="1475" width="330" height="50" rx="14" fill="#fff" stroke="#28836b" stroke-width="2"/>
+<text x="1245.0" y="1509.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#28836b" font-weight="700" text-anchor="middle">RECURRENT × loop_count</text>
+<rect x="1440" y="1475" width="230" height="50" rx="14" fill="#fff" stroke="#28836b" stroke-width="2"/>
+<text x="1555.0" y="1509.0" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#28836b" font-weight="700" text-anchor="middle">CODA</text>
+<text x="800" y="1580" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#71839a" font-weight="400" text-anchor="start">Runners own input buffers, GPU events, readback storage and sampling.</text>
+<rect x="1910" y="1210" width="380" height="300" rx="14" fill="#f0f5fc" stroke="#326ca8" stroke-width="2"/>
+<text x="2100" y="1260" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#326ca8" font-weight="700" text-anchor="middle">Model weights</text>
+<rect x="2000" y="1290" width="165" height="70" rx="8" fill="#fff" stroke="#326ca8" stroke-width="2"/>
+<rect x="2018" y="1308" width="165" height="70" rx="8" fill="#fff" stroke="#326ca8" stroke-width="2"/>
+<rect x="2036" y="1326" width="165" height="70" rx="8" fill="#fff" stroke="#326ca8" stroke-width="2"/>
+<text x="2100" y="1435" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#71839a" font-weight="400" text-anchor="middle">Loaded by StageWorker</text>
+<text x="2100" y="1476" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#71839a" font-weight="400" text-anchor="middle">Shared within this stage</text>
+<path d="M1700 1480H1825V1370H1910" fill="none" stroke="#71839a" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 7" marker-end="url(#arr)"/>
+<text x="60" y="1730" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#213951" font-weight="700" text-anchor="start">Boxes: process / component membership</text>
+<path d="M770 1722H845" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="865" y="1730" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#326ca8" font-weight="400" text-anchor="start">Calls / control</text>
+<path d="M1170 1722H1245" fill="none" stroke="#855ca9" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
+<text x="1265" y="1730" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#855ca9" font-weight="400" text-anchor="start">Returns</text>
+<path d="M1470 1722H1545" fill="none" stroke="#71839a" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 7" marker-end="url(#arr)"/>
+<text x="1565" y="1730" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#71839a" font-weight="400" text-anchor="start">Shared references / lifecycle</text>
+<text x="60" y="1794" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#213951" font-weight="700" text-anchor="start">Scheduler selects; StageEngine coordinates; runners execute. A submission runs its selected operation, not necessarily PRELUDE → RECURRENT → CODA.</text>
+</svg>

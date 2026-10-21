@@ -7,25 +7,12 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tests.helpers import tiny_nanbeige_config
+from tests.helpers import make_cpu_cache, tiny_nanbeige_config
 from tests.reference import dense_nanbeige_reference
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import AutoModelForCausalLM, NanbeigeConfig, NanbeigeForCausalLM
 from vllm_rlt.sampling_params import SamplingParams
-
-
-def make_cache(config, *, blocks=64):
-    return KVCacheManager(
-        num_layers=config.num_hidden_layers,
-        num_kv_heads=config.num_key_value_heads,
-        head_dim=config.head_dim,
-        num_blocks=blocks,
-        block_size=2,
-        max_loops=config.total_ut_steps,
-        device="cpu",
-        dtype=torch.float32,
-    )
 
 
 @pytest.fixture
@@ -60,7 +47,7 @@ def test_packed_prefill_matches_dense_at_every_depth(kv_heads):
     model = NanbeigeForCausalLM(config)
     tokens = torch.tensor([5, 7, 2, 11, 3])
     expected = dense_nanbeige_reference(model, tokens, config.total_ut_steps)
-    cache = make_cache(config)
+    cache = make_cpu_cache(config)
     assert cache.allocate("prompt", len(tokens))
     hidden = model.prelude(tokens)
     for depth, (expected_hidden, expected_logits) in enumerate(expected):
@@ -74,7 +61,7 @@ def test_packed_prefill_matches_dense_at_every_depth(kv_heads):
 def test_incremental_tokens_match_dense_fixed_depth(model):
     tokens = torch.tensor([4, 15, 6, 2, 9, 12, 3])
     expected = dense_nanbeige_reference(model, tokens, model.config.total_ut_steps)
-    cache = make_cache(model.config)
+    cache = make_cpu_cache(model.config)
     assert cache.allocate("sequence", len(tokens))
     for position, token in enumerate(tokens):
         hidden = model.prelude(token.unsqueeze(0))
@@ -92,7 +79,7 @@ def test_mixed_request_depth_batch_matches_separate_dense(model):
     second = torch.tensor([6, 13, 2, 4])
     expected_first = dense_nanbeige_reference(model, first, 2)[1]
     expected_second = dense_nanbeige_reference(model, second, 1)[0]
-    cache = make_cache(model.config)
+    cache = make_cpu_cache(model.config)
     assert cache.allocate("first", len(first))
     assert cache.allocate("second", len(second))
     first_hidden = model.prelude(first)
@@ -278,7 +265,7 @@ def test_parity_against_official_hf_transformers():
     torch.testing.assert_close(ref_logits, official_logits, atol=1e-5, rtol=1e-4)
 
     # 4. Compare native engine execution
-    cache = make_cache(mini_vllm_cfg)
+    cache = make_cpu_cache(mini_vllm_cfg)
     tokens = input_ids[0]
     seq_len = len(tokens)
     assert cache.allocate("parity-req", seq_len)

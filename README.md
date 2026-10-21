@@ -56,9 +56,11 @@ vLLM to be installed. See [Citation](#citation) for the paper's BibTeX entry.
 - **Three native models:** Ouro-1.4B with fixed-depth or learned early-exit
   decoding, Nanbeige4.2-3B with fixed two-loop inference, and Huginn-0125 with
   synchronous fixed-depth inference.
-- **Measured decode speed:** synchronous self-speculation reached **236.45
-  committed tokens/s**, versus **154.23 tokens/s** for native fixed-depth async
-  decoding (**~1.53×**) on the historical Ouro-1.4B workload below.[^decode-benchmark]
+- **Measured serving performance:** on the B300 ShareGPT C8 workload below,
+  single-GPU asynchronous self-speculation reached **628.9 output tokens/s**,
+  versus **370.6 tokens/s** with base optimizations (**+69.7%**). Mean completion
+  latency fell **40.7%**; TTFT and ITL tails increased. These are diagnostic
+  measurements with unresolved output-equivalence differences.
 - **Loop-aware runtime:** continuous batching, depth-aware paged KV, and opt-in
   prefix caching, CUDA Graphs, self-speculation, and single-host prefill/decode
   disaggregation.
@@ -72,14 +74,6 @@ async self-speculation has unresolved worker-failure and cleanup issues
 ([#115](https://github.com/ThinkFlowLab/vllm-rlt/pull/115)). See the release notes
 for supported combinations and limitations.
 
-[^decode-benchmark]: Historical medians of five trials on one NVIDIA H20-3e:
-    Ouro-1.4B BF16, Triton 3.6.0, eager execution, LAST_EXITED KV,
-    64-token prompt / 32-token output, concurrency 8, draft depth 2 / target
-    depth 4, K=2. Committed-decode timing excludes prefill, the first output
-    token, and HTTP/client overhead. [Full protocol and measurements](https://github.com/ThinkFlowLab/vllm-rlt/blob/ea3f74c5cd9c280086195d996a4f9fbcf82bc04b/docs/async-speculative.md#matched-bf16-measurements)
-    used runtime `d977817d4e174cbc2fcc9aa7ef5893c35da2ec89`; these are
-    workload-specific results, not a fresh v0.1.0 benchmark or production guarantee.
-
 ## Features
 
 - **Loop-level continuous batching.** Mix requests at different recurrence
@@ -92,7 +86,9 @@ for supported combinations and limitations.
   priority scheduling, and preemption with CPU state snapshots.
 - **Configurable GPU execution.** Triton and FlashAttention backends, asynchronous
   scheduling, multiple CUDA streams, reusable buffers, and CUDA Graph capture
-  of decode recurrent cores.
+  of decode recurrent cores. Asynchronous self-speculation also supports compatible
+  paged FlashAttention backends and recurrent/coda CUDA Graphs; see the
+  [execution scope and constraints](docs/async-speculative.md#cuda-graph-scope-and-ownership).
 - **Offline and online inference.** A Python API, a command-line interface,
   and an OpenAI-compatible completions endpoint with streaming, greedy decoding,
   and seeded top-k/top-p sampling.
@@ -108,12 +104,12 @@ supported combinations.
 
 | Checkpoint | Implementation | Documented validation scope | Guide |
 | --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | Existing runtime and benchmark coverage under their recorded configurations | [Runtime](docs/cdb_runtime.md), [accuracy](docs/accuracy.md) |
+| Ouro-1.4B | Native Ouro | Existing runtime and benchmark coverage under their recorded configurations | [Runtime](docs/runtime.md), [accuracy](docs/accuracy.md) |
 | Ouro-2.6B | Shared Ouro | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
 | Ouro-1.4B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
 | Ouro-2.6B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
-| Nanbeige4.2-3B | Native Nanbeige | Fixed two-loop inference | [Runtime](docs/cdb_runtime.md) |
-| Huginn-0125 | Native Huginn | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/cdb_runtime.md) |
+| Nanbeige4.2-3B | Native Nanbeige | Fixed two-loop inference | [Runtime](docs/runtime.md) |
+| Huginn-0125 | Native Huginn | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/runtime.md) |
 
 Shared implementation does not qualify every checkpoint/feature combination;
 see the linked guides for validation scope and limitations. See
@@ -125,9 +121,11 @@ inference and CUDA Graphs for the recurrent core and decode coda.
 
 ## How It Works
 
-Full-depth prefill produces the first token through the coda. Each subsequent
-token passes through the prelude and a variable number of recurrent loops
-before sampling. Requests at different loop depths can share the same batch.
+Prompt tokens traverse the full recurrent depth before the coda produces the
+first output. With atomic prefill, a chunk's loops run in one submission; split
+prefill exposes loop boundaries for scheduling and compatible prefill/decode
+mixed batches. Each subsequent token passes through prelude, recurrence and
+coda. The diagram below illustrates the atomic-prefill path.
 
 ```mermaid
 flowchart LR
@@ -145,9 +143,13 @@ flowchart LR
     class E recurrent
 ```
 
-The diagram shows logical token flow; asynchronous execution can overlap
-stages. See the [runtime guide](docs/cdb_runtime.md) for scheduling, exit policies,
-and depth-aware KV caching.
+**Stage is the deployment and resource boundary; loop is the unit of execution
+and scheduling within a stage.** Prefill, decode and prefill_decode stages share one
+execution architecture.
+
+See the [architecture and flow diagrams](docs/unified_execution.md) and the
+[runtime guide](docs/runtime.md) for implementation details and supported
+configurations.
 
 <a href="docs/assets/inference/ouro-inference.mp4">
   <picture>
@@ -183,68 +185,59 @@ configuration, optional backends, and design notes.
 
 ## Performance Baselines
 
-The current performance baselines are recorded in
-[PR #30: depth-aware KV and asynchronous execution](https://github.com/hsliuustc0106/vllm-rlt/pull/30)
-and [PR #31: prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31).
-These reports provide the reference measurements for subsequent runtime work.
+The figure below shows the October 2026 serving campaign on **Ouro-1.4B BF16,
+NVIDIA B300, FlashAttention 4**, fixed four loops and greedy decoding. It covers
+ShareGPT at closed-loop concurrency 8 and 32, with natural EOS and an output
+cap of 512 tokens. The legend explicitly identifies each configuration's GPU count.
 
-### Single-GPU runtime
+![ShareGPT C8 and C32: base optimized is plotted at 1 for throughput and mean TTFT, TPOT, ITL and E2E; Vanilla and the other configurations are normalized to that same baseline, with absolute values and percentage changes above every bar](docs/assets/performance/core-overview.png)
 
-PR #30 evaluates feature stacking on Ouro-1.4B BF16 on B300. The figure
-shows **relative engine end-to-end throughput** for 1,024-token inputs at
-concurrency 1, 32, and 128. Each curve is normalized to its own FA4 baseline;
-the legend includes absolute baseline throughput. Triton is excluded.
+[Full-size PNG](docs/assets/performance/core-overview.png) ·
+[All workloads, mean/p95/p99 latency and analysis](docs/unified_execution.md#measured-serving-performance)
 
-![PR 30 feature stacking: end-to-end output throughput at concurrency 1, 32, and 128 with cumulative runtime features](docs/assets/performance/pr30-feature-stacking.png)
+**Reading the comparisons.** **Base optimized is the baseline for every metric
+and is always plotted at 1**, shown by blue bars and a dashed line. Each colored
+bar is the candidate's value divided by the base-optimized value for the same
+metric and workload. **Above 1 is better for throughput; below 1 is better for
+latency.** A throughput ratio of 1.7 means 70% higher throughput; a latency ratio
+of 0.6 means 40% lower latency. Each bar label shows the **absolute value on
+the first line and percentage change on the second**. Units appear below each
+metric: tok/s for throughput, ms for TTFT/TPOT/ITL, and seconds for E2E. Baseline
+bars also show their absolute values, with 0.0% change. **Vanilla** is the
+unoptimized configuration and is included alongside the optimized modes, using
+the same base-optimized denominator.
 
-P1–P8 progressively add early exit, delayed exit, asynchronous scheduling,
-multiple streams, static buffers, padding, and decode recurrent-core CUDA
-Graphs. The shaded pair is the separate **FA4 split=1** rerun, comparing CUDA
-Graphs with and without resident asynchronous state. Its normalization to the original
-FA4 baseline is a cross-campaign comparison; only the shaded pair is matched.
+Two replicas means two independent base-optimized servers, each handling half
+the total concurrency. PD uses one prefill GPU and one decode GPU. Their gains
+against the single-GPU baseline include the additional hardware; see the
+[per-GPU results](docs/unified_execution.md#two-gpu-resource-efficiency).
 
-Values are medians of three trials, with 128 output tokens per request and
-2×concurrency requests using closed-loop replacement. Timing includes prefill
-and drain time, excluding HTTP, tokenization, loading, and warmup. The vertical
-axis is linear. P2→P3 changes the exit policy;
-output and exit-depth differences remain unresolved in some configurations.
-See [PR #30](https://github.com/hsliuustc0106/vllm-rlt/pull/30) for decode-only
-results, latency tables, and the full protocol.
+Throughput uses the median of three 60-second admission-plus-drain measurements.
+TTFT, TPOT and E2E use pooled request means; ITL uses the pooled mean of client
+token-arrival intervals, including zero intervals within each received chunk.
+All workloads and latency p95/p99 are in the detailed report. All selected windows ran without profiling or new CUDA Graph captures.
 
-### Four-GPU serving
+At C8, single-GPU speculation improves throughput by **69.7%** over base
+optimized and reduces mean E2E by **40.7%**. At C32, two-GPU PD + speculation
+reaches **1,991.2 output tokens/s**, **84.0%** above the single-GPU base, with
+mean E2E **44.5%** lower. Additional hardware does not guarantee proportional
+throughput: at C8, PD + speculation is only slightly faster than single-GPU
+speculation. Two speculative replicas were not measured.
 
-PR #31 compares four independent replicas with disaggregated prefill (P) and
-decode (D) pools. Each configuration uses four GPUs, Ouro-1.4B BF16, FA4
-split=1, asynchronous scheduling, CUDA Graphs, and the new KV/scheduling
-features. Each phase replays 512 ShareGPT prompts with 128 output tokens.
+**Scope and validation.** TTFT and token-interval tails can worsen even when
+mean completion time improves. Natural input coverage and output lengths differ
+between configurations, and full greedy output equivalence has not passed
+across all modes. These are diagnostic serving measurements, not equal-quality
+speedup claims or a production qualification. The complete campaign includes
+26 combinations, 78 selected runs and 12,288 successful requests with no request
+failures; configuration, provenance and metric definitions are in the
+[detailed report](docs/unified_execution.md#measured-serving-performance).
 
-Each figure compares all four configurations against **four replicas = 100%**.
-Bar labels show the PR-reported percentage changes. Higher throughput is better;
-lower latency is better. At 4 and 8 req/s, **2P2D retains 99.0% and 97.5% of
-baseline throughput**, while reducing TTFT by **13.3% and 25.8%** and ITL by
-**53.5% and 47.9%**, respectively.
-
-![PR 31 at 4 requests per second: all four deployments and five metrics, with changes relative to four replicas](docs/assets/performance/pr31-pd-serving-4rps.png)
-
-![PR 31 at 8 requests per second: all four deployments and five metrics, with changes relative to four replicas](docs/assets/performance/pr31-pd-serving-8rps.png)
-
-Bars average the initial and immediate-replay phases equally; latency values
-are averages of phase percentiles, not pooled percentiles. TTFT measures time
-to first token, TPOT average time per subsequent token, ITL individual token
-intervals, and E2E request completion latency. Some cases use isolated reruns
-while others were measured with concurrent configurations on the same host;
-see [PR #31](https://github.com/hsliuustc0106/vllm-rlt/pull/31) for the full protocol.
-
-In this workload, 1P3D improves generation latency at the cost of TTFT, while
-2P2D improves all reported latency metrics with slightly lower throughput.
-These are fixed-arrival-rate measurements, not peak-capacity results, and do
-not isolate the benefit of individual cache or scheduling features.
-
-### Validation
-
-See the [runtime validation and context/concurrency results](https://github.com/hsliuustc0106/vllm-rlt/pull/30)
-and [GSM8K evaluation guide](docs/accuracy.md) for additional checks. The PRs above
-are the public references for the reported performance results and limitations.
+Earlier measurements remain available in
+[PR #30](https://github.com/hsliuustc0106/vllm-rlt/pull/30) and
+[PR #31](https://github.com/hsliuustc0106/vllm-rlt/pull/31); their workloads and timing
+boundaries differ from this campaign. See the [GSM8K evaluation guide](docs/accuracy.md)
+for task-quality evaluation.
 
 ## Roadmap
 
@@ -284,7 +277,7 @@ group and discuss usage and development.
 
 <p align="center">
   <a href="docs/assets/wechat-group-qrcode.jpg">
-    <img src="docs/assets/wechat-group-qrcode.jpg" alt="vllm-rlt WeChat developer group QR code / 微信开发者交流群二维码" width="320">
+    <img src="docs/assets/wechat-group-qrcode.jpg" alt="vllm-rlt WeChat developer group QR code" width="320">
   </a>
 </p>
 

@@ -1,0 +1,251 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="3160" viewBox="0 0 2400 3160" role="img" aria-labelledby="title desc"><title id="title">Complete preemption policy: triggers, protection, ranking, retry and restoration</title><desc id="desc">Two trigger paths join enablement, safety filtering, victim ranking and CPU snapshot. Requester retry and victim restoration have separate branches. Defer, stop admission, repeated waiting, cancellation and copy-error outcomes are explicit.</desc><defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1L7 4L1 7" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect width="2400" height="3160" fill="white"/>
+<text x="70" y="67" font-family="Arial,Helvetica,sans-serif" font-size="44" fill="#203951" font-weight="700" text-anchor="start">Preemption: the complete decision flow</text>
+<text x="70" y="114" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#728399" font-weight="400" text-anchor="start">One shared selection path. Then two lifecycles: requester retry and victim restoration.</text>
+<circle cx="95" cy="190" r="24" fill="#356bab"/>
+<text x="95" y="198" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="white" font-weight="700" text-anchor="middle">1</text>
+<text x="135" y="200" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#356bab" font-weight="700" text-anchor="start">TRIGGER</text>
+<rect x="70" y="235" width="890" height="255" rx="17" fill="#f6f9fe" stroke="#d0dceb" stroke-width="2"/>
+<text x="100" y="278" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#356bab" font-weight="700" text-anchor="start">A · KV growth</text>
+<rect x="100" y="302" width="270" height="48" rx="17" fill="#edf3fc" stroke="#d0dceb" stroke-width="2"/>
+<text x="235.0" y="334" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Request needs KV</text>
+<rect x="395" y="309" width="32" height="32" rx="7" fill="#dce9fb" stroke="#356bab" stroke-width="2"/>
+<rect x="437" y="309" width="32" height="32" rx="7" fill="#dce9fb" stroke="#356bab" stroke-width="2"/>
+<path d="M490 326H560" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M705 282L850.0 326L705 370L560.0 326Z" fill="#e4eefb" stroke="#9fb8d8" stroke-width="2"/>
+<text x="705" y="334" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Capacity fits?</text>
+<path d="M850 326H940V435H925" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="865" y="365" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#43856f" font-weight="400" text-anchor="start">yes</text>
+<rect x="760" y="410" width="165" height="48" rx="17" fill="#edf7f1" stroke="#d0dceb" stroke-width="2"/>
+<text x="842.5" y="442" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#43856f" font-weight="700" text-anchor="middle">select</text>
+<path d="M705 370V490" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="730" y="401" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="400" text-anchor="start">no</text>
+<rect x="1120" y="235" width="890" height="255" rx="17" fill="#f6f9fe" stroke="#d0dceb" stroke-width="2"/>
+<text x="1150" y="278" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#356bab" font-weight="700" text-anchor="start">B · Admission slots</text>
+<rect x="1150" y="302" width="290" height="48" rx="17" fill="#edf3fc" stroke="#d0dceb" stroke-width="2"/>
+<text x="1295.0" y="334" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Waiting request</text>
+<path d="M1440 326H1490" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M1660 282L1830.0 326L1660 370L1490.0 326Z" fill="#e4eefb" stroke="#9fb8d8" stroke-width="2"/>
+<text x="1660" y="334" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Slot available?</text>
+<path d="M1830 326H1990V435H1980" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1900" y="365" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#43856f" font-weight="400" text-anchor="start">yes</text>
+<rect x="1730" y="410" width="250" height="48" rx="17" fill="#edf7f1" stroke="#d0dceb" stroke-width="2"/>
+<text x="1855.0" y="442" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#43856f" font-weight="700" text-anchor="middle">continue admission</text>
+<path d="M1660 370V490" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1690" y="401" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="400" text-anchor="start">no</text>
+<path d="M705 490V540H1000V565" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M1660 490V540H1000" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M1000 571L1210.0 615L1000 659L790.0 615Z" fill="#e4eefb" stroke="#9fb8d8" stroke-width="2"/>
+<text x="1000" y="623" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Preemption allowed?</text>
+<text x="1040" y="701" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="start">Enabled; B requires priority policy</text>
+<path d="M1210 615H1600" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1400" y="594" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#b9656b" font-weight="400" text-anchor="start">no</text>
+<rect x="1600" y="560" width="410" height="180" rx="17" fill="#fff5f3" stroke="#dfc2c2" stroke-width="2"/>
+<text x="1630" y="601" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#b9656b" font-weight="700" text-anchor="start">NO PREEMPTION</text>
+<text x="1630" y="646" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#203951" font-weight="400" text-anchor="start">A → requeue; try other work</text>
+<text x="1630" y="690" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#203951" font-weight="400" text-anchor="start">B → stop admission scan</text>
+<path d="M1000 659V745" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1025" y="727" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="400" text-anchor="start">yes</text>
+<rect x="70" y="745" width="1940" height="300" rx="17" fill="#f7f9fc" stroke="#d0dceb" stroke-width="2"/>
+<circle cx="105" cy="790" r="24" fill="#356bab"/>
+<text x="105" y="798" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="white" font-weight="700" text-anchor="middle">2</text>
+<text x="145" y="800" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#356bab" font-weight="700" text-anchor="start">EXCLUDE FROM VICTIM SELECTION</text>
+<rect x="110" y="835" width="590" height="66" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<path d="M132 862V854a11 11 0 0 1 22 0v8" fill="none" stroke="#728399" stroke-width="3"/>
+<rect x="125" y="861" width="36" height="29" rx="7" fill="#e1e7ee" stroke="#728399" stroke-width="2"/>
+<text x="185" y="877" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#203951" font-weight="400" text-anchor="start">Requester itself</text>
+<rect x="745" y="835" width="590" height="66" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<path d="M767 862V854a11 11 0 0 1 22 0v8" fill="none" stroke="#728399" stroke-width="3"/>
+<rect x="760" y="861" width="36" height="29" rx="7" fill="#e1e7ee" stroke="#728399" stroke-width="2"/>
+<text x="820" y="877" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#203951" font-weight="400" text-anchor="start">Already selected in batch</text>
+<rect x="1380" y="835" width="590" height="66" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<path d="M1402 862V854a11 11 0 0 1 22 0v8" fill="none" stroke="#728399" stroke-width="3"/>
+<rect x="1395" y="861" width="36" height="29" rx="7" fill="#e1e7ee" stroke="#728399" stroke-width="2"/>
+<text x="1455" y="877" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#203951" font-weight="400" text-anchor="start">Pending output</text>
+<rect x="110" y="920" width="590" height="66" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<path d="M132 947V939a11 11 0 0 1 22 0v8" fill="none" stroke="#728399" stroke-width="3"/>
+<rect x="125" y="946" width="36" height="29" rx="7" fill="#e1e7ee" stroke="#728399" stroke-width="2"/>
+<text x="185" y="962" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#203951" font-weight="400" text-anchor="start">WAITING / RECEIVING</text>
+<rect x="745" y="920" width="590" height="66" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<path d="M767 947V939a11 11 0 0 1 22 0v8" fill="none" stroke="#728399" stroke-width="3"/>
+<rect x="760" y="946" width="36" height="29" rx="7" fill="#e1e7ee" stroke="#728399" stroke-width="2"/>
+<text x="820" y="962" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#203951" font-weight="400" text-anchor="start">Transfer lease</text>
+<rect x="1380" y="920" width="590" height="66" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<path d="M1402 947V939a11 11 0 0 1 22 0v8" fill="none" stroke="#728399" stroke-width="3"/>
+<rect x="1395" y="946" width="36" height="29" rx="7" fill="#e1e7ee" stroke="#728399" stroke-width="2"/>
+<text x="1455" y="962" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#203951" font-weight="400" text-anchor="start">B: equal / higher priority</text>
+<text x="110" y="1020" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">Safety first. Priority-admission filtering is stricter than capacity-pressure filtering.</text>
+<path d="M1000 1045V1076" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M1000 1076L1190.0 1120L1000 1164L810.0 1120Z" fill="#e4eefb" stroke="#9fb8d8" stroke-width="2"/>
+<text x="1000" y="1128" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Any candidates?</text>
+<path d="M1190 1120H2060V650H2010" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1270" y="1100" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#b9656b" font-weight="400" text-anchor="start">no → same A / B outcomes</text>
+<path d="M1000 1164V1210" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1025" y="1197" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="400" text-anchor="start">yes</text>
+<rect x="70" y="1210" width="1940" height="270" rx="17" fill="#f9f6fc" stroke="#d6c5e3" stroke-width="2"/>
+<circle cx="105" cy="1255" r="24" fill="#356bab"/>
+<text x="105" y="1263" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="white" font-weight="700" text-anchor="middle">3</text>
+<text x="145" y="1265" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#356bab" font-weight="700" text-anchor="start">RANK → PICK ONE VICTIM</text>
+<rect x="150" y="1300" width="470" height="145" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<text x="170" y="1337" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#9570ac" font-weight="700" text-anchor="start">Candidate X</text>
+<text x="600" y="1337" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#728399" font-weight="400" text-anchor="end">priority 0</text>
+<rect x="170" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="212" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="254" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="296" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="338" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="380" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<text x="600" y="1422" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="end">6 estimated blocks</text>
+<rect x="790" y="1300" width="470" height="145" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<text x="810" y="1337" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#9570ac" font-weight="700" text-anchor="start">Candidate Y</text>
+<text x="1240" y="1337" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#728399" font-weight="400" text-anchor="end">priority 10</text>
+<rect x="810" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="852" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<text x="1240" y="1422" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="end">2 estimated blocks</text>
+<rect x="1430" y="1300" width="470" height="145" rx="17" fill="#f0e6f8" stroke="#9570ac" stroke-width="2"/>
+<text x="1450" y="1337" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#9570ac" font-weight="700" text-anchor="start">Victim V</text>
+<text x="1880" y="1337" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#728399" font-weight="400" text-anchor="end">priority 10</text>
+<rect x="1450" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1492" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1534" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1576" y="1360" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<text x="1880" y="1422" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="end">4 estimated blocks</text>
+<circle cx="1886" cy="1300" r="20" fill="#9570ac"/><path d="M1875 1300l8 8 15-18" stroke="white" stroke-width="3" fill="none"/>
+<path d="M620 1375H790" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="705" y="1354" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#9570ac" font-weight="700" text-anchor="middle">10 &gt; 0</text>
+<path d="M1260 1375H1430" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1345" y="1354" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#9570ac" font-weight="700" text-anchor="middle">4 &gt; 2</text>
+<text x="110" y="1469" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="start">Larger priority number loses first; footprint breaks ties. Exact ties follow candidate order.</text>
+<path d="M1000 1480V1530" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<rect x="70" y="1530" width="1940" height="215" rx="17" fill="#f8fafd" stroke="#d0dceb" stroke-width="2"/>
+<circle cx="105" cy="1573" r="24" fill="#356bab"/>
+<text x="105" y="1581" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="white" font-weight="700" text-anchor="middle">4</text>
+<text x="145" y="1583" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#356bab" font-weight="700" text-anchor="start">SUSPEND V</text>
+<rect x="110" y="1620" width="370" height="48" rx="17" fill="#edf3fc" stroke="#d0dceb" stroke-width="2"/>
+<text x="295.0" y="1652" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Sync runner / rewind chunk</text>
+<path d="M480 1644H550" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<rect x="575" y="1627" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="617" y="1627" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="659" y="1627" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="701" y="1627" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<path d="M750 1644H850" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<rect x="875" y="1598" width="485" height="113" rx="17" fill="#f4edf9" stroke="#cbb4de" stroke-width="2"/>
+<text x="900" y="1633" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#9570ac" font-weight="700" text-anchor="start">CPU snapshot</text>
+<rect x="900" y="1653" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="942" y="1653" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="984" y="1653" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1026" y="1653" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<text x="1110" y="1677" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="400" text-anchor="start">KV + h / token + phase</text>
+<path d="M1360 1644H1440" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<rect x="1460" y="1620" width="505" height="48" rx="17" fill="#f4edf9" stroke="#d0dceb" stroke-width="2"/>
+<text x="1712.5" y="1652" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">Free GPU resources; retain RNG</text>
+<path d="M1000 1745V1790H500V1840" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M1000 1790H1570V1840" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<rect x="70" y="1840" width="920" height="1000" rx="17" fill="#f5f9fe" stroke="#d0dceb" stroke-width="2"/>
+<circle cx="105" cy="1885" r="24" fill="#356bab"/>
+<text x="105" y="1893" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="white" font-weight="700" text-anchor="middle">5</text>
+<text x="145" y="1895" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#356bab" font-weight="700" text-anchor="start">REQUESTER</text>
+<text x="110" y="1960" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#356bab" font-weight="700" text-anchor="start">A · Growth request</text>
+<path d="M510 1986L710.0 2030L510 2074L310.0 2030Z" fill="#e4eefb" stroke="#9fb8d8" stroke-width="2"/>
+<text x="510" y="2038" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">One KV retry fits?</text>
+<path d="M510 1986V1970H350" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M310 2030H150V2130H290" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="180" y="2010" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#43856f" font-weight="400" text-anchor="start">yes</text>
+<rect x="290" y="2105" width="440" height="48" rx="17" fill="#edf7f1" stroke="#d0dceb" stroke-width="2"/>
+<text x="510.0" y="2137" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#43856f" font-weight="700" text-anchor="middle">Select; protect in this batch</text>
+<path d="M710 2030H880V2220H730" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="780" y="2010" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#b9656b" font-weight="400" text-anchor="start">no</text>
+<rect x="290" y="2195" width="440" height="48" rx="17" fill="#fff5f3" stroke="#d0dceb" stroke-width="2"/>
+<text x="510.0" y="2227" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#b9656b" font-weight="700" text-anchor="middle">Requeue in original phase</text>
+<text x="290" y="2275" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#728399" font-weight="400" text-anchor="start">Other requests can still be selected.</text>
+<path d="M110 2310H950" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="110" y="2355" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#356bab" font-weight="700" text-anchor="start">B · Slot freed → shared admission</text>
+<rect x="110" y="2385" width="840" height="120" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<rect x="130" y="2405" width="235" height="48" rx="17" fill="#edf3fc" stroke="#d0dceb" stroke-width="2"/>
+<text x="247.5" y="2437" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Existing snapshot?</text>
+<path d="M365 2429H425" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="445" y="2438" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#9570ac" font-weight="400" text-anchor="start">yes → restoration path at right</text>
+<text x="445" y="2474" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">no → fresh allocation / import handling</text>
+<path d="M530 2505V2546" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M530 2546L720.0 2590L530 2634L340.0 2590Z" fill="#e4eefb" stroke="#9fb8d8" stroke-width="2"/>
+<text x="530" y="2598" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Admission succeeds?</text>
+<path d="M340 2590H145V2700H250" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="180" y="2570" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#43856f" font-weight="400" text-anchor="start">yes</text>
+<rect x="250" y="2675" width="300" height="48" rx="17" fill="#edf7f1" stroke="#d0dceb" stroke-width="2"/>
+<text x="400.0" y="2707" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#43856f" font-weight="700" text-anchor="middle">Queue next phase</text>
+<path d="M720 2590H910V2780H600" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="805" y="2570" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#b9656b" font-weight="400" text-anchor="start">no</text>
+<rect x="250" y="2755" width="350" height="48" rx="17" fill="#fff5f3" stroke="#d0dceb" stroke-width="2"/>
+<text x="425.0" y="2787" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#b9656b" font-weight="700" text-anchor="middle">Defer in WAITING</text>
+<text x="110" y="2820" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">No fresh-KV-failure eviction loop.</text>
+<rect x="1100" y="1840" width="910" height="1000" rx="17" fill="#faf6fd" stroke="#d6c5e3" stroke-width="2"/>
+<circle cx="1140" cy="1885" r="24" fill="#356bab"/>
+<text x="1140" y="1893" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="white" font-weight="700" text-anchor="middle">6</text>
+<text x="1180" y="1895" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#9570ac" font-weight="700" text-anchor="start">VICTIM V</text>
+<rect x="1170" y="1930" width="65" height="49" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<rect x="1255" y="1930" width="65" height="49" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<rect x="1340" y="1930" width="65" height="49" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<rect x="1425" y="1930" width="65" height="49" rx="17" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<text x="1457" y="1963" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#9570ac" font-weight="700" text-anchor="middle">V</text>
+<text x="1530" y="1963" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#9570ac" font-weight="700" text-anchor="start">WAITING</text>
+<path d="M1560 1979V2026" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M1560 2026L1745.0 2070L1560 2114L1375.0 2070Z" fill="#e4eefb" stroke="#9fb8d8" stroke-width="2"/>
+<text x="1560" y="2078" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">Slot available?</text>
+<path d="M1745 2070H2095V326H2010" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)" stroke-dasharray="8 7"/>
+<text x="1880" y="2050" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#9570ac" font-weight="400" text-anchor="start">no → B</text>
+<path d="M1560 2114V2166" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1585" y="2146" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#9570ac" font-weight="400" text-anchor="start">yes</text>
+<path d="M1560 2166L1745.0 2210L1560 2254L1375.0 2210Z" fill="#e4eefb" stroke="#9fb8d8" stroke-width="2"/>
+<text x="1560" y="2218" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#356bab" font-weight="700" text-anchor="middle">KV allocation fits?</text>
+<path d="M1375 2210H1130V1955H1170" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)" stroke-dasharray="8 7"/>
+<text x="1150" y="2170" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#9570ac" font-weight="400" text-anchor="start">no</text>
+<text x="1150" y="2247" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#9570ac" font-weight="400" text-anchor="start">Keep snapshot</text>
+<path d="M1560 2254V2310" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<text x="1585" y="2288" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#9570ac" font-weight="400" text-anchor="start">yes</text>
+<rect x="1180" y="2310" width="750" height="165" rx="17" fill="#fff" stroke="#d0dceb" stroke-width="2"/>
+<text x="1205" y="2347" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#9570ac" font-weight="700" text-anchor="start">Restore tensors + logical KV state</text>
+<rect x="1205" y="2370" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1247" y="2370" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1289" y="2370" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1331" y="2370" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<path d="M1380 2387H1480" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<rect x="1505" y="2370" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1547" y="2370" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1589" y="2370" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1631" y="2370" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<text x="1205" y="2445" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#728399" font-weight="400" text-anchor="start">CPU → new GPU allocation → synchronize</text>
+<path d="M1560 2475V2520" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<rect x="1180" y="2520" width="750" height="48" rx="17" fill="#f0e6f8" stroke="#d0dceb" stroke-width="2"/>
+<text x="1555.0" y="2552" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">Delete snapshot → enqueue saved phase</text>
+<path d="M1560 2568V2605" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M1560 2587H1298V2605" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<path d="M1560 2587H1808V2605" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
+<rect x="1180" y="2605" width="235" height="48" rx="17" fill="#f4edf9" stroke="#d0dceb" stroke-width="2"/>
+<text x="1297.5" y="2637" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">PRELUDE</text>
+<rect x="1435" y="2605" width="235" height="48" rx="17" fill="#f4edf9" stroke="#d0dceb" stroke-width="2"/>
+<text x="1552.5" y="2637" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">RECURRENT</text>
+<rect x="1690" y="2605" width="235" height="48" rx="17" fill="#f4edf9" stroke="#d0dceb" stroke-width="2"/>
+<text x="1807.5" y="2637" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">CODA</text>
+<text x="1180" y="2681" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#9570ac" font-weight="400" text-anchor="start">One saved phase; queue labels above are examples.</text>
+<text x="1180" y="2715" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">Split-prefill rewind resumes at chunk PRELUDE.</text>
+<text x="1180" y="2748" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">Failed restore defers without nested KV preemption.</text>
+<text x="1180" y="2782" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">Shared admission: bounded scan; FCFS / priority.</text>
+<text x="1180" y="2817" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="start">Restore and fresh-admission bypass paths differ.</text>
+<path d="M1930 2390H2083Q2095 2378 2107 2390H2218Q2230 2378 2242 2390H2330" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8 7"/>
+<text x="1960" y="2370" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#b9656b" font-weight="400" text-anchor="start">copy error</text>
+<path d="M2010 1945H2083Q2095 1933 2107 1945H2230V2920H1900" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)" stroke-dasharray="8 7"/>
+<text x="2020" y="1925" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#b9656b" font-weight="400" text-anchor="start">cancel</text>
+<rect x="1120" y="2880" width="780" height="110" rx="17" fill="#fff5f3" stroke="#dfc2c2" stroke-width="2"/>
+<text x="1145" y="2922" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#b9656b" font-weight="700" text-anchor="start">Cancel while suspended</text>
+<text x="1145" y="2964" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#203951" font-weight="400" text-anchor="start">Discard CPU snapshot → release RNG → abort Request</text>
+<path d="M2010 1665H2083Q2095 1653 2107 1665H2330V3060H1900" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8 7"/>
+<text x="2020" y="1645" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#b9656b" font-weight="400" text-anchor="start">error</text>
+<rect x="70" y="2880" width="970" height="110" rx="17" fill="#f8fafc" stroke="#d0dceb" stroke-width="2"/>
+<text x="95" y="2922" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#b9656b" font-weight="700" text-anchor="start">Copy / restore error</text>
+<text x="95" y="2964" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#203951" font-weight="400" text-anchor="start">Exception propagates; no transactional rollback here.</text>
+<path d="M1900 3060H555V2990" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)" stroke-dasharray="8 7"/>
+<text x="70" y="3120" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">Preemption defaults off; speculation excludes it. CPU swap is current behavior; generic KV recompute / cost-based victim selection are not implemented.</text>
+<path d="M2083 1665Q2095 1653 2107 1665" fill="none" stroke="white" stroke-width="10"/><path d="M2083 1665Q2095 1653 2107 1665" fill="none" stroke="#b9656b" stroke-width="3"/>
+<path d="M2083 1945Q2095 1933 2107 1945" fill="none" stroke="white" stroke-width="10"/><path d="M2083 1945Q2095 1933 2107 1945" fill="none" stroke="#b9656b" stroke-width="3"/>
+<path d="M2083 2390Q2095 2378 2107 2390" fill="none" stroke="white" stroke-width="10"/><path d="M2083 2390Q2095 2378 2107 2390" fill="none" stroke="#b9656b" stroke-width="3"/>
+<path d="M2218 2390Q2230 2378 2242 2390" fill="none" stroke="white" stroke-width="10"/><path d="M2218 2390Q2230 2378 2242 2390" fill="none" stroke="#b9656b" stroke-width="3"/>
+</svg>

@@ -136,7 +136,8 @@ def test_auto_does_not_hide_unexpected_backend_failures(packages, monkeypatch):
         create_backend("auto", torch.device("cuda"), torch.bfloat16, 128, 16)
 
 
-def test_execution_requirements_prevent_unsafe_torch_fallback(packages, monkeypatch):
+@pytest.mark.parametrize("requirement", ["cuda_graphs", "device_context_lengths"])
+def test_execution_requirements_prevent_unsafe_torch_fallback(packages, monkeypatch, requirement):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
     packages.clear()
     with pytest.raises(ValueError, match="no compatible attention backend"):
@@ -146,8 +147,26 @@ def test_execution_requirements_prevent_unsafe_torch_fallback(packages, monkeypa
             torch.bfloat16,
             128,
             16,
-            required_capabilities=BackendCapabilities(cuda_graphs=True),
+            required_capabilities=BackendCapabilities(**{requirement: True}),
         )
+
+
+@pytest.mark.parametrize(
+    "sm,backend", [((8, 0), "flash_attn_2"), ((9, 0), "flash_attn_3"), ((10, 0), "flash_attn_4")]
+)
+def test_flash_device_lengths_and_graph_requirements(packages, monkeypatch, sm, backend):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
+    selected = create_backend(
+        backend,
+        torch.device("cuda"),
+        torch.bfloat16,
+        64,
+        256,
+        required_capabilities=BackendCapabilities(
+            async_scheduling=True, cuda_graphs=True, device_context_lengths=True
+        ),
+    )
+    assert selected.info["selected_backend"] == backend
 
 
 def test_packed_prefill_requires_declared_support(packages, monkeypatch):
@@ -185,7 +204,7 @@ def test_cpu_engine_resolves_auto_before_cache_planning():
     "execution", [ExecutionConfig(cuda_graphs=True), ExecutionConfig(async_scheduling=True)]
 )
 def test_cuda_engine_resolves_auto_before_profiling(packages, monkeypatch, execution):
-    from vllm_rlt.engine import llm_engine
+    from vllm_rlt.engine import stage_engine as llm_engine
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
     model = SimpleNamespace(

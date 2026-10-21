@@ -612,27 +612,30 @@ def run(args):
     generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"], exit_policy)
     load_seconds = time.monotonic() - start
     rows = []
-    with (output / "samples.jsonl").open("x", buffering=1) as stream:
-        for row in protocol["records"]:
-            stops = row["generation_kwargs"]["until"] + [tokenizer.eos_token]
-            start = time.monotonic()
-            result = generator.generate(row["prompt_ids"], protocol["max_new_tokens"], stops)
-            if scorer == SCORER_THINKING:
-                result.update(score_thinking(row, result["token_ids"], tokenizer, close_id))
-            else:
-                result.update(score(task, row, result["text"]))
-            result.update(
-                id=row["id"],
-                prompt_sha256=digest(row["prompt_ids"]),
-                seconds=time.monotonic() - start,
-            )
-            stream.write(json.dumps(result) + "\n")
-            rows.append(result)
-            print(
-                f"{args.backend} {len(rows)}/{len(protocol['records'])}: "
-                f"correct={sum(r['correct'] for r in rows)}",
-                flush=True,
-            )
+    try:
+        with (output / "samples.jsonl").open("x", buffering=1) as stream:
+            for row in protocol["records"]:
+                stops = row["generation_kwargs"]["until"] + [tokenizer.eos_token]
+                start = time.monotonic()
+                result = generator.generate(row["prompt_ids"], protocol["max_new_tokens"], stops)
+                if scorer == SCORER_THINKING:
+                    result.update(score_thinking(row, result["token_ids"], tokenizer, close_id))
+                else:
+                    result.update(score(task, row, result["text"]))
+                result.update(
+                    id=row["id"],
+                    prompt_sha256=digest(row["prompt_ids"]),
+                    seconds=time.monotonic() - start,
+                )
+                stream.write(json.dumps(result) + "\n")
+                rows.append(result)
+                print(
+                    f"{args.backend} {len(rows)}/{len(protocol['records'])}: "
+                    f"correct={sum(r['correct'] for r in rows)}",
+                    flush=True,
+                )
+    finally:
+        generator.close()
     summary = {
         **metadata,
         "complete": True,

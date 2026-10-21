@@ -2,9 +2,8 @@ from dataclasses import replace
 
 import torch
 
-from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.models import (
-    AutoModelForCausalLM,
     load_tokenizer,
     resolve_model_config,
     resolve_model_source,
@@ -21,8 +20,8 @@ class LLM:
         *,
         tokenizer=None,
         revision=None,
-        device="cpu",
-        dtype=torch.bfloat16,
+        device=None,
+        dtype=None,
         cache_config=None,
         scheduler_config=None,
         attention_backend="torch",
@@ -33,18 +32,16 @@ class LLM:
         self._tokenizer_source = None
         if isinstance(model, str):
             tokenizer_source = resolve_model_source(model)
-            model_name, revision, _ = resolve_model_config(model, revision=revision)
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                revision=revision,
-                device=device,
-                dtype=dtype,
-            )
+            model, revision, _ = resolve_model_config(model, revision=revision)
             if tokenizer is None:
                 self._tokenizer_source = (tokenizer_source, revision)
         self.tokenizer = tokenizer
-        self.engine = LLMEngine(
+        self.engine = StageClient(
             model,
+            device=device,
+            dtype=dtype,
+            revision=revision,
+            seed=torch.initial_seed(),
             cache_config=cache_config,
             scheduler_config=scheduler_config,
             attention_backend=attention_backend,
@@ -97,7 +94,7 @@ class LLM:
             return [results[request_id] for request_id in request_ids]
         except Exception:
             for request_id in request_ids:
-                if request_id in self.engine.scheduler.requests:
+                if self.engine.has_request(request_id):
                     self.engine.abort_request(request_id)
             raise
 

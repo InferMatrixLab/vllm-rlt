@@ -6,23 +6,9 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tests.helpers import tiny_ouro_config
+from tests.helpers import make_cpu_cache, tiny_ouro_config
 from tests.reference import dense_reference
-from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.models import OuroConfig, OuroForCausalLM
-
-
-def make_cache(config, *, blocks=64):
-    return KVCacheManager(
-        num_layers=config.num_hidden_layers,
-        num_kv_heads=config.num_key_value_heads,
-        head_dim=config.head_dim,
-        num_blocks=blocks,
-        block_size=2,
-        max_loops=config.total_ut_steps,
-        device="cpu",
-        dtype=torch.float32,
-    )
 
 
 @pytest.fixture
@@ -38,7 +24,7 @@ def test_packed_prefill_matches_dense_at_every_depth(kv_heads):
     model = OuroForCausalLM(config)
     tokens = torch.tensor([5, 7, 2, 11, 3])
     expected = dense_reference(model, tokens, config.total_ut_steps)
-    cache = make_cache(config)
+    cache = make_cpu_cache(config)
     assert cache.allocate("prompt", len(tokens))
     hidden = model.prelude(tokens)
     for depth, (expected_hidden, expected_gate, expected_logits) in enumerate(expected):
@@ -53,7 +39,7 @@ def test_packed_prefill_matches_dense_at_every_depth(kv_heads):
 def test_incremental_tokens_match_dense_fixed_depth(model):
     tokens = torch.tensor([4, 15, 6, 2, 9, 12, 3])
     expected = dense_reference(model, tokens, model.config.total_ut_steps)
-    cache = make_cache(model.config)
+    cache = make_cpu_cache(model.config)
     assert cache.allocate("sequence", len(tokens))
     for position, token in enumerate(tokens):
         hidden = model.prelude(token.unsqueeze(0))
@@ -72,7 +58,7 @@ def test_mixed_request_depth_batch_matches_separate_dense(model):
     second = torch.tensor([6, 13, 2, 4])
     expected_first = dense_reference(model, first, 3)[2]
     expected_second = dense_reference(model, second, 1)[0]
-    cache = make_cache(model.config)
+    cache = make_cpu_cache(model.config)
     assert cache.allocate("first", len(first))
     assert cache.allocate("second", len(second))
     first_hidden = model.prelude(first)
@@ -121,7 +107,7 @@ def test_native_safetensors_roundtrip(tmp_path, model, sharded):
         torch.testing.assert_close(tensor, weights[name], atol=0, rtol=0)
     torch.testing.assert_close(loaded.model.rotary_emb.inv_freq, model.model.rotary_emb.inv_freq)
     tokens = torch.tensor([5, 8, 12])
-    cache = make_cache(model.config)
+    cache = make_cpu_cache(model.config)
     cache.allocate("loaded", len(tokens))
     hidden = loaded.prelude(tokens)
     for depth in range(2):

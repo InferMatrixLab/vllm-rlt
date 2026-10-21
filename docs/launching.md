@@ -110,7 +110,7 @@ the first generation can also incur kernel compilation overhead.
 This first-run configuration uses a bounded KV pool and one active sequence
 for short prompts. It is not a performance-benchmark configuration. For longer
 prompts or more concurrency, adjust cache capacity and scheduling as described
-in the [runtime guide](cdb_runtime.md). Omitting `--num-blocks` enables automatic
+in the [runtime guide](runtime.md). Omitting `--num-blocks` enables automatic
 CUDA KV sizing.
 
 ## 7. Check readiness and send a request
@@ -216,8 +216,9 @@ why earlier candidates were skipped.
 Explicit choices (`torch`, `triton`, `flash_attn`, or `flash_attn_2/3/4`) retain
 their validation errors and never fall back. Existing defaults are unchanged:
 the inference CLI defaults to Torch and the local server defaults to Triton.
-The Python equivalent is `attention_backend="auto"`; selection details are also
-available in `engine.cache_manager.attention_info`.
+The Python equivalent is `attention_backend="auto"`. Read the worker startup
+log for the selection decision. `LLM.engine` is a `StageClient`; worker-local
+cache objects are not exposed through that client.
 
 ## Python API
 
@@ -225,29 +226,39 @@ Save the following as `example.py` in the repository root, then run
 `python example.py` from the activated environment. Stop the HTTP server first
 if it uses the same GPU.
 
+`LLM` starts a spawned worker process. In Python scripts, create it inside
+`main()` and use the `if __name__ == "__main__":` guard shown below. The context
+manager closes the worker when inference finishes or raises.
+
 ```python
 from vllm_rlt import CacheConfig, LLM, SamplingParams
 
-llm = LLM(
-    './artifacts/models/Ouro-1.4B',
-    device='cuda',
-    attention_backend='triton',
-    cache_config=CacheConfig(num_blocks=64),
-)
-outputs = llm.generate(
-    ['The capital of France is', '2 + 2 ='],
-    SamplingParams(max_tokens=32, min_loops=2, max_loops=4, exit_threshold=0.7),
-)
-for output in outputs:
-    print(output.text)
-    print('Exit depths:', output.exit_depths)
+
+def main():
+    with LLM(
+        "./artifacts/models/Ouro-1.4B",
+        device="cuda",
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=64),
+    ) as llm:
+        outputs = llm.generate(
+            ["The capital of France is", "2 + 2 ="],
+            SamplingParams(max_tokens=32, min_loops=2, max_loops=4, exit_threshold=0.7),
+        )
+        for output in outputs:
+            print(output.text)
+            print("Exit depths:", output.exit_depths)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 Results preserve input order. Prompt prefill runs at full depth; the exit
 threshold controls subsequent decode. Set `exit_threshold=1.0` for fixed-depth
 execution. The first generated token comes from full-depth prefill, reflected
 in `exit_depths`. For dynamic arrivals, stepwise output, and cancellation, see
-the [engine design](design.md).
+the [architecture overview](unified_execution.md).
 
 ## Troubleshooting
 
@@ -266,3 +277,16 @@ the [engine design](design.md).
 
 When reporting a problem, include the failing command, server error, GPU model,
 PyTorch/CUDA versions from step 4, and your Git revision (`git rev-parse HEAD`).
+
+## Choosing scheduling and deployment separately
+
+The default atomic prefill path and loop-yielding prefill use the same execution
+architecture. On supported models with LAST_EXITED KV, the CLI/server flags
+`--mode mixed --no-atomic-prefill` allow compatible prompt and decode recurrence
+to share a batch. This is a batching choice, not PD disaggregation.
+
+Stage roles are `prefill`, `decode` and `prefill_decode`; `mixed` is a scheduling
+mode, not a stage role. Speculation requires refill scheduling and cannot join
+mixed recurrent batches. Model/backend restrictions still apply. See the
+[runtime guide](runtime.md#execution-batches-and-mixed-scheduling) before
+combining optional features.

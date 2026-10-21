@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1260" viewBox="0 0 1800 1260" role="img" aria-labelledby="title desc"><title id="title">Preemption by data kind and scheduling decision</title><desc id="desc">Request and RNG stay resident. KV and hidden/token tensors move to CPU and back. Logical KV metadata is saved, physical mappings and execution metadata are rebuilt. Victim selection is shown in a separate companion diagram.</desc><defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1L7 4L1 7" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect width="1800" height="1260" fill="white"/>
+<text x="65" y="65" font-family="Arial,Helvetica,sans-serif" font-size="39" fill="#203951" font-weight="700" text-anchor="start">01 / Preserve identity. Move only the state that needs it.</text>
+<text x="65" y="110" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#728399" font-weight="400" text-anchor="start">One victim request, six data kinds. Read each lane from left to right.</text>
+<text x="390" y="177" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#356bab" font-weight="700" text-anchor="start">RUNNING</text>
+<text x="390" y="209" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="start">GPU resources assigned</text>
+<text x="850" y="177" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#356bab" font-weight="700" text-anchor="start">SUSPENDED</text>
+<text x="850" y="209" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="start">Request ID in WAITING</text>
+<text x="1310" y="177" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#356bab" font-weight="700" text-anchor="start">RESUMED</text>
+<text x="1310" y="209" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#728399" font-weight="400" text-anchor="start">New allocation + saved progress</text>
+<rect x="55" y="250" width="1690" height="130" rx="14" fill="#f8fafd" stroke="#cedbea" stroke-width="2"/>
+<rect x="55" y="395" width="1690" height="130" rx="14" fill="#f8fafd" stroke="#cedbea" stroke-width="2"/>
+<rect x="55" y="540" width="1690" height="150" rx="14" fill="#f8fafd" stroke="#cedbea" stroke-width="2"/>
+<rect x="55" y="705" width="1690" height="150" rx="14" fill="#f8fafd" stroke="#cedbea" stroke-width="2"/>
+<rect x="55" y="870" width="1690" height="150" rx="14" fill="#f8fafd" stroke="#cedbea" stroke-width="2"/>
+<rect x="55" y="1035" width="1690" height="150" rx="14" fill="#f8fafd" stroke="#cedbea" stroke-width="2"/>
+<text x="80" y="295" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#203951" font-weight="700" text-anchor="start">Request</text>
+<text x="80" y="328" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">identity / progress</text>
+<text x="80" y="440" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#203951" font-weight="700" text-anchor="start">Sampling RNG</text>
+<text x="80" y="473" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">random stream</text>
+<text x="80" y="585" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#203951" font-weight="700" text-anchor="start">KV tensors</text>
+<text x="80" y="618" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">attention state</text>
+<text x="80" y="750" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#203951" font-weight="700" text-anchor="start">Hidden + token</text>
+<text x="80" y="783" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">intermediate tensors</text>
+<text x="80" y="915" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#203951" font-weight="700" text-anchor="start">KV metadata</text>
+<text x="80" y="948" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">logical written state</text>
+<text x="80" y="1080" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#203951" font-weight="700" text-anchor="start">Execution metadata</text>
+<text x="80" y="1113" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">physical addresses / rows</text>
+<rect x="390" y="270" width="1250" height="88" rx="14" fill="#eef6f3" stroke="#c2dbd1" stroke-width="2"/>
+<rect x="410" y="289" width="290" height="48" rx="14" fill="#e3f0ea" stroke="#cedbea" stroke-width="2"/>
+<text x="555.0" y="321" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#43856f" font-weight="700" text-anchor="middle">R2 · active phase</text>
+<rect x="870" y="289" width="290" height="48" rx="14" fill="#e3f0ea" stroke="#cedbea" stroke-width="2"/>
+<text x="1015.0" y="321" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#43856f" font-weight="700" text-anchor="middle">R2 · WAITING</text>
+<rect x="1330" y="289" width="290" height="48" rx="14" fill="#e3f0ea" stroke="#cedbea" stroke-width="2"/>
+<text x="1475.0" y="321" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#43856f" font-weight="700" text-anchor="middle">R2 · saved phase</text>
+<path d="M700 313H870" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<path d="M1160 313H1330" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<rect x="390" y="415" width="1250" height="88" rx="14" fill="#eef6f3" stroke="#c2dbd1" stroke-width="2"/>
+<circle cx="430" cy="460" r="6" fill="#43856f"/>
+<circle cx="457" cy="460" r="6" fill="#43856f"/>
+<circle cx="484" cy="460" r="6" fill="#43856f"/>
+<circle cx="511" cy="460" r="6" fill="#43856f"/>
+<circle cx="538" cy="460" r="6" fill="#43856f"/>
+<circle cx="565" cy="460" r="6" fill="#43856f"/>
+<circle cx="890" cy="460" r="6" fill="#43856f"/>
+<circle cx="917" cy="460" r="6" fill="#43856f"/>
+<circle cx="944" cy="460" r="6" fill="#43856f"/>
+<circle cx="971" cy="460" r="6" fill="#43856f"/>
+<circle cx="998" cy="460" r="6" fill="#43856f"/>
+<circle cx="1025" cy="460" r="6" fill="#43856f"/>
+<circle cx="1350" cy="460" r="6" fill="#43856f"/>
+<circle cx="1377" cy="460" r="6" fill="#43856f"/>
+<circle cx="1404" cy="460" r="6" fill="#43856f"/>
+<circle cx="1431" cy="460" r="6" fill="#43856f"/>
+<circle cx="1458" cy="460" r="6" fill="#43856f"/>
+<circle cx="1485" cy="460" r="6" fill="#43856f"/>
+<path d="M630 460H850" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<path d="M1090 460H1310" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<text x="710" y="448" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#43856f" font-weight="400" text-anchor="start">retain</text>
+<text x="1180" y="448" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#43856f" font-weight="400" text-anchor="start">continue</text>
+<rect x="390" y="560" width="330" height="105" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="410" y="588" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">GPU</text>
+<rect x="425" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="481" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="537" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="593" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="850" y="560" width="330" height="105" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="870" y="588" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">CPU snapshot</text>
+<rect x="885" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="941" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="997" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1053" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1310" y="560" width="330" height="105" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="1330" y="588" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">GPU</text>
+<rect x="1345" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1401" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1457" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<rect x="1513" y="605" width="44" height="40" rx="14" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
+<path d="M720 616H850" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<path d="M1180 616H1310" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<text x="785" y="597" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#9570ac" font-weight="400" text-anchor="middle">copy out</text>
+<text x="1245" y="597" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#9570ac" font-weight="400" text-anchor="middle">copy back</text>
+<rect x="390" y="725" width="330" height="105" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="410" y="753" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">GPU</text>
+<rect x="425" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="447" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">h</text>
+<rect x="481" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="503" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">h</text>
+<rect x="537" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="559" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">t</text>
+<rect x="593" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="615" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">t</text>
+<rect x="850" y="725" width="330" height="105" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="870" y="753" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">CPU snapshot</text>
+<rect x="885" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="907" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">h</text>
+<rect x="941" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="963" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">h</text>
+<rect x="997" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="1019" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">t</text>
+<rect x="1053" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="1075" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">t</text>
+<rect x="1310" y="725" width="330" height="105" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="1330" y="753" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">GPU</text>
+<rect x="1345" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="1367" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">h</text>
+<rect x="1401" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="1423" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">h</text>
+<rect x="1457" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="1479" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">t</text>
+<rect x="1513" y="770" width="44" height="40" rx="14" fill="#dceaf9" stroke="#356bab" stroke-width="2"/>
+<text x="1535" y="797" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#356bab" font-weight="700" text-anchor="middle">t</text>
+<path d="M720 781H850" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<path d="M1180 781H1310" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<text x="785" y="762" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#9570ac" font-weight="400" text-anchor="middle">copy out</text>
+<text x="1245" y="762" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#9570ac" font-weight="400" text-anchor="middle">copy back</text>
+<rect x="390" y="890" width="330" height="110" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="408" y="918" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">allocation</text>
+<rect x="410" y="931" width="165" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<rect x="410" y="948" width="220" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<rect x="410" y="965" width="125" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<rect x="850" y="890" width="330" height="110" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="868" y="918" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">KVSnapshot</text>
+<rect x="870" y="931" width="165" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<rect x="870" y="948" width="220" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<rect x="870" y="965" width="125" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<rect x="1310" y="890" width="330" height="110" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="1328" y="918" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="700" text-anchor="start">new allocation</text>
+<rect x="1330" y="931" width="165" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<rect x="1330" y="948" width="220" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<rect x="1330" y="965" width="125" height="9" rx="14" fill="#e8dcf2" stroke="#e8dcf2" stroke-width="2"/>
+<path d="M720 945H850" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<path d="M1180 945H1310" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<text x="785" y="925" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#9570ac" font-weight="400" text-anchor="middle">deep copy</text>
+<text x="1245" y="925" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#9570ac" font-weight="400" text-anchor="middle">restore</text>
+<rect x="390" y="1055" width="330" height="110" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="420" y="1085" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#728399" font-weight="400" text-anchor="start">0</text>
+<path d="M443 1079H485" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<rect x="498" y="1063" width="55" height="25" rx="14" fill="#edf3fc" stroke="#cedbea" stroke-width="2"/>
+<text x="525" y="1082" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#356bab" font-weight="700" text-anchor="middle">7</text>
+<text x="420" y="1112" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#728399" font-weight="400" text-anchor="start">1</text>
+<path d="M443 1106H485" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<rect x="498" y="1090" width="55" height="25" rx="14" fill="#edf3fc" stroke="#cedbea" stroke-width="2"/>
+<text x="525" y="1109" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#356bab" font-weight="700" text-anchor="middle">12</text>
+<text x="420" y="1139" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#728399" font-weight="400" text-anchor="start">2</text>
+<path d="M443 1133H485" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<rect x="498" y="1117" width="55" height="25" rx="14" fill="#edf3fc" stroke="#cedbea" stroke-width="2"/>
+<text x="525" y="1136" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#356bab" font-weight="700" text-anchor="middle">19</text>
+<text x="580" y="1110" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">old mapping</text>
+<rect x="850" y="1055" width="330" height="110" rx="14" fill="#fff" stroke="#cbd5df" stroke-width="2" stroke-dasharray="7 6"/>
+<text x="1015" y="1100" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="middle">old allocation released</text>
+<text x="1015" y="1134" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="middle">no batch snapshot</text>
+<rect x="1310" y="1055" width="330" height="110" rx="14" fill="#fff" stroke="#cedbea" stroke-width="2"/>
+<text x="1340" y="1085" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#728399" font-weight="400" text-anchor="start">0</text>
+<path d="M1363 1079H1405" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<rect x="1418" y="1063" width="55" height="25" rx="14" fill="#edf3fc" stroke="#cedbea" stroke-width="2"/>
+<text x="1445" y="1082" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#356bab" font-weight="700" text-anchor="middle">3</text>
+<text x="1340" y="1112" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#728399" font-weight="400" text-anchor="start">1</text>
+<path d="M1363 1106H1405" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<rect x="1418" y="1090" width="55" height="25" rx="14" fill="#edf3fc" stroke="#cedbea" stroke-width="2"/>
+<text x="1445" y="1109" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#356bab" font-weight="700" text-anchor="middle">9</text>
+<text x="1340" y="1139" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#728399" font-weight="400" text-anchor="start">2</text>
+<path d="M1363 1133H1405" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<rect x="1418" y="1117" width="55" height="25" rx="14" fill="#edf3fc" stroke="#cedbea" stroke-width="2"/>
+<text x="1445" y="1136" font-family="Arial,Helvetica,sans-serif" font-size="17" fill="#356bab" font-weight="700" text-anchor="middle">22</text>
+<text x="1500" y="1110" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#356bab" font-weight="400" text-anchor="start">new mapping</text>
+<path d="M720 1110H850" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<path d="M1180 1110H1310" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
+<text x="1245" y="1090" font-family="Arial,Helvetica,sans-serif" font-size="18" fill="#356bab" font-weight="400" text-anchor="middle">rebuild</text>
+<text x="80" y="1225" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#728399" font-weight="400" text-anchor="start">Green: retained in runtime     Purple: saved / restored     Blue: reconstructed for execution</text>
+</svg>
