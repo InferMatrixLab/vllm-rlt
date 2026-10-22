@@ -14,7 +14,7 @@ from aiohttp import ClientPayloadError
 from aiohttp.test_utils import TestClient, TestServer
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import LLM, CacheConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import RequestPhase
@@ -483,6 +483,27 @@ def test_eos_usage_and_non_usage_stream():
             assert len(frames) == 2 and "usage" not in json.loads(frames[0][6:])
 
     asyncio.run(run())
+
+
+def test_offline_stop_token_text_is_omitted_and_http_keeps_its_fields():
+    engine, tokenizer = factory()
+    engine.add_request("direct", tokenizer.encode("abc"), SamplingParams(max_tokens=4))
+    outputs = []
+    while engine.has_unfinished_requests():
+        outputs.extend(engine.step())
+    tokens = outputs[-1].token_ids
+    index = next(i for i, t in enumerate(tokens) if i and t not in tokens[:i])
+    stop, expected = tokens[index], tokenizer.decode(tokens[:index])
+    # The stop ID stays in token_ids; only its text is omitted, as in vLLM.
+    llm = LLM(engine.model, tokenizer=tokenizer)
+    output = llm.generate("abc", SamplingParams(max_tokens=4, stop_token_ids=[stop]))[0]
+    assert (output.text, output.token_ids) == (expected, tokens[: index + 1])
+    output = llm.generate("abc", SamplingParams(max_tokens=4))[0]  # Other finishes keep it.
+    assert (output.text, output.finish_reason) == (tokenizer.decode(tokens), "length")
+    # HTTP request fields are unchanged until the token-in/token-out API.
+    for fields in ({"stop_token_ids": [stop]}, {"seed": None}):
+        with pytest.raises(ValueError):
+            CompletionRequest.parse(body(**fields), "test-model")
 
 
 def test_owner_thread_dynamic_batching_cancellation_and_overload():

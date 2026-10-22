@@ -786,11 +786,24 @@ class Scheduler:
         maximum = request.sampling_params.max_loops or self.total_ut_steps
         return self.exit_mode != "trace" and request.loops_done + 1 < maximum
 
-    def _record_token(self, request: Request, token: int, depth: int) -> bool:
+    def _record_token(
+        self, request: Request, token: int, depth: int, logprob: float | None = None
+    ) -> bool:
+        """Record one sampled token; return whether it finished the request.
+
+        EOS stops unless ignore_eos; stop_token_ids stop even with ignore_eos, as
+        in vLLM. Either stop token stays in the output. Then max_tokens is LENGTH.
+        """
         request.generated_token_ids.append(token)
         request.exit_depths.append(depth)
+        if request.logprobs is not None:
+            if logprob is None:
+                raise RuntimeError("missing logprob for a request that asked for logprobs")
+            request.logprobs.append(logprob)
         params = request.sampling_params
-        if token in self.eos_token_ids and not params.ignore_eos:
+        if token in params.stop_token_ids or (
+            token in self.eos_token_ids and not params.ignore_eos
+        ):
             request.finish_reason = FinishReason.STOP
         elif len(request.generated_token_ids) >= params.max_tokens:
             request.finish_reason = FinishReason.LENGTH
@@ -868,7 +881,8 @@ class Scheduler:
                         raise RuntimeError("invalid pending output count")
                     request.num_output_placeholders -= 1
                 depth = result.depths[row] if delivered else request.loops_done
-                if self._record_token(request, result.token_ids[row], depth):
+                logprob = result.logprobs[row] if result.logprobs is not None else None
+                if self._record_token(request, result.token_ids[row], depth, logprob):
                     update.finished.append(request)
                 elif not delivered:
                     self.enqueue(

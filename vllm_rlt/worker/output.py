@@ -27,6 +27,9 @@ class SpeculativeResult:
 class ModelRunnerOutput:
     gate_scores: list[float] | None = None
     token_ids: list[int] | None = None
+    # CODA: FP32 logprob of each token_ids entry; None when no row asked. Rows that did
+    # not ask hold arbitrary values.
+    logprobs: list[float] | None = None
     completion: object = None
     depths: tuple[int, ...] = ()
     output_indices: tuple[int, ...] = ()

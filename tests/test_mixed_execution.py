@@ -255,7 +255,7 @@ def test_prepared_batch_survives_progress_changes_and_contains_no_policy_label()
         scheduled_request.request.generated_token_ids.append(17)
     # The prepared batch owns its addresses and routing; later request progress cannot
     # retarget the submitted operation, even for mixed multi-row state bindings.
-    actual = engine.model_runner._execute(batch, prepared)
+    actual = engine.model_runner._execute(batch, prepared).values
     torch.testing.assert_close(actual, torch.tensor(expected.gate_scores))
     assert not hasattr(prepared.batch, "stage")
     for left, right in zip(prepared.batch.spans, build_execution_batch(reference_batch, 4).spans):

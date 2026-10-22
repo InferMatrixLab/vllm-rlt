@@ -63,13 +63,18 @@ def benchmark(device="cpu", layout="last_exited", trace=None, seed=123):
         rid: SamplingParams(max_tokens=6, exit_threshold=q, ignore_eos=True)
         for rid, q in zip(prompts, [0.0, 1.0, 0.5])
     }
-    fingerprint = dict(
-        model_config=model.config.to_dict(),
-        seed=seed,
-        dtype=str(dtype),
-        layout=layout,
-        prompts=prompts,
-        sampling={rid: asdict(p) for rid, p in parameters.items()},
+    # JSON-canonical (tuples become lists) to match a --trace-out/--trace-in round trip.
+    fingerprint = json.loads(
+        json.dumps(
+            dict(
+                model_config=model.config.to_dict(),
+                seed=seed,
+                dtype=str(dtype),
+                layout=layout,
+                prompts=prompts,
+                sampling={rid: asdict(p) for rid, p in parameters.items()},
+            )
+        )
     )
     backend = "triton" if device == "cuda" else "torch"
 
