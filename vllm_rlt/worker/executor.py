@@ -9,8 +9,8 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from vllm_rlt.core.execution import ExecutionBatch, Operation, StateSpan, WorkKey
 from vllm_rlt.core.scheduler import SchedulerOutput
-from vllm_rlt.request import ExecutionBatch, Operation, RequestPhase, StateSpan
 
 
 def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -> ExecutionBatch:
@@ -20,33 +20,36 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
     The runner prepares its backend-specific metadata once from these bindings.
     """
     spans = []
-    operations = set()
-    loop_counts = set()
+    batch_operation = None
+    batch_loop_count = None
     for scheduled_request in scheduled_batch.requests:
-        phase = scheduled_batch.phase_for(scheduled_request)
+        work = scheduled_request.work
         request = scheduled_request.request
-        chunk = phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
-        prompt_input = phase in (RequestPhase.PREFILL, RequestPhase.PREFILLING_PRELUDE)
-        operation = {
-            RequestPhase.PREFILL: Operation.PRELUDE,
-            RequestPhase.PREFILLING_PRELUDE: Operation.PRELUDE,
-            RequestPhase.PRELUDE: Operation.PRELUDE,
-            RequestPhase.PREFILLING_RECURRENT: Operation.RECURRENT,
-            RequestPhase.RECURRENT: Operation.RECURRENT,
-            RequestPhase.CODA: Operation.CODA,
-        }.get(phase)
+        operation = work.operation
         if operation is None:
-            raise ValueError(f"phase {phase} does not describe a model operation")
+            raise ValueError(f"work {work.name} is handled by the speculative runner")
+        chunk = work in (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
+        prompt_input = work in (WorkKey.PROMPT_ATOMIC, WorkKey.PROMPT_PRELUDE)
+        loop_count = (
+            total_depths if work == WorkKey.PROMPT_ATOMIC else int(operation == Operation.RECURRENT)
+        )
+        if batch_operation is None:
+            batch_operation, batch_loop_count = operation, loop_count
+        elif operation != batch_operation or loop_count != batch_loop_count:
+            raise ValueError(
+                f"request {request.request_id} work {work.name} has "
+                f"operation={operation.value}, loop_count={loop_count}; "
+                f"batch expects operation={batch_operation.value}, "
+                f"loop_count={batch_loop_count}"
+            )
         depth = (
             scheduled_request.depth if scheduled_request.depth is not None else request.loops_done
         )
         if operation != Operation.RECURRENT:
-            # PRELUDE starts from 0. CODA has no recurrent work; 0 addresses
-            # boundary-layer KV, not the request's actual completed-loop count.
             depth = 0
         position = (
             scheduled_request.token_start
-            if chunk or phase == RequestPhase.PREFILL or scheduled_request.depth is not None
+            if chunk or work == WorkKey.PROMPT_ATOMIC or scheduled_request.depth is not None
             else request.position
         )
         spans.append(
@@ -56,9 +59,10 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
                 token_count=scheduled_request.token_count,
                 depth=depth,
                 chunk_start=scheduled_request.chunk_start if chunk else None,
-                retain_chunk=chunk and (operation == Operation.PRELUDE or depth + 1 < total_depths),
+                retain_chunk=chunk
+                and (work == WorkKey.PROMPT_PRELUDE or depth + 1 < total_depths),
                 retain_last=scheduled_request.completes_prompt if chunk else True,
-                emit_gate=phase == RequestPhase.RECURRENT,
+                emit_gate=work == WorkKey.DECODE_RECURRENT,
                 input_tokens=tuple(
                     request.prompt_token_ids[position : position + scheduled_request.token_count]
                 )
@@ -66,13 +70,14 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
                 else None,
             )
         )
-        operations.add(operation)
-        loop_counts.add(
-            total_depths if phase == RequestPhase.PREFILL else int(operation == Operation.RECURRENT)
-        )
-    if len(operations) != 1 or len(loop_counts) != 1:
-        raise ValueError("batch requests must share an operation and execution boundary")
-    return ExecutionBatch(operations.pop(), tuple(spans), loop_counts.pop())
+    if batch_operation is None:
+        raise ValueError("cannot build an execution batch without scheduled work")
+    return ExecutionBatch(
+        batch_operation,
+        tuple(spans),
+        batch_loop_count,
+        has_split_prefill_work=scheduled_batch.has_split_prefill_work,
+    )
 
 
 class Executor:

@@ -364,7 +364,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
 
     from vllm_rlt.core.scheduler import Scheduler
     from vllm_rlt.engine.preemption import PreemptionManager
-    from vllm_rlt.request import Request, RequestPhase
+    from vllm_rlt.request import Request, RequestStatus
 
     engine = object.__new__(LLMEngine)
     engine.async_speculative = False
@@ -373,7 +373,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
     engine.execution_config = ExecutionConfig(async_scheduling=async_scheduling)
     engine.scheduler = Scheduler(SchedulerConfig(), Mock())
     engine.cache_manager = engine.scheduler.cache_manager
-    receiving = Request("remote", [1], SamplingParams(max_tokens=1), phase=RequestPhase.RECEIVING)
+    receiving = Request("remote", [1], SamplingParams(max_tokens=1), status=RequestStatus.RECEIVING)
     engine.scheduler.requests[receiving.request_id] = receiving
     engine._inflight = []
     engine._pending_coda = []
@@ -391,7 +391,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
     engine.model_runner.synchronize.assert_not_called()
     if async_scheduling:
         # Reap the last local output while another request still awaits KV.
-        active = Request("local", [1], SamplingParams(max_tokens=1), phase=RequestPhase.CODA)
+        active = Request("local", [1], SamplingParams(max_tokens=1), status=RequestStatus.ACTIVE)
         engine.scheduler.requests[active.request_id] = active
         active.num_output_placeholders = 1
         engine.model = SimpleNamespace(config=SimpleNamespace(eos_token_id=2))
@@ -407,7 +407,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
         assert outputs[0].token_ids == [3]
         assert list(engine.scheduler.requests) == ["remote"]
     # A lost runnable request must still trigger the original invariant.
-    receiving.phase = RequestPhase.RECURRENT
+    receiving.status = RequestStatus.ACTIVE
     with pytest.raises(RuntimeError, match="scheduler made no progress"):
         engine.step()
 

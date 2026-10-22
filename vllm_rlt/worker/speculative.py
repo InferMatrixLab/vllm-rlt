@@ -9,8 +9,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_rlt.core.execution import Operation
 from vllm_rlt.core.scheduler import SchedulerOutput
-from vllm_rlt.request import Operation
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime

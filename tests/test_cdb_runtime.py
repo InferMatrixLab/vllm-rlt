@@ -8,11 +8,12 @@ import torch
 from tests.helpers import LocalLLM as LLM
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import budget_blocks
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import RequestPhase
+from vllm_rlt.request import RequestStatus
 from vllm_rlt.worker.model_runner import Submission
 
 
@@ -191,14 +192,17 @@ def test_short_requests_bypass_then_protected_long_request_gets_memory():
     engine.add_request("short", [2], params)  # 4 blocks
     engine.add_request("later", [3], params)
     engine.scheduler._admit()
-    assert engine.scheduler.requests["short"].phase == RequestPhase.PREFILL
-    assert list(engine.scheduler.queues[RequestPhase.WAITING]) == ["long", "later"]
+    assert (
+        engine.scheduler.pending_work(engine.scheduler.requests["short"])
+        == WorkKey.PROMPT_ATOMIC
+    )
+    assert list(engine.scheduler.waiting) == ["long", "later"]
     engine.abort_request("short")
     engine.scheduler._admit()
-    assert engine.scheduler.requests["later"].phase == RequestPhase.WAITING
+    assert engine.scheduler.requests["later"].status == RequestStatus.WAITING
     engine.abort_request("running")
     engine.scheduler._admit()
-    assert engine.scheduler.requests["long"].phase == RequestPhase.PREFILL
+    assert engine.scheduler.pending_work(engine.scheduler.requests["long"]) == WorkKey.PROMPT_ATOMIC
     assert set(drain(engine)) == {"long", "later"}
 
 
@@ -228,12 +232,12 @@ def test_async_submits_next_core_before_collecting_previous_signal(monkeypatch):
     events = []
 
     def submit(batch):
-        if batch.phase == RequestPhase.RECURRENT:
+        if WorkKey.DECODE_RECURRENT in batch.works:
             events.append("submit")
         return original_submit(batch)
 
     def collect(ticket):
-        if ticket.batch.phase == RequestPhase.RECURRENT:
+        if WorkKey.DECODE_RECURRENT in ticket.batch.works:
             events.append("collect")
         return original_collect(ticket)
 
@@ -375,7 +379,7 @@ def test_pending_coda_does_not_block_other_recurrent_work(monkeypatch):
     def submit(batch):
         ticket = original(batch)
         if (
-            batch.phase == RequestPhase.CODA
+            WorkKey.DECODE_CODA in batch.works
             and len(batch.requests) == 1
             and batch.requests[0].request.request_id == "fast"
         ):
@@ -392,11 +396,11 @@ def test_pending_coda_does_not_block_other_recurrent_work(monkeypatch):
     engine.step()
     # The pending sample can already re-enter prelude on device. Its next
     # recurrent batch includes BOTH requests, without waiting for CPU delivery.
-    assert engine.last_schedule.phase == RequestPhase.PRELUDE
+    assert engine.last_schedule.works == frozenset((WorkKey.DECODE_PRELUDE,))
     assert engine.last_schedule.requests[0].request.request_id == "fast"
     assert not held.complete
     engine.step()
-    assert engine.last_schedule.phase == RequestPhase.RECURRENT
+    assert engine.last_schedule.works == frozenset((WorkKey.DECODE_RECURRENT,))
     assert {i.request.request_id for i in engine.last_schedule.requests} == {"fast", "slow"}
     assert not held.complete
     held.complete = True
@@ -495,11 +499,11 @@ def test_cuda_boundary_and_core_can_overlap(monkeypatch):
 
     def execute(batch, prepared=None):
         label = None
-        if batch.phase == RequestPhase.CODA and len(batch.requests) == 1:
+        if WorkKey.DECODE_CODA in batch.works and len(batch.requests) == 1:
             request = batch.requests[0].request
             if request.request_id == "fast" and len(request.generated_token_ids) == 1:
                 label = "coda"
-        if batch.phase == RequestPhase.RECURRENT:
+        if WorkKey.DECODE_RECURRENT in batch.works:
             if any(
                 i.request.request_id == "slow"
                 and i.request.loops_done == 2
@@ -513,7 +517,7 @@ def test_cuda_boundary_and_core_can_overlap(monkeypatch):
         # Preparation is outside _execute now. Keep both measured operations
         # alive long enough to test stream independence, regardless of which
         # one the host submits first; a tiny coda can finish before core launch.
-        if batch.phase == RequestPhase.RECURRENT or label == "coda":
+        if WorkKey.DECODE_RECURRENT in batch.works or label == "coda":
             torch.cuda._sleep(30_000_000)
         result = original(batch, prepared)
         end.record()

@@ -5,10 +5,11 @@ import torch
 
 from tests.helpers import RecordingConnector, make_stage_engine, tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import RequestPhase
+from vllm_rlt.request import RequestStatus
 
 
 def drain(engine):
@@ -49,8 +50,8 @@ def test_prefill_handoff_matches_local_execution_without_sampling(atomic, asynch
                 break
         else:
             pytest.fail("prompt did not complete")
-    assert request.phase == RequestPhase.TRANSFERRING
-    assert original.phase == RequestPhase.CODA
+    assert request.status == RequestStatus.TRANSFERRING
+    assert local.scheduler.pending_work(original) == WorkKey.DECODE_CODA
     assert request.generated_token_ids == []
     torch.testing.assert_close(request.hidden_state, original.hidden_state)
     assert all(r is request for r, _ in connector.submissions)
@@ -71,11 +72,11 @@ def test_connector_backpressure_preserves_other_requests_and_queue_membership():
     for _ in range(20):
         engine.step()
     assert engine.scheduler.requests["a"].num_preluded_tokens == 0
-    assert engine.scheduler.requests["b"].phase == RequestPhase.TRANSFERRING
+    assert engine.scheduler.requests["b"].status == RequestStatus.TRANSFERRING
     connector.blocked.clear()
     for _ in range(20):
         engine.step()
-    assert engine.scheduler.requests["a"].phase == RequestPhase.TRANSFERRING
+    assert engine.scheduler.requests["a"].status == RequestStatus.TRANSFERRING
     engine.close()
 
 
@@ -87,7 +88,7 @@ def test_cancelled_import_cannot_activate_reused_request_id():
     engine.reserve_transfer("r", [3], SamplingParams(max_tokens=2), receiving=True)
     current = engine.scheduler.requests["r"]
     assert not engine.accept_import(old, torch.zeros(1))
-    assert current.phase == RequestPhase.RECEIVING
+    assert current.status == RequestStatus.RECEIVING
     assert current.hidden_state is None
     engine.close()
 
@@ -110,7 +111,7 @@ def test_independent_stage_resources_preserve_output_after_import(atomic, asynch
     assert d.step() == []
     for _ in range(100):
         p.step()
-        if source.phase == RequestPhase.TRANSFERRING:
+        if source.status == RequestStatus.TRANSFERRING:
             break
     else:
         pytest.fail("source prompt did not complete")
@@ -188,7 +189,7 @@ def test_prefill_decode_stage_routes_per_request_and_keeps_local_decode_running(
     connector.blocked.clear()
     for _ in range(100):
         engine.step()
-        if engine.scheduler.requests["remote"].phase == RequestPhase.TRANSFERRING:
+        if engine.scheduler.requests["remote"].status == RequestStatus.TRANSFERRING:
             break
     else:
         pytest.fail("remote request did not reach its handoff boundary")
@@ -221,7 +222,7 @@ def test_prefill_does_not_hide_a_lost_runnable_request():
     engine = make_stage_engine(role="prefill")
     engine.connector = RecordingConnector()
     engine.add_request("r", [1, 2], SamplingParams(max_tokens=1))
-    engine.scheduler.queues[RequestPhase.WAITING].clear()
+    engine.scheduler.waiting.clear()
     with pytest.raises(RuntimeError, match="no progress"):
         engine.step()
     engine.close()
@@ -239,13 +240,13 @@ def test_prefill_admission_waits_for_transfer_to_release_kv():
     engine.add_request("first", [1, 2], SamplingParams(max_tokens=1))
     engine.step()
     first = engine.scheduler.requests["first"]
-    assert first.phase == RequestPhase.TRANSFERRING
+    assert first.status == RequestStatus.TRANSFERRING
     engine.add_request("second", [1, 2], SamplingParams(max_tokens=1))
     assert engine.step() == []
-    assert engine.scheduler.requests["second"].phase == RequestPhase.WAITING
+    assert engine.scheduler.requests["second"].status == RequestStatus.WAITING
     engine.release_transfer(first)
     engine.step()
-    assert engine.scheduler.requests["second"].phase == RequestPhase.TRANSFERRING
+    assert engine.scheduler.requests["second"].status == RequestStatus.TRANSFERRING
     engine.close()
 
 
@@ -388,7 +389,7 @@ def test_speculative_policy_schedules_newly_imported_coda():
         assert engine.step() == []
         engine.accept_import(request, torch.zeros(1, engine.model.config.hidden_size))
         batch = engine.scheduler.schedule()
-        assert batch.phase == RequestPhase.CODA
+        assert batch.works == frozenset((WorkKey.DECODE_CODA,))
         assert batch.requests[0].request is request
     finally:
         engine.close()
@@ -578,7 +579,7 @@ def test_backpressured_export_allows_queued_arrival_to_wait(asynchronous):
     connector.blocked.add("active")
     engine.reserve_transfer("waiting", [3, 4], SamplingParams(max_tokens=1), receiving=False)
     assert engine.step() == []
-    assert engine.scheduler.requests["waiting"].phase == RequestPhase.WAITING
+    assert engine.scheduler.requests["waiting"].status == RequestStatus.WAITING
     connector.blocked.clear()
     engine.step()
     assert engine.last_schedule is not None
@@ -607,7 +608,8 @@ def test_transfer_reservation_preserves_active_prompt_growth(receiving, preempti
         assert engine.reserve_transfer("remote", [1, 2], params, receiving=receiving) is None
         assert not engine.has_request("remote")
         assert not engine.cache_manager.has_allocation("remote")
-        assert all("remote" not in queue for queue in engine.scheduler.queues.values())
+        assert "remote" not in engine.scheduler.waiting
+        assert all("remote" not in queue for queue in engine.scheduler.work_queues.values())
         assert len(drain(engine)["local"][0]) == 1
         # A rejected generation can retry after the local request releases its KV.
         remote = engine.reserve_transfer("remote", [1, 2], params, receiving=receiving)
@@ -646,7 +648,7 @@ def test_decode_import_preemption_restores_outputs_and_rng(device):
     source_engine.connector = RecordingConnector()
     params = SamplingParams(max_tokens=5, temperature=0.7, seed=41, ignore_eos=True)
     source = source_engine.reserve_transfer("source", [1, 2, 3, 4], params, receiving=False)
-    while source.phase != RequestPhase.TRANSFERRING:
+    while source.status != RequestStatus.TRANSFERRING:
         source_engine.step()
     results = []
     try:
@@ -685,7 +687,7 @@ def test_decode_import_preemption_restores_outputs_and_rng(device):
                 waiting = import_request("waiting")
                 if preempt:
                     assert engine.scheduler.preempt(waiting)
-                    assert victim.phase == RequestPhase.WAITING
+                    assert victim.status == RequestStatus.WAITING
                 results.append(drain(engine))
                 assert engine.preemption.resumptions == int(preempt)
                 assert not engine.preemption.snapshots

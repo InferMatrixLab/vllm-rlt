@@ -15,6 +15,7 @@ import torch
 
 from tests.helpers import make_prefill_engine, tiny_ouro_config, tiny_ouro_model
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import Operation, WorkKey
 from vllm_rlt.core.scheduling_policy import (
     NoRefillPolicy,
     RefillPolicy,
@@ -24,7 +25,7 @@ from vllm_rlt.core.scheduling_policy import (
 )
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Operation, Request, RequestPhase
+from vllm_rlt.request import Request, RequestStatus
 from vllm_rlt.worker.executor import build_execution_batch
 
 TOTAL_DEPTHS = 4
@@ -59,10 +60,9 @@ def test_cpu_prefill_segments_gather_and_scatter_contiguous_spans():
     e.add_request("b", [5, 6, 7, 8], SamplingParams(max_tokens=1))
     a, b = (e.scheduler.requests[request_id] for request_id in ("a", "b"))
     batch = SchedulerOutput(
-        RequestPhase.PREFILLING_PRELUDE,
         [
-            ScheduledRequest(a, 1, 2, chunk_start=0),
-            ScheduledRequest(b, 2, 1, chunk_start=1),
+            ScheduledRequest(a, WorkKey.PROMPT_PRELUDE, 1, 2, chunk_start=0),
+            ScheduledRequest(b, WorkKey.PROMPT_PRELUDE, 2, 1, chunk_start=1),
         ],
     )
     prepared = e.model_runner.prepare_on_gpu(
@@ -95,8 +95,16 @@ def test_recurrent_prepare_uses_absolute_token_start_for_kv_rows():
     request = e.scheduler.requests["a"]
     assert e.cache_manager.allocate("a", 4)
     batch = SchedulerOutput(
-        RequestPhase.PREFILLING_RECURRENT,
-        [ScheduledRequest(request, token_start=2, token_count=1, depth=1, chunk_start=1)],
+        [
+            ScheduledRequest(
+                request,
+                WorkKey.PROMPT_RECURRENT,
+                token_start=2,
+                token_count=1,
+                depth=1,
+                chunk_start=1,
+            )
+        ],
     )
     try:
         prepared = e.model_runner.prepare_on_gpu(
@@ -126,10 +134,17 @@ def test_final_depth_prefill_scatter_retains_only_coda_hidden_per_item():
         assert e.cache_manager.allocate(request_id, 2)
     mid, final = (e.scheduler.requests[rid] for rid in ("mid", "final"))
     batch = SchedulerOutput(
-        RequestPhase.PREFILLING_RECURRENT,
         [
-            ScheduledRequest(mid, 0, 2, depth=1, chunk_start=0),
-            ScheduledRequest(final, 0, 2, depth=3, chunk_start=0, completes_prompt=True),
+            ScheduledRequest(mid, WorkKey.PROMPT_RECURRENT, 0, 2, depth=1, chunk_start=0),
+            ScheduledRequest(
+                final,
+                WorkKey.PROMPT_RECURRENT,
+                0,
+                2,
+                depth=3,
+                chunk_start=0,
+                completes_prompt=True,
+            ),
         ],
     )
     runner = e.model_runner
@@ -178,10 +193,9 @@ def test_cuda_prefill_segments_gather_and_scatter_variable_spans():
         e.add_request("b", [5, 6, 7, 8], SamplingParams(max_tokens=1))
         a, b = (e.scheduler.requests[request_id] for request_id in ("a", "b"))
         batch = SchedulerOutput(
-            RequestPhase.PREFILLING_PRELUDE,
             [
-                ScheduledRequest(a, 1, 2, chunk_start=0),
-                ScheduledRequest(b, 2, 1, chunk_start=1),
+                ScheduledRequest(a, WorkKey.PROMPT_PRELUDE, 1, 2, chunk_start=0),
+                ScheduledRequest(b, WorkKey.PROMPT_PRELUDE, 2, 1, chunk_start=1),
             ],
         )
         prepared = e.model_runner.prepare_on_gpu(
@@ -226,10 +240,17 @@ def test_cuda_final_depth_prefill_scatter_retains_only_coda_hidden_per_item():
             assert e.cache_manager.allocate(request_id, 2)
         mid, final = (e.scheduler.requests[rid] for rid in ("mid", "final"))
         batch = SchedulerOutput(
-            RequestPhase.PREFILLING_RECURRENT,
             [
-                ScheduledRequest(mid, 0, 2, depth=1, chunk_start=0),
-                ScheduledRequest(final, 0, 2, depth=3, chunk_start=0, completes_prompt=True),
+                ScheduledRequest(mid, WorkKey.PROMPT_RECURRENT, 0, 2, depth=1, chunk_start=0),
+                ScheduledRequest(
+                    final,
+                    WorkKey.PROMPT_RECURRENT,
+                    0,
+                    2,
+                    depth=3,
+                    chunk_start=0,
+                    completes_prompt=True,
+                ),
             ],
         )
         runner = e.model_runner
@@ -292,8 +313,7 @@ def test_cuda_prefill_submit_keeps_host_and_device_buffers_until_event(use_uva):
         a, b = (e.scheduler.requests[rid] for rid in ("a", "b"))
         batches = [
             SchedulerOutput(
-                RequestPhase.PREFILLING_PRELUDE,
-                [ScheduledRequest(request, 0, 2, chunk_start=0)],
+                [ScheduledRequest(request, WorkKey.PROMPT_PRELUDE, 0, 2, chunk_start=0)],
             )
             for request in (a, b)
         ]
@@ -375,8 +395,16 @@ def test_submit_transfer_failure_releases_only_prepared_prefill_buffers():
     assert e.cache_manager.allocate("a", 4)
     request = e.scheduler.requests["a"]
     batch = SchedulerOutput(
-        RequestPhase.PREFILLING_RECURRENT,
-        [ScheduledRequest(request, token_start=0, token_count=2, depth=0, chunk_start=0)],
+        [
+            ScheduledRequest(
+                request,
+                WorkKey.PROMPT_RECURRENT,
+                token_start=0,
+                token_count=2,
+                depth=0,
+                chunk_start=0,
+            )
+        ],
     )
     runner = e.model_runner
     original_prepare = runner.prepare_on_cpu
@@ -421,8 +449,11 @@ def test_submit_does_not_retry_failed_routing_cleanup(monkeypatch):
     e.add_request("a", [1, 2], SamplingParams(max_tokens=1))
     request = e.scheduler.requests["a"]
     batch = SchedulerOutput(
-        RequestPhase.PREFILLING_PRELUDE,
-        [ScheduledRequest(request, token_start=0, token_count=2, chunk_start=0)],
+        [
+            ScheduledRequest(
+                request, WorkKey.PROMPT_PRELUDE, token_start=0, token_count=2, chunk_start=0
+            )
+        ],
     )
     runner = e.model_runner
 
@@ -485,8 +516,11 @@ def test_cuda_submit_readback_failure_releases_batch_input_buffers(monkeypatch):
     e.add_request("a", [1, 2, 3, 4], SamplingParams(max_tokens=1))
     request = e.scheduler.requests["a"]
     batch = SchedulerOutput(
-        RequestPhase.PREFILLING_PRELUDE,
-        [ScheduledRequest(request, token_start=0, token_count=2, chunk_start=0)],
+        [
+            ScheduledRequest(
+                request, WorkKey.PROMPT_PRELUDE, token_start=0, token_count=2, chunk_start=0
+            )
+        ],
     )
     runner = e.model_runner
     original_readback = runner._readback_slot
@@ -537,7 +571,7 @@ def advance_chunk(request, scheduled_request):
 
 
 def schedule_stage(scheduler, stage):
-    batch = scheduler._take(stage)
+    batch = scheduler.take_works((stage,))
     assert batch is not None, f"no {stage.value} batch was selected"
     return batch
 
@@ -551,17 +585,17 @@ def test_split_prefill_steps_one_depth_per_chunk_and_keeps_the_prompt_ordered():
     # Mirror the pending engine update: each completed stage enqueues the next one.
     def apply(batch):
         scheduled_request = batch.requests[0]
-        if batch.phase == RequestPhase.PREFILLING_PRELUDE:
+        if scheduled_request.work == WorkKey.PROMPT_PRELUDE:
             request.num_preluded_tokens = (
                 scheduled_request.token_start + scheduled_request.token_count
             )
-            e.scheduler.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
+            e.scheduler.enqueue_work(request, WorkKey.PROMPT_RECURRENT)
             return (scheduled_request.token_start, scheduled_request.token_count, None)
         depth = advance_chunk(request, scheduled_request)
         if depth + 1 < TOTAL_DEPTHS:
-            e.scheduler.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
+            e.scheduler.enqueue_work(request, WorkKey.PROMPT_RECURRENT)
         elif request.num_prefilled_tokens < len(prompt):
-            e.scheduler.enqueue(request, RequestPhase.PREFILLING_PRELUDE)
+            e.scheduler.enqueue_work(request, WorkKey.PROMPT_PRELUDE)
         return (scheduled_request.token_start, scheduled_request.token_count, depth)
 
     trace = []
@@ -570,25 +604,25 @@ def test_split_prefill_steps_one_depth_per_chunk_and_keeps_the_prompt_ordered():
         if batch is None:
             break
         assert len(batch.requests) == 1
-        trace.append((batch.phase, *apply(batch)))
+        trace.append((batch.requests[0].work, *apply(batch)))
     assert e.scheduler.schedule() is None, "prefill must drain, not schedule forever"
 
     assert trace == [
-        (RequestPhase.PREFILLING_PRELUDE, 0, 2, None),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 3),
-        (RequestPhase.PREFILLING_PRELUDE, 2, 2, None),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 3),
-        (RequestPhase.PREFILLING_PRELUDE, 4, 1, None),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 3),
+        (WorkKey.PROMPT_PRELUDE, 0, 2, None),
+        (WorkKey.PROMPT_RECURRENT, 0, 2, 0),
+        (WorkKey.PROMPT_RECURRENT, 0, 2, 1),
+        (WorkKey.PROMPT_RECURRENT, 0, 2, 2),
+        (WorkKey.PROMPT_RECURRENT, 0, 2, 3),
+        (WorkKey.PROMPT_PRELUDE, 2, 2, None),
+        (WorkKey.PROMPT_RECURRENT, 2, 2, 0),
+        (WorkKey.PROMPT_RECURRENT, 2, 2, 1),
+        (WorkKey.PROMPT_RECURRENT, 2, 2, 2),
+        (WorkKey.PROMPT_RECURRENT, 2, 2, 3),
+        (WorkKey.PROMPT_PRELUDE, 4, 1, None),
+        (WorkKey.PROMPT_RECURRENT, 4, 1, 0),
+        (WorkKey.PROMPT_RECURRENT, 4, 1, 1),
+        (WorkKey.PROMPT_RECURRENT, 4, 1, 2),
+        (WorkKey.PROMPT_RECURRENT, 4, 1, 3),
     ]
     assert request.num_prefilled_tokens == 5
     assert all(left == right for left, right in request.prefill_depth_ranges)
@@ -606,10 +640,12 @@ def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
             break
         assert len(batch.requests) == 1
         scheduled_request = batch.requests[0]
-        progress = e._apply_split_prefill_progress(request, batch.phase, scheduled_request)
+        progress = e._apply_split_prefill_progress(
+            request, scheduled_request.work, scheduled_request
+        )
         trace.append(
             (
-                batch.phase,
+                scheduled_request.work,
                 scheduled_request.token_start,
                 scheduled_request.token_count,
                 scheduled_request.depth,
@@ -619,24 +655,24 @@ def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
             break
 
     assert trace == [
-        (RequestPhase.PREFILLING_PRELUDE, 0, 2, None),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 3),
-        (RequestPhase.PREFILLING_PRELUDE, 2, 2, None),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 3),
-        (RequestPhase.PREFILLING_PRELUDE, 4, 1, None),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 3),
+        (WorkKey.PROMPT_PRELUDE, 0, 2, None),
+        (WorkKey.PROMPT_RECURRENT, 0, 2, 0),
+        (WorkKey.PROMPT_RECURRENT, 0, 2, 1),
+        (WorkKey.PROMPT_RECURRENT, 0, 2, 2),
+        (WorkKey.PROMPT_RECURRENT, 0, 2, 3),
+        (WorkKey.PROMPT_PRELUDE, 2, 2, None),
+        (WorkKey.PROMPT_RECURRENT, 2, 2, 0),
+        (WorkKey.PROMPT_RECURRENT, 2, 2, 1),
+        (WorkKey.PROMPT_RECURRENT, 2, 2, 2),
+        (WorkKey.PROMPT_RECURRENT, 2, 2, 3),
+        (WorkKey.PROMPT_PRELUDE, 4, 1, None),
+        (WorkKey.PROMPT_RECURRENT, 4, 1, 0),
+        (WorkKey.PROMPT_RECURRENT, 4, 1, 1),
+        (WorkKey.PROMPT_RECURRENT, 4, 1, 2),
+        (WorkKey.PROMPT_RECURRENT, 4, 1, 3),
     ]
     assert request.num_prefilled_tokens == len(request.prompt_token_ids)
-    assert request.phase is RequestPhase.CODA
+    assert e.scheduler.pending_work(request) is WorkKey.DECODE_CODA
 
 
 @pytest.mark.parametrize(
@@ -742,7 +778,7 @@ def test_cpu_async_split_frontier_advances_once_per_submission():
 
     def hold_split_ticket(batch):
         ticket = submit(batch)
-        if batch.phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT):
+        if batch.has_split_prefill_work:
             ticket.event = HeldEvent()
             held.append(ticket.event)
             for scheduled_request in batch.requests:
@@ -752,10 +788,10 @@ def test_cpu_async_split_frontier_advances_once_per_submission():
     e.executor.submit = hold_split_ticket
     for _ in range(32):
         e.step()
-        if request.phase is RequestPhase.CODA:
+        if e.scheduler.pending_work(request) is WorkKey.DECODE_CODA:
             break
 
-    assert request.phase is RequestPhase.CODA
+    assert e.scheduler.pending_work(request) is WorkKey.DECODE_CODA
     assert request.num_prefilled_tokens == len(prompt)
     assert all(left == right for left, right in request.prefill_depth_ranges)
     assert len(held) == 15  # Three chunks, each with prelude plus four depths.
@@ -835,18 +871,18 @@ def test_split_preemption_rewinds_and_recomputes_the_resident_chunk(completed_de
 
     for _ in range(completed_depths + 1):
         e.step()
-    assert request.phase is RequestPhase.PREFILLING_RECURRENT
+    assert e.scheduler.pending_work(request) is WorkKey.PROMPT_RECURRENT
 
     requester = Request("pressure", [9], SamplingParams(max_tokens=1))
     assert e.scheduler.preempt(requester)
-    assert e.preemption.snapshots["victim"]["phase"] is RequestPhase.PREFILLING_PRELUDE
+    assert e.preemption.snapshots["victim"]["work"] is WorkKey.PROMPT_PRELUDE
     assert request.num_preluded_tokens == request.num_prefilled_tokens
     assert request.prefill_chunk_start == request.num_prefilled_tokens
     assert all(left == request.num_prefilled_tokens for left, _ in request.prefill_depth_ranges)
     assert e.cache_manager.num_used_blocks == 0
 
     e.scheduler._admit()
-    assert request.phase is RequestPhase.PREFILLING_PRELUDE
+    assert e.scheduler.pending_work(request) is WorkKey.PROMPT_PRELUDE
     actual = drain_request(e)
     assert actual.token_ids == expected.token_ids
     assert actual.exit_depths == expected.exit_depths
@@ -882,7 +918,7 @@ def test_priority_admission_preempts_split_prefill_and_matches_reference():
     e.add_request("low", prompt, params)
     e.step()
     e.step()
-    assert e.scheduler.requests["low"].phase is RequestPhase.PREFILLING_RECURRENT
+    assert e.scheduler.pending_work(e.scheduler.requests["low"]) is WorkKey.PROMPT_RECURRENT
     e.add_request(
         "high",
         [5, 6],
@@ -930,7 +966,7 @@ def test_cuda_split_failure_drains_writes_before_request_id_reuse(
         is_loop = (
             (batch.batch.operation == Operation.RECURRENT)
             if failure_site == "prepare_on_gpu"
-            else (batch.phase == RequestPhase.PREFILLING_RECURRENT)
+            else (batch.works == frozenset((WorkKey.PROMPT_RECURRENT,)))
         )
         if is_loop:
             torch.cuda._sleep(10_000_000)
@@ -1043,10 +1079,10 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
             e.step()
             e.step()
             split_request = e.scheduler.requests["split"]
-            assert split_request.phase is RequestPhase.PREFILLING_RECURRENT
+            assert e.scheduler.pending_work(split_request) is WorkKey.PROMPT_RECURRENT
             assert split_request.prefill_depth_ranges[0] == [2, 4]
             # Keep the staged chunk resident while decode triggers graph capture.
-            e.scheduler.queues[RequestPhase.PREFILLING_RECURRENT].remove("split")
+            e.scheduler.work_queues[WorkKey.PROMPT_RECURRENT].remove("split")
 
             e.add_request(
                 "decode",
@@ -1057,7 +1093,7 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
             for _ in range(100):
                 e.step()
                 batch = e.last_schedule
-                if batch is not None and batch.phase is RequestPhase.RECURRENT:
+                if batch is not None and batch.works == frozenset((WorkKey.DECODE_RECURRENT,)):
                     decode_recurrent_runs += sum(
                         scheduled_request.request.request_id == "decode"
                         for scheduled_request in batch.requests
@@ -1066,7 +1102,7 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
                     break
             else:
                 pytest.fail("decode request did not reach its second recurrent step")
-            assert split_request.phase is RequestPhase.PREFILLING_RECURRENT
+            assert e.scheduler.pending_work(split_request) is WorkKey.PROMPT_RECURRENT
             assert split_request.num_prefilled_tokens == 0
             assert split_request.num_preluded_tokens == 2
 
@@ -1077,7 +1113,7 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
                     e.model_runner.graphs.replays,
                     e.model_runner.graphs.fallbacks,
                 )
-            e.scheduler.enqueue(split_request, RequestPhase.PREFILLING_RECURRENT)
+            e.scheduler.enqueue_work(split_request, WorkKey.PROMPT_RECURRENT)
             finished = {}
             for _ in range(200):
                 for output in e.step():
@@ -1173,7 +1209,7 @@ def test_cuda_async_split_preemption_releases_and_reuses_slot():
         e.add_request("victim", prompt, params)
         e.step()
         e.step()
-        assert e.scheduler.requests["victim"].phase is RequestPhase.PREFILLING_RECURRENT
+        assert e.scheduler.pending_work(e.scheduler.requests["victim"]) is WorkKey.PROMPT_RECURRENT
         state = e.model_runner.async_state
         slot = state.slots["victim"]
         old_event = e.model_runner.events["victim"]
@@ -1189,7 +1225,7 @@ def test_cuda_async_split_preemption_releases_and_reuses_slot():
         e.add_request("pressure-b", [7, 8], pressure_params)
         e.scheduler._admit()
         e.step()
-        assert e.scheduler.requests["victim"].phase is RequestPhase.WAITING
+        assert e.scheduler.requests["victim"].status is RequestStatus.WAITING
         assert slot in state.slots.values()
         assert len(state.slots) == 2
         occupant = next(rid for rid, assigned in state.slots.items() if assigned == slot)
@@ -1241,14 +1277,14 @@ def test_cuda_split_prefill_batches_mixed_depths(attention_backend):
         e.add_request("b", [3, 4], params)
         e.step()  # Prelude for both requests.
 
-        recurrent = e.scheduler.queues[RequestPhase.PREFILLING_RECURRENT]
+        recurrent = e.scheduler.work_queues[WorkKey.PROMPT_RECURRENT]
         recurrent.clear()
         recurrent.append("a")
         e.step()  # Advance only request a to depth one.
         recurrent.append("b")
         e.step()  # Request a is depth one; request b is depth zero.
 
-        assert e.last_schedule.phase is RequestPhase.PREFILLING_RECURRENT
+        assert e.last_schedule.works == frozenset((WorkKey.PROMPT_RECURRENT,))
         assert {scheduled_request.depth for scheduled_request in e.last_schedule.requests} == {0, 1}
     finally:
         e.close()
@@ -1261,19 +1297,19 @@ def test_split_prefill_holds_the_next_prelude_until_the_chunk_is_read():
     e.scheduler._admit()
     request = e.scheduler.requests["a"]
 
-    prelude = schedule_stage(e.scheduler, RequestPhase.PREFILLING_PRELUDE)
+    prelude = schedule_stage(e.scheduler, WorkKey.PROMPT_PRELUDE)
     scheduled_request = prelude.requests[0]
     request.num_preluded_tokens = scheduled_request.token_start + scheduled_request.token_count
-    e.scheduler.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
-    batch = schedule_stage(e.scheduler, RequestPhase.PREFILLING_RECURRENT)
+    e.scheduler.enqueue_work(request, WorkKey.PROMPT_RECURRENT)
+    batch = schedule_stage(e.scheduler, WorkKey.PROMPT_RECURRENT)
     advance_chunk(request, batch.requests[0])
 
     # Depth 0 of the first chunk is done, but its hidden rows are still the input
     # of depth 1, so staging the next chunk must wait.
-    e.scheduler.enqueue(request, RequestPhase.PREFILLING_PRELUDE)
-    assert e.scheduler._take(RequestPhase.PREFILLING_PRELUDE) is None
-    assert list(e.scheduler.queues[RequestPhase.PREFILLING_PRELUDE]) == ["a"]
-    e.scheduler.queues[RequestPhase.PREFILLING_PRELUDE].clear()
+    e.scheduler.enqueue_work(request, WorkKey.PROMPT_PRELUDE)
+    assert e.scheduler.take_works((WorkKey.PROMPT_PRELUDE,)) is None
+    assert list(e.scheduler.work_queues[WorkKey.PROMPT_PRELUDE]) == ["a"]
+    e.scheduler.work_queues[WorkKey.PROMPT_PRELUDE].clear()
     assert e.scheduler._prelude_window_open(request) is False
 
 
@@ -1289,8 +1325,8 @@ def test_split_prefill_reports_no_depth_work_before_the_prelude():
     e.scheduler._admit()
     request = e.scheduler.requests["a"]
 
-    scheduled_request = e.scheduler._make_scheduled_request(
-        request, RequestPhase.PREFILLING_RECURRENT, 4
+    scheduled_request = e.scheduler._make_scheduled_work(
+        request, WorkKey.PROMPT_RECURRENT, 4
     )
     assert scheduled_request.token_count == 0
     assert request.num_prefilled_tokens == 0
@@ -1305,7 +1341,7 @@ def test_split_prefill_batches_stay_within_the_token_budget():
     for name in ("a", "b", "c"):
         e.add_request(name, [1, 2, 3, 4], SamplingParams(max_tokens=1, ignore_eos=True))
     e.scheduler._admit()
-    batch = schedule_stage(e.scheduler, RequestPhase.PREFILLING_PRELUDE)
+    batch = schedule_stage(e.scheduler, WorkKey.PROMPT_PRELUDE)
     assert sum(i.token_count for i in batch.requests) <= 3
     assert len(batch.requests) == 2
 
@@ -1318,32 +1354,36 @@ def test_split_policy_honors_decode_due_before_split_prefill():
     policy = e.scheduler.policy
     policy.prefill_batches_since_recurrent = 1
     scheduler = SimpleNamespace(
-        queues={
-            RequestPhase.RECURRENT: deque(["decode"]),
-            RequestPhase.PRELUDE: deque(),
-            RequestPhase.CODA: deque(),
-            RequestPhase.PREFILLING_PRELUDE: deque(["prefill"]),
+        work_queues={
+            WorkKey.DECODE_RECURRENT: deque(["decode"]),
+            WorkKey.DECODE_PRELUDE: deque(),
+            WorkKey.DECODE_CODA: deque(),
+            WorkKey.PROMPT_PRELUDE: deque(["prefill"]),
+            WorkKey.PROMPT_ATOMIC: deque(),
+            WorkKey.PROMPT_RECURRENT: deque(),
+            WorkKey.SPECULATIVE: deque(),
         },
-        _take=lambda stage: stage,
+        take_works=lambda works: works[0],
     )
-    scheduler.has_ready = lambda stage: bool(scheduler.queues[stage])
-    assert policy.schedule(scheduler) is RequestPhase.RECURRENT
+    scheduler.has_ready_work = lambda work: bool(scheduler.work_queues[work])
+    scheduler.has_ready_works = lambda *works: any(scheduler.has_ready_work(work) for work in works)
+    assert policy.schedule(scheduler) is WorkKey.DECODE_RECURRENT
     e.close()
 
 
 def test_split_prefill_stages_count_toward_decode_fairness():
     e = make_prefill_engine(scheduler_config=SchedulerConfig(max_prefill_batches_before_decode=2))
     policy = e.scheduler.policy
-    assert policy.PREFILL_PHASES == (
-        RequestPhase.PREFILLING_PRELUDE,
-        RequestPhase.PREFILLING_RECURRENT,
+    assert policy.PREFILL_WORKS == (
+        WorkKey.PROMPT_PRELUDE,
+        WorkKey.PROMPT_RECURRENT,
     )
 
-    policy.record_batch(RequestPhase.PREFILLING_PRELUDE)
+    policy.record_batch((WorkKey.PROMPT_PRELUDE,))
     assert not policy.decode_due
-    policy.record_batch(RequestPhase.PREFILLING_RECURRENT)
+    policy.record_batch((WorkKey.PROMPT_RECURRENT,))
     assert policy.decode_due
-    policy.record_batch(RequestPhase.RECURRENT)
+    policy.record_batch((WorkKey.DECODE_RECURRENT,))
     assert not policy.decode_due
     e.close()
 
@@ -1361,8 +1401,8 @@ def test_split_prefill_stages_after_a_reused_prompt_prefix():
     request.num_prefilled_tokens = 2
     request.num_preluded_tokens = 2
     assert e.scheduler._prelude_window_open(request)
-    scheduled_request = e.scheduler._make_scheduled_request(
-        request, RequestPhase.PREFILLING_PRELUDE, 4
+    scheduled_request = e.scheduler._make_scheduled_work(
+        request, WorkKey.PROMPT_PRELUDE, 4
     )
     assert (scheduled_request.token_start, scheduled_request.token_count) == (2, 2)
     assert request.prefill_depth(scheduled_request.token_start) == 0
@@ -1403,14 +1443,14 @@ def test_split_prefill_policy_is_selected_only_by_the_atomic_prefill_flag():
     )
 
 
-def test_scheduling_policies_declare_their_prefill_stages():
-    assert SchedulingPolicy.PREFILL_PHASES == (RequestPhase.PREFILL,)
-    assert RefillPolicy.PREFILL_PHASES == (RequestPhase.PREFILL,)
-    assert NoRefillPolicy.PREFILL_PHASES == (RequestPhase.PREFILL,)
-    assert SpeculativePolicy.PREFILL_PHASES == (RequestPhase.PREFILL,)
-    assert SplitPrefillPolicy.PREFILL_PHASES == (
-        RequestPhase.PREFILLING_PRELUDE,
-        RequestPhase.PREFILLING_RECURRENT,
+def test_scheduling_policies_declare_their_prompt_work():
+    assert SchedulingPolicy.PREFILL_WORKS == (WorkKey.PROMPT_ATOMIC,)
+    assert RefillPolicy.PREFILL_WORKS == (WorkKey.PROMPT_ATOMIC,)
+    assert NoRefillPolicy.PREFILL_WORKS == (WorkKey.PROMPT_ATOMIC,)
+    assert SpeculativePolicy.PREFILL_WORKS == (WorkKey.PROMPT_ATOMIC,)
+    assert SplitPrefillPolicy.PREFILL_WORKS == (
+        WorkKey.PROMPT_PRELUDE,
+        WorkKey.PROMPT_RECURRENT,
     )
 
 
@@ -1513,8 +1553,7 @@ def test_chunk_prompt_cache_reuse_override_and_request_id_reuse(device, use_uva)
 
     def prepare(request, start, override=None):
         scheduled = SchedulerOutput(
-            RequestPhase.PREFILLING_PRELUDE,
-            [ScheduledRequest(request, start, 2, chunk_start=start)],
+            [ScheduledRequest(request, WorkKey.PROMPT_PRELUDE, start, 2, chunk_start=start)],
         )
         batch = build_execution_batch(scheduled, e.model.config.total_ut_steps)
         assert batch.spans[0].input_tokens is None
@@ -1550,7 +1589,7 @@ def test_chunk_prompt_cache_reuse_override_and_request_id_reuse(device, use_uva)
 @pytest.mark.gpu
 @pytest.mark.parametrize("use_uva", [False, True])
 def test_mixed_hidden_buffers_wait_for_strided_decode_and_chunk_producers(multi_stream, use_uva):
-    from vllm_rlt.request import ExecutionBatch, StateSpan
+    from vllm_rlt.core.execution import ExecutionBatch, StateSpan
 
     e = LLMEngine(
         tiny_ouro_model().to("cuda"),

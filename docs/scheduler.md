@@ -23,14 +23,11 @@ active-request limit and the KV budget, including growth reserved for existing
 requests. Priority/FCFS and bounded bypass decide which waiting requests get a
 chance; they do not replace the resource checks.
 
-If resources fit, the request enters the appropriate phase queue in B. A new
-prompt starts prefill; a fully imported prompt enters CODA after admission;
-restoration returns to the saved phase. No fit means waiting. Where preemption
-is enabled, a safe victim can be suspended and later restored through this same
-admission path. These decisions are inside A, not a separate post-processing
-step. The request sent back to WAITING by preemption is the **victim**, not
-necessarily the candidate whose admission was blocked. Restoration is retried
-through resource checks and returns the victim to its saved phase.
+If resources fit, the request becomes ACTIVE and enters the appropriate work
+queue in B. A new prompt starts prompt work; a fully imported prompt enters
+CODA after admission; restoration returns to the saved `WorkKey`. No fit means
+waiting. Where preemption is enabled, a safe victim can be suspended and later
+restored through this same admission path. These decisions are inside A, not a separate post-processing step. The request sent back to WAITING by preemption is the **victim**, not necessarily the candidate whose admission was blocked. Restoration is retried through resource checks and returns the victim to its saved work.
 
 The amber **PD import → A** line starts only after the connector has observed
 commit and all expected chunks. Its destination Request and prompt KV mapping
@@ -38,19 +35,22 @@ already exist; receiving data alone does not grant an execution slot.
 
 ### B — Ready queues: what does each request need next?
 
-B is a collection of phase queues, not a model computation. Each Request retains
+B is a collection of work queues, not a model computation. Each Request retains
 its own position, prompt frontier and recurrent depth. The diagram groups queues
 by the work they represent:
 
-- **Atomic prompt:** PRELUDE and all recurrent depths of a prompt chunk run in one
-  submission. Chunking and yielding between recurrent depths are separate choices.
-- **Split prompt:** PRELUDE prepares a chunk, then RECURRENT work can be selected
-  at individual depths. Prompt tokens still traverse the full model depth.
-- **Decode:** PRELUDE prepares the current token, RECURRENT advances its hidden
-  state, and CODA produces logits after recurrence exits.
-- **Speculative round:** the local controller drafts candidate tokens and verifies
-  them. A round expands into model calls rather than becoming another model
-  operation alongside PRELUDE, RECURRENT and CODA.
+- **Atomic prompt (`PROMPT_ATOMIC`):** PRELUDE and all recurrent depths of a
+  prompt chunk run in one submission. Chunking and yielding between recurrent
+  depths are separate choices.
+- **Split prompt (`PROMPT_PRELUDE`, `PROMPT_RECURRENT`):** PRELUDE prepares a
+  chunk, then RECURRENT work can be selected at individual depths. Prompt tokens
+  still traverse the full model depth.
+- **Decode (`DECODE_PRELUDE`, `DECODE_RECURRENT`, `DECODE_CODA`):** PRELUDE
+  prepares the current token, RECURRENT advances its hidden state, and CODA
+  produces logits after recurrence exits.
+- **Speculative round (`SPECULATIVE`):** the local controller drafts candidate
+  tokens and verifies them. A round expands into model calls rather than becoming
+  another model operation alongside PRELUDE, RECURRENT and CODA.
 
 Queue membership is not proof that GPU or transport work has completed. C checks
 scheduling eligibility; execution events order the actual device consumers.
@@ -70,7 +70,7 @@ peer conceptual choices:
 The ordinary-generation rows in C show currently supported combinations:
 atomic with refill/no-refill, and split with refill/mixed. These are compatibility
 rules, not a claim that the two dimensions mean the same thing.
-`SplitPrefillPolicy` uses refill ordering with split prompt phases;
+`SplitPrefillPolicy` uses refill ordering with split prompt work;
 `MixedPolicy` extends that behavior with recurrent co-batching.
 
 Prompt-only is a stage-role constraint. Speculation selects a local draft/verify
@@ -119,8 +119,7 @@ more general than “embedding” and “LM head.”
 ### E — Track completion: what is still using device state or buffers?
 
 Pending submissions retain result/readback storage and completion evidence.
-They are execution tickets, not additional Request phases. The diagram does not
-prescribe a universal queue count shared by every controller.
+They are execution tickets, not additional Request work items. The diagram does not prescribe a universal queue count shared by every controller.
 
 Events prevent buffer reuse while earlier GPU consumers still read them. A
 synchronous path collects host-dependent results when needed. An asynchronous
@@ -135,7 +134,7 @@ GPU dependencies or authorize early resource reuse.
 ### F — Apply progress: what should each request do next?
 
 StageEngine applies progress and result-dependent decisions per Request, then
-calls `Scheduler.enqueue()` for its next phase. The four labels show common
+calls `Scheduler.enqueue_work()` for its next `WorkKey`. The four labels show common
 continuations: another loop, another prompt chunk, the next generated token, or
 CODA after recurrence exits. The blue return arrow leads back to B, not A:
 continuing requests keep their admitted resources.
@@ -209,7 +208,7 @@ arcs on the right indicate separate paths, not joins.
 | 3. Ranking | Lower service priority first, then larger estimated footprint; pick one victim. |
 | 4. Suspend | Synchronize, rewind unfinished split prefill if applicable, snapshot, release device resources and retain RNG. |
 | 5. Requester | A retries once, then selects or requeues. B continues shared admission, including restore or fresh allocation/import handling, and defers if admission fails. |
-| 6. Victim | Shared WAITING, slot check, allocation, tensor restoration, synchronization, snapshot deletion and saved-phase enqueue. Slot shortage returns to B; failed KV allocation retains the snapshot and waits. |
+| 6. Victim | Shared WAITING, slot check, allocation, tensor restoration, synchronization, snapshot deletion and saved-work enqueue. Slot shortage returns to B; failed KV allocation retains the snapshot and waits. |
 | Red exits | Cancellation discards suspended state and aborts; snapshot/restore exceptions propagate without transactional rollback in this manager. |
 
 The detailed rules below describe configuration restrictions, scan/bypass
@@ -220,22 +219,18 @@ preemption policy; it does not expand the separate connector import protocol.
 
 | Data | While suspended | On resumption | Current owner / implementation |
 | --- | --- | --- | --- |
-| Request identity and logical progress: token history, position, counters | The original Request stays in the registry; its ID moves to shared WAITING. Its phase becomes WAITING; the resume phase is saved separately. | Reuse the same Request and enqueue the saved phase. | `Scheduler.requests`, `Scheduler.queues`, `PreemptionManager.snapshots` |
+| Request identity and logical progress: token history, position, counters | The original Request stays in the registry; its `status` becomes WAITING; the resume work is saved separately. | Reuse the same Request, activate it and enqueue the saved `WorkKey`. | `Scheduler.requests`, `Scheduler.waiting`, `Scheduler.work_queues`, `PreemptionManager.snapshots` |
 | Sampling RNG | Retained by the runner's RNG manager; not serialized into the CPU snapshot. | Continue the same random stream. | `ModelRunner.suspend()` preserves RNG but frees the runner execution slot. |
 | KV tensors | Copy allocated KV pages to CPU, then release the request's GPU allocation. Shared/cached pages need not all become free. | Allocate fresh GPU blocks and copy the saved pages into them. | `KVCacheManager.snapshot()` / `restore()` |
 | KV logical metadata: capacity, page count, written state per plane | Save capacity and page count; deep-copy written-state metadata into `KVSnapshot`. | Restore written-state metadata onto the new allocation. | `KVSnapshot` and cache allocation |
 | Physical KV mapping and batch execution metadata: block tables, write locations, row indices | Do not preserve the old batch as a resumable execution object. The old allocation is released. | Allocation establishes physical block mappings; subsequent batch preparation derives execution metadata from current mappings and progress. | Cache allocation and `ModelRunner.prepare_on_cpu()` / `prepare_on_gpu()` |
 | Intermediate hidden state and input-token tensor | When present, copy to CPU and clear their references on the Request. | Copy back to the cache device and attach to the same Request. | `PreemptionManager` |
 
-There is no dedicated queue containing snapshots. WAITING contains request IDs;
-`snapshots[request_id]` contains `phase`, `kv`, `hidden` and `token`. Persistent
+There is no dedicated queue containing snapshots. `Scheduler.waiting` contains request IDs; `snapshots[request_id]` contains `work`, `kv`, `hidden` and `token`. Persistent
 logical state must not be confused with physical-address metadata that becomes
 invalid when GPU resources are reassigned.
 
-For split prefill, `_rewind_split_prefill()` first resets an unfinished chunk to
-`num_prefilled_tokens` and sets the resume phase to `PREFILLING_PRELUDE`. The
-snapshot therefore records the rewound phase, not necessarily the loop at which
-the request was interrupted. The unfinished chunk is replayed after restoration.
+For split prefill, `_rewind_split_prefill()` first resets an unfinished chunk to `num_prefilled_tokens` and returns `WorkKey.PROMPT_PRELUDE`. The snapshot therefore records the rewound work, not necessarily the loop at which the request was interrupted. The unfinished chunk is replayed after restoration.
 
 #### Current policy: triggers and eligibility
 
@@ -273,7 +268,7 @@ Memory-pressure selection uses this ranking even under FCFS; only priority
 admission requires the victim to be strictly lower priority than the requester.
 
 If no safe victim exists, or the one allocation retry still fails, batch
-construction returns the requesting ID to its phase queue and considers other
+construction returns the requesting ID to its work queue and considers other
 candidates within the scan/token/sequence limits. It does not force an unsafe
 eviction or keep evicting until that individual request fits. A later scheduling
 attempt can try again; other candidates in the same call can also trigger their
@@ -283,11 +278,11 @@ own capacity checks. With no selected work, no batch is returned.
 
 | Transition | Ordered actions |
 | --- | --- |
-| Suspend device state | Synchronize the runner's configured streams; rewind unfinished split prefill; snapshot KV, phase and optional hidden/token tensors to CPU. |
+| Suspend device state | Synchronize the runner's configured streams; rewind unfinished split prefill; snapshot KV, pending `WorkKey` and optional hidden/token tensors to CPU. |
 | Relinquish resources | Suspend runner resources while retaining RNG; poll cache prefixes; free the victim's cache allocation; clear hidden/token references; store the snapshot. |
-| Move the request | Remove the victim's old queue entries and enqueue its ID into shared WAITING. |
+| Move the request | Remove the victim's pending work and enqueue its ID into shared WAITING. |
 | Reconsider admission | FCFS preserves waiting order; priority mode sorts by numeric priority. Admission is bounded by `admission_scan_limit` and checks active slots before attempting restoration. |
-| Restore | If allocation succeeds, copy KV and optional hidden/token tensors to device, synchronize the current CUDA stream, delete the CPU snapshot and enqueue the saved phase. If allocation fails, retain the snapshot and defer. |
+| Restore | If allocation succeeds, copy KV and optional hidden/token tensors to device, synchronize the current CUDA stream, delete the CPU snapshot and enqueue the saved `WorkKey`. If allocation fails, retain the snapshot and defer. |
 | Abort a suspended request | Discard its snapshot, release runner resources/RNG and abort it through the scheduler. |
 
 Deferred IDs are put back at the front in their existing order. Fresh admission
@@ -427,8 +422,9 @@ forward chains. Panel B shows one mixed recurrent selection:
 | B | One decode token | 1 | 3 |
 | C | A prefill span | 4 | 0 |
 
-`MixedPolicy` considers decode and prefill recurrent queues.
-`Scheduler.take_phases()` checks eligibility, shared token/sequence budgets and KV
+`MixedPolicy` considers decode and prompt recurrent queues.
+`Scheduler.take_works((WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT))`
+checks eligibility, shared token/sequence budgets and KV
 capacity, retaining each selected request's token range and depth. The example
 assumes all three fit; a blocked or over-budget request need not be selected.
 
@@ -554,10 +550,10 @@ The four numbered steps are actions with explicit owners:
 
 | Step | Owner and action | Handoff |
 | --- | --- | --- |
-| 01 | Scheduling policy chooses ready, compatible phases | Prompt and decode recurrent queues in this example |
+| 01 | Scheduling policy chooses ready, compatible work | Prompt and decode recurrent queues in this example |
 | 02 | Scheduler selects token ranges/depths under readiness and resource limits | `SchedulerOutput` with per-request snapshots |
 | 03 | Executor/runner prepares and executes the selected batch | Result storage and completion events |
-| 04 | StageEngine applies progress and calls `Scheduler.enqueue()` | Updated requests in their next phase queues; return to 01 |
+| 04 | StageEngine applies progress and calls `Scheduler.enqueue_work()` | Updated requests in their next work queues; return to 01 |
 
 Steps 01 and 02 are parts of one scheduling call, not separate runtime stages.
 Policy chooses which queues to consider; batch construction checks individual
@@ -588,7 +584,7 @@ Suppose three requests have recurrent work ready:
 With a six-token budget and room for three requests, mixed scheduling selects B
 and C from the generation recurrent queue, then fills the remaining four rows
 with A's prompt span. These six token rows share one RECURRENT execution, even
-though their request phases and depths differ. In code, recurrent `depth` is
+though their `WorkKey` values and depths differ. In code, recurrent `depth` is
 zero-based: A, B and C carry 1, 2 and 0 respectively.
 
 The batch retains each request's identity, token range and depth. A prompt span
@@ -603,22 +599,23 @@ still traverse the full model depth; mixing does not apply decode early exit to
 prompt rows.
 
 PRELUDE and CODA are selected separately. Mixed scheduling currently combines
-`RECURRENT` and `PREFILLING_RECURRENT`, not arbitrary operations or speculative
+`DECODE_RECURRENT` and `PROMPT_RECURRENT`, not arbitrary operations or speculative
 verification rows.
 
 ## Who owns each decision?
 
 | Component | Responsibility | Code |
 | --- | --- | --- |
-| `Scheduler` | Request registry, phase queues, admission, capacity checks, batch selection and queue transitions | [scheduler.py](../vllm_rlt/core/scheduler.py) |
-| `SchedulingPolicy` implementations | Choose when to admit and which ready phase or compatible phases to select; track fairness/cohort state | [scheduling_policy.py](../vllm_rlt/core/scheduling_policy.py) |
+| `Scheduler` | Request registry, waiting/work queues, admission slots, capacity checks, batch selection and queue transitions | [scheduler.py](../vllm_rlt/core/scheduler.py) |
+| `SchedulingPolicy` implementations | Choose when to admit and which ready `WorkKey` or compatible work groups to select; track fairness/cohort state | [scheduling_policy.py](../vllm_rlt/core/scheduling_policy.py) |
 | `StageEngine` | Drive scheduling/submission, apply logical progress and output decisions, coordinate retirement | [stage_engine.py](../vllm_rlt/engine/stage_engine.py) |
 | `Executor` and runners | Bind selected work, prepare tensors, submit model computation and expose results/events | [executor.py](../vllm_rlt/worker/executor.py) |
 | `KVCacheManager` | Allocate/grow pages, track validity and protect borrowed allocations | [kv_cache_manager.py](../vllm_rlt/core/kv_cache_manager.py) |
 | Connector | Report transport readiness and manage transfers; never choose loop progress or mutate scheduler queues | [connector.py](../vllm_rlt/engine/connector.py) |
 
-A **stage** is a deployment/resource boundary. A **request phase** describes
-what that request needs next. PRELUDE, RECURRENT and CODA are model operations.
+A **stage** is a deployment/resource boundary. `RequestStatus` describes the
+request lifecycle, while `WorkKey` describes what it needs next. PRELUDE,
+RECURRENT and CODA are model operations.
 A **scheduling mode** chooses batching policy. These are separate concepts:
 `prefill_decode` is a stage role; `mixed` is a scheduling mode.
 
@@ -631,11 +628,11 @@ StageEngine.step
   → Scheduler.schedule
     → policy.schedule
       → _admit, when the policy allows new or restored work
-      → _take(phase) or take_phases(phases)
+      → take_works(compatible_work_keys)
         → readiness check → range snapshot → KV capacity check
         → SchedulerOutput
   → Executor.submit
-  → StageEngine applies progress/results and enqueues the next phase
+  → StageEngine applies progress/results and enqueues the next WorkKey
 ```
 
 This is a logical chain, not a requirement to block after every submission.
@@ -643,10 +640,11 @@ The asynchronous path can submit dependent work before collecting an earlier
 result, subject to its event and exit-policy contracts.
 
 `ScheduledRequest` holds a reference to the existing local `Request` plus a
-snapshot of the selected token range, depth, chunk start and phase. It does not
-copy the request or construct GPU metadata. `SchedulerOutput.phase` is the
-common phase for homogeneous work, or `None` when selected phases differ;
-`phase_for()` retrieves the phase of an individual selection.
+snapshot of the selected `WorkKey`, token range, depth and chunk start. It does
+not copy the request or construct GPU metadata. `SchedulerOutput.works` reports
+the set of work types selected in the batch, and each `ScheduledRequest.work`
+preserves the immutable per-request work identity. `is_mixed` is derived from
+that set; batch inspection should use `works` and each item's `work`.
 
 `Executor` binds ordinary selections into `ExecutionBatch` spans. All spans must
 share a model operation and execution boundary. Different recurrent depths are
@@ -692,16 +690,16 @@ update cache bookkeeping; `_allocate()` performs the actual allocation.
 
 ## Constructing the batch
 
-`take_phases()` visits the supplied phase queues in order under one token budget,
+`take_works()` visits the supplied work queues in order under one token budget,
 request-count limit and selected-request protection set. For each candidate it:
 
-1. Checks connector readiness and phase-specific eligibility.
+1. Checks connector readiness and work-specific eligibility.
 2. Snapshots a contiguous token range and recurrent depth.
 3. Ensures KV capacity covers the exclusive token frontier.
 4. Adds the request to the selected set and deducts its token count.
 
-Blocked requests return to the queue tail. Each phase scans at most the queue
-length observed when that phase begins, so a blocked request cannot cycle
+Blocked requests return to the queue tail. Each work queue scans at most the queue
+length observed when that queue begins, so a blocked request cannot cycle
 forever in one call. An empty selection returns `None` without changing fairness
 counters. Selecting a request does not advance its completed progress.
 
@@ -711,8 +709,8 @@ waits. For split recurrence, a span is additionally limited by the ready depth
 frontier and the prompt tokens whose prelude is already resident.
 
 `execution_ready` is the connector's nonblocking readiness predicate. Both
-`has_ready()` and batch construction consult it, so a blocked transfer does not
-hide another runnable phase. This is backpressure: the connector can defer work
+`has_ready_work()` and batch construction consult it, so a blocked transfer does
+not hide another runnable work type. This is backpressure: the connector can defer work
 when it cannot safely accept more transfer state. It does not wait for transport
 completion inside the scheduler.
 
@@ -723,10 +721,10 @@ independent, peer configuration dimensions.
 
 | Policy | Selection behavior |
 | --- | --- |
-| `PromptOnlyPolicy` | Admit and select prompt work only, using atomic or split prompt phases |
+| `PromptOnlyPolicy` | Admit and select prompt work only, using atomic or split prompt work |
 | `RefillPolicy` | Prefer ready PRELUDE, eligible CODA and due recurrent work; admit and interleave prompt work |
 | `NoRefillPolicy` | Prepare a cohort, drain its recurrence, then process CODA before filling the next cohort |
-| `SplitPrefillPolicy` | Refill ordering with separate prompt PRELUDE and RECURRENT scheduling boundaries |
+| `SplitPrefillPolicy` | Refill ordering with separate `PROMPT_PRELUDE` and `PROMPT_RECURRENT` scheduling boundaries |
 | `MixedPolicy` | If both recurrent queues have ready work, select generation rows first and fill with prompt spans; otherwise use split-prefill ordering |
 | `SpeculativePolicy` | Select CODA bootstrap, prompt work and local draft/verify rounds, with a prefill fairness bound |
 
@@ -771,8 +769,8 @@ transitions; receiving data does not mean decode has started.
 
 ## Progress and resource safety
 
-`StageEngine` applies per-request progress, then calls `Scheduler.enqueue()` for
-the next phase. In the async path, host progress can describe submitted work;
+`StageEngine` applies per-request progress, then calls `Scheduler.enqueue_work()`
+for the next `WorkKey`. In the async path, host progress can describe submitted work;
 CUDA events establish when the corresponding device state is ready. Queue
 membership alone is not completion evidence.
 
@@ -784,7 +782,8 @@ requests; memory-pressure selection has its own priority/footprint ranking.
 
 The preemption manager copies/restores device state. Its resume callback returns
 `None` for no snapshot, `False` for insufficient capacity, or the saved
-`RequestPhase` after restoration. Scheduler enqueues that phase. Preemption may
+`WorkKey` after restoration. Scheduler activates the request and enqueues that
+work. Preemption may
 synchronize and copy state; ordinary scheduling does not add a global barrier.
 
 Finishing removes queue entries, records the finish reason and requests KV
@@ -795,7 +794,7 @@ their own lifetimes beyond one CPU scheduling call.
 ## Code and regression entry points
 
 Start with `Scheduler.schedule()` and `create_scheduling_policy()`, then follow
-`take_phases()` and `_make_scheduled_request()`. Read `_admit()` and
+`take_works()` and `_make_scheduled_work()`. Read `_admit()` and
 `_plan_admission()` for capacity behavior. Progress application lives in
 `StageEngine._update()` and `_apply_split_prefill_progress()`, with separate
 asynchronous result handling in the same engine.
