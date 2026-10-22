@@ -4,7 +4,7 @@ The batch retains Request objects, whose identity rejects cancelled/reused IDs
 in this single-process runtime. Only delayed delivery needs depth/index snapshots.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from vllm_rlt.request import Request
 
@@ -21,14 +21,15 @@ class ExitSignal:
 class SpeculativeResult:
     token_ids: list[int]
     accepted_count: int
-    log_probs: list = field(default_factory=list)
 
 
 @dataclass(frozen=True, kw_only=True)
 class ModelRunnerOutput:
     gate_scores: list[float] | None = None
     token_ids: list[int] | None = None
-    log_probs: list | None = None
+    # CODA: FP32 logprob of each token_ids entry; None when no row asked. Rows that did
+    # not ask hold arbitrary values.
+    logprobs: list[float] | None = None
     completion: object = None
     depths: tuple[int, ...] = ()
     output_indices: tuple[int, ...] = ()

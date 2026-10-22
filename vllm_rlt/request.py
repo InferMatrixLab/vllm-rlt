@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from secrets import randbits
 
 import torch
 
@@ -43,6 +42,8 @@ class Request:
     phase: RequestPhase = RequestPhase.WAITING
     generated_token_ids: list[int] = field(default_factory=list)
     exit_depths: list[int] = field(default_factory=list)
+    # Aligned with generated_token_ids when sampling_params.logprobs is set, else None.
+    logprobs: list[float] | None = None
     # Scheduling advances before coda's CPU output delivery.
     num_output_placeholders: int = 0
     num_speculative_rounds: int = 0
@@ -69,11 +70,10 @@ class Request:
     finish_reason: FinishReason | None = None
     exit_trace: tuple[int, ...] = field(default=(), repr=False)
     weight_version: int = 0
-    log_probs: list[torch.Tensor] = field(default_factory=list, repr=False)
 
     def __post_init__(self):
-        if self.sampling_params.seed is None:
-            self.sampling_params = replace(self.sampling_params, seed=randbits(63))
+        if self.logprobs is None and self.sampling_params.logprobs is not None:
+            self.logprobs = []
 
     @staticmethod
     def prefill_boundaries(
@@ -211,8 +211,10 @@ class RequestOutput:
     finished: bool
     finish_reason: str | None = None
     text: str = ""
-    log_probs: list[float] | None = None
+    # Log-probability of each token_ids entry, conditional on its exit_depths entry.
+    logprobs: list[float] | None = None
     weight_version: int = 0
+    # Effective parameters, including the engine-chosen seed for seed=None.
     sampling_params: SamplingParams | None = None
 
     @classmethod
@@ -226,13 +228,7 @@ class RequestOutput:
             finish_reason=request.finish_reason.value
             if request.finish_reason is not None
             else None,
-            log_probs=(
-                torch.stack(request.log_probs[: len(request.generated_token_ids)]).tolist()
-                if request.generated_token_ids
-                else []
-            )
-            if request.sampling_params.logprobs is not None
-            else None,
+            logprobs=list(request.logprobs) if request.logprobs is not None else None,
             weight_version=request.weight_version,
             sampling_params=request.sampling_params,
         )

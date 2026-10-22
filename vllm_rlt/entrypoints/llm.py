@@ -30,6 +30,7 @@ class LLM:
         exit_config=None,
         execution_config=None,
         speculative_config=None,
+        logprobs_mode="raw_logprobs",
     ):
         self._tokenizer_source = None
         if isinstance(model, (LLMEngine, StageClient, PDEngine)):
@@ -55,6 +56,7 @@ class LLM:
             exit_config=exit_config,
             execution_config=execution_config,
             speculative_config=speculative_config,
+            logprobs_mode=logprobs_mode,
         )
         self._next_request_id = 0
 
@@ -91,10 +93,13 @@ class LLM:
                 for output in self.engine.step():
                     if output.finished:
                         if self.tokenizer is not None:
+                            # As in vLLM, the stop-terminating ID adds no text.
+                            stop = output.finish_reason == "stop"
                             output = replace(
                                 output,
                                 text=self.tokenizer.decode(
-                                    output.token_ids, skip_special_tokens=True
+                                    output.token_ids[:-1] if stop else output.token_ids,
+                                    skip_special_tokens=True,
                                 ),
                             )
                         results[output.request_id] = output

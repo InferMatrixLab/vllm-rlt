@@ -15,8 +15,9 @@ from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
-from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.sampling_params import SamplingParams, resolve_seed
 from vllm_rlt.worker.executor import Executor
+from vllm_rlt.worker.logprobs import check_logprobs_mode
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry
@@ -47,7 +48,9 @@ class StageEngine:
         speculative_config=None,
         stage_config=None,
         connector: StageConnector | None = None,
+        logprobs_mode="raw_logprobs",
     ):
+        check_logprobs_mode(logprobs_mode)
         self.model = model
         self._weight_version = 0
         self._update_version = None
@@ -192,6 +195,7 @@ class StageEngine:
             scheduler_config=scheduler_config,
             staged_prefill=self.scheduler.staged_prefill,
             rng=self.rng,
+            logprobs_mode=logprobs_mode,
         )
         self.speculative_runner = (
             SpeculativeRunner(
@@ -285,11 +289,10 @@ class StageEngine:
             raise RuntimeError("Generation admission is paused")
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
-        params = sampling_params or SamplingParams()
+        # Every output, including an abort before the first sample, reports this seed.
+        params = resolve_seed(sampling_params or SamplingParams())
         if self.async_speculative and params.temperature != 0:
             raise ValueError("async speculative decoding currently requires greedy sampling")
-        if self.async_speculative and params.logprobs is not None:
-            raise ValueError("async speculative decoding does not yet support logprobs")
         if request_id in self._retiring_speculative:
             self._retire_speculative(wait=True, request_id=request_id)
         config = self.model.config
@@ -298,15 +301,16 @@ class StageEngine:
         if any(type(t) is not int or not 0 <= t < config.vocab_size for t in prompt_token_ids):
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
         if any(t >= config.vocab_size for t in params.stop_token_ids):
-            raise ValueError("stop token IDs must be within the model vocabulary")
+            raise ValueError("stop_token_ids must be within the model vocabulary")
         max_loops = params.max_loops or config.total_ut_steps
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
-        params = replace(params, max_loops=max_loops, top_k=min(params.top_k, config.vocab_size))
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
             raise ValueError("speculative requests require fixed target depth and exit_threshold=1")
+        if self.speculative_config is not None and params.logprobs is not None:
+            raise ValueError("logprobs are not yet supported with speculative decoding")
         if trace_id is not None:
             if not isinstance(trace_id, str) or not trace_id:
                 raise ValueError("trace_id must be a nonempty string")

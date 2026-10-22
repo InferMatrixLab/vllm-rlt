@@ -22,8 +22,8 @@ from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.engine import PDEngine
 
 
-@pytest.mark.parametrize("asynchronous,speculative", [(False, False), (True, False), (False, True)])
-@pytest.mark.parametrize("mode", ["raw", "processed"])
+@pytest.mark.parametrize("asynchronous,speculative", [(False, False), (True, False)])
+@pytest.mark.parametrize("mode", ["raw_logprobs", "processed_logprobs"])
 @pytest.mark.parametrize("temperature", [0, 0.7])
 def test_selected_scores_match_dense_target_and_keep_tokens(
     asynchronous, speculative, mode, temperature
@@ -35,25 +35,20 @@ def test_selected_scores_match_dense_target_and_keep_tokens(
         execution_config=ExecutionConfig(async_scheduling=asynchronous),
         exit_config=ExitConfig("ouro_delayed" if asynchronous else "ouro"),
         speculative_config=SpeculativeConfig(2) if speculative else None,
-    )
-    params = SamplingParams(
-        max_tokens=7,
-        ignore_eos=True,
-        temperature=temperature,
-        logprobs=0,
         logprobs_mode=mode,
     )
+    params = SamplingParams(max_tokens=7, ignore_eos=True, temperature=temperature, logprobs=0)
     prompts = [[2, 3], [4, 5, 6]]
     try:
         outputs = llm.generate(prompts, params)
         ordinary = llm.generate(prompts, replace(params, logprobs=None))
         assert [o.token_ids for o in outputs] == [o.token_ids for o in ordinary]
         for prompt, output in zip(prompts, outputs):
-            assert len(output.log_probs) == len(output.token_ids) == 7
+            assert len(output.logprobs) == len(output.token_ids) == 7
             prefix = list(prompt)
-            for token, actual in zip(output.token_ids, output.log_probs):
+            for token, actual in zip(output.token_ids, output.logprobs):
                 logits = dense_reference(model, prefix, model.config.total_ut_steps)[-1][2][-1]
-                if mode == "processed" and temperature > 0:
+                if mode == "processed_logprobs" and temperature > 0:
                     logits = logits / temperature
                 expected = logits.float().log_softmax(-1)[token].item()
                 assert actual == pytest.approx(expected, abs=2e-5)
@@ -89,7 +84,7 @@ def test_full_publication_invalidates_prefix_and_preserves_parameter_addresses()
             torch.testing.assert_close(value, expected)
         output = llm.generate([[2, 3]], params)[0]
         assert output.weight_version == 3
-        assert output.sampling_params.max_loops == model.config.total_ut_steps
+        assert output.sampling_params == params
     finally:
         llm.close()
 
@@ -147,7 +142,7 @@ def test_publication_waits_for_requests_and_remote_transfer_leases():
         engine.close()
 
 
-@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("speculative", [False])
 def test_explicit_stop_applies_with_ignore_eos_and_scores_align(speculative):
     llm = LocalLLM(
         tiny_ouro_model(),
@@ -161,7 +156,7 @@ def test_explicit_stop_applies_with_ignore_eos_and_scores_align(speculative):
         stopped = llm.generate([[2, 3]], replace(params, stop_token_ids=(stop,)))[0]
         count = full.token_ids.index(stop) + 1
         assert stopped.token_ids == full.token_ids[:count]
-        assert stopped.log_probs == pytest.approx(full.log_probs[:count], abs=2e-5)
+        assert stopped.logprobs == pytest.approx(full.logprobs[:count], abs=2e-5)
         assert stopped.finish_reason == "stop"
     finally:
         llm.close()
@@ -205,7 +200,7 @@ def test_cpu_stage_clients_publish_to_all_pd_peers_and_recover_control_errors():
         llm = LLM(clients[0])
         output = llm.generate([[2, 3]], SamplingParams(max_tokens=2, logprobs=0))[0]
         assert output.weight_version == 2
-        assert len(output.log_probs) == len(output.token_ids)
+        assert len(output.logprobs) == len(output.token_ids)
     finally:
         for client in clients:
             client.close()
@@ -230,25 +225,13 @@ def test_mixed_score_admission_and_unspecified_seed_replay(asynchronous):
             ignore_eos=True,
         )
         outputs = llm.generate([[2, 3], [4, 5]], [replace(scored, logprobs=None), scored])
-        assert outputs[0].log_probs is None
-        assert len(outputs[1].log_probs) == 4
+        assert outputs[0].logprobs is None
+        assert len(outputs[1].logprobs) == 4
         effective = outputs[1].sampling_params
-        assert effective.top_k == model.config.vocab_size
+        assert effective == replace(scored, seed=effective.seed)
         assert 0 <= effective.seed < 2**63
         replay = llm.generate([[4, 5]], effective)[0]
         assert replay.token_ids == outputs[1].token_ids
-        assert replay.log_probs == pytest.approx(outputs[1].log_probs, abs=2e-5)
+        assert replay.logprobs == pytest.approx(outputs[1].logprobs, abs=2e-5)
     finally:
         llm.close()
-
-
-def test_async_speculative_logprob_rejected_before_any_request_or_transfer():
-    engine = StageEngine(tiny_ouro_model(), cache_config=CacheConfig(64, 2))
-    engine.async_speculative = True  # Admission only: no CUDA speculative runner is constructed.
-    try:
-        with pytest.raises(ValueError, match="logprobs"):
-            engine.add_request("unsupported", [1], SamplingParams(logprobs=0))
-        assert not engine.has_unfinished_requests()
-    finally:
-        engine.async_speculative = False
-        engine.close()

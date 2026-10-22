@@ -21,7 +21,8 @@ from vllm_rlt.models import prepare_model
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
-from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.sampling_params import SamplingParams, resolve_seed
+from vllm_rlt.worker.logprobs import check_logprobs_mode
 
 from .config import PDConfig
 from .connector import PDStageConnector
@@ -74,7 +75,9 @@ class PDEngine:
         seed=0,
         speculative_config=None,
         terminate_workers_on_failure: bool = True,
+        logprobs_mode="raw_logprobs",
     ):
+        check_logprobs_mode(logprobs_mode)
         self.speculative_config = speculative_config
         model, revision, self.model_config = prepare_model(
             model, revision=revision, model_config=model_config
@@ -150,6 +153,7 @@ class PDEngine:
                         speculative_config=speculative_config if role == "decode" else None,
                         execution_config=execution,
                         attention_backend=attention_backend,
+                        logprobs_mode=logprobs_mode,
                     )
                     self.peers[name] = Peer(name, role, client)
             deadline = time.monotonic() + self.config.startup_timeout
@@ -240,6 +244,8 @@ class PDEngine:
                 w.latest_output = output
                 w.request.generated_token_ids = list(output.token_ids)
                 w.request.exit_depths = list(output.exit_depths)
+                if output.logprobs is not None:
+                    w.request.logprobs = list(output.logprobs)
                 w.timings.setdefault("first_token", now)
                 self.outputs.append(output)
                 if output.finished:
@@ -289,7 +295,8 @@ class PDEngine:
             raise ValueError("request ID must be nonempty and unique among active requests")
         if len(self.transfers) >= self.config.max_pending_requests:
             raise ValueError("PD pending-request limit reached")
-        params = sampling_params or SamplingParams()
+        # P and D receive the same resolved params; only D samples.
+        params = resolve_seed(sampling_params or SamplingParams())
         cfg = self.model_config
         if self.speculative_config is not None:
             if (
@@ -299,8 +306,8 @@ class PDEngine:
                 raise ValueError(
                     "speculative requests require fixed target depth and exit_threshold=1"
                 )
-            if self._async_speculative and params.logprobs is not None:
-                raise ValueError("async speculative decoding does not yet support logprobs")
+            if params.logprobs is not None:
+                raise ValueError("logprobs are not yet supported with speculative decoding")
             if self._async_speculative and params.temperature != 0:
                 raise ValueError("async speculative decoding currently requires greedy sampling")
         if not prompt_token_ids or any(
@@ -308,11 +315,10 @@ class PDEngine:
         ):
             raise ValueError("prompt must contain valid model token IDs")
         if any(t >= cfg.vocab_size for t in params.stop_token_ids):
-            raise ValueError("stop token IDs must be within the model vocabulary")
+            raise ValueError("stop_token_ids must be within the model vocabulary")
         maximum = params.max_loops or cfg.total_ut_steps
         if maximum > cfg.total_ut_steps or params.min_loops > maximum:
             raise ValueError("requested loop bounds exceed model depth")
-        params = replace(params, max_loops=maximum, top_k=min(params.top_k, cfg.vocab_size))
         if len(prompt_token_ids) + params.max_tokens - 1 > cfg.max_position_embeddings:
             raise ValueError("prompt plus decode exceeds context capacity")
         if trace_id is not None and (not isinstance(trace_id, str) or not trace_id):

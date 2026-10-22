@@ -18,7 +18,6 @@ class SamplingParams:
     priority: int = 0
     # vLLM convention: 0 returns only the sampled token's log-probability.
     logprobs: int | None = None
-    logprobs_mode: str = "raw"
     # Stop after emitting any of these IDs, even with ignore_eos (vLLM semantics).
     stop_token_ids: tuple[int, ...] = ()
 
@@ -54,8 +53,6 @@ class SamplingParams:
                     "logprobs > 0 (top-k alternatives) is not supported yet; "
                     "use 0 for the sampled token's log-probability"
                 )
-        if self.logprobs_mode not in ("raw", "processed"):
-            raise ValueError("logprobs_mode must be raw or processed")
         if not isinstance(self.stop_token_ids, (list, tuple)) or any(
             type(token) is not int or token < 0 for token in self.stop_token_ids
         ):

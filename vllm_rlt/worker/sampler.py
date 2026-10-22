@@ -68,16 +68,6 @@ class Sampler:
         return Sampler.processed_logits(logits, params).softmax(-1)
 
     @staticmethod
-    def selected_logprob(
-        logits: torch.Tensor, token: int | torch.Tensor, params: SamplingParams
-    ) -> torch.Tensor:
-        """Score the selected token using the same filters as token sampling."""
-        if params.logprobs_mode == "processed" and params.temperature > 0:
-            return Sampler.probabilities(logits, params)[token].log()
-        # Integer speculative tokens otherwise retain a view of the vocabulary row.
-        return logits.float().log_softmax(-1)[token].clone()
-
-    @staticmethod
     def draw(probs: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
         """Draw one token from a normalized distribution as a 0-dim long tensor."""
         return torch.multinomial(probs, 1, generator=generator).squeeze(0)

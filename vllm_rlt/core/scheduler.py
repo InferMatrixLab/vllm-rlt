@@ -1190,9 +1190,20 @@ class Scheduler:
         maximum = request.sampling_params.max_loops or self.total_ut_steps
         return self.exit_mode != "trace" and request.loops_done + 1 < maximum
 
-    def _record_token(self, request: Request, token: int, depth: int) -> bool:
+    def _record_token(
+        self, request: Request, token: int, depth: int, logprob: float | None = None
+    ) -> bool:
+        """Record one sampled token; return whether it finished the request.
+
+        EOS stops unless ignore_eos; stop_token_ids stop even with ignore_eos, as
+        in vLLM. Either stop token stays in the output. Then max_tokens is LENGTH.
+        """
         request.generated_token_ids.append(token)
         request.exit_depths.append(depth)
+        if request.logprobs is not None:
+            if logprob is None:
+                raise RuntimeError("missing logprob for a request that asked for logprobs")
+            request.logprobs.append(logprob)
         params = request.sampling_params
         if token in params.stop_token_ids or (
             token in self.eos_token_ids and not params.ignore_eos
@@ -1296,9 +1307,8 @@ class Scheduler:
                         raise RuntimeError("invalid pending output count")
                     request.num_output_placeholders -= 1
                 depth = result.depths[row] if delivered else request.loops_done
-                if request.sampling_params.logprobs is not None:
-                    request.log_probs.append(result.log_probs[row])
-                if self._record_token(request, result.token_ids[row], depth):
+                logprob = result.logprobs[row] if result.logprobs is not None else None
+                if self._record_token(request, result.token_ids[row], depth, logprob):
                     update.finished.append(request)
                 elif not delivered:
                     self.enqueue(
@@ -1321,9 +1331,7 @@ class Scheduler:
                             "speculative GPU frontier disagrees with committed prefix"
                         )
                 emitted = 0
-                for index, token in enumerate(spec.token_ids):
-                    if request.sampling_params.logprobs is not None:
-                        request.log_probs.append(spec.log_probs[index])
+                for token in spec.token_ids:
                     emitted += 1
                     if self._record_token(request, token, self.speculative_config.target_loops):
                         update.finished.append(request)

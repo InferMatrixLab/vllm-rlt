@@ -27,6 +27,7 @@ from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Operation, Request, RequestPhase
 from vllm_rlt.worker.executor import build_execution_batch
+from vllm_rlt.worker.model_runner import ExecutionOutput
 
 TOTAL_DEPTHS = 4
 
@@ -587,7 +588,7 @@ def test_cuda_submit_readback_failure_releases_batch_input_buffers(monkeypatch):
 
     def execute_with_result(batch, prepared):
         original_execute(batch, prepared)
-        return torch.zeros(1, device=runner.device, dtype=torch.float32)
+        return ExecutionOutput(torch.zeros(1, device=runner.device, dtype=torch.float32))
 
     monkeypatch.setattr(runner, "_execute", execute_with_result)
 
