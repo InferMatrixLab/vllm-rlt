@@ -67,11 +67,11 @@ vLLM to be installed. See [Citation](#citation) for the paper's BibTeX entry.
 - **Ready-to-use interfaces:** Python API, CLI, and streaming OpenAI-compatible
   completions.
 
-**[v0.1.0 is experimental](https://github.com/ThinkFlowLab/vllm-rlt/releases/tag/v0.1.0).**
+**[v0.1.0 is experimental](https://github.com/InferMatrixLab/vllm-rlt/releases/tag/v0.1.0).**
 Start with synchronous execution. Async execution with preemption can produce
-incorrect outputs ([#109](https://github.com/ThinkFlowLab/vllm-rlt/pull/109));
+incorrect outputs ([#109](https://github.com/InferMatrixLab/vllm-rlt/pull/109));
 async self-speculation has unresolved worker-failure and cleanup issues
-([#115](https://github.com/ThinkFlowLab/vllm-rlt/pull/115)). See the release notes
+([#115](https://github.com/InferMatrixLab/vllm-rlt/pull/115)). See the release notes
 for supported combinations and limitations.
 
 ## Features
@@ -113,7 +113,7 @@ supported combinations.
 
 Shared implementation does not qualify every checkpoint/feature combination;
 see the linked guides for validation scope and limitations. See
-[RFC #69](https://github.com/ThinkFlowLab/vllm-rlt/issues/69) for the broader roadmap.
+[RFC #69](https://github.com/InferMatrixLab/vllm-rlt/issues/69) for the broader roadmap.
 
 Huginn uses native checkpoint loading and depth-aware KV for its recurrent
 core, with separate prelude and coda KV. It supports synchronous fixed-depth
@@ -234,15 +234,15 @@ failures; configuration, provenance and metric definitions are in the
 [detailed report](docs/unified_execution.md#measured-serving-performance).
 
 Earlier measurements remain available in
-[PR #30](https://github.com/hsliuustc0106/vllm-rlt/pull/30) and
-[PR #31](https://github.com/hsliuustc0106/vllm-rlt/pull/31); their workloads and timing
+[PR #30](https://github.com/InferMatrixLab/vllm-rlt/pull/30) and
+[PR #31](https://github.com/InferMatrixLab/vllm-rlt/pull/31); their workloads and timing
 boundaries differ from this campaign. See the [GSM8K evaluation guide](docs/accuracy.md)
 for task-quality evaluation.
 
 ## Roadmap
 
 We are refactoring module boundaries and state ownership while preserving
-loop-level scheduling and KV semantics. See [RFC #32](https://github.com/hsliuustc0106/vllm-rlt/issues/32)
+loop-level scheduling and KV semantics. See [RFC #32](https://github.com/InferMatrixLab/vllm-rlt/issues/32)
 for the target architecture, module breakdown, and implementation sequence.
 
 <a id="contributing"></a>
@@ -258,7 +258,7 @@ A reproducible bug report, a carefully measured experiment, or a clearer example
 can be just as useful as a runtime optimization.
 
 - 🛠️ **Improve the engine.** Work on loop-level scheduling, attention, KV caching,
-  or prefill/decode disaggregation. The [architecture RFC and refactoring roadmap](https://github.com/hsliuustc0106/vllm-rlt/issues/32)
+  or prefill/decode disaggregation. The [architecture RFC and refactoring roadmap](https://github.com/InferMatrixLab/vllm-rlt/issues/32)
   describe the current priorities and module boundaries.
 - 📊 **Bring evidence.** Test your workloads and hardware, investigate numerical
   differences, or contribute reproducible benchmarks. Include your configuration
@@ -266,8 +266,8 @@ can be just as useful as a runtime optimization.
 - 📖 **Make it easier to use.** Improve installation instructions, explain a
   runtime behavior, or turn a working example into a guide for the next user.
 
-**Have an idea or found a problem?** [Open an issue](https://github.com/hsliuustc0106/vllm-rlt/issues/new)
-with the details, or [send a pull request](https://github.com/hsliuustc0106/vllm-rlt/compare).
+**Have an idea or found a problem?** [Open an issue](https://github.com/InferMatrixLab/vllm-rlt/issues/new)
+with the details, or [send a pull request](https://github.com/InferMatrixLab/vllm-rlt/compare).
 For larger changes, start a discussion in an issue so we can work through the
 design together. If you are new to the codebase, tell us what interests you—we
 can help identify a useful starting point.

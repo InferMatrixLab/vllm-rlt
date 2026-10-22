@@ -122,10 +122,12 @@ Registering a request and completing its generation are separate events.
 
 **Engine and scheduler.** StageEngine calls Scheduler to select work. Scheduler
 owns its local Request registry, phase queues and policy, checks admission/KV
-capacity and returns selected operations, token ranges and depths. It does not
-invoke ModelRunner. StageEngine submits the returned batch, retains tickets,
-handles required results and applies progress, including requeueing and stop or
-retirement decisions. The engine drives this cycle even when the caller is not
+capacity, returns selected operations, token ranges and depths, and applies
+per-request progress, exit and termination decisions through
+`update_from_output()` and `update_after_submission()`. It does not invoke
+ModelRunner. StageEngine submits the returned batch, retains tickets, collects
+required `ModelRunnerOutput` results and coordinates runner/connector side
+effects and retirement. The engine drives this cycle even when the caller is not
 polling outputs.
 
 **Executor and runners.** Engine calls `Executor.submit(batch)`. Executor binds
@@ -148,7 +150,7 @@ and optional stream overlap remain execution choices behind this interface.
 | --- | --- |
 | Worker process, channel and host-side ID mappings | StageClient; connected workers are coordinated by the deployment host |
 | Loaded model and local service loop | StageWorker; the engine and runners reference the same loaded model |
-| Request registry, phase queues and selection policy | Scheduler; StageEngine coordinates lifecycle and progress |
+| Request registry, phase queues and selection policy | Scheduler; StageEngine coordinates lifecycle, pending tickets and runner/connector side effects |
 | KV pages, mappings, validity and references/pins | KVCacheManager, shared by local scheduling and execution |
 | RNG registry and pending results | StageEngine; runners use the shared RNG, and tickets retain their result storage |
 | Input buffers, GPU events and readback storage | Runner/controller owners, retained until consumers finish |

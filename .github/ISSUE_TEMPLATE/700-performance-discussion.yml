@@ -7,7 +7,7 @@ body:
 - type: markdown
   attributes:
     value: >
-      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+).
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/InferMatrixLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+).
 - type: textarea
   attributes:
     label: Proposal to improve performance
@@ -19,7 +19,7 @@ body:
   attributes:
     label: Report of performance regression
     description: >
-      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark scripts at https://github.com/ThinkFlowLab/vllm-rlt/tree/main/benchmarks .
+      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark scripts at https://github.com/InferMatrixLab/vllm-rlt/tree/main/benchmarks .
   validations:
     required: false
 - type: textarea
@@ -54,5 +54,5 @@ body:
   attributes:
     label: Before submitting a new issue...
     options:
-      - label: Make sure you already searched for relevant issues in the [issue tracker](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+), and looked for the answer in the [documentation](https://github.com/ThinkFlowLab/vllm-rlt/tree/main/docs).
+      - label: Make sure you already searched for relevant issues in the [issue tracker](https://github.com/InferMatrixLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+), and looked for the answer in the [documentation](https://github.com/InferMatrixLab/vllm-rlt/tree/main/docs).
         required: true

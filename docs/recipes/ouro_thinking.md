@@ -3,8 +3,8 @@
 One native Ouro backend serves both checkpoint sizes. This recipe targets BF16,
 fixed four-loop, synchronous eager inference with LAST_EXITED KV. It adds no chat
 endpoint, structured reasoning parser, alternate precision profile or PD path.
-See [RFC #69](https://github.com/ThinkFlowLab/vllm-rlt/issues/69) for model scope
-and [RFC #32](https://github.com/ThinkFlowLab/vllm-rlt/issues/32) for ownership:
+See [RFC #69](https://github.com/InferMatrixLab/vllm-rlt/issues/69) for model scope
+and [RFC #32](https://github.com/InferMatrixLab/vllm-rlt/issues/32) for ownership:
 message preparation belongs to M1; model, sampling and attention remain unchanged.
 
 ## 1. Prepare an environment and checkpoint
@@ -226,8 +226,8 @@ establish Base checkpoint quality or performance.
 Adaptive exit, CUDA Graphs, asynchronous execution, PD, speculation and
 alternative backend/layout combinations require their own checkpoint-specific
 validation. Shared runtime features in
-[PR #30](https://github.com/ThinkFlowLab/vllm-rlt/pull/30) and
-[PR #31](https://github.com/ThinkFlowLab/vllm-rlt/pull/31) retain their own
-validation scope; [RFC #43](https://github.com/ThinkFlowLab/vllm-rlt/issues/43)
+[PR #30](https://github.com/InferMatrixLab/vllm-rlt/pull/30) and
+[PR #31](https://github.com/InferMatrixLab/vllm-rlt/pull/31) retain their own
+validation scope; [RFC #43](https://github.com/InferMatrixLab/vllm-rlt/issues/43)
 tracks speculative decoding separately. Shared implementation does not imply
 that every combination has been validated on both Thinking checkpoints.

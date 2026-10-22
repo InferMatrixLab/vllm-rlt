@@ -240,7 +240,7 @@ def test_two_round_kv_matches_serial_replay_at_every_depth(dtype):
     request = bootstrap_speculation(e)
     e.step()
     e.step()
-    results = [ticket.collect()[0][0] for ticket in e._pending_speculative]
+    results = [ticket.collect().speculative[0] for ticket in e._pending_speculative]
     tokens = request.prompt_token_ids + request.generated_token_ids
     tokens += [token for result in results for token in result.token_ids]
     # Last emitted token has not been forwarded; all earlier tokens have KV.
@@ -318,9 +318,7 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     # Simulate retirement, then shrink both dimensions using the same storage.
     buffer.leased = False
     before = buffer.host_tables.clone()
-    smaller = SchedulerOutput(
-        [ScheduledRequest(requests[0], WorkKey.SPECULATIVE, 0, 1)]
-    )
+    smaller = SchedulerOutput([ScheduledRequest(requests[0], WorkKey.SPECULATIVE, 0, 1)])
     _, _, host, device = runner._prepare_round(smaller)
     assert host.shape == device.shape == (1, 4, 1)
     assert host.is_contiguous() and device.is_contiguous()

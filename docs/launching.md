@@ -28,7 +28,7 @@ Keep this environment active for the following steps.
 ## 3. Clone the repository
 
 ```bash
-git clone https://github.com/hsliuustc0106/vllm-rlt.git
+git clone https://github.com/InferMatrixLab/vllm-rlt.git
 cd vllm-rlt
 ```
 

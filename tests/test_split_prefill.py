@@ -640,7 +640,7 @@ def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
             break
         assert len(batch.requests) == 1
         scheduled_request = batch.requests[0]
-        progress = e._apply_split_prefill_progress(
+        progress = e.scheduler._apply_split_prefill_progress(
             request, scheduled_request.work, scheduled_request
         )
         trace.append(
@@ -1327,9 +1327,7 @@ def test_split_prefill_reports_no_depth_work_before_the_prelude():
     e.scheduler._admit()
     request = e.scheduler.requests["a"]
 
-    scheduled_request = e.scheduler._make_scheduled_work(
-        request, WorkKey.PROMPT_RECURRENT, 4
-    )
+    scheduled_request = e.scheduler._make_scheduled_work(request, WorkKey.PROMPT_RECURRENT, 4)
     assert scheduled_request.token_count == 0
     assert request.num_prefilled_tokens == 0
 
@@ -1403,9 +1401,7 @@ def test_split_prefill_stages_after_a_reused_prompt_prefix():
     request.num_prefilled_tokens = 2
     request.num_preluded_tokens = 2
     assert e.scheduler._prelude_window_open(request)
-    scheduled_request = e.scheduler._make_scheduled_work(
-        request, WorkKey.PROMPT_PRELUDE, 4
-    )
+    scheduled_request = e.scheduler._make_scheduled_work(request, WorkKey.PROMPT_PRELUDE, 4)
     assert (scheduled_request.token_start, scheduled_request.token_count) == (2, 2)
     assert request.prefill_depth(scheduled_request.token_start) == 0
 

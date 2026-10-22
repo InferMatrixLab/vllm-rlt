@@ -19,6 +19,7 @@ from vllm_rlt.worker.buffers import (
 )
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
+from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import StagedInputTensor, TensorTransfer, UvaBuffer, pinned_tensor
@@ -108,11 +109,13 @@ class Submission:
     batch: SchedulerOutput | None
     values: torch.Tensor | None
     event: object = None
-    cached: list | None = None
+    cached: ModelRunnerOutput | None = None
     slot: ReadbackSlot | None = None
     device_values: torch.Tensor | None = None
     depths: tuple[int, ...] = ()
+    positions: tuple[int, ...] = ()
     output_indices: tuple[int, ...] = ()
+    operation: Operation | None = None
 
     def __del__(self):
         if self.slot is not None:
@@ -125,17 +128,25 @@ class Submission:
     def ready(self):
         return self.event is None or self.event.query()
 
-    def collect(self):
+    def collect(self) -> ModelRunnerOutput:
         if self.cached is not None:
             return self.cached
         if self.event is not None:
             self.event.synchronize()
-        if self.cached is None and self.values is not None:
-            self.cached = self.values.tolist()
-            self.values = None
-            if self.slot is not None:
-                self.slot.leased = False
-                self.slot = None
+        values = self.values.tolist() if self.values is not None else None
+        is_coda = self.operation == Operation.CODA
+        is_recurrent = self.operation == Operation.RECURRENT
+        self.cached = ModelRunnerOutput(
+            gate_scores=values if is_recurrent else None,
+            token_ids=values if is_coda else None,
+            completion=self.event,
+            depths=self.depths,
+            output_indices=self.output_indices,
+        )
+        self.values = None
+        if self.slot is not None:
+            self.slot.leased = False
+            self.slot = None
         return self.cached
 
 
@@ -1238,7 +1249,9 @@ class ModelRunner:
                 slot=slot,
                 device_values=device_values,
                 depths=prepared.depths,
+                positions=prepared.positions,
                 output_indices=prepared.output_indices,
+                operation=batch.operation,
             )
         except Exception:
             self._synchronize_submission(stream, prepared)

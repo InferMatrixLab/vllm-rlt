@@ -268,7 +268,7 @@ def test_prepared_batch_survives_progress_changes_and_contains_no_policy_label()
     # The prepared batch owns its addresses and routing; later request progress cannot
     # retarget the submitted operation, even for mixed multi-row state bindings.
     actual = engine.model_runner._execute(batch, prepared)
-    torch.testing.assert_close(actual, torch.tensor(expected))
+    torch.testing.assert_close(actual, torch.tensor(expected.gate_scores))
     assert not hasattr(prepared.batch, "stage")
     for left, right in zip(prepared.batch.spans, build_execution_batch(reference_batch, 4).spans):
         for layer in range(engine.model.config.num_hidden_layers):
@@ -376,7 +376,9 @@ def test_input_operation_mixes_host_tokens_and_device_sample_without_stage():
             tokens.append(17)
     batch = ExecutionBatch(Operation.PRELUDE, tuple(spans))
     expected = engine.model.prelude(torch.tensor(tokens))
-    assert engine.model_runner.submit(batch=batch).collect() is None
+    ticket = engine.model_runner.submit(batch=batch)
+    assert not ticket.has_result
+    assert ticket.collect().gate_scores is None and ticket.collect().token_ids is None
     rows = []
     for span in batch.spans:
         if span.chunk_start is None:

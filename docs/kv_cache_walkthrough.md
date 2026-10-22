@@ -9,8 +9,8 @@ Transfer completion, request progress and GPU completion are also distinct.
 | Component | Owns or performs |
 | --- | --- |
 | `KVCacheManager` | Physical pages and tensors, allocation identities, references, prefix entries, transfer pins, written positions, KV write/attention/finalize operations |
-| `Scheduler` | Admission budgets and capacity checks for selected token frontiers |
-| `StageEngine` | Request lifecycle, logical progress and coordination of resource retirement |
+| `Scheduler` | Admission budgets, capacity checks and logical progress for selected token frontiers |
+| `StageEngine` | Request lifecycle, pending tickets and coordination of resource retirement |
 | `MetadataBuilder` | Resolve validated allocation mappings into host layouts or borrow device-owned descriptors |
 | Runner and buffer owners | Materialize metadata tensors, stage transfers, select streams and retain buffers until consumers finish |
 | Connector | Transport state and remote-access lifetime; ask the engine to reserve/import/release resources |

@@ -1,6 +1,6 @@
 # PyTorch profiling
 
-Profiling is disabled by default. Collection options are independent and use PyTorch Profiler. Each rank exports its own trace. A background thread parses the completed files, creates a verified `.tar.gz` archive, and removes the standalone raw files. This implements the core interface proposed in [RFC #71](https://github.com/ThinkFlowLab/vllm-rlt/issues/71).
+Profiling is disabled by default. Collection options are independent and use PyTorch Profiler. Each rank exports its own trace. A background thread parses the completed files, creates a verified `.tar.gz` archive, and removes the standalone raw files. This implements the core interface proposed in [RFC #71](https://github.com/InferMatrixLab/vllm-rlt/issues/71).
 
 ## Offline CLI
 

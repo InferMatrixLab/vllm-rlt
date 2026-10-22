@@ -194,7 +194,7 @@ preserves the target distribution in exact arithmetic, not identical text for
 the same seed. BF16 batch shapes can introduce numerical differences.
 
 The same flags work with the single-device server. A streaming event may contain
-multiple committed tokens. See [RFC #43](https://github.com/ThinkFlowLab/vllm-rlt/issues/43)
+multiple committed tokens. See [RFC #43](https://github.com/InferMatrixLab/vllm-rlt/issues/43)
 for the design.
 
 ## SHARED prefill semantics

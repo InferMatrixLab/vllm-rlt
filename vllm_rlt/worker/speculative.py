@@ -1,7 +1,7 @@
 """Submitted block self-speculation with depth-specific KV/activation reuse.
 
 Temporary tensors belong to a submission until collection. Requests expose only committed
-outputs; the engine applies returned tokens and owns KV commit/truncation.
+outputs; Scheduler applies returned tokens and KV commits; Engine coordinates cleanup.
 """
 
 from contextlib import nullcontext
@@ -14,16 +14,10 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
+from vllm_rlt.worker.output import ModelRunnerOutput, SpeculativeResult
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import SubmissionQueue
 from vllm_rlt.worker.tensors import StagedInputTensor
-
-
-@dataclass(frozen=True)
-class SpeculativeResult:
-    token_ids: list[int]
-    accepted_count: int
-    draft_count: int
 
 
 @dataclass
@@ -77,7 +71,7 @@ class SpeculativeSubmission:
     drafted: list
     proposals: list
     event: object = None
-    cached: list[SpeculativeResult] | None = None
+    cached: ModelRunnerOutput | None = None
 
     @property
     def has_result(self):
@@ -86,13 +80,16 @@ class SpeculativeSubmission:
     def ready(self):
         return self.event is None or self.event.query()
 
-    def collect(self):
+    def collect(self) -> ModelRunnerOutput:
         if self.cached is None:
             if self.event is not None:
                 self.event.synchronize()
             stream = self.runner.compute_stream
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
-                self.cached = self.runner._collect_round(self)
+                self.cached = ModelRunnerOutput(
+                    speculative=self.runner._collect_round(self),
+                    completion=self.event,
+                )
             self.logits = None
             self.drafted.clear()
             self.proposals.clear()
@@ -293,7 +290,7 @@ class SpeculativeRunner:
                     candidates[i], targets[start : start + scheduled_request.token_count]
                 )
                 start += scheduled_request.token_count
-                results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
+                results.append(SpeculativeResult(tokens, accepted))
                 continue
             start += scheduled_request.token_count
             # Sampling keeps sequential rejection; RNG consumption order is unchanged.
@@ -316,5 +313,5 @@ class SpeculativeRunner:
                     self._acquire_generator(request, rows[-1]),
                 )
                 tokens.append(int(token.item()))
-            results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
+            results.append(SpeculativeResult(tokens, accepted))
         return results

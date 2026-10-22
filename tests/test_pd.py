@@ -362,16 +362,19 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from vllm_rlt.core.scheduler import Scheduler
+    from vllm_rlt.core.execution import WorkKey
+    from vllm_rlt.core.scheduler import ScheduledRequest, Scheduler, SchedulerOutput
     from vllm_rlt.engine.preemption import PreemptionManager
     from vllm_rlt.request import Request, RequestStatus
+    from vllm_rlt.worker.output import ModelRunnerOutput
 
     engine = object.__new__(LLMEngine)
     engine.async_speculative = False
+    engine.speculative_runner = None
     engine.profiling = Profiler("cpu")
     engine.preemption = PreemptionManager(engine)
     engine.execution_config = ExecutionConfig(async_scheduling=async_scheduling)
-    engine.scheduler = Scheduler(SchedulerConfig(), Mock())
+    engine.scheduler = Scheduler(SchedulerConfig(), Mock(), eos_token_id=2)
     engine.cache_manager = engine.scheduler.cache_manager
     receiving = Request("remote", [1], SamplingParams(max_tokens=1), status=RequestStatus.RECEIVING)
     engine.scheduler.requests[receiving.request_id] = receiving
@@ -396,11 +399,11 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
         active.num_output_placeholders = 1
         engine.model = SimpleNamespace(config=SimpleNamespace(eos_token_id=2))
         ticket = Mock()
-        ticket.batch.requests = [SimpleNamespace(request=active)]
+        ticket.batch = SchedulerOutput([ScheduledRequest(active, WorkKey.DECODE_CODA)])
         ticket.ready.return_value = True
-        ticket.collect.return_value = [3]
-        ticket.output_indices = [0]
-        ticket.depths = [4]
+        ticket.collect.return_value = ModelRunnerOutput(
+            token_ids=[3], output_indices=(0,), depths=(4,)
+        )
         engine._pending_coda = [ticket]
         outputs = engine.step()
         assert len(outputs) == 1 and outputs[0].finished

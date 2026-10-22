@@ -7,7 +7,7 @@ Historical results retain their original dtype, bounds and limitations.
 ## Inference precision
 
 Follow the pinned Ouro release, distinguishing storage/output dtype from
-accumulation precision. The [source notes](https://github.com/hsliuustc0106/vllm-rlt/blob/0f091a985e13a207f4fa127a08d51a625d130ef5/docs/paper-notes.md#original-ouro-paper-and-precision-guidance)
+accumulation precision. The [source notes](https://github.com/InferMatrixLab/vllm-rlt/blob/0f091a985e13a207f4fa127a08d51a625d130ef5/docs/paper-notes.md#original-ouro-paper-and-precision-guidance)
 identify author guidance and project differences.
 
 | Operation | Precision requirement |
@@ -35,4 +35,4 @@ Passing FP32 or matching a few generated tokens does not qualify BF16 generally.
 Match dtype, hardware, workload and timed work across performance comparisons.
 Report preparation separately, retain raw observations and variability, and keep
 profiling outside throughput timing. Frozen milestone-specific budgets and
-thresholds belong to their [historical records](https://github.com/hsliuustc0106/vllm-rlt/releases/tag/implementation-notes-archive-20260913).
+thresholds belong to their [historical records](https://github.com/InferMatrixLab/vllm-rlt/releases/tag/implementation-notes-archive-20260913).

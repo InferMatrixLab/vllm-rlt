@@ -133,8 +133,10 @@ GPU dependencies or authorize early resource reuse.
 
 ### F — Apply progress: what should each request do next?
 
-StageEngine applies progress and result-dependent decisions per Request, then
-calls `Scheduler.enqueue_work()` for its next `WorkKey`. The four labels show common
+`Scheduler` applies progress and result-dependent decisions per `Request` using
+the selected `WorkKey` (`update_from_output()` or `update_after_submission()`),
+then enqueues its next work. `StageEngine` applies side effects such as connector
+notifications, runner finalization, and retirement. The four labels show common
 continuations: another loop, another prompt chunk, the next generated token, or
 CODA after recurrence exits. The blue return arrow leads back to B, not A:
 continuing requests keep their admitted resources.
@@ -553,7 +555,7 @@ The four numbered steps are actions with explicit owners:
 | 01 | Scheduling policy chooses ready, compatible work | Prompt and decode recurrent queues in this example |
 | 02 | Scheduler selects token ranges/depths under readiness and resource limits | `SchedulerOutput` with per-request snapshots |
 | 03 | Executor/runner prepares and executes the selected batch | Result storage and completion events |
-| 04 | StageEngine applies progress and calls `Scheduler.enqueue_work()` | Updated requests in their next work queues; return to 01 |
+| 04 | Scheduler applies progress (`update_from_output` / `update_after_submission`) and enqueues next work; StageEngine handles tickets, connector hooks and retirement | Updated requests in their next work queues; return to 01 |
 
 Steps 01 and 02 are parts of one scheduling call, not separate runtime stages.
 Policy chooses which queues to consider; batch construction checks individual
@@ -592,7 +594,7 @@ must have a ready causal prefix at its selected depth; mixing does not make
 arbitrary prompt positions runnable. Each selected span has one depth, but
 other spans in the batch can have different depths.
 
-After execution, `StageEngine` advances each request independently. A's prefill
+After execution, `Scheduler` advances each request independently. A's prefill
 frontier advances; B and C continue recurrence or enter CODA according to their
 exit decisions. The scheduler can then form a different batch. Prompt tokens
 still traverse the full model depth; mixing does not apply decode early exit to
@@ -606,10 +608,10 @@ verification rows.
 
 | Component | Responsibility | Code |
 | --- | --- | --- |
-| `Scheduler` | Request registry, waiting/work queues, admission slots, capacity checks, batch selection and queue transitions | [scheduler.py](../vllm_rlt/core/scheduler.py) |
+| `Scheduler` | Request registry, waiting/work queues, admission slots, capacity checks, batch selection, logical progress, exit decisions and queue transitions | [scheduler.py](../vllm_rlt/core/scheduler.py) |
 | `SchedulingPolicy` implementations | Choose when to admit and which ready `WorkKey` or compatible work groups to select; track fairness/cohort state | [scheduling_policy.py](../vllm_rlt/core/scheduling_policy.py) |
-| `StageEngine` | Drive scheduling/submission, apply logical progress and output decisions, coordinate retirement | [stage_engine.py](../vllm_rlt/engine/stage_engine.py) |
-| `Executor` and runners | Bind selected work, prepare tensors, submit model computation and expose results/events | [executor.py](../vllm_rlt/worker/executor.py) |
+| `StageEngine` | Drive scheduling/submission, retain pending tickets, apply connector/runner side effects and coordinate retirement | [stage_engine.py](../vllm_rlt/engine/stage_engine.py) |
+| `Executor` and runners | Bind selected work, prepare tensors, submit model computation and expose `ModelRunnerOutput` / events | [executor.py](../vllm_rlt/worker/executor.py) |
 | `KVCacheManager` | Allocate/grow pages, track validity and protect borrowed allocations | [kv_cache_manager.py](../vllm_rlt/core/kv_cache_manager.py) |
 | Connector | Report transport readiness and manage transfers; never choose loop progress or mutate scheduler queues | [connector.py](../vllm_rlt/engine/connector.py) |
 
@@ -632,7 +634,8 @@ StageEngine.step
         → readiness check → range snapshot → KV capacity check
         → SchedulerOutput
   → Executor.submit
-  → StageEngine applies progress/results and enqueues the next WorkKey
+  → Scheduler.update_from_output / update_after_submission applies per-WorkKey progress
+  → StageEngine applies runner/connector side effects and retirement
 ```
 
 This is a logical chain, not a requirement to block after every submission.
@@ -769,10 +772,12 @@ transitions; receiving data does not mean decode has started.
 
 ## Progress and resource safety
 
-`StageEngine` applies per-request progress, then calls `Scheduler.enqueue_work()`
-for the next `WorkKey`. In the async path, host progress can describe submitted work;
-CUDA events establish when the corresponding device state is ready. Queue
-membership alone is not completion evidence.
+`Scheduler` applies per-request progress and enqueues the next `WorkKey` through
+`update_from_output()` / `update_after_submission()`; `StageEngine` applies the
+side effects (connector notifications, runner finalization and retirement). In
+the async path, host progress can describe submitted work; CUDA events establish
+when the corresponding device state is ready. Queue membership alone is not
+completion evidence.
 
 If B needs more KV after A has already been selected, preemption must not evict
 A. The local selected set is passed as an exclusion set to victim selection.
@@ -796,8 +801,9 @@ their own lifetimes beyond one CPU scheduling call.
 Start with `Scheduler.schedule()` and `create_scheduling_policy()`, then follow
 `take_works()` and `_make_scheduled_work()`. Read `_admit()` and
 `_plan_admission()` for capacity behavior. Progress application lives in
-`StageEngine._update()` and `_apply_split_prefill_progress()`, with separate
-asynchronous result handling in the same engine.
+`Scheduler.update_from_output()`, `Scheduler.update_after_submission()`, and
+`Scheduler._apply_split_prefill_progress()`, coordinated by `StageEngine._update()`
+and `StageEngine._apply_update()`.
 
 Relevant regressions are [scheduler selection](../tests/test_scheduler_selection.py),
 [split prefill and mixed execution](../tests/test_split_prefill.py),

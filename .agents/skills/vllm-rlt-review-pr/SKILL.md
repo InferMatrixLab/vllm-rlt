@@ -1,6 +1,6 @@
 ---
 name: vllm-rlt-review-pr
-description: "Review PRs and local changes for hsliuustc0106/vllm-rlt: Ouro engine and KV correctness, serving behavior, and BF16 accuracy/speed evidence. Use for maintainer reviews, repeat reviews, and author self-reviews of this project; not for vLLM-Omni or unrelated repositories."
+description: "Review PRs and local changes for InferMatrixLab/vllm-rlt: Ouro engine and KV correctness, serving behavior, and BF16 accuracy/speed evidence. Use for maintainer reviews, repeat reviews, and author self-reviews of this project; not for vLLM-Omni or unrelated repositories."
 ---
 
 # Review vllm-rlt changes
@@ -64,7 +64,7 @@ Contributor entry point: [CONTRIBUTING.md](../../../CONTRIBUTING.md).
 ## Freeze the review
 
 - Verify the repository/remotes and applicable AGENTS.md. The project is
-  `hsliuustc0106/vllm-rlt`; accept its verified forks. Do not inherit vLLM-Omni's
+  `InferMatrixLab/vllm-rlt`; accept its verified forks. Do not inherit vLLM-Omni's
   architecture, reviewers, test requirements or milestone gates.
 - For a PR, record base/head SHAs, merge base, state, description, full diff,
   relevant review threads and checks. Read code from the frozen head, not a
