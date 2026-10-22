@@ -190,6 +190,7 @@ class StageEngine:
                 rng=self.rng,
                 runtime=self.model_runner.runtime,
                 compute_stream=self.model_runner.core_stream,
+                logprobs_mode=logprobs_mode,
             )
             if speculative_config is not None and not self.async_speculative
             else None
@@ -207,6 +208,7 @@ class StageEngine:
                 copy_stream=self.model_runner.copy_stream,
                 rng=self.rng,
                 runtime=self.model_runner.runtime,
+                logprobs_mode=logprobs_mode,
             )
         self.executor = Executor(self.model_runner, speculation=self.speculative_runner)
         self._pending_speculative = []
@@ -291,8 +293,6 @@ class StageEngine:
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
             raise ValueError("speculative requests require fixed target depth and exit_threshold=1")
-        if self.speculative_config is not None and params.logprobs is not None:
-            raise ValueError("logprobs are not yet supported with speculative decoding")
         if trace_id is not None:
             if not isinstance(trace_id, str) or not trace_id:
                 raise ValueError("trace_id must be a nonempty string")

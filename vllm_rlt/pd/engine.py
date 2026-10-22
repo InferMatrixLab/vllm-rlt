@@ -287,8 +287,6 @@ class PDEngine:
                 raise ValueError(
                     "speculative requests require fixed target depth and exit_threshold=1"
                 )
-            if params.logprobs is not None:
-                raise ValueError("logprobs are not yet supported with speculative decoding")
             if self._async_speculative and params.temperature != 0:
                 raise ValueError("async speculative decoding currently requires greedy sampling")
         if not prompt_token_ids or any(

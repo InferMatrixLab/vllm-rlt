@@ -10,7 +10,7 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Operation, Request
 from vllm_rlt.worker.executor import ForwardBatch
 from vllm_rlt.worker.output import ModelRunnerOutput, SpeculativeResult
-from vllm_rlt.worker.sampler import RngRegistry
+from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.speculative import SpeculativeRunner
 
 
@@ -37,6 +37,11 @@ class SpeculativeRoundBuffer:
         size = scheduler.max_num_batched_tokens + 2 * scheduler.max_num_seqs
         self.host_result = torch.empty(size, dtype=torch.int64, pin_memory=True)
         self.result = torch.empty(size, dtype=torch.int64, device=cache.device)
+        # FP32 target logprob of each verification row's argmax, copied only for
+        # rounds with a request that asked for logprobs.
+        rows = scheduler.max_num_batched_tokens
+        self.host_logprobs = torch.empty(rows, dtype=torch.float32, pin_memory=True)
+        self.logprobs = torch.empty(rows, dtype=torch.float32, device=cache.device)
         self.leased = False
         self.copy_done: torch.cuda.Event | None = None
         self.compute_done: torch.cuda.Event | None = None
@@ -50,6 +55,7 @@ class SpeculativeRoundTicket:
     states: tuple[SpeculativeRequestState, ...]
     rounds: tuple[int, ...]
     rows: int
+    logprobs_copied: bool = False
     cached: ModelRunnerOutput | None = None
     retired: bool = False
 
@@ -69,13 +75,19 @@ class SpeculativeRoundTicket:
             self.buffer.copy_done.synchronize()
             b = len(self.batch.requests)
             values = self.buffer.host_result[: self.rows + 2 * b].tolist()
+            scores = (
+                self.buffer.host_logprobs[: self.rows].tolist() if self.logprobs_copied else None
+            )
             results, start = [], 0
             for i, scheduled_request in enumerate(self.batch.requests):
                 accepted = values[self.rows + i]
+                params = scheduled_request.request.sampling_params
+                wants = scores is not None and params.logprobs is not None
                 results.append(
                     SpeculativeResult(
                         values[start : start + accepted + 1],
                         accepted,
+                        scores[start : start + accepted + 1] if wants else None,
                     )
                 )
                 start += scheduled_request.token_count
@@ -117,8 +129,19 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         copy_stream,
         rng: RngRegistry | None = None,
         runtime=None,
+        logprobs_mode="raw_logprobs",
     ):
-        super().__init__(model, cache, config, execution, rng=rng, runtime=runtime)
+        # Async speculation is greedy-only, and greedy rows report raw logprobs in
+        # both modes, so the mode never changes a score here.
+        super().__init__(
+            model,
+            cache,
+            config,
+            execution,
+            rng=rng,
+            runtime=runtime,
+            logprobs_mode=logprobs_mode,
+        )
         self.compute_stream = compute_stream
         self.copy_stream = copy_stream
         self.compute_stream.wait_stream(torch.cuda.current_stream(self.device))
@@ -233,7 +256,11 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                     candidates[i].append(proposed[row])
         return starts, candidates, hidden_rows
 
-    def _verify(self, scheduled_requests, starts, hidden_rows, tables, allocations):
+    def _verify(self, scheduled_requests, starts, hidden_rows, tables, allocations, *, score=False):
+        """Return (target, scores): the target argmax of every verification row and, with
+        ``score``, each row's FP32 raw logprob of that argmax (else None). Committed tokens
+        are exactly the target argmax of their rows.
+        """
         positions = torch.cat(
             [
                 start + torch.arange(scheduled_request.token_count, device=self.device)
@@ -249,8 +276,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         hidden = torch.stack([h for rows in hidden_rows for h in rows])
         for depth in range(self.config.draft_loops, self.config.target_loops):
             hidden = self._execute_recurrent_step(hidden, positions, row_tables, depth, allocations)
-        target = self._coda(hidden).argmax(-1)
-        return target
+        logits = self._coda(hidden)
+        target = logits.argmax(-1)
+        return target, Sampler.raw_logprobs(logits, target) if score else None
 
     def _accept_and_update_state(
         self, scheduled_requests, states, starts, candidates, target, buffer
@@ -295,7 +323,15 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             starts, candidates, hidden_rows = self._draft(
                 scheduled_requests, states, tables, allocations
             )
-            target = self._verify(scheduled_requests, starts, hidden_rows, tables, allocations)
+            scoring = any(
+                scheduled_request.request.sampling_params.logprobs is not None
+                for scheduled_request in scheduled_requests
+            )
+            target, scores = self._verify(
+                scheduled_requests, starts, hidden_rows, tables, allocations, score=scoring
+            )
+            if scoring:
+                buffer.logprobs[: len(target)].copy_(scores)
             count = self._accept_and_update_state(
                 scheduled_requests, states, starts, candidates, target, buffer
             )
@@ -308,6 +344,8 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             self.copy_stream.wait_event(buffer.compute_done)
             n = count + 2 * len(scheduled_requests)
             buffer.host_result[:n].copy_(buffer.result[:n], non_blocking=True)
+            if scoring:
+                buffer.host_logprobs[:count].copy_(buffer.logprobs[:count], non_blocking=True)
             buffer.copy_done = torch.cuda.Event()
             buffer.copy_done.record(self.copy_stream)
         self.stats.rounds += len(scheduled_requests)
@@ -315,7 +353,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             scheduled_request.token_count - 1 for scheduled_request in scheduled_requests
         )
         self.stats.verified_rows += count
-        return SpeculativeRoundTicket(batch, buffer, states, rounds, count)
+        return SpeculativeRoundTicket(batch, buffer, states, rounds, count, logprobs_copied=scoring)
 
     def request_ready(self, request):
         state = self.states.get(request.request_id)

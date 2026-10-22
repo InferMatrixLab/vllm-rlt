@@ -905,9 +905,11 @@ class Scheduler:
                             "speculative GPU frontier disagrees with committed prefix"
                         )
                 emitted = 0
-                for token in spec.token_ids:
+                for index, token in enumerate(spec.token_ids):
                     emitted += 1
-                    if self._record_token(request, token, self.speculative_config.target_loops):
+                    logprob = spec.logprobs[index] if spec.logprobs is not None else None
+                    depth = self.speculative_config.target_loops
+                    if self._record_token(request, token, depth, logprob):
                         update.finished.append(request)
                         break
                 update.committed_tokens += emitted

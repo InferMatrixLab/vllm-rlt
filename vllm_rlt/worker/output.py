@@ -19,8 +19,18 @@ class ExitSignal:
 
 @dataclass(frozen=True)
 class SpeculativeResult:
+    """One request's committed tokens from one round.
+
+    ``token_ids[:accepted_count]`` are accepted draft tokens; ``token_ids[accepted_count]``
+    is the correction, or the bonus when every draft was accepted. Token ``j`` comes from
+    verification row ``j``.
+    """
+
     token_ids: list[int]
     accepted_count: int
+    # Aligned with token_ids when the request asked for logprobs; else None. Each is the
+    # target's logprob of the committed token on its verification row, never the draft's.
+    logprobs: list[float] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -305,7 +305,22 @@ at that loop depth. A teacher-forced recompute therefore has to replay the depth
   shares the request's generator with sampling, so no ordinary forward reproduces
   them either.
 
-Speculative decoding does not accept `logprobs` yet.
+Under [speculative decoding](async-speculative.md), every `exit_depths` entry is
+`target_loops`, and each committed token is scored on its target verification row.
+This covers an accepted draft token, the correction after a rejection, and the bonus
+token. The draft distribution q never enters `logprobs`:
+
+- Verification resumes from the hidden state and KV that the draft loops computed
+  with the same weights. The scores therefore match a full-depth forward
+  numerically, not necessarily bitwise. The rollout replays like any other
+  full-depth rollout.
+- A correction is drawn from the residual `(p - q)+`. The round's output is still
+  distributed as p, so its policy logprob is `log p[token]`.
+- For a given seed, the sampled tokens depend on q, because draft draws and
+  rejection tests consume the request's generator. The logprob of a given token
+  does not depend on q. Greedy tokens do not depend on it either.
+- Cross-round async speculation is greedy-only, so it reports raw values in both
+  modes.
 
 The HTTP API does not accept `logprobs`, `stop_token_ids` or `seed: null` yet.
 
