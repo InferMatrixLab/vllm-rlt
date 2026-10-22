@@ -193,8 +193,7 @@ def test_short_requests_bypass_then_protected_long_request_gets_memory():
     engine.add_request("later", [3], params)
     engine.scheduler._admit()
     assert (
-        engine.scheduler.pending_work(engine.scheduler.requests["short"])
-        == WorkKey.PROMPT_ATOMIC
+        engine.scheduler.pending_work(engine.scheduler.requests["short"]) == WorkKey.PROMPT_ATOMIC
     )
     assert list(engine.scheduler.waiting) == ["long", "later"]
     engine.abort_request("short")

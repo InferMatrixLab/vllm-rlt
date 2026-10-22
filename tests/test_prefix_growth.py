@@ -85,9 +85,7 @@ def test_incremental_growth_matches_reserved_generation():
     assert outputs[0].exit_depths == outputs[1].exit_depths
 
 
-@pytest.mark.parametrize(
-    "stage", [WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT]
-)
+@pytest.mark.parametrize("stage", [WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT])
 def test_incremental_split_prefill_reserves_prompt_growth(stage):
     prompt = list(range(1, 9))
     e = LLMEngine(
@@ -326,6 +324,7 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
     # (LIFO), so the victim resumes in another slot whose device token belongs
     # to a different request. Distinct prompts make a stale token visible.
     from vllm_rlt import ExecutionConfig, ExitConfig
+
     torch.manual_seed(72)
     m = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to(device="cuda", dtype=torch.bfloat16)
     results, victim_stages = [], []

@@ -291,8 +291,7 @@ def test_export_holds_compute_admission_until_final_staging_read_finishes():
     assert engine.release_transfer_compute(transfer.request, ready_event=event)
     engine.scheduler._admit()
     assert (
-        engine.scheduler.pending_work(engine.scheduler.requests["local"])
-        == WorkKey.PROMPT_PRELUDE
+        engine.scheduler.pending_work(engine.scheduler.requests["local"]) == WorkKey.PROMPT_PRELUDE
     )
     assert engine.cache_manager.has_transfer_lease("export")
     connector.cancel("export")
@@ -322,8 +321,7 @@ def test_export_reservation_obeys_shared_compute_admission(local_priority, remot
     assert engine.cache_manager.has_transfer_lease("remote")
     engine.scheduler._admit()
     assert (
-        engine.scheduler.pending_work(engine.scheduler.requests[winner])
-        == WorkKey.PROMPT_PRELUDE
+        engine.scheduler.pending_work(engine.scheduler.requests[winner]) == WorkKey.PROMPT_PRELUDE
     )
     loser = "remote" if winner == "local" else "local"
     assert engine.scheduler.requests[loser].status == RequestStatus.WAITING

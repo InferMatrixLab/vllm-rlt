@@ -59,8 +59,7 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
                 token_count=scheduled_request.token_count,
                 depth=depth,
                 chunk_start=scheduled_request.chunk_start if chunk else None,
-                retain_chunk=chunk
-                and (work == WorkKey.PROMPT_PRELUDE or depth + 1 < total_depths),
+                retain_chunk=chunk and (work == WorkKey.PROMPT_PRELUDE or depth + 1 < total_depths),
                 retain_last=scheduled_request.completes_prompt if chunk else True,
                 emit_gate=work == WorkKey.DECODE_RECURRENT,
                 input_tokens=tuple(
