@@ -16,10 +16,11 @@ from vllm_rlt import (
     SchedulerConfig,
     SpeculativeConfig,
 )
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Request, RequestPhase
+from vllm_rlt.request import Request
 from vllm_rlt.worker.sampler import Sampler
 from vllm_rlt.worker.speculative import greedy_accept, rejection_sample
 
@@ -125,9 +126,7 @@ def test_reused_hidden_logits_and_all_kv_match_serial_oracle(dtype, device, back
         lambda module, inputs, output: head_outputs.append(output.detach().clone())
     )
     try:
-        runner.submit(
-            SchedulerOutput(RequestPhase.SPECULATIVE, [ScheduledRequest(r, 3, 4)])
-        ).collect()
+        runner.submit(SchedulerOutput([ScheduledRequest(r, WorkKey.SPECULATIVE, 3, 4)])).collect()
     finally:
         hook.remove()
         m.recurrent_prepared = core
@@ -343,7 +342,7 @@ def test_acquire_generator_uses_the_logits_device(monkeypatch):
 
 def test_speculative_greedy_execution_never_acquires_a_generator(monkeypatch):
     # The CODA path has the same check in test_engine.py; this one proves the
-    # contract on a request that really executes through RequestPhase.SPECULATIVE, so a
+    # contract on a request that really executes through WorkKey.SPECULATIVE, so a
     # generator that is created but unused would still be caught.
     e = engine(model())
 
@@ -357,10 +356,10 @@ def test_speculative_greedy_execution_never_acquires_a_generator(monkeypatch):
         if not e.has_unfinished_requests():
             break
         e.step()
-        stages.append(e.last_schedule.phase)
+        stages.append(e.last_schedule.works)
     else:
         pytest.fail("speculative engine did not drain")
-    assert RequestPhase.SPECULATIVE in stages
+    assert any(WorkKey.SPECULATIVE in works for works in stages)
     assert e.rng.peek("r") is None
 
 
@@ -377,7 +376,7 @@ def test_speculative_path_advances_the_registry_generator():
     def step_until_speculative():
         for _ in range(10):
             e.step()
-            if e.last_schedule.phase == RequestPhase.SPECULATIVE:
+            if WorkKey.SPECULATIVE in e.last_schedule.works:
                 return True
         return False
 
@@ -524,7 +523,7 @@ def test_greedy_round_reads_back_once_with_ragged_requests():
                 e.step()
             finally:
                 torch.cuda.set_sync_debug_mode("default")
-        if e.last_schedule.phase == RequestPhase.SPECULATIVE:
+        if WorkKey.SPECULATIVE in e.last_schedule.works:
             rounds += 1
             assert sum("synchroniz" in str(w.message) for w in caught) == 1
     assert rounds > 1
@@ -568,7 +567,7 @@ def test_speculative_cuda_graph_matches_eager_with_ragged_replay(max_graph_rows)
 @pytest.mark.parametrize("chunk_size", [1, 3, 8])
 @pytest.mark.parametrize("budget", [2, 7])
 def test_split_prefill_and_speculation_share_forward_and_match_atomic(chunk_size, budget):
-    from vllm_rlt.request import Operation
+    from vllm_rlt.core.execution import Operation
 
     def run(atomic):
         e = engine(
@@ -606,7 +605,7 @@ def test_common_submit_entry_preserves_prefill_and_speculative_results(atomic, m
     submit = e.executor.submit
 
     def record(batch):
-        calls.append((batch.phase, batch.is_speculative))
+        calls.append((batch.works, batch.is_speculative))
         return submit(batch)
 
     monkeypatch.setattr(e.executor, "submit", record)
@@ -618,13 +617,14 @@ def test_common_submit_entry_preserves_prefill_and_speculative_results(atomic, m
     assert actual.exit_depths == expected.exit_depths
     assert any(flag for _, flag in calls)
     assert any(not flag for _, flag in calls)
-    assert all(flag == (stage == RequestPhase.SPECULATIVE) for stage, flag in calls)
+    assert all(flag == (works == frozenset((WorkKey.SPECULATIVE,))) for works, flag in calls)
     assert e.cache_manager.num_used_blocks == 0
 
 
 def test_common_submit_rejects_speculation_without_controller():
     e = LLMEngine(model())
-    batch = SchedulerOutput(RequestPhase.SPECULATIVE, [])
+    request = Request("r", [2], SamplingParams())
+    batch = SchedulerOutput([ScheduledRequest(request, WorkKey.SPECULATIVE, 0, 1)])
     with pytest.raises(ValueError, match="configured round controller"):
         e.executor.submit(batch).collect()
 
@@ -644,7 +644,7 @@ def test_speculative_submit_defers_collection_and_collects_once(monkeypatch, tem
         "r", [2, 3, 4], SamplingParams(max_tokens=9, ignore_eos=True, temperature=temperature)
     )
     try:
-        while e.scheduler.requests["r"].phase != RequestPhase.SPECULATIVE:
+        while e.scheduler.pending_work(e.scheduler.requests["r"]) != WorkKey.SPECULATIVE:
             e.step()
         batch = e._schedule()
         ticket = e.executor.submit(batch)
@@ -668,7 +668,7 @@ def test_speculative_inputs_reuse_owned_buffers_without_private_cache_staging(
     params = SamplingParams(max_tokens=30, ignore_eos=True)
     e.add_request("r", [2, 3, 4], params)
     try:
-        while e.scheduler.requests["r"].phase != RequestPhase.SPECULATIVE:
+        while e.scheduler.pending_work(e.scheduler.requests["r"]) != WorkKey.SPECULATIVE:
             e.step()
         batch = e._schedule()
         runner = e.speculative_runner
@@ -704,11 +704,14 @@ def test_speculative_input_slots_survive_three_submits_before_collection(use_uva
     try:
         for i in range(3):
             e.add_request(str(i), [i + 2, i + 3], SamplingParams(max_tokens=12, ignore_eos=True))
-        while any(r.phase != RequestPhase.SPECULATIVE for r in e.scheduler.requests.values()):
+        while any(
+            e.scheduler.pending_work(request) != WorkKey.SPECULATIVE
+            for request in e.scheduler.requests.values()
+        ):
             e.step()
         batch = e._schedule()
         assert len(batch.requests) == 3
-        batches = [SchedulerOutput(RequestPhase.SPECULATIVE, [span]) for span in batch.requests]
+        batches = [SchedulerOutput([span]) for span in batch.requests]
         runner = e.speculative_runner
         expected = [runner.submit(part).collect().speculative for part in batches]
         # The third submission wraps the two input slots before any host collection.

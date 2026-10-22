@@ -23,7 +23,7 @@ from vllm_rlt.attention import (
     create_backend,
     validate_backend_name,
 )
-from vllm_rlt.request import ExecutionBatch
+from vllm_rlt.core.execution import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
 

@@ -5,10 +5,11 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import ExecutionBatch, Operation, StateSpan, WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.scheduler import Scheduler, SchedulerOutput
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import ExecutionBatch, Operation, Request, RequestPhase, StateSpan
+from vllm_rlt.request import Request, RequestStatus
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime, build_execution_batch
 
 
@@ -102,8 +103,8 @@ def test_scheduled_recurrence_does_not_follow_mutated_request_progress():
     request = Request("r", [1, 2, 3], SamplingParams())
     request.loops_done = 2
     scheduler = Scheduler(SchedulerConfig(), None)
-    scheduled_request = scheduler._make_scheduled_request(request, RequestPhase.RECURRENT, 1)
-    batch = SchedulerOutput(RequestPhase.RECURRENT, [scheduled_request])
+    scheduled_request = scheduler._make_scheduled_work(request, WorkKey.DECODE_RECURRENT, 1)
+    batch = SchedulerOutput([scheduled_request])
     request.loops_done = 3
     request.generated_token_ids.append(4)
     assert build_execution_batch(batch, 4).addresses() == (["r"], [2], [2])
@@ -182,12 +183,18 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
         outputs = {}
         mixed = []
         calls = []
+        prelude = engine.model.prelude
         recurrent = engine.model.recurrent_prepared
+
+        def record_prelude(token_ids):
+            calls.append(len(token_ids))
+            return prelude(token_ids)
 
         def record(hidden, kv, cache, **kwargs):
             calls.append(len(hidden))
             return recurrent(hidden, kv, cache, **kwargs)
 
+        engine.model.prelude = record_prelude
         engine.model.recurrent_prepared = record
         for _ in range(300):
             calls.clear()
@@ -196,8 +203,8 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
                     outputs[output.request_id] = (output.token_ids, output.exit_depths)
             batch = engine.last_schedule
             if batch is not None and batch.is_mixed:
-                phases = {batch.phase_for(i) for i in batch.requests}
-                if len(phases) == 2:
+                works = {item.work for item in batch.requests}
+                if len(works) == 2:
                     # Both storage kinds pass through a single model invocation.
                     if not graphs:
                         assert calls == [batch.num_tokens]
@@ -232,9 +239,14 @@ def mixed_ready_engine():
         engine.add_request(name, prompt, SamplingParams(max_tokens=6, ignore_eos=True))
     for _ in range(100):
         batch = engine.scheduler.schedule()
-        if batch.is_mixed and len({batch.phase_for(i) for i in batch.requests}) == 2:
+        works = batch.works if batch is not None else frozenset()
+        if {
+            WorkKey.DECODE_RECURRENT,
+            WorkKey.PROMPT_RECURRENT,
+        } <= works:
             return engine, batch
-        engine._update(batch, engine.executor.submit(batch).collect())
+        if batch is not None:
+            engine._update(batch, engine.executor.submit(batch).collect())
     pytest.fail("no mixed batch became ready")
 
 
@@ -273,14 +285,14 @@ def test_late_mixed_result_cannot_advance_a_reused_request_id():
     old = next(
         scheduled_request.request
         for scheduled_request in batch.requests
-        if batch.phase_for(scheduled_request) == RequestPhase.RECURRENT
+        if scheduled_request.work == WorkKey.DECODE_RECURRENT
     )
     engine.abort_request(old.request_id)
     engine.add_request(old.request_id, [8, 9], SamplingParams(max_tokens=2))
     replacement = engine.scheduler.requests[old.request_id]
     engine._update(batch, result)
     assert replacement is not old
-    assert replacement.phase == RequestPhase.WAITING
+    assert replacement.status == RequestStatus.WAITING
     assert replacement.loops_done == 0
     assert replacement.generated_token_ids == []
     other = next(
@@ -294,12 +306,12 @@ def test_late_mixed_result_cannot_advance_a_reused_request_id():
 def test_mixed_selection_protects_requests_selected_from_another_queue(monkeypatch):
     engine, batch = mixed_ready_engine()
     for scheduled_request in batch.requests:
-        engine.scheduler.enqueue(scheduled_request.request, batch.phase_for(scheduled_request))
+        engine.scheduler.enqueue_work(scheduled_request.request, scheduled_request.work)
     selected = next(
-        i.request.request_id for i in batch.requests if batch.phase_for(i) == RequestPhase.RECURRENT
+        i.request.request_id for i in batch.requests if i.work == WorkKey.DECODE_RECURRENT
     )
     blocked = next(
-        i.request.request_id for i in batch.requests if batch.phase_for(i) != RequestPhase.RECURRENT
+        i.request.request_id for i in batch.requests if i.work != WorkKey.DECODE_RECURRENT
     )
     exclusions = []
     monkeypatch.setattr(
@@ -314,7 +326,7 @@ def test_mixed_selection_protects_requests_selected_from_another_queue(monkeypat
     actual = engine.scheduler.schedule()
     assert [i.request.request_id for i in actual.requests] == [selected]
     assert exclusions == [frozenset({selected})]
-    assert list(engine.scheduler.queues[RequestPhase.PREFILLING_RECURRENT]) == [blocked]
+    assert list(engine.scheduler.work_queues[WorkKey.PROMPT_RECURRENT]) == [blocked]
 
 
 def test_runtime_closes_metadata_iterator_when_loop_execution_fails():
@@ -454,12 +466,16 @@ def test_mixed_attempt_with_one_selected_phase_is_not_a_mixed_batch():
     from dataclasses import replace
 
     engine, batch = mixed_ready_engine()
-    for span in batch.requests:
-        engine.scheduler.enqueue(span.request, span.phase)
+    for item in batch.requests:
+        engine.scheduler.enqueue_work(item.request, item.work)
+    compatible = {WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT}
+    for work, queue in engine.scheduler.work_queues.items():
+        if work not in compatible:
+            queue.clear()
     engine.scheduler.config = replace(engine.scheduler.config, max_num_batched_tokens=1)
     selected = engine.scheduler.schedule()
     assert selected is not None
-    assert {span.phase for span in selected.requests} == {RequestPhase.RECURRENT}
-    assert selected.phase == RequestPhase.RECURRENT
+    assert {item.work for item in selected.requests} == {WorkKey.DECODE_RECURRENT}
+    assert selected.works == frozenset((WorkKey.DECODE_RECURRENT,))
     assert not selected.is_mixed
     engine.close()

@@ -23,11 +23,14 @@ class PreemptionManager:
     def suspend(self, victim):
         """Save the selected request's resources; Scheduler owns its queue transition."""
         e = self.engine
+        work = e.scheduler.pending_work(victim)
+        if work is None:
+            raise ValueError("a preemption victim must have pending work")
         e.model_runner.synchronize()
-        e._rewind_split_prefill(victim)
+        work = e._rewind_split_prefill(victim, work)
         cache = e.cache_manager
         snapshot = dict(
-            phase=victim.phase,
+            work=work,
             kv=cache.snapshot(victim.request_id),
             hidden=None if victim.hidden_state is None else victim.hidden_state.cpu().clone(),
             token=None
@@ -44,7 +47,7 @@ class PreemptionManager:
         self.preemptions += 1
 
     def resume(self, request):
-        """Return the saved phase, None without a snapshot, or False when blocked."""
+        """Return saved work, None without a snapshot, or False when blocked."""
         state = self.snapshots.get(request.request_id)
         if state is None:
             return None
@@ -63,4 +66,4 @@ class PreemptionManager:
             torch.cuda.current_stream(cache.device).synchronize()
         del self.snapshots[request.request_id]
         self.resumptions += 1
-        return state["phase"]
+        return state["work"]

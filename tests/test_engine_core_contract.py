@@ -8,9 +8,10 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import RequestPhase
+from vllm_rlt.request import RequestStatus
 from vllm_rlt.worker.model_runner import Submission
 
 
@@ -60,7 +61,10 @@ def wait_for_signal(engine, request_id):
     for _ in range(100):
         engine.step()
         request = engine.scheduler.requests[request_id]
-        if request.generated_token_ids and request.phase == RequestPhase.RECURRENT:
+        if (
+            request.generated_token_ids
+            and engine.scheduler.pending_work(request) == WorkKey.DECODE_RECURRENT
+        ):
             if request_id in engine._pending_exit_signals:
                 return request
     pytest.fail("recurrent signal was not retained")
@@ -85,19 +89,19 @@ def test_delayed_signal_consumption_at_max_and_threshold(
     engine.add_request("a", [2, 3], params)
     probabilities = []
     consumed = {}
-    enqueue = engine.scheduler.enqueue
+    enqueue = engine.scheduler.enqueue_work
     delayed_signal = engine.scheduler._delayed_signal
 
-    def record_enqueue(request, phase):
-        if phase == RequestPhase.CODA and request.generated_token_ids:
+    def record_enqueue(request, work):
+        if work == WorkKey.DECODE_CODA and request.generated_token_ids:
             probabilities.append(request.remaining_probability)
-        return enqueue(request, phase)
+        return enqueue(request, work)
 
     def record_signal(request, score, depth):
         consumed.setdefault(len(request.generated_token_ids), []).append(depth)
         return delayed_signal(request, score, depth)
 
-    monkeypatch.setattr(engine.scheduler, "enqueue", record_enqueue)
+    monkeypatch.setattr(engine.scheduler, "enqueue_work", record_enqueue)
     monkeypatch.setattr(engine.scheduler, "_delayed_signal", record_signal)
     result = drain(engine)[-1]
     assert result.exit_depths == expected_depths
@@ -117,7 +121,7 @@ def test_async_pending_signal_survives_preemption_and_resume():
     retained = engine._pending_exit_signals["a"]
     engine.add_request("new", [4], SamplingParams(max_tokens=1, ignore_eos=True))
     assert engine.scheduler.preempt(engine.scheduler.requests["new"])
-    assert request.phase == RequestPhase.WAITING
+    assert request.status == RequestStatus.WAITING
     assert engine._pending_exit_signals["a"] is retained
     actual = drain(engine)
     assert [out for out in actual if out.request_id == "a"][-1] == expected
@@ -304,13 +308,13 @@ def test_async_recurrent_collects_each_prior_score_after_next_submit(monkeypatch
         ticket = (
             submit(scheduled_batch, batch=batch) if batch is not None else submit(scheduled_batch)
         )
-        if ticket.batch.phase == RequestPhase.RECURRENT:
+        if WorkKey.DECODE_RECURRENT in ticket.batch.works:
             recurrent_submissions += 1
             submitted_at[id(ticket)] = recurrent_submissions
         return ticket
 
     def record_collect(ticket):
-        if ticket.batch.phase == RequestPhase.RECURRENT:
+        if WorkKey.DECODE_RECURRENT in ticket.batch.works:
             observed.append((submitted_at[id(ticket)], recurrent_submissions))
         return collect(ticket)
 
@@ -380,10 +384,9 @@ def test_mixed_recurrent_and_split_prefill_progression_through_scheduler(asynchr
             if out.finished:
                 actual[out.request_id] = out
         batch = engine.last_schedule
-        if batch is not None and {batch.phase_for(item) for item in batch.requests} == {
-            RequestPhase.RECURRENT,
-            RequestPhase.PREFILLING_RECURRENT,
-        }:
+        if batch is not None and batch.works == frozenset(
+            (WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT)
+        ):
             saw_mixed_batch = True
     assert saw_mixed_batch
     assert actual["decode"].token_ids == expected["decode"].token_ids

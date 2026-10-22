@@ -28,7 +28,7 @@ def drive(engine):
         if batch is not None:
             steps.append(
                 dict(
-                    stage=batch.phase.value,
+                    works=sorted(work.name.lower() for work in batch.works),
                     effective_rows=batch.num_tokens,
                     submitted_rows=engine.model_runner.last_submitted_size,
                 )

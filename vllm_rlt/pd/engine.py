@@ -17,7 +17,7 @@ from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.models import OuroConfig, resolve_model_config
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
-from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
+from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestStatus
 from vllm_rlt.sampling_params import SamplingParams
 
 from .config import PDConfig
@@ -392,7 +392,7 @@ class PDEngine:
                 self._send(w.d, "cancel_safe", tid=w.tid)
             else:
                 self._send(w.p, "cancel", tid=w.tid)
-        request.phase = RequestPhase.FINISHED
+        request.status = RequestStatus.FINISHED
         request.finish_reason = FinishReason.ABORT
         return RequestOutput.from_request(request)
 

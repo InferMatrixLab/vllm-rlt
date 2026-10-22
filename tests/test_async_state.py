@@ -5,9 +5,9 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import RequestPhase
 
 
 def engine(*, asynchronous=True, static=False, graph=False, shared=False, use_uva=True):
@@ -125,7 +125,7 @@ def test_execution_error_retires_routing_readers_before_request_reuse(monkeypatc
 
     def fail(batch, prepared=None):
         result = execute(batch, prepared)
-        if batch.phase == RequestPhase.RECURRENT:
+        if WorkKey.DECODE_RECURRENT in batch.works:
             torch.cuda._sleep(10_000_000)
             raise RuntimeError("injected failure after GPU submission")
         return result
