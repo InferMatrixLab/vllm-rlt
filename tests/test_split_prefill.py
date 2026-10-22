@@ -1082,7 +1082,8 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
             assert e.scheduler.pending_work(split_request) is WorkKey.PROMPT_RECURRENT
             assert split_request.prefill_depth_ranges[0] == [2, 4]
             # Keep the staged chunk resident while decode triggers graph capture.
-            e.scheduler.work_queues[WorkKey.PROMPT_RECURRENT].remove("split")
+            parked_work = e.scheduler.remove_pending_work(split_request)
+            assert parked_work is WorkKey.PROMPT_RECURRENT
 
             e.add_request(
                 "decode",
@@ -1102,7 +1103,7 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
                     break
             else:
                 pytest.fail("decode request did not reach its second recurrent step")
-            assert e.scheduler.pending_work(split_request) is WorkKey.PROMPT_RECURRENT
+            assert e.scheduler.pending_work(split_request) is None
             assert split_request.num_prefilled_tokens == 0
             assert split_request.num_preluded_tokens == 2
 
@@ -1114,6 +1115,7 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
                     e.model_runner.graphs.fallbacks,
                 )
             e.scheduler.enqueue_work(split_request, WorkKey.PROMPT_RECURRENT)
+            assert e.scheduler.pending_work(split_request) is WorkKey.PROMPT_RECURRENT
             finished = {}
             for _ in range(200):
                 for output in e.step():
