@@ -9,6 +9,7 @@ from safetensors.torch import save_file
 
 from tests.helpers import tiny_nanbeige_config
 from tests.reference import dense_nanbeige_reference
+from vllm_rlt.config import CacheConfig, ExecutionConfig, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import AutoModelForCausalLM, NanbeigeConfig, NanbeigeForCausalLM
@@ -414,3 +415,122 @@ def test_parity_against_real_checkpoint_hf_transformers():
     assert hf_greedy_tokens == vllm_greedy_tokens, (
         f"Greedy tokens mismatch: HF {hf_greedy_tokens} vs vLLM {vllm_greedy_tokens}"
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("max_graphs", [1, 16])
+def test_nanbeige_graph_replay_matches_eager_with_reuse_and_fallback(max_graphs):
+    """Verify Nanbeige recurrent CUDA Graph replay matches eager with reuse and fallback."""
+    torch.manual_seed(42)
+    model = (
+        NanbeigeForCausalLM(
+            tiny_nanbeige_config(
+                hidden_size=64,
+                num_attention_heads=4,
+                intermediate_size=128,
+            )
+        )
+        .to(device="cuda", dtype=torch.bfloat16)
+        .eval()
+    )
+    results = []
+    for graph in (False, True):
+        engine = LLMEngine(
+            model,
+            attention_backend="triton",
+            cache_config=CacheConfig(num_blocks=256, block_size=4),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=16,
+                prefill_chunk_size=2,
+            ),
+            execution_config=ExecutionConfig(cuda_graphs=graph, cuda_graph_max_graphs=max_graphs),
+        )
+        rounds = []
+        for _ in range(2):
+            torch.manual_seed(123)
+            for i, prompt in enumerate(([4, 7, 3], [9, 2], [3, 8, 7, 6], [4])):
+                engine.add_request(
+                    str(i),
+                    prompt,
+                    SamplingParams(
+                        max_tokens=4 + i,
+                        min_loops=2,
+                        max_loops=2,
+                        ignore_eos=True,
+                    ),
+                )
+            finished = {}
+            while engine.has_unfinished_requests():
+                for output in engine.step():
+                    if output.finished:
+                        finished[output.request_id] = (output.token_ids, output.exit_depths)
+            assert len(finished) == 4
+            assert engine.cache_manager.num_used_blocks == 0
+            rounds.append(finished)
+        if graph:
+            stats = engine.model_runner.graphs
+            assert stats.captures > 0 and stats.replays > stats.captures
+            if max_graphs == 1:
+                assert stats.fallbacks > 0
+        results.append(rounds)
+    assert results[0] == results[1]
+
+
+@pytest.mark.gpu
+def test_nanbeige_graph_states_logits_and_kv_match_eager():
+    """Verify bitwise match of hidden states, logits, and KV entries between eager and graph."""
+    from vllm_rlt.worker.cuda_graph import RecurrentGraphs
+
+    torch.manual_seed(42)
+    cfg = tiny_nanbeige_config(hidden_size=64, num_attention_heads=4, intermediate_size=128)
+    model = NanbeigeForCausalLM(cfg).to(device="cuda", dtype=torch.bfloat16).eval()
+
+    def make_cuda_cache():
+        return KVCacheManager(
+            num_layers=cfg.num_hidden_layers,
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            num_blocks=128,
+            block_size=4,
+            max_loops=cfg.total_ut_steps,
+            device="cuda",
+            dtype=torch.bfloat16,
+            backend="triton",
+        )
+
+    caches = [make_cuda_cache(), make_cuda_cache()]
+    graphs = RecurrentGraphs(model, caches[1], ExecutionConfig(cuda_graphs=True), False)
+    for c in caches:
+        assert c.allocate("request", 5)
+
+    with torch.no_grad():
+        for position in range(5):
+            token = torch.tensor([4 + position], device="cuda", dtype=torch.long)
+            states = [model.prelude(token), model.prelude(token)]
+            torch.testing.assert_close(states[0], states[1], rtol=0, atol=0)
+
+            for depth in range(cfg.total_ut_steps):
+                batches = [c._prepare_batch(["request"], [depth], [position]) for c in caches]
+                states[0], _ = model.recurrent_prepared(
+                    states[0], batches[0], caches[0], compute_gate=False
+                )
+                states[1], _ = graphs.run(states[1], batches[1])
+                torch.testing.assert_close(states[0], states[1], rtol=0, atol=0)
+
+                for layer in range(cfg.num_hidden_layers):
+                    for eager, replay in zip(
+                        caches[0].read(layer, "request", depth),
+                        caches[1].read(layer, "request", depth),
+                    ):
+                        torch.testing.assert_close(eager, replay, rtol=0, atol=0)
+
+            logits = [model.coda(h) for h in states]
+            torch.testing.assert_close(logits[0], logits[1], rtol=0, atol=0)
+            for c in caches:
+                c.finalize_token("request", position, cfg.total_ut_steps - 1)
+
+    assert graphs.captures == 1 and graphs.replays == 10 and graphs.fallbacks == 0
+    for c in caches:
+        c.free("request")
+        assert c.num_used_blocks == 0
