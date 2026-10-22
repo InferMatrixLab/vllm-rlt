@@ -9,6 +9,7 @@ from safetensors.torch import save_file
 
 from tests.helpers import tiny_nanbeige_config
 from tests.reference import dense_nanbeige_reference
+from vllm_rlt.config import CacheConfig, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import AutoModelForCausalLM, NanbeigeConfig, NanbeigeForCausalLM
@@ -159,6 +160,134 @@ def test_nanbeige_engine_generation(model):
     final = [o for o in all_outputs if o.request_id == "request-1"][-1]
     assert len(final.token_ids) == 5
     assert final.finish_reason == "length"
+
+
+@pytest.mark.parametrize("chunk_size", [2, 3, 4])
+def test_nanbeige_chunked_prefill_matches_unsegmented(model, chunk_size):
+    """Verify Nanbeige chunked prefill generates bitwise identical tokens to unsegmented prefill."""
+    prompt = [1, 5, 8, 12, 19, 24, 30]
+    torch.manual_seed(42)
+    eng_dense = LLMEngine(
+        model,
+        attention_backend="torch",
+        scheduler_config=SchedulerConfig(prefill_chunk_size=128),
+    )
+    eng_dense.add_request("unseg", prompt, SamplingParams(max_tokens=6, temperature=0.0))
+    while eng_dense.has_unfinished_requests():
+        out_dense = eng_dense.step()
+    ref_tokens = out_dense[0].token_ids
+
+    torch.manual_seed(42)
+    eng_chunk = LLMEngine(
+        model,
+        attention_backend="torch",
+        scheduler_config=SchedulerConfig(prefill_chunk_size=chunk_size),
+    )
+    eng_chunk.add_request("chunk", prompt, SamplingParams(max_tokens=6, temperature=0.0))
+    while eng_chunk.has_unfinished_requests():
+        out_chunk = eng_chunk.step()
+    assert out_chunk[0].token_ids == ref_tokens
+
+
+def test_nanbeige_priority_scheduling_and_preemption(model):
+    """Verify priority-based preemption and lossless resumption on Nanbeige."""
+    torch.manual_seed(100)
+    eng_iso_low = LLMEngine(model, attention_backend="torch")
+    eng_iso_low.add_request("low", [2, 4, 6], SamplingParams(max_tokens=6, temperature=0.0))
+    while eng_iso_low.has_unfinished_requests():
+        out_iso_low = eng_iso_low.step()
+    iso_low_tokens = out_iso_low[0].token_ids
+
+    torch.manual_seed(200)
+    eng_iso_high = LLMEngine(model, attention_backend="torch")
+    eng_iso_high.add_request("high", [10, 20, 30], SamplingParams(max_tokens=3, temperature=0.0))
+    while eng_iso_high.has_unfinished_requests():
+        out_iso_high = eng_iso_high.step()
+    iso_high_tokens = out_iso_high[0].token_ids
+
+    torch.manual_seed(100)
+    sched_cfg = SchedulerConfig(policy="priority", enable_preemption=True, max_num_seqs=1)
+    eng_prio = LLMEngine(model, attention_backend="torch", scheduler_config=sched_cfg)
+    eng_prio.add_request(
+        "low", [2, 4, 6], SamplingParams(max_tokens=6, temperature=0.0, priority=10)
+    )
+    eng_prio.step()  # low runs 1 step
+    torch.manual_seed(200)
+    eng_prio.add_request(
+        "high", [10, 20, 30], SamplingParams(max_tokens=3, temperature=0.0, priority=1)
+    )
+
+    completed = []
+    while eng_prio.has_unfinished_requests():
+        outs = eng_prio.step()
+        for o in outs:
+            if o.finish_reason is not None and o.request_id not in [c[0] for c in completed]:
+                completed.append((o.request_id, o.token_ids))
+
+    assert completed[0][0] == "high", "High priority request should finish first"
+    assert completed[1][0] == "low", "Low priority request should finish second"
+    assert completed[0][1] == iso_high_tokens, "High priority tokens corrupted"
+    assert completed[1][1] == iso_low_tokens, (
+        "Low priority tokens corrupted after preemption recovery"
+    )
+
+
+def test_nanbeige_last_exited_kv_layout(model):
+    """Verify Nanbeige fixed 2-loop inference under LAST_EXITED KV layout."""
+    prompt = [1, 5, 8, 12, 19, 24, 30]
+    torch.manual_seed(42)
+    eng_ref = LLMEngine(model, attention_backend="torch")
+    eng_ref.add_request("ref", prompt, SamplingParams(max_tokens=6, temperature=0.0))
+    while eng_ref.has_unfinished_requests():
+        out_ref = eng_ref.step()
+    ref_tokens = out_ref[0].token_ids
+
+    torch.manual_seed(42)
+    eng_le = LLMEngine(
+        model, attention_backend="torch", cache_config=CacheConfig(layout="last_exited")
+    )
+    eng_le.add_request("le", prompt, SamplingParams(max_tokens=6, temperature=0.0))
+    while eng_le.has_unfinished_requests():
+        out_le = eng_le.step()
+    assert out_le[0].token_ids == ref_tokens
+
+
+def test_nanbeige_prefix_caching_hit_and_identity(model):
+    """Verify shared prompt prefix reuses cached KV and matches fresh inference."""
+    shared_prefix = [3, 7, 11, 15, 23, 31]
+    suffix_a = [40, 41]
+    suffix_b = [50, 51]
+
+    torch.manual_seed(333)
+    eng_clean = LLMEngine(model, attention_backend="torch")
+    eng_clean.add_request(
+        "req_b_clean", shared_prefix + suffix_b, SamplingParams(max_tokens=4, temperature=0.0)
+    )
+    while eng_clean.has_unfinished_requests():
+        out_b_clean = eng_clean.step()
+    b_clean_tokens = out_b_clean[0].token_ids
+
+    torch.manual_seed(333)
+    eng_pc = LLMEngine(
+        model,
+        attention_backend="torch",
+        cache_config=CacheConfig(enable_prefix_caching=True),
+    )
+    eng_pc.add_request(
+        "req_a", shared_prefix + suffix_a, SamplingParams(max_tokens=4, temperature=0.0)
+    )
+    while eng_pc.has_unfinished_requests():
+        eng_pc.step()
+
+    eng_pc.add_request(
+        "req_b", shared_prefix + suffix_b, SamplingParams(max_tokens=4, temperature=0.0)
+    )
+    while eng_pc.has_unfinished_requests():
+        out_b_pc = eng_pc.step()
+    b_pc_tokens = [o for o in out_b_pc if o.request_id == "req_b"][-1].token_ids
+    assert b_pc_tokens == b_clean_tokens, (
+        f"Prefix cache mismatch: {b_pc_tokens} vs {b_clean_tokens}"
+    )
 
 
 def test_nanbeige_caller_revision_is_consistently_used_without_override(
