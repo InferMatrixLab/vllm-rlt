@@ -198,7 +198,7 @@ The [Ouro evaluation settings](https://arxiv.org/html/2510.25741v5#A3.T16) do no
 pin the exact harness revision, demonstrations or token limits, so the settings
 above are explicit project choices rather than an exact paper reproduction.
 
-The [full 1,319-question comparison](https://github.com/hsliuustc0106/vllm-rlt/blob/d2f7db20593cccfe666b3c04c3ee50abc8c39af7/docs/benchmarks/gsm8k-bf16-20260912.md) recorded
+The [full 1,319-question comparison](https://github.com/InferMatrixLab/vllm-rlt/blob/d2f7db20593cccfe666b3c04c3ee50abc8c39af7/docs/benchmarks/gsm8k-bf16-20260912.md) recorded
 **62.02% native versus 61.64% Transformers** with strict matching. It includes
 per-question audits and a separate extraction diagnostic. That experiment's
 frozen 75.92% reference floor failed; the current default remains the measured

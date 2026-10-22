@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1840" height="1240" viewBox="-20 -20 1840 1240" role="img" aria-labelledby="title description">
+<title id="title">Composable stages with loop-level scheduling and execution</title>
+<desc id="description">An independently owned stage receives requests directly or state through an optional upstream connector, and delivers output directly or hands state to an optional downstream stage. Inside, scheduler, execution, and request and KV progress form a loop. Recurrent work is scheduled by depth and may combine compatible prefill and decode work.</desc>
+<defs>
+<marker id="blueArrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M1,1 L8,4.5 L1,8" fill="none" stroke="#3569b8" stroke-width="1.7" stroke-linejoin="round"/></marker>
+<marker id="grayArrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M1,1 L8,4.5 L1,8" fill="none" stroke="#8996a8" stroke-width="1.5"/></marker>
+<filter id="cardShadow" x="-10%" y="-10%" width="120%" height="125%"><feDropShadow dx="0" dy="5" stdDeviation="9" flood-color="#183b66" flood-opacity="0.07"/></filter>
+</defs>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#172b45}.title{font-size:38px;font-weight:700;letter-spacing:-.5px}.h{font-size:28px;font-weight:700}.body{font-size:22px}.small{font-size:20px}.tiny{font-size:17px}.muted{fill:#61748a}.blue{fill:#265ca9}.bold{font-weight:700}</style>
+<rect x="-20" y="-20" width="1840" height="1240" fill="white"/>
+
+<text x="40" y="63" class="title" text-anchor="start">Composable stages. Loop-level scheduling and execution.</text>
+<text x="40" y="105" class="body muted" text-anchor="start">The scheduler drives request progress and mixed batching; execution runs the selected work.</text>
+<g opacity="0.42">
+<rect x="-100" y="515" width="290" height="220" rx="18" fill="#f3f6fa" stroke="#abbacf" stroke-width="2"/>
+<text x="20" y="565" class="small bold" text-anchor="start">Upstream stage</text>
+<text x="20" y="600" class="tiny muted" text-anchor="start">Same stage design</text>
+<path d="M-25,650 H115 V695 H-25 V655" fill="none" stroke="#8996a8" stroke-width="2" marker-end="url(#grayArrow)"/>
+<rect x="1610" y="515" width="290" height="220" rx="18" fill="#f3f6fa" stroke="#abbacf" stroke-width="2"/>
+<text x="1630" y="565" class="small bold" text-anchor="start">Downstream stage</text>
+<text x="1630" y="600" class="tiny muted" text-anchor="start">Same stage design</text>
+<path d="M1685,650 H1825 V695 H1685 V655" fill="none" stroke="#8996a8" stroke-width="2" marker-end="url(#grayArrow)"/>
+<text x="45" y="780" class="title muted" text-anchor="start">…</text>
+<text x="1745" y="780" class="title muted" text-anchor="start">…</text>
+</g>
+<rect x="350" y="155" width="1100" height="950" rx="22" fill="#fbfdff" stroke="#c4d3e7" stroke-width="1.5" filter="url(#cardShadow)"/>
+<text x="390" y="207" class="title blue" text-anchor="start">Stage</text>
+<text x="390" y="241" class="body muted" text-anchor="start">Independent deployment · local resource ownership</text>
+<text x="1410" y="204" class="tiny muted" text-anchor="end">PREFILL / DECODE / PREFILL_DECODE</text>
+<text x="145" y="269" class="tiny muted bold" text-anchor="middle">NO UPSTREAM</text>
+<rect x="40" y="285" width="210" height="70" rx="12" fill="#f8fafc" stroke="#d8e1ec" stroke-width="1.5"/>
+<text x="145" y="328" class="body" text-anchor="middle">Request input</text>
+<text x="1650" y="269" class="tiny muted bold" text-anchor="middle">NO DOWNSTREAM</text>
+<rect x="1540" y="285" width="220" height="70" rx="12" fill="#f8fafc" stroke="#d8e1ec" stroke-width="1.5"/>
+<text x="1650" y="328" class="body" text-anchor="middle">Output delivery</text>
+<rect x="390" y="285" width="220" height="70" rx="12" fill="#f0f5fd" stroke="#cadbf1" stroke-width="1.5"/>
+<text x="500" y="328" class="body" text-anchor="middle">Request admission</text>
+<rect x="1180" y="285" width="230" height="70" rx="12" fill="#f0f5fd" stroke="#cadbf1" stroke-width="1.5"/>
+<text x="1295" y="328" class="body" text-anchor="middle">Output / handoff</text>
+<path d="M250,320 H390" fill="none" stroke="#8996a8" stroke-width="2" marker-end="url(#grayArrow)"/>
+<path d="M1410,320 H1540" fill="none" stroke="#8996a8" stroke-width="2" marker-end="url(#grayArrow)"/>
+<text x="270" y="563" class="tiny muted bold" text-anchor="middle">WITH UPSTREAM</text>
+<rect x="215" y="590" width="110" height="70" rx="10" fill="#fff6eb" stroke="#e5bf8e" stroke-width="1.5"/>
+<text x="270" y="631" class="small" text-anchor="middle">Connector</text>
+<path d="M190,625 H215" fill="none" stroke="#8996a8" stroke-width="2" marker-end="url(#grayArrow)" stroke-dasharray="6 5"/>
+<path d="M325,625 H335 V320 H390" fill="none" stroke="#8996a8" stroke-width="2" marker-end="url(#grayArrow)" stroke-dasharray="6 5"/>
+<text x="1530" y="563" class="tiny muted bold" text-anchor="middle">WITH DOWNSTREAM</text>
+<rect x="1475" y="590" width="110" height="70" rx="10" fill="#fff6eb" stroke="#e5bf8e" stroke-width="1.5"/>
+<text x="1530" y="631" class="small" text-anchor="middle">Connector</text>
+<path d="M1410,320 H1465 V625 H1475" fill="none" stroke="#8996a8" stroke-width="2" marker-end="url(#grayArrow)" stroke-dasharray="6 5"/>
+<path d="M1585,625 H1610" fill="none" stroke="#8996a8" stroke-width="2" marker-end="url(#grayArrow)" stroke-dasharray="6 5"/>
+<text x="270" y="694" class="tiny muted" text-anchor="middle">KV + state</text>
+<text x="1530" y="694" class="tiny muted" text-anchor="middle">KV + state</text>
+<rect x="400" y="400" width="640" height="530" rx="18" fill="#f0f5fd" stroke="#7399ce" stroke-width="2.5" filter="url(#cardShadow)"/>
+<path d="M418,400 H1022 Q1040,400 1040,418 V482 H400 V418 Q400,400 418,400" fill="#234f88"/>
+<text x="1015" y="437" class="tiny" text-anchor="end" style="fill:#d6e5fa;letter-spacing:1px">LOOP CONTROL</text>
+<text x="425" y="439" class="h" style="fill:white;font-size:32px" text-anchor="start">Scheduler</text>
+<text x="425" y="469" class="small" style="fill:#d6e5fa" text-anchor="start">Select work · batch · advance requests</text>
+<rect x="820" y="490" width="180" height="170" rx="10" fill="#fff" stroke="#7da7df" stroke-width="2"/>
+<text x="910" y="680" class="small blue bold" text-anchor="middle">Mixed batch</text>
+<rect x="425" y="490" width="350" height="48" rx="10" fill="#fff2da" stroke="#c9932c" stroke-width="1.5"/>
+<text x="442" y="521" class="small bold" text-anchor="start">A  ·  Prefill chunk</text>
+<text x="758" y="521" class="small bold" text-anchor="end">Loop 2</text>
+<rect x="832" y="500" width="156" height="42" rx="10" fill="#fff2da" stroke="#c9932c" stroke-width="1.5"/>
+<text x="910" y="527" class="small bold" text-anchor="middle">A  ·  Loop 2</text>
+<path d="M775,514 H795 V575" fill="none" stroke="#c9932c" stroke-width="2"/>
+<rect x="425" y="546" width="350" height="48" rx="10" fill="#eee7fd" stroke="#9871ce" stroke-width="1.5"/>
+<text x="442" y="577" class="small bold" text-anchor="start">B  ·  Decode token</text>
+<text x="758" y="577" class="small bold" text-anchor="end">Loop 3</text>
+<rect x="832" y="552" width="156" height="42" rx="10" fill="#eee7fd" stroke="#9871ce" stroke-width="1.5"/>
+<text x="910" y="579" class="small bold" text-anchor="middle">B  ·  Loop 3</text>
+<path d="M775,570 H795 V575" fill="none" stroke="#9871ce" stroke-width="2"/>
+<rect x="425" y="602" width="350" height="48" rx="10" fill="#ddf4f3" stroke="#429d9a" stroke-width="1.5"/>
+<text x="442" y="633" class="small bold" text-anchor="start">C  ·  Decode token</text>
+<text x="758" y="633" class="small bold" text-anchor="end">Loop 1</text>
+<rect x="832" y="604" width="156" height="42" rx="10" fill="#ddf4f3" stroke="#429d9a" stroke-width="1.5"/>
+<text x="910" y="631" class="small bold" text-anchor="middle">C  ·  Loop 1</text>
+<path d="M775,626 H795 V575" fill="none" stroke="#429d9a" stroke-width="2"/>
+<path d="M795,575 H820" fill="none" stroke="#3569b8" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+<path d="M500,355 V400" fill="none" stroke="#3569b8" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+<rect x="1110" y="400" width="270" height="380" rx="18" fill="#ffffff" stroke="#d0dbe8" stroke-width="1.5"/>
+<text x="1130" y="466" class="tiny muted">Run the selected operation</text>
+<text x="1130" y="439" class="h" text-anchor="start">Execution</text>
+<rect x="1130" y="490" width="230" height="42" rx="10" fill="#fff" stroke="#d1e3d9" stroke-width="1.5"/>
+<text x="1245" y="518" class="small bold" text-anchor="middle">PRELUDE</text>
+<rect x="1130" y="561" width="230" height="128" rx="10" fill="#dceaff" stroke="#7da7df" stroke-width="2"/>
+<text x="1245" y="590" class="body blue bold" text-anchor="middle">RECURRENT</text>
+<text x="1245" y="615" class="tiny blue" text-anchor="middle">One shared execution</text>
+<rect x="1140" y="632" width="66" height="36" rx="10" fill="#fff2da" stroke="#c9932c" stroke-width="1.5"/>
+<text x="1173" y="656" class="tiny bold" text-anchor="middle">A · d2</text>
+<rect x="1212" y="632" width="66" height="36" rx="10" fill="#eee7fd" stroke="#9871ce" stroke-width="1.5"/>
+<text x="1245" y="656" class="tiny bold" text-anchor="middle">B · d3</text>
+<rect x="1284" y="632" width="66" height="36" rx="10" fill="#ddf4f3" stroke="#429d9a" stroke-width="1.5"/>
+<text x="1317" y="656" class="tiny bold" text-anchor="middle">C · d1</text>
+<rect x="1130" y="726" width="230" height="35" rx="10" fill="#fff" stroke="#d1e3d9" stroke-width="1.5"/>
+<text x="1245" y="750" class="small bold" text-anchor="middle">CODA</text>
+<path d="M1245,532 V561" fill="none" stroke="#8996a8" stroke-width="1.6" marker-end="url(#grayArrow)"/>
+<path d="M1245,689 V726" fill="none" stroke="#8996a8" stroke-width="1.6" marker-end="url(#grayArrow)"/>
+<path d="M1360,661 H1370 V583 H1360" fill="none" stroke="#8996a8" stroke-width="1.4" marker-end="url(#grayArrow)"/>
+<text x="1264" y="714" class="tiny muted">on exit</text>
+<path d="M1000,575 H1130" fill="none" stroke="#3569b8" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+<text x="1075" y="553" class="small blue bold" text-anchor="middle">submit</text>
+<text x="1075" y="607" class="tiny muted" text-anchor="middle">same batch</text>
+<path d="M425,703 H1015" stroke="#c9d9ee" stroke-width="1"/>
+<text x="425" y="733" class="small blue bold">Select operation · token range · loop depth</text>
+<rect x="425" y="800" width="590" height="110" rx="12" fill="#fff" stroke="#cadbf1" stroke-width="1.3"/>
+<text x="445" y="831" class="body blue bold" text-anchor="start">Per-request progress &amp; KV state</text>
+<text x="445" y="865" class="small" text-anchor="start">Each request advances or exits independently</text>
+<text x="445" y="892" class="small muted" text-anchor="start">Independent depth · token range · KV validity</text>
+<path d="M1245,780 V850 H1015" fill="none" stroke="#3569b8" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+<text x="1130" y="880" class="tiny blue" text-anchor="middle">Completion feedback</text>
+<path d="M450,800 V751" fill="none" stroke="#3569b8" stroke-width="2.5" marker-end="url(#blueArrow)"/>
+<text x="475" y="775" class="small blue" text-anchor="start">Regroup for the next loop</text>
+
+<path d="M1015,900 H1395 V370 H1295 V355" fill="none" stroke="#8996a8" stroke-width="2.5" marker-end="url(#grayArrow)"/>
+<text x="1278" y="377" class="tiny muted" text-anchor="end">Output or handoff ready</text>
+<text x="900" y="966" class="small muted" text-anchor="middle">Independent request progress. Consecutive loops can run in one submission.</text>
+<rect x="390" y="1005" width="1020" height="66" rx="10" fill="#f1f4f8" stroke="#dce3eb" stroke-width="1.5"/>
+<text x="900" y="1045" class="body muted" text-anchor="middle">Owned resources: model · KV cache · request state · reusable buffers</text>
+<text x="40" y="1151" class="small muted" text-anchor="start">Blue: scheduler-driven execution and feedback. Gray inside Execution: model operation order. Dashed gray: stage transfer.</text>
+<text x="40" y="1182" class="tiny muted" text-anchor="start">Mixed = compatible recurrent work across requests, prefill/decode phases and loop depths within one stage. Speculative rounds are not included.</text>
+</svg>

@@ -6,13 +6,14 @@ from transformers import AutoModelForCausalLM, DynamicCache, LogitsProcessor
 
 from benchmarks.gsm8k import is_fixed
 from vllm_rlt import (
-    LLM,
     CacheConfig,
     ExecutionConfig,
     ExitConfig,
     SamplingParams,
     SchedulerConfig,
 )
+from vllm_rlt.engine.stage_engine import StageEngine
+from vllm_rlt.models import AutoModelForCausalLM as NativeModel
 
 
 def check_logits(logits):
@@ -109,10 +110,14 @@ class Generator:
                 else ReleaseExitHooks(self.model, exit_policy["threshold"])
             )
         else:
-            self.llm = LLM(
-                model_path,
-                device="cuda",
-                dtype=torch.bfloat16,
+            # Accuracy checks need a local logits hook. The deployment client
+            # owns a separate worker process and does not expose its model.
+            self.model = NativeModel.from_pretrained(
+                model_path, device="cuda", dtype=torch.bfloat16
+            ).eval()
+            check_depth(self.model.config, loops)
+            self.engine = StageEngine(
+                self.model,
                 attention_backend="triton",
                 # last_exited KV keeps one plane per loop.
                 cache_config=CacheConfig(num_blocks=loops * ((max_length + 15) // 16)),
@@ -121,8 +126,6 @@ class Generator:
                 execution_config=ExecutionConfig(async_scheduling=exit_policy["async_scheduling"]),
             )
             # Observe the existing sampling boundary without changing arithmetic.
-            self.model = self.llm.engine.model
-            check_depth(self.model.config, loops)
             self._finite_hook = self.model.lm_head.register_forward_hook(
                 lambda module, inputs, output: check_logits(output)
             )
@@ -163,7 +166,7 @@ class Generator:
             if depths is not None and len(depths) != len(ids):
                 raise RuntimeError("Recorded exit depths do not match the generated tokens")
         else:
-            engine = self.llm.engine
+            engine = self.engine
             engine.add_request(
                 "gsm8k",
                 prompt_ids,
@@ -201,3 +204,10 @@ class Generator:
             # decode depths. The release still computes every loop for every token.
             result["exit_depths"] = list(depths)
         return result
+
+    def close(self):
+        if self.backend != "transformers":
+            try:
+                self.engine.close()
+            finally:
+                self._finite_hook.remove()

@@ -19,8 +19,7 @@ gpu run --gpu-ids <available-id> --timeout 30m --note "Ouro HTTP serving" -- \
 ```
 
 BF16 weights, ordinary activations and KV are this frontend's primary target,
-consistent with the precision policy proposed in [PR #12](https://github.com/hsliuustc0106/vllm-rlt/pull/12).
-That policy is pending and is not yet part of this branch.
+as described in the [precision policy](precision-policy.md).
 The current model uses FP32 RMSNorm/RoPE intermediates and gate/sampling
 probabilities; Triton attention uses FP32 internal accumulation. Record the
 matrix multiplication backend/reduction flags separately. `--dtype float32`
@@ -33,6 +32,21 @@ leaves health unavailable and emits the cause in the server log. The first
 actual inference may include lazy library/kernel setup; validate it explicitly.
 `GET /v1/models` lists the configured `--served-model-name` (default
 `ByteDance/Ouro-1.4B`).
+
+## Stage deployment and batching
+
+Serving workers use the common stage engine. A local `prefill_decode` stage
+handles prompt and generation work; PD deploys prefill and decode stages and
+uses a connector for state transfer. Request submission and output delivery
+remain separate from the stage-local model execution contract.
+
+Mixed scheduling means batching compatible prompt/decode recurrent work within
+one stage. It does not mean a worker role, and PD does not require it. For
+supported models, select it with `--mode mixed --no-atomic-prefill` and
+LAST_EXITED KV. PD can configure speculative decoding on the decode stage, but
+mixed scheduling and speculative rounds are not a supported combination.
+See [runtime configuration](runtime.md#execution-batches-and-mixed-scheduling)
+for constraints and [the architecture](unified_execution.md) for ownership.
 
 ## Completions contract
 
@@ -175,7 +189,7 @@ concurrency semaphore and ends at the last choice event, excluding client-side
 queueing and the usage/`[DONE]` tail. The historical offline M1 harness instead timestamps
 engine enqueue/steps and excludes HTTP/tokenization; the values are not
 interchangeable. The M1 harness has been removed; see the
-[archived baseline report](https://github.com/hsliuustc0106/vllm-rlt/blob/5bee22950357d93e3f7a3c6c87b8fbed004c9296/docs/benchmarks/m1-20260910.md)
+[archived baseline report](https://github.com/InferMatrixLab/vllm-rlt/blob/5bee22950357d93e3f7a3c6c87b8fbed004c9296/docs/benchmarks/m1-20260910.md)
 for its measurement scope.
 
 ## Validation

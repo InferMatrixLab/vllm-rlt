@@ -8,19 +8,24 @@ an environment to receiving the first generated response. The
 | --- | --- |
 | [Developer Must-Read](developer-guide.md) | Requirement understanding, correctness, performance analysis, refactoring rules, and completion criteria |
 | [First-run user guide](launching.md) | Environment setup, model download, server startup, first request, CLI, Python API, and troubleshooting |
-| [Engine design](design.md) | Model stages, scheduling, and KV ownership |
-| [Scheduler walkthrough](scheduler_walkthrough.md) | Responsibilities, admission cases, control flow, and refactoring checklist |
+| [Unified architecture](unified_execution.md) | Stage process boundaries, component responsibilities, shared resources and loop-level execution |
+| [Model and KV semantics](design.md) | PRELUDE/RECURRENT/CODA, request progress and depth-specific history |
+| [Loop-level scheduling](scheduler.md) | Mixed batching, policy selection, admission budgets, progress and resource safety |
 | [KV layout examples](kv_layout_computation.md) | SHARED and LAST_EXITED semantics and worked attention examples |
-| [KV cache walkthrough](kv_cache_walkthrough.md) | Allocation state, contracts, cross-module dependencies, and the M4 migration plan |
-| [Runtime configuration](cdb_runtime.md) | Exit policies, KV layouts, execution options, and CUDA Graphs |
-| [Asynchronous scheduling](https://github.com/hsliuustc0106/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
-| [FlashAttention](https://github.com/hsliuustc0106/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
-| [Cache and scheduling features](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
-| [Prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
+| [KV cache walkthrough](kv_cache_walkthrough.md) | Capacity, validity, shared metadata, transfer pins and snapshot/restore |
+| [Runtime execution and configuration](runtime.md) | Batch contracts, preparation, transfers, execution options and compatibility |
+| [Asynchronous self-speculation](async-speculative.md) | Shared execution, device-owned positions and round lifetimes |
+| [Asynchronous scheduling](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
+| [FlashAttention](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
+| [Cache and scheduling features](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
+| [Prefill/decode disaggregation](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
 | [HTTP serving](serving.md) | Completions API, streaming, and service lifecycle |
 | [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
 | [Ouro-Thinking recipe](recipes/ouro_thinking.md) | Shared 1.4B/2.6B setup, JSON/SSE client, budgets and validation limits |
 | [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |
+
+Earlier measurements and known limitations are retained in the
+[historical validation record](runtime-history.md); they do not qualify the current revision.
 
 ## Support and Runtime Notes
 

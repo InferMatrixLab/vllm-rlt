@@ -18,6 +18,7 @@ class CacheConfig:
     memory_reserve_bytes: int = 256 * 1024 * 1024
     enable_prefix_caching: bool = False
     incremental_allocation: bool = False
+    # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
 
     def __post_init__(self):
@@ -50,6 +51,7 @@ class CacheConfig:
 class SchedulerConfig:
     max_num_seqs: int = 8
     max_num_batched_tokens: int = 128
+    # mixed selects compatible prompt/generation loops in a shared token budget.
     mode: str = "refill"
     min_coda_batch_size: int = 1
     admission_scan_limit: int = 64
@@ -74,8 +76,8 @@ class SchedulerConfig:
             raise ValueError("enable_preemption must be a boolean")
         if self.policy not in ("fcfs", "priority"):
             raise ValueError("policy must be fcfs or priority")
-        if self.mode not in ("refill", "no_refill"):
-            raise ValueError("mode must be 'refill' or 'no_refill'")
+        if self.mode not in ("refill", "no_refill", "mixed"):
+            raise ValueError("mode must be 'refill', 'no_refill' or 'mixed'")
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,8 @@ class ExitConfig:
 @dataclass(frozen=True)
 class ExecutionConfig:
     async_scheduling: bool = False
+    # CUDA execution optimization, independent of CPU scheduling lookahead.
+    # False uses one stream; True separates recurrent, boundary and copy streams.
     multi_stream: bool = True
     static_buffers: bool = False
     pad_to_power_of_two: bool = False
@@ -107,11 +111,21 @@ class ExecutionConfig:
     cuda_graph_max_batch_size: int = 128
     cuda_graph_max_graphs: int = 16
     cuda_graph_memory_reserve_bytes: int = 1024**3
+    # Shared switch for mapped pinned-memory reads; unsupported devices copy instead.
+    use_uva: bool = True
+    # Select packed prefill metadata staging (and require packed attention).
+    # The historical name is retained; use_uva controls its transfer mechanism.
     prefill_uva: bool = False
+    # Split prompt prefill into a staged prelude plus one scheduling boundary per
+    # recurrence depth. Atomic prefill keeps mainline behavior and remains the
+    # default until the split path is feature-complete.
+    atomic_prefill: bool = True
 
     def __post_init__(self):
         for name in (
             "prefill_uva",
+            "use_uva",
+            "atomic_prefill",
             "async_scheduling",
             "multi_stream",
             "static_buffers",

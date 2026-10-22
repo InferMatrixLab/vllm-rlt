@@ -18,6 +18,8 @@ class BackendCapabilities:
     packed_prefill: bool = False
     cuda_graphs: bool = False
     async_scheduling: bool = False
+    # Consume GPU-owned context lengths without a host read between submissions.
+    device_context_lengths: bool = False
 
 
 @dataclass
@@ -41,11 +43,15 @@ class AttentionBackend:
 
 
 _TORCH_CAPABILITIES = BackendCapabilities()
-_TRITON_CAPABILITIES = BackendCapabilities(cuda_graphs=True, async_scheduling=True)
+_TRITON_CAPABILITIES = BackendCapabilities(
+    cuda_graphs=True, async_scheduling=True, device_context_lengths=True
+)
 _FLASH_CAPABILITIES = {
-    2: BackendCapabilities(cuda_graphs=True, async_scheduling=True),
-    3: BackendCapabilities(cuda_graphs=True, async_scheduling=True),
-    4: BackendCapabilities(packed_prefill=True, cuda_graphs=True, async_scheduling=True),
+    2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
+    3: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
+    4: BackendCapabilities(
+        packed_prefill=True, cuda_graphs=True, async_scheduling=True, device_context_lengths=True
+    ),
 }
 _AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")
 
@@ -103,7 +109,12 @@ def create_backend(
             implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
             missing = [
                 name
-                for name in ("packed_prefill", "cuda_graphs", "async_scheduling")
+                for name in (
+                    "packed_prefill",
+                    "cuda_graphs",
+                    "async_scheduling",
+                    "device_context_lengths",
+                )
                 if getattr(required_capabilities, name)
                 and not getattr(implementation.capabilities, name)
             ]

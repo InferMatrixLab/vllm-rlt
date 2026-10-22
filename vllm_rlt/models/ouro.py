@@ -28,7 +28,8 @@ from vllm_rlt.layers import (
 )
 
 if TYPE_CHECKING:
-    from vllm_rlt.core.kv_cache_manager import KVCacheManager, _DeviceKVBatch, _PreparedKVBatch
+    from vllm_rlt.core.kv_cache_manager import KVCacheManager
+    from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata
 
 
 @dataclass(frozen=True)
@@ -171,7 +172,7 @@ class OuroAttention(nn.Module):
         self,
         hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        batch: "_PreparedKVBatch | _DeviceKVBatch",
+        batch: "KVMetadata | DeviceKVMetadata",
         cache: "KVCacheManager",
     ) -> torch.Tensor:
         shape = (hidden.shape[0], -1, self.config.head_dim)
@@ -210,7 +211,7 @@ class OuroDecoderLayer(nn.Module):
         self,
         hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        batch: "_PreparedKVBatch | _DeviceKVBatch",
+        batch: "KVMetadata | DeviceKVMetadata",
         cache: "KVCacheManager",
     ) -> torch.Tensor:
         attention = self.self_attn(self.input_layernorm(hidden), position_embeddings, batch, cache)

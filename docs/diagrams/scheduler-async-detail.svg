@@ -1,0 +1,220 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2300" height="3160" viewBox="0 0 2300 3160" role="img" aria-labelledby="title desc"><title id="title">A complete forward: preparation, execution, feedback and safe reuse</title><desc id="desc">One request completes a decode token with two recurrent loops. CPU preparation, GPU dependencies, readback, collection and buffer lifetimes share one time axis. The scheduler selects compatible loops from several requests into one batch. Named buffer waits connect directly to the storage they protect. A separate panel shows delayed exit decisions.</desc><defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M1 1L8 4.5L1 8" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect width="2300" height="3160" fill="#fff"/>
+<text x="55" y="67" font-family="Arial,Helvetica,sans-serif" font-size="44" fill="#20354d" font-weight="700" text-anchor="start">02 / One forward. Three kinds of dependency.</text>
+<text x="55" y="112" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#687c92" font-weight="400" text-anchor="start">CPU may submit ahead. GPU waits for its inputs. Host decisions wait only for the results they consume.</text>
+<text x="55" y="177" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#2967a5" font-weight="700" text-anchor="start">A   SAME REQUEST · FULL DECODE TOKEN · TWO FIXED RECURRENT LOOPS</text>
+<text x="55" y="217" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="400" text-anchor="start">P = PRELUDE    R0 / R1 = recurrent depths 0 / 1    C = CODA + sampling    P′ = next token’s PRELUDE</text>
+<path d="M340 265H2210" fill="none" stroke="#687c92" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="2120" y="247" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#687c92" font-weight="400" text-anchor="start">time →</text>
+<text x="65" y="339" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">CPU schedule</text>
+<text x="65" y="370" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#687c92" font-weight="400" text-anchor="start">prepare → submit</text>
+<path d="M340 381H2200" fill="none" stroke="#e4ebf2" stroke-width="3" stroke-linejoin="round"/>
+<text x="65" y="469" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">Input buffer 0</text>
+<text x="65" y="500" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#687c92" font-weight="400" text-anchor="start">one rotating owner</text>
+<path d="M340 511H2200" fill="none" stroke="#e4ebf2" stroke-width="3" stroke-linejoin="round"/>
+<text x="65" y="579" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">Input buffer 1</text>
+<text x="65" y="610" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#687c92" font-weight="400" text-anchor="start">same owner</text>
+<path d="M340 621H2200" fill="none" stroke="#e4ebf2" stroke-width="3" stroke-linejoin="round"/>
+<text x="65" y="789" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">GPU work</text>
+<text x="65" y="820" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#687c92" font-weight="400" text-anchor="start">prepare → forward</text>
+<path d="M340 831H2200" fill="none" stroke="#e4ebf2" stroke-width="3" stroke-linejoin="round"/>
+<text x="65" y="994" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">Result D2H</text>
+<text x="65" y="1025" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#687c92" font-weight="400" text-anchor="start">separate stream</text>
+<path d="M340 1036H2200" fill="none" stroke="#e4ebf2" stroke-width="3" stroke-linejoin="round"/>
+<text x="65" y="1139" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">CPU feedback</text>
+<text x="65" y="1170" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#687c92" font-weight="400" text-anchor="start">collect → update</text>
+<path d="M340 1181H2200" fill="none" stroke="#e4ebf2" stroke-width="3" stroke-linejoin="round"/>
+<text x="65" y="1269" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">Output buffer</text>
+<text x="65" y="1300" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#687c92" font-weight="400" text-anchor="start">separate ownership</text>
+<path d="M340 1311H2200" fill="none" stroke="#e4ebf2" stroke-width="3" stroke-linejoin="round"/>
+<path d="M740 285V625 M740 730V840" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 6"/>
+<text x="740" y="295" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#a97524" font-weight="700" text-anchor="middle">W0 ends</text>
+<rect x="650" y="310" width="90" height="52" rx="12" fill="#fff4dd" stroke="#a97524" stroke-width="2"/>
+<text x="695.0" y="344.0" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#a97524" font-weight="700" text-anchor="middle">W0</text>
+<path d="M1090 285V625 M1090 730V840" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 6"/>
+<text x="1090" y="295" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#a97524" font-weight="700" text-anchor="middle">W1 ends</text>
+<rect x="940" y="310" width="150" height="52" rx="12" fill="#fff4dd" stroke="#a97524" stroke-width="2"/>
+<text x="1015.0" y="344.0" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#a97524" font-weight="700" text-anchor="middle">W1</text>
+<path d="M1440 285V625 M1440 730V840" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 6"/>
+<text x="1440" y="295" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#a97524" font-weight="700" text-anchor="middle">W2 ends</text>
+<rect x="1290" y="310" width="150" height="52" rx="12" fill="#fff4dd" stroke="#a97524" stroke-width="2"/>
+<text x="1365.0" y="344.0" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#a97524" font-weight="700" text-anchor="middle">W2</text>
+<text x="350" y="247" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#687c92" font-weight="400" text-anchor="start">Shared vertical lines: wait ends = old input use ends = prior GPU work completes.</text>
+<rect x="350" y="310" width="150" height="52" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="425.0" y="344.0" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#2967a5" font-weight="700" text-anchor="middle">P: prep</text>
+<rect x="350" y="440" width="390" height="52" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="545.0" y="474.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2967a5" font-weight="700" text-anchor="middle">P inputs → P done</text>
+<rect x="525" y="310" width="125" height="52" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="587.5" y="344.0" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#26806b" font-weight="700" text-anchor="middle">R0: prep</text>
+<rect x="525" y="550" width="565" height="52" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="807.5" y="584.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#26806b" font-weight="700" text-anchor="middle">R0 inputs → R0 done</text>
+<rect x="740" y="310" width="200" height="52" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="840.0" y="344.0" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#26806b" font-weight="700" text-anchor="middle">R1: prep</text>
+<rect x="740" y="440" width="700" height="52" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1090.0" y="474.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#26806b" font-weight="700" text-anchor="middle">R1 inputs → R1 done</text>
+<rect x="1090" y="310" width="200" height="52" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="1190.0" y="344.0" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#8657a5" font-weight="700" text-anchor="middle">C: prep</text>
+<rect x="1090" y="550" width="680" height="52" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="1430.0" y="584.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8657a5" font-weight="700" text-anchor="middle">C inputs → C done</text>
+<rect x="1440" y="310" width="250" height="52" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="1565.0" y="344.0" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#2967a5" font-weight="700" text-anchor="middle">P′: prep</text>
+<rect x="1440" y="440" width="710" height="52" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="1795.0" y="474.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2967a5" font-weight="700" text-anchor="middle">P′ inputs → P′ done</text>
+<path d="M740 362V440" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M740 448V484" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round"/>
+<path d="M1090 362V430" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round"/>
+<path d="M1090 502V550" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1090 558V594" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round"/>
+<path d="M1440 362V440" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1440 448V484" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round"/>
+<text x="350" y="660" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97524" font-weight="700" text-anchor="start">W0 ends: P done / buffer 0 released</text>
+<text x="1000" y="660" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97524" font-weight="700" text-anchor="start">W1 ends: R0 done / buffer 1 released</text>
+<text x="1660" y="660" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97524" font-weight="700" text-anchor="start">W2 ends: R1 done / buffer 0 released</text>
+<text x="350" y="704" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#687c92" font-weight="400" text-anchor="start">The next prep and buffer write start at that boundary. Host wake-up overhead is omitted; widths are illustrative.</text>
+<rect x="520" y="760" width="220" height="70" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="630.0" y="803.0" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#2967a5" font-weight="700" text-anchor="middle">P</text>
+<circle cx="740" cy="830" r="7" fill="#2967a5"/>
+<text x="740" y="865" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2967a5" font-weight="700" text-anchor="middle">P done</text>
+<rect x="770" y="760" width="320" height="70" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="930.0" y="803.0" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#26806b" font-weight="700" text-anchor="middle">R0</text>
+<circle cx="1090" cy="830" r="7" fill="#26806b"/>
+<text x="1090" y="865" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#26806b" font-weight="700" text-anchor="middle">R0 done</text>
+<rect x="1120" y="760" width="320" height="70" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1280.0" y="803.0" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#26806b" font-weight="700" text-anchor="middle">R1</text>
+<circle cx="1440" cy="830" r="7" fill="#26806b"/>
+<text x="1440" y="865" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#26806b" font-weight="700" text-anchor="middle">R1 done</text>
+<rect x="1470" y="760" width="300" height="70" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="1620.0" y="803.0" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#8657a5" font-weight="700" text-anchor="middle">C + sample</text>
+<circle cx="1770" cy="830" r="7" fill="#8657a5"/>
+<text x="1770" y="865" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#8657a5" font-weight="700" text-anchor="middle">C done</text>
+<rect x="1800" y="760" width="350" height="70" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="1975.0" y="803.0" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#2967a5" font-weight="700" text-anchor="middle">P′</text>
+<circle cx="2150" cy="830" r="7" fill="#2967a5"/>
+<text x="2150" y="865" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2967a5" font-weight="700" text-anchor="middle">P′ done</text>
+<path d="M740 795H770" fill="none" stroke="#26806b" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1090 795H1120" fill="none" stroke="#26806b" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1440 795H1470" fill="none" stroke="#26806b" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1770 795H1800" fill="none" stroke="#26806b" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="350" y="915" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#26806b" font-weight="700" text-anchor="start">GPU arrows: hidden / KV / sampled token stay on device. No collect between P, R0 and R1.</text>
+<rect x="1790" y="965" width="100" height="52" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="1840.0" y="999.0" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#8657a5" font-weight="700" text-anchor="middle">token</text>
+<path d="M1770 837V991H1790" fill="none" stroke="#8657a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<circle cx="1890" cy="1017" r="7" fill="#8657a5"/>
+<text x="1890" y="1052" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#8657a5" font-weight="700" text-anchor="middle">D: readable</text>
+<text x="350" y="1000" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#687c92" font-weight="400" text-anchor="start">P / R0 / R1: no host result in this fixed-depth example.</text>
+<rect x="1940" y="1110" width="245" height="52" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="2062.5" y="1144.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8657a5" font-weight="700" text-anchor="middle">collect + EOS</text>
+<path d="M1897 1017H2030V1080H2060V1110" fill="none" stroke="#8657a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="350" y="1144" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#687c92" font-weight="400" text-anchor="start">C submission queues P′ using the device token; collection decides stop / continue.</text>
+<rect x="1290" y="1240" width="895" height="52" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="1737.5" y="1274.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8657a5" font-weight="700" text-anchor="middle">C result storage held until collect releases it</text>
+<text x="350" y="1355" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">Input reuse follows compute completion. D2H completion makes output readable; collect releases its lease.</text>
+<text x="350" y="1394" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#8657a5" font-weight="700" text-anchor="start">P′ may run before EOS is known; the next CODA must resolve the preceding token’s stop decision.</text>
+<rect x="35" y="1440" width="2230" height="960" rx="12" fill="#f8fafd" stroke="#d5dfeb" stroke-width="2"/>
+<text x="60" y="1486" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#2967a5" font-weight="700" text-anchor="start">B   MANY REQUESTS → ONE RECURRENT BATCH → PER-REQUEST PROGRESS</text>
+<text x="80" y="1532" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#20354d" font-weight="700" text-anchor="start">Ready request work</text>
+<rect x="80" y="1560" width="460" height="58" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="310.0" y="1597.0" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#2967a5" font-weight="700" text-anchor="middle">A · decode · depth 1 · 1 token</text>
+<rect x="80" y="1645" width="460" height="58" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="310.0" y="1682.0" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#8657a5" font-weight="700" text-anchor="middle">B · decode · depth 3 · 1 token</text>
+<rect x="80" y="1730" width="460" height="58" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="310.0" y="1767.0" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#26806b" font-weight="700" text-anchor="middle">C · prefill · depth 0 · 4 tokens</text>
+<path d="M540 1589H585" fill="none" stroke="#2967a5" stroke-width="3" stroke-linejoin="round"/>
+<path d="M540 1674H585" fill="none" stroke="#8657a5" stroke-width="3" stroke-linejoin="round"/>
+<path d="M540 1759H585" fill="none" stroke="#26806b" stroke-width="3" stroke-linejoin="round"/>
+<path d="M585 1589V1759" fill="none" stroke="#687c92" stroke-width="3" stroke-linejoin="round"/>
+<path d="M585 1674H650" fill="none" stroke="#2967a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="650" y="1560" width="420" height="228" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="680" y="1604" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#2967a5" font-weight="700" text-anchor="start">SCHEDULER</text>
+<text x="680" y="1651" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#20354d" font-weight="700" text-anchor="start">Compatible recurrent work</text>
+<text x="680" y="1694" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#20354d" font-weight="400" text-anchor="start">Eligibility + token / seq budget</text>
+<text x="680" y="1733" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#20354d" font-weight="400" text-anchor="start">KV capacity + reservations</text>
+<text x="680" y="1766" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#20354d" font-weight="400" text-anchor="start">Keep each request’s own depth</text>
+<path d="M1070 1674H1140" fill="none" stroke="#2967a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1140" y="1560" width="550" height="228" rx="12" fill="#fff" stroke="#2967a5" stroke-width="2"/>
+<text x="1165" y="1604" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#2967a5" font-weight="700" text-anchor="start">ONE BATCH · 6 token rows</text>
+<rect x="1170" y="1630" width="73" height="58" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="1206.5" y="1667.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#2967a5" font-weight="700" text-anchor="middle">A</text>
+<rect x="1251" y="1630" width="73" height="58" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="1287.5" y="1667.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#8657a5" font-weight="700" text-anchor="middle">B</text>
+<rect x="1332" y="1630" width="73" height="58" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1368.5" y="1667.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#26806b" font-weight="700" text-anchor="middle">C</text>
+<rect x="1413" y="1630" width="73" height="58" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1449.5" y="1667.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#26806b" font-weight="700" text-anchor="middle">C</text>
+<rect x="1494" y="1630" width="73" height="58" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1530.5" y="1667.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#26806b" font-weight="700" text-anchor="middle">C</text>
+<rect x="1575" y="1630" width="73" height="58" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1611.5" y="1667.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#26806b" font-weight="700" text-anchor="middle">C</text>
+<text x="1165" y="1729" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#20354d" font-weight="700" text-anchor="start">depths: [1, 3, 0, 0, 0, 0]</text>
+<text x="1165" y="1765" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#20354d" font-weight="400" text-anchor="start">Per-request positions, KV and row ranges</text>
+<path d="M1690 1674H1760" fill="none" stroke="#2967a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1760" y="1560" width="450" height="228" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1790" y="1604" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#26806b" font-weight="700" text-anchor="start">ONE SUBMISSION</text>
+<text x="1790" y="1651" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="400" text-anchor="start">Prepare batch inputs once</text>
+<text x="1790" y="1693" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#20354d" font-weight="400" text-anchor="start">Wait on member dependencies</text>
+<text x="1790" y="1734" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#26806b" font-weight="700" text-anchor="start">Run one recurrent batch</text>
+<text x="1790" y="1766" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#20354d" font-weight="400" text-anchor="start">Preserve sequence / KV isolation</text>
+<path d="M1985 1788V1835H400" fill="none" stroke="#687c92" stroke-width="3" stroke-linejoin="round"/>
+<path d="M400 1835V1870" fill="none" stroke="#687c92" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1120 1835V1870" fill="none" stroke="#687c92" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1910 1835V1870" fill="none" stroke="#687c92" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="80" y="1870" width="640" height="60" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="400.0" y="1908.0" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#2967a5" font-weight="700" text-anchor="middle">A → depth 2 · recurrent queue</text>
+<rect x="790" y="1870" width="660" height="60" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="1120.0" y="1908.0" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#8657a5" font-weight="700" text-anchor="middle">B → CODA queue · if exit is established</text>
+<rect x="1580" y="1870" width="630" height="60" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1895.0" y="1908.0" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#26806b" font-weight="700" text-anchor="middle">C → depth 1 · prefill recurrent queue</text>
+<text x="80" y="1985" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#20354d" font-weight="700" text-anchor="start">Each request advances separately. The scheduler selects the next batch again; membership is not fixed.</text>
+<text x="80" y="2025" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#687c92" font-weight="400" text-anchor="start">Example order follows decode then prefill selection. PRELUDE / CODA are not mixed into this recurrent batch.</text>
+<text x="80" y="2085" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#2967a5" font-weight="700" text-anchor="start">PIPELINE BETWEEN BATCHES</text>
+<text x="80" y="2153" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">CPU</text>
+<rect x="350" y="2120" width="400" height="52" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="550.0" y="2154.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2967a5" font-weight="700" text-anchor="middle">Prepare batch [A, B, C]</text>
+<rect x="820" y="2120" width="570" height="52" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1105.0" y="2154.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#26806b" font-weight="700" text-anchor="middle">Prepare ready batch [D, E]</text>
+<text x="80" y="2263" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">GPU</text>
+<rect x="800" y="2230" width="700" height="52" rx="12" fill="#e8f1fc" stroke="#2967a5" stroke-width="2"/>
+<text x="1150.0" y="2264.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2967a5" font-weight="700" text-anchor="middle">Recurrent batch [A, B, C]</text>
+<rect x="1580" y="2230" width="600" height="52" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1880.0" y="2264.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#26806b" font-weight="700" text-anchor="middle">Batch [D, E]</text>
+<path d="M750 2146H775V2230" fill="none" stroke="#2967a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1390 2172V2200H1580V2230" fill="none" stroke="#26806b" stroke-width="3" stroke-linejoin="round" stroke-dasharray="7 6" marker-end="url(#arrow)"/>
+<text x="80" y="2345" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">D / E are independent ready requests; no collect of A / B / C is needed just to prepare their batch.</text>
+<text x="80" y="2380" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#687c92" font-weight="400" text-anchor="start">The rotating input buffers belong to batch submissions. Previous readers still protect each buffer before reuse.</text>
+<rect x="35" y="2440" width="2230" height="350" rx="12" fill="#fbf9fd" stroke="#d5dfeb" stroke-width="2"/>
+<text x="60" y="2486" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#8657a5" font-weight="700" text-anchor="start">C   DATA-DEPENDENT EXIT · THE DELAYED POLICY CHANGES THE HOST DEPENDENCY</text>
+<text x="65" y="2565" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">GPU</text>
+<rect x="350" y="2530" width="420" height="52" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="560.0" y="2564.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#26806b" font-weight="700" text-anchor="middle">R0 + gate g0</text>
+<rect x="820" y="2530" width="600" height="52" rx="12" fill="#e6f4ef" stroke="#26806b" stroke-width="2"/>
+<text x="1120.0" y="2564.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#26806b" font-weight="700" text-anchor="middle">R1 + gate g1</text>
+<path d="M770 2556H820" fill="none" stroke="#26806b" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1820" y="2530" width="360" height="52" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="2000.0" y="2564.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8657a5" font-weight="700" text-anchor="middle">R2 or CODA</text>
+<path d="M1420 2556H1820" fill="none" stroke="#26806b" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="65" y="2660" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">Host decision</text>
+<rect x="820" y="2625" width="200" height="52" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="920.0" y="2659.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8657a5" font-weight="700" text-anchor="middle">D2H g0</text>
+<rect x="1080" y="2625" width="340" height="52" rx="12" fill="#f0e8f8" stroke="#8657a5" stroke-width="2"/>
+<text x="1250.0" y="2659.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8657a5" font-weight="700" text-anchor="middle">collect g0</text>
+<rect x="1490" y="2625" width="300" height="52" rx="12" fill="#fff4dd" stroke="#a97524" stroke-width="2"/>
+<text x="1640.0" y="2659.0" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#a97524" font-weight="700" text-anchor="middle">choose next</text>
+<path d="M770 2582V2651H820" fill="none" stroke="#8657a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1020 2651H1080" fill="none" stroke="#8657a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1420 2651H1490" fill="none" stroke="#8657a5" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1789 2651H1805V2556H1820" fill="none" stroke="#a97524" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="350" y="2732" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#20354d" font-weight="700" text-anchor="start">Submit R1 first; consume g0 to allow R2 or enqueue CODA. This is the configured delayed-exit semantics.</text>
+<text x="350" y="2767" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#687c92" font-weight="400" text-anchor="start">If g0 is required and not readable, collect waits. Fixed-depth / trace / maximum-depth paths can skip it.</text>
+<text x="55" y="2852" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#2967a5" font-weight="700" text-anchor="start">READ THE DEPENDENCIES</text>
+<rect x="60" y="2880" width="690" height="116" rx="12" fill="#fff" stroke="#26806b" stroke-width="2"/>
+<text x="82" y="2920" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#26806b" font-weight="700" text-anchor="start">GPU data</text>
+<text x="82" y="2964" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#20354d" font-weight="400" text-anchor="start">Previous compute event → next consumer</text>
+<rect x="810" y="2880" width="690" height="116" rx="12" fill="#fff" stroke="#8657a5" stroke-width="2"/>
+<text x="832" y="2920" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#8657a5" font-weight="700" text-anchor="start">Host decision</text>
+<text x="832" y="2964" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#20354d" font-weight="400" text-anchor="start">Readback event → collect → scheduling</text>
+<rect x="1560" y="2880" width="690" height="116" rx="12" fill="#fff" stroke="#a97524" stroke-width="2"/>
+<text x="1582" y="2920" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#a97524" font-weight="700" text-anchor="start">Buffer reuse</text>
+<text x="1582" y="2964" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#20354d" font-weight="400" text-anchor="start">Previous reader done → overwrite</text>
+<text x="55" y="3041" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#20354d" font-weight="700" text-anchor="start">Split prefill: each chunk follows P → R0 → … → Rlast; only prompt completion proceeds to CODA.</text>
+<text x="55" y="3081" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#687c92" font-weight="400" text-anchor="start">Atomic prefill may fuse P + recurrent loops into one submission. Each input tensor owner has its own pool.</text>
+<text x="55" y="3118" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#687c92" font-weight="400" text-anchor="start">One GPU lane is shown; multi-stream execution remains optional. Time widths are illustrative. Draft/verify uses its own round controller.</text>
+</svg>

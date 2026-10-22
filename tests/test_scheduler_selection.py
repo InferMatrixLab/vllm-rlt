@@ -10,10 +10,10 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestPhase
 
 
 def model():
@@ -21,7 +21,7 @@ def model():
     return OuroForCausalLM(tiny_ouro_config())
 
 
-def engine(max_num_seqs=2, **scheduler_options):
+def engine(max_num_seqs=2, atomic_prefill=True, **scheduler_options):
     return LLMEngine(
         model(),
         cache_config=CacheConfig(64, 2),
@@ -30,6 +30,7 @@ def engine(max_num_seqs=2, **scheduler_options):
             enable_preemption=True,
             **scheduler_options,
         ),
+        execution_config=ExecutionConfig(atomic_prefill=atomic_prefill),
     )
 
 
@@ -44,10 +45,10 @@ def test_batch_selection_is_never_preempted_by_a_later_item(monkeypatch):
         e.add_request(name, [1, 2], params())
     e.scheduler._admit()
     monkeypatch.setattr(e.cache_manager, "ensure_capacity", lambda rid, frontier: rid != "b")
-    batch = e.scheduler._take(Stage.PREFILL)
-    assert [item.request.request_id for item in batch.items] == ["a"]
+    batch = e.scheduler._take(RequestPhase.PREFILL)
+    assert [scheduled_request.request.request_id for scheduled_request in batch.requests] == ["a"]
     assert e.preemption.preemptions == 0
-    assert e.scheduler.requests["a"].stage == Stage.PREFILL
+    assert e.scheduler.requests["a"].phase == RequestPhase.PREFILL
 
 
 def test_direct_take_does_not_inherit_an_earlier_batch_selection(monkeypatch):
@@ -57,7 +58,7 @@ def test_direct_take_does_not_inherit_an_earlier_batch_selection(monkeypatch):
         e.add_request(name, [1, 2], params())
     e.scheduler._admit()
     # A first batch selects both requests.
-    assert e.scheduler._take(Stage.PREFILL) is not None
+    assert e.scheduler._take(RequestPhase.PREFILL) is not None
 
     seen = []
 
@@ -66,11 +67,11 @@ def test_direct_take_does_not_inherit_an_earlier_batch_selection(monkeypatch):
         return False
 
     # The Scheduler holds the callback it was given, so replace that reference.
-    monkeypatch.setattr(e.scheduler, "preempt_callback", spy)
+    monkeypatch.setattr(e.scheduler, "preempt", spy)
     for name in ("a", "b"):
-        e.scheduler.enqueue(e.scheduler.requests[name], Stage.PREFILL)
+        e.scheduler.enqueue(e.scheduler.requests[name], RequestPhase.PREFILL)
     monkeypatch.setattr(e.cache_manager, "ensure_capacity", lambda rid, frontier: rid != "b")
-    assert e.scheduler._take(Stage.PREFILL) is not None
+    assert e.scheduler._take(RequestPhase.PREFILL) is not None
     # Only "a", selected in this batch, is excluded. The first batch's
     # selection is not still in force, and the set is handed over frozen.
     assert seen == [("b", frozenset({"a"}))]
@@ -81,9 +82,9 @@ def test_request_selected_in_an_earlier_batch_is_still_preemptable():
     e = engine(max_num_seqs=1)
     e.add_request("victim", [1, 2], params())
     e.step()
-    assert e.scheduler.requests["victim"].stage != Stage.WAITING
+    assert e.scheduler.requests["victim"].phase != RequestPhase.WAITING
     e.add_request("requester", [3, 4], params())
-    assert e.preemption.preempt(e.scheduler.requests["requester"])
+    assert e.scheduler.preempt(e.scheduler.requests["requester"])
     assert "victim" in e.preemption.snapshots
 
 
@@ -96,18 +97,19 @@ def test_reused_request_id_is_not_protected_by_the_previous_request():
     e.add_request("r", [3, 4], params())
     e.step()
     e.add_request("requester", [5, 6], params())
-    assert e.preemption.preempt(e.scheduler.requests["requester"])
+    assert e.scheduler.preempt(e.scheduler.requests["requester"])
     assert "r" in e.preemption.snapshots
 
 
-@pytest.mark.parametrize("boundary", [Stage.PRELUDE, Stage.CODA])
-def test_refill_runs_boundary_restored_during_admission(boundary):
+@pytest.mark.parametrize("boundary", [RequestPhase.PRELUDE, RequestPhase.CODA])
+@pytest.mark.parametrize("atomic_prefill", [True, False], ids=["atomic", "split"])
+def test_refill_runs_boundary_restored_during_admission(boundary, atomic_prefill):
     """A sole resumed boundary must run in the admission step that restores it."""
-    e = engine(max_num_seqs=1)
+    e = engine(max_num_seqs=1, atomic_prefill=atomic_prefill)
     e.add_request("resumed", [1, 2], params(max_tokens=3))
     request = e.scheduler.requests["resumed"]
     for _ in range(20):
-        if request.stage == boundary:
+        if request.phase == boundary:
             break
         e.step()
     else:
@@ -115,22 +117,22 @@ def test_refill_runs_boundary_restored_during_admission(boundary):
 
     generated_before = len(request.generated_token_ids)
     e.add_request("pressure", [3, 4], params(max_tokens=1))
-    assert e.preemption.preempt(e.scheduler.requests["pressure"])
-    assert e.preemption.snapshots["resumed"]["stage"] == boundary
-    assert request.stage == Stage.WAITING
+    assert e.scheduler.preempt(e.scheduler.requests["pressure"])
+    assert e.preemption.snapshots["resumed"]["phase"] == boundary
+    assert request.phase == RequestPhase.WAITING
     e.abort_request("pressure")
 
     outputs = e.step()
 
     assert e.preemption.resumptions == 1
-    assert e.last_schedule.stage == boundary
-    if boundary == Stage.PRELUDE:
+    assert e.last_schedule.phase == boundary
+    if boundary == RequestPhase.PRELUDE:
         assert not outputs
-        assert request.stage == Stage.RECURRENT
+        assert request.phase == RequestPhase.RECURRENT
         assert len(request.generated_token_ids) == generated_before
     else:
         assert [output.request_id for output in outputs] == ["resumed"]
-        assert request.stage == Stage.PRELUDE
+        assert request.phase == RequestPhase.PRELUDE
         assert len(request.generated_token_ids) == generated_before + 1
 
 
@@ -144,7 +146,7 @@ def test_refill_restored_coda_waits_for_recurrent_batchmate():
     e.add_request("core", [1, 2], SamplingParams(max_tokens=2, ignore_eos=True))
     core = e.scheduler.requests["core"]
     for _ in range(20):
-        if core.stage == Stage.RECURRENT:
+        if core.phase == RequestPhase.RECURRENT:
             break
         e.step()
     else:
@@ -157,27 +159,29 @@ def test_refill_restored_coda_waits_for_recurrent_batchmate():
     )
     e.step()
     restored = e.scheduler.requests["restored-coda"]
-    assert core.stage == Stage.RECURRENT
-    assert restored.stage == Stage.CODA
+    assert core.phase == RequestPhase.RECURRENT
+    assert restored.phase == RequestPhase.CODA
 
     e.add_request("pressure", [5, 6], params(max_tokens=1))
-    assert e.preemption.preempt(e.scheduler.requests["pressure"])
-    assert e.preemption.snapshots["restored-coda"]["stage"] == Stage.CODA
+    assert e.scheduler.preempt(e.scheduler.requests["pressure"])
+    assert e.preemption.snapshots["restored-coda"]["phase"] == RequestPhase.CODA
     e.abort_request("pressure")
 
     e.step()
 
     assert e.preemption.resumptions == 1
-    assert e.last_schedule.stage == Stage.RECURRENT
-    assert restored.stage == Stage.CODA
+    assert e.last_schedule.phase == RequestPhase.RECURRENT
+    assert restored.phase == RequestPhase.CODA
 
     for _ in range(20):
         e.step()
-        if e.last_schedule.stage == Stage.CODA:
+        if e.last_schedule.phase == RequestPhase.CODA:
             break
     else:
         pytest.fail("CODA requests did not form a batch")
-    assert {item.request.request_id for item in e.last_schedule.items} == {
+    assert {
+        scheduled_request.request.request_id for scheduled_request in e.last_schedule.requests
+    } == {
         "core",
         "restored-coda",
     }

@@ -5,6 +5,13 @@ import triton.language as tl
 
 
 @triton.jit
+def slots_kernel(D, Slots, N, SIZE, TILE: tl.constexpr):
+    row = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    slot = tl.load(D + row * 3, row < N, 0)
+    tl.store(Slots + row, slot, row < SIZE)
+
+
+@triton.jit
 def metadata_kernel(
     D,
     Tables,
@@ -74,6 +81,67 @@ def scatter_kernel(
     slot = tl.load(Slots + row)
     value = tl.load(In + row * IN_STRIDE + col, col < H, 0)
     tl.store(Pool + slot * OUT_STRIDE + col, value, col < H)
+
+
+@triton.jit
+def gather_segments_kernel(
+    Pool,
+    Segments,
+    Out,
+    POOL_ROWS: tl.constexpr,
+    H: tl.constexpr,
+    IN_STRIDE: tl.constexpr,
+    OUT_STRIDE: tl.constexpr,
+    ROWS: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    segment = tl.program_id(0)
+    rows = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+    cols = tl.program_id(2) * TILE + tl.arange(0, TILE)
+    slot = tl.load(Segments + segment * 5)
+    offset = tl.load(Segments + segment * 5 + 1)
+    count = tl.load(Segments + segment * 5 + 2)
+    out_start = tl.load(Segments + segment * 5 + 3)
+    mask = (rows[:, None] < count) & (cols[None, :] < H)
+    source = tl.load(
+        Pool + (slot * POOL_ROWS + offset + rows[:, None]) * IN_STRIDE + cols[None, :],
+        mask,
+        0,
+    )
+    tl.store(Out + (out_start + rows[:, None]) * OUT_STRIDE + cols[None, :], source, mask)
+
+
+@triton.jit
+def scatter_segments_kernel(
+    In,
+    Segments,
+    Pool,
+    POOL_ROWS: tl.constexpr,
+    H: tl.constexpr,
+    IN_STRIDE: tl.constexpr,
+    OUT_STRIDE: tl.constexpr,
+    ROWS: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    segment = tl.program_id(0)
+    rows = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+    cols = tl.program_id(2) * TILE + tl.arange(0, TILE)
+    slot = tl.load(Segments + segment * 5)
+    offset = tl.load(Segments + segment * 5 + 1)
+    count = tl.load(Segments + segment * 5 + 2)
+    in_start = tl.load(Segments + segment * 5 + 3)
+    keep_intermediate = tl.load(Segments + segment * 5 + 4) != 0
+    mask = (rows[:, None] < count) & (cols[None, :] < H) & keep_intermediate
+    value = tl.load(
+        In + (in_start + rows[:, None]) * IN_STRIDE + cols[None, :],
+        mask,
+        0,
+    )
+    tl.store(
+        Pool + (slot * POOL_ROWS + offset + rows[:, None]) * OUT_STRIDE + cols[None, :],
+        value,
+        mask,
+    )
 
 
 @triton.jit

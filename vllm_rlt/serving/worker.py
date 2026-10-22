@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
 
-from vllm_rlt.request import Stage
 from vllm_rlt.serving.protocol import IncrementalText, ServingError, ServingLimits
 
 logger = logging.getLogger(__name__)
@@ -142,7 +141,7 @@ class EngineWorker:
     def _tick(self, pending, cancellations):
         failures = []
         for request_id in cancellations:
-            if request_id in self.engine.scheduler.requests:
+            if self.engine.has_request(request_id):
                 self.engine.abort_request(request_id)
             self.decoders.pop(request_id, None)
         for channel in pending:
@@ -171,8 +170,7 @@ class EngineWorker:
                 )
                 self.decoders[output.request_id] = (decoder, len(output.token_ids))
             except ValueError as exc:
-                request = self.engine.scheduler.requests.get(output.request_id)
-                if request is not None and request.stage != Stage.FINISHED:
+                if self.engine.has_request(output.request_id):
                     self.engine.abort_request(output.request_id)
                 del self.decoders[output.request_id]
                 closed.add(output.request_id)
@@ -196,16 +194,12 @@ class EngineWorker:
 
     def _unload(self):
         if self.engine is not None:
-            for request_id in list(self.engine.scheduler.requests):
+            for request_id in self.engine.request_ids():
                 self.engine.abort_request(request_id)
             close = getattr(self.engine, "close", None)
             if close is not None:
                 close()
-            logger.info(
-                "engine cleanup: requests=%d kv_blocks=%d",
-                len(self.engine.scheduler.requests),
-                self.engine.cache_manager.num_used_blocks,
-            )
+            logger.info("engine cleanup: %s", self.engine.stats())
         self.decoders.clear()
         self.engine = None
         self.tokenizer = None

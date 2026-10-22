@@ -4,38 +4,33 @@ D reservations precede P computation. Control channels carry only metadata and
 outputs; NIXL moves KV directly between registered worker allocations.
 """
 
-import multiprocessing as mp
 import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
 
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt.engine.llm_engine import StageClient
+from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.models import OuroConfig, resolve_model_config
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
-from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
+from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
 
 from .config import PDConfig
-from .worker import worker_main
+from .connector import PDStageConnector
 
 
 @dataclass
 class Peer:
     name: str
     role: str
-    process: object
-    channel: object
-    info: dict = field(default_factory=dict)
-    blocks: int = 0
+    client: StageClient
+    reserved_blocks: int = 0
     slots: int = 0
-    compute_slots: int = 0
-    ready: bool = False
-    connected: bool = False
-    stopped: bool = False
 
 
 @dataclass
@@ -47,11 +42,10 @@ class Pending:
     p: str | None = None
     d: str | None = None
     phase: str = "waiting"
-    p_blocks: int = 0
-    d_blocks: int = 0
+    p_reserved_blocks: int = 0
+    d_reserved_blocks: int = 0
     cancelled: bool = False
     p_released: bool = False
-    p_compute_released: bool = False
     d_released: bool = False
     finished: bool = False
     timings: dict = field(default_factory=dict)
@@ -75,13 +69,15 @@ class PDEngine:
         seed=0,
         speculative_config=None,
     ):
-        if speculative_config is not None:
-            raise ValueError("speculative decoding is not yet supported by PD")
+        self.speculative_config = speculative_config
         if isinstance(model, (str, Path)):
             model, revision, _ = resolve_model_config(model, revision=revision)
         self.config = pd_config or PDConfig()
-        self.exit_config = exit_config or ExitConfig("ouro_delayed")
+        self.exit_config = exit_config or ExitConfig(
+            "ouro" if speculative_config else "ouro_delayed"
+        )
         execution = execution_config or ExecutionConfig(async_scheduling=True)
+        self._async_speculative = bool(speculative_config and execution.async_scheduling)
         p_scheduler = prefill_scheduler_config or SchedulerConfig(
             max_num_seqs=8, max_num_batched_tokens=2048, prefill_chunk_size=2048
         )
@@ -98,19 +94,15 @@ class PDEngine:
         self.peers = {}
         self.requests = {}
         self.transfers = {}
-        self.scheduler = SimpleNamespace(requests=self.requests)
-        self.cache_manager = SimpleNamespace(num_used_blocks=0)
         self.metrics = deque(maxlen=1024)
         self.worker_metrics = {}
         self.outputs = deque()
         self.closed = False
         self.failure = None
         self._profile_session = None
-        self._profile_replies = {}
         self._profile_statuses = {}
         self._profile_recording = False
         self._profile_errors = []
-        context = mp.get_context("spawn")
         epoch = uuid.uuid4().hex
         try:
             for role, devices, cache, scheduler in (
@@ -119,52 +111,53 @@ class PDEngine:
             ):
                 for device in devices:
                     name = f"{epoch}-{role}-{device}"
-                    parent, child = context.Pipe()
-                    options = dict(
+                    client = StageClient(
+                        model,
+                        device=device,
+                        stage_config=StageConfig(stage_id=name, role=role),
+                        connector_factory=partial(PDStageConnector.create, config=self.config),
+                        max_control_messages=self.config.max_control_messages,
+                        startup_timeout=self.config.startup_timeout,
+                        shutdown_timeout=self.config.shutdown_timeout,
+                        wait_for_ready=False,
                         dtype=dtype,
                         revision=revision,
                         seed=seed,
-                        engine=dict(
-                            cache_config=cache,
-                            scheduler_config=scheduler,
-                            exit_config=self.exit_config,
-                            execution_config=(
-                                replace(execution, cuda_graphs=False)
-                                if role == "prefill"
-                                else execution
-                            ),
-                            attention_backend=attention_backend,
+                        cache_config=cache,
+                        scheduler_config=scheduler,
+                        exit_config=(
+                            ExitConfig("ouro_delayed")
+                            if role == "prefill"
+                            and speculative_config is not None
+                            and execution.async_scheduling
+                            else self.exit_config
                         ),
+                        speculative_config=speculative_config if role == "decode" else None,
+                        execution_config=execution,
+                        attention_backend=attention_backend,
                     )
-                    process = context.Process(
-                        target=worker_main,
-                        args=(role, device, name, child, model, options, self.config),
-                        name=f"vllm-rlt-{role}-{device}",
-                    )
-                    process.start()
-                    child.close()
-                    self.peers[name] = Peer(name, role, process, parent)
+                    self.peers[name] = Peer(name, role, client)
             deadline = time.monotonic() + self.config.startup_timeout
-            self._wait(lambda: all(p.ready for p in self.peers.values()), deadline)
-            fingerprints = {p.info["fingerprint"] for p in self.peers.values()}
+            self._wait(lambda: all(p.client.ready for p in self.peers.values()), deadline)
+            fingerprints = {p.client.info["fingerprint"] for p in self.peers.values()}
             if len(fingerprints) != 1:
                 raise ValueError("P/D model weights or KV configuration do not match")
-            self.model = SimpleNamespace(
-                config=OuroConfig(**next(iter(self.peers.values())).info["model"])
-            )
+            self.model_config = OuroConfig(**next(iter(self.peers.values())).client.info["model"])
             for peer in self.peers.values():
                 self._send(
                     peer.name,
                     "connect",
-                    peers=[p.info["info"] for p in self.peers.values() if p.role != peer.role],
+                    peers=[
+                        p.client.info["info"] for p in self.peers.values() if p.role != peer.role
+                    ],
                 )
-            self._wait(lambda: all(p.connected for p in self.peers.values()), deadline)
+            self._wait(lambda: all(p.client.connected for p in self.peers.values()), deadline)
         except BaseException:
             self._terminate()
             raise
 
     def _send(self, destination, kind, **fields):
-        self.peers[destination].channel.send(dict(kind=kind, **fields))
+        self.peers[destination].client.send(kind, **fields)
 
     def _wait(self, condition, deadline):
         while not condition():
@@ -175,39 +168,17 @@ class PDEngine:
 
     def _poll(self):
         for peer in self.peers.values():
-            for _ in range(self.config.max_control_messages):
-                if not peer.channel.poll():
-                    break
-                try:
-                    message = peer.channel.recv()
-                except EOFError:
-                    if peer.stopped:
-                        break
-                    raise RuntimeError(f"PD worker {peer.name} disconnected") from None
+            for message in peer.client.poll():
                 self._message(peer, message)
-            if not peer.process.is_alive() and not peer.stopped:
-                raise RuntimeError(f"PD worker {peer.name} exited {peer.process.exitcode}")
 
     def _message(self, peer, m):
         kind = m["kind"]
-        if kind == "profile_reply":
-            pending = self._profile_replies.get(m.get("control_id"))
-            if pending is not None and m.get("session_id") == self._profile_session:
-                pending[peer.name] = m
-            return
-        if kind == "fatal":
-            raise RuntimeError(f"PD {peer.role} failed:\n{m['error']}")
-        if kind == "ready":
-            peer.info, peer.ready = m, True
-            return
-        if kind == "connected":
-            peer.connected = True
-            return
+        if kind in ("ready", "connected", "reply"):
+            return  # StageClient owns common worker lifecycle state.
         if kind == "stopped":
-            peer.stopped = True
             self.worker_metrics[peer.name] = m
             return
-        w = self.transfers.get(m.get("tid"))
+        w = self.transfers.get(m["request_id"] if kind == "output" else m.get("tid"))
         if w is None:
             return  # Delayed messages from retired generations.
         if peer.name not in (w.p, w.d):
@@ -226,7 +197,7 @@ class PDEngine:
                 tokens=w.request.prompt_token_ids,
                 params=w.request.sampling_params,
                 trace_id=w.trace_id,
-                peer=self.peers[w.d].info["info"]["agent"],
+                peer=self.peers[w.d].client.info["info"]["agent"],
                 tables=m["tables"],
                 slot=m["slot"],
                 cached_tokens=m.get("cached_tokens", 0),
@@ -234,18 +205,19 @@ class PDEngine:
         elif kind == "prefill_started":
             w.timings["prefill_started"] = now
         elif kind == "prefill_complete":
-            if not w.p_compute_released:
-                peer.compute_slots -= 1
-                w.p_compute_released = True
             w.timings["prefill_compute_completed"] = now
+            w.timings["prefill_transfer_boundaries"] = m["boundaries"]
+            w.timings["prefill_transfer_overlaps"] = m["overlaps"]
         elif kind == "commit":
             w.timings["prefill_submitted"] = now
             if not w.cancelled:
                 self._send(w.d, "commit", tid=w.tid, count=m["count"])
+        elif kind == "received":
+            w.timings["d_received"] = now
+            self._send(w.p, "ack", tid=w.tid)
         elif kind == "activated":
             w.phase = "decode"
             w.timings["d_activated"] = now
-            self._send(w.p, "ack", tid=w.tid)
         elif kind == "output":
             if not w.cancelled:
                 output = replace(m["output"], request_id=w.request.request_id)
@@ -260,17 +232,14 @@ class PDEngine:
         elif kind == "released":
             if peer.role == "prefill" and not w.p_released:
                 w.p_released = True
-                if not w.p_compute_released:
-                    peer.compute_slots -= 1
-                    w.p_compute_released = True
                 peer.slots -= 1
-                peer.blocks -= w.p_blocks
+                peer.reserved_blocks -= w.p_reserved_blocks
                 if w.cancelled and not w.d_released:
                     self._send(w.d, "cancel_safe", tid=w.tid)
             elif peer.role == "decode" and not w.d_released:
                 w.d_released = True
                 peer.slots -= 1
-                peer.blocks -= w.d_blocks
+                peer.reserved_blocks -= w.d_reserved_blocks
         elif kind == "rejected":
             # Coordinator holds exact credits; rejection indicates a state mismatch.
             raise RuntimeError("PD reserved capacity rejected by worker")
@@ -286,11 +255,12 @@ class PDEngine:
                 )
             )
             del self.transfers[w.tid]
-        self.cache_manager.num_used_blocks = sum(p.blocks for p in self.peers.values())
 
     def _blocks(self, peer, tokens):
         return (
-            (tokens + peer.info["block_size"] - 1) // peer.info["block_size"] * peer.info["depths"]
+            (tokens + peer.client.info["block_size"] - 1)
+            // peer.client.info["block_size"]
+            * peer.client.info["depths"]
         )
 
     def add_request(self, request_id, prompt_token_ids, sampling_params=None, *, trace_id=None):
@@ -301,7 +271,17 @@ class PDEngine:
         if len(self.transfers) >= self.config.max_pending_requests:
             raise ValueError("PD pending-request limit reached")
         params = sampling_params or SamplingParams()
-        cfg = self.model.config
+        cfg = self.model_config
+        if self.speculative_config is not None:
+            if (
+                params.exit_threshold != 1.0
+                or (params.max_loops or cfg.total_ut_steps) != cfg.total_ut_steps
+            ):
+                raise ValueError(
+                    "speculative requests require fixed target depth and exit_threshold=1"
+                )
+            if self._async_speculative and params.temperature != 0:
+                raise ValueError("async speculative decoding currently requires greedy sampling")
         if not prompt_token_ids or any(
             type(t) is not int or not 0 <= t < cfg.vocab_size for t in prompt_token_ids
         ):
@@ -330,7 +310,7 @@ class PDEngine:
         for role in ("prefill", "decode"):
             tokens = len(prompt_token_ids) + (params.max_tokens - 1 if role == "decode" else 0)
             if not any(
-                self._blocks(p, tokens) <= p.info["num_blocks"]
+                self._blocks(p, tokens) <= p.client.info["num_blocks"]
                 for p in self.peers.values()
                 if p.role == role
             ):
@@ -359,16 +339,19 @@ class PDEngine:
                     p
                     for p in self.peers.values()
                     if p.role == role
-                    and p.slots < p.info["max_seqs"]
-                    and (role != "prefill" or p.compute_slots < p.info["active_limit"])
-                    and p.blocks + self._blocks(p, length)
-                    <= p.info["num_blocks"] - (p.info["watermark_blocks"] if p.slots else 0)
+                    and p.slots < p.client.info["transfer_slots"]
+                    and p.reserved_blocks + self._blocks(p, length)
+                    <= p.client.info["num_blocks"]
+                    - (p.client.info["watermark_blocks"] if p.slots else 0)
                 ]
                 if not eligible:
                     break
                 candidates[role] = min(
                     eligible,
-                    key=lambda p: (p.blocks / p.info["num_blocks"], p.slots / p.info["max_seqs"]),
+                    key=lambda p: (
+                        p.reserved_blocks / p.client.info["num_blocks"],
+                        p.slots / p.client.info["transfer_slots"],
+                    ),
                 )
             if len(candidates) != 2:
                 if time.monotonic() - w.created > self.config.request_timeout / 2:
@@ -376,14 +359,13 @@ class PDEngine:
                 continue
             p, d = candidates["prefill"], candidates["decode"]
             w.p, w.d = p.name, d.name
-            w.p_blocks = self._blocks(p, len(w.request.prompt_token_ids))
-            w.d_blocks = self._blocks(
+            w.p_reserved_blocks = self._blocks(p, len(w.request.prompt_token_ids))
+            w.d_reserved_blocks = self._blocks(
                 d, len(w.request.prompt_token_ids) + w.request.sampling_params.max_tokens - 1
             )
-            p.blocks += w.p_blocks
-            d.blocks += w.d_blocks
+            p.reserved_blocks += w.p_reserved_blocks
+            d.reserved_blocks += w.d_reserved_blocks
             p.slots += 1
-            p.compute_slots += 1
             d.slots += 1
             w.phase = "reserving"
             w.timings["admitted"] = time.monotonic() - w.created
@@ -394,7 +376,7 @@ class PDEngine:
                 tokens=w.request.prompt_token_ids,
                 params=w.request.sampling_params,
                 trace_id=w.trace_id,
-                peer=p.info["info"]["agent"],
+                peer=p.client.info["info"]["agent"],
             )
 
     def abort_request(self, request_id):
@@ -410,9 +392,22 @@ class PDEngine:
                 self._send(w.d, "cancel_safe", tid=w.tid)
             else:
                 self._send(w.p, "cancel", tid=w.tid)
-        request.stage = Stage.FINISHED
+        request.phase = RequestPhase.FINISHED
         request.finish_reason = FinishReason.ABORT
         return RequestOutput.from_request(request)
+
+    def request_ids(self):
+        return tuple(self.requests)
+
+    def has_request(self, request_id):
+        return request_id in self.requests
+
+    def stats(self):
+        # Coordinator credits are reservations, not measured worker KV usage.
+        return dict(
+            requests=len(self.requests),
+            reserved_blocks=sum(peer.reserved_blocks for peer in self.peers.values()),
+        )
 
     def has_unfinished_requests(self):
         return bool(self.transfers)
@@ -442,7 +437,7 @@ class PDEngine:
         result = dict(
             session_id=self._profile_session,
             recording=self._profile_recording,
-            errors=getattr(self, "_profile_errors", []),
+            errors=self._profile_errors,
             ranks={
                 str(rank): dict(
                     worker=name, **self._profile_statuses.get(name, {"state": "missing"})
@@ -468,27 +463,35 @@ class PDEngine:
     def _profile_control(self, action, *, timeout=None, **fields):
         if self.closed:
             raise RuntimeError("PD engine is closed")
-        control_id = uuid.uuid4().hex
-        replies = {}
-        self._profile_replies[control_id] = replies
+        method = {"start": "start_profile", "stop": "stop_profile", "status": "profile_status"}[
+            action
+        ]
+        calls, replies = {}, {}
         deadline = time.monotonic() + (self.config.startup_timeout if timeout is None else timeout)
         try:
-            for rank, name in enumerate(self.peers):
-                self._send(
-                    name,
-                    "profile_" + action,
-                    control_id=control_id,
-                    session_id=self._profile_session,
-                    rank=rank,
-                    **fields,
+            for rank, (name, peer) in enumerate(self.peers.items()):
+                kwargs = dict(fields)
+                if action == "start":
+                    kwargs.update(rank=rank, managed_manifest=False)
+                calls[name] = peer.client.submit_control(
+                    method, session_id=self._profile_session, **kwargs
                 )
-            while len(replies) < len(self.peers):
+            while len(replies) < len(calls):
                 self._poll()
+                for name, control_id in calls.items():
+                    reply = self.peers[name].client.take_control_reply(control_id)
+                    if reply is not None:
+                        if reply.get("session_id") != self._profile_session:
+                            raise RuntimeError("PD profile reply session mismatch")
+                        replies[name] = reply
+                if len(replies) == len(calls):
+                    break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("PD profile control timed out")
                 time.sleep(0.001)
         finally:
-            self._profile_replies.pop(control_id, None)
+            for name, control_id in calls.items():
+                self.peers[name].client.discard_control(control_id)
             for name in self.peers:
                 reply = replies.get(name)
                 self._profile_statuses[name] = (
@@ -587,15 +590,11 @@ class PDEngine:
         for role in ("prefill", "decode"):
             selected = [p for p in self.peers.values() if p.role == role]
             for p in selected:
-                if p.process.is_alive():
-                    p.process.terminate()
+                p.client.terminate()
             for p in selected:
-                p.process.join(5)
-                if p.process.is_alive():
-                    p.process.kill()
-                    p.process.join(5)
-                p.channel.close()
-        self.cache_manager.num_used_blocks = 0
+                p.client.join(5, force=True)
+        for peer in self.peers.values():
+            peer.reserved_blocks = peer.slots = 0
         self.closed = True
 
     def close(self):
@@ -610,13 +609,10 @@ class PDEngine:
                 self.stop_profile()
                 self.wait_for_profile_artifacts(max(0, deadline - time.monotonic()))
             for peer in self.peers.values():
-                self._send(peer.name, "stop")
-            self._wait(lambda: all(p.stopped for p in self.peers.values()), deadline)
+                peer.client.request_stop()
+            self._wait(lambda: all(p.client.stopped for p in self.peers.values()), deadline)
             for peer in self.peers.values():
-                peer.process.join(max(0, deadline - time.monotonic()))
-                if peer.process.is_alive():
-                    raise TimeoutError("PD worker did not exit")
-                peer.channel.close()
+                peer.client.join(max(0, deadline - time.monotonic()))
             self.closed = True
         except BaseException:
             self._terminate()

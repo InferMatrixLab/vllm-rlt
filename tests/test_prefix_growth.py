@@ -2,10 +2,11 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
+from vllm_rlt.request import RequestPhase
 
 
 def model():
@@ -36,7 +37,7 @@ def test_prefix_reuse_matches_cold_generation_and_retains_shared_pages():
     assert e.cache_manager.lookup_prefix([1, 2, 3, 4, 5])
     e.add_request("second", [1, 2, 3, 4, 5], p)
     e.step()
-    assert e.last_schedule.items[0].token_start == 4
+    assert e.last_schedule.requests[0].token_start == 4
     second = finish(e)["second"]
     assert second.token_ids == first.token_ids
     assert second.exit_depths == first.exit_depths
@@ -83,6 +84,39 @@ def test_incremental_growth_matches_reserved_generation():
     assert outputs[0].exit_depths == outputs[1].exit_depths
 
 
+@pytest.mark.parametrize(
+    "stage", [RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT]
+)
+def test_incremental_split_prefill_reserves_prompt_growth(stage):
+    prompt = list(range(1, 9))
+    e = LLMEngine(
+        model(),
+        cache_config=CacheConfig(64, 2, incremental_allocation=True),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=2,
+            prefill_chunk_size=2,
+            enable_preemption=True,
+        ),
+        execution_config=ExecutionConfig(atomic_prefill=False),
+    )
+    try:
+        e.add_request("split", prompt, SamplingParams(max_tokens=1, ignore_eos=True))
+        e.scheduler._admit()
+        request = e.scheduler.requests["split"]
+        assert request.phase is RequestPhase.PREFILLING_PRELUDE
+        if stage is RequestPhase.PREFILLING_RECURRENT:
+            e.step()
+            assert request.phase is RequestPhase.PREFILLING_RECURRENT
+
+        allocated = e.cache_manager.allocated_blocks(request.request_id)
+        expected = max(0, e.cache_manager.required_blocks(len(prompt)) - allocated)
+        assert expected > 0
+        assert e.scheduler._reserved_growth_blocks(reserve_outputs=False) == expected
+    finally:
+        e.close()
+
+
 def test_lossless_preemption_preserves_looped_history():
     m = model()
     p = SamplingParams(max_tokens=7, temperature=0.8, seed=45, exit_threshold=0, ignore_eos=True)
@@ -101,7 +135,7 @@ def test_lossless_preemption_preserves_looped_history():
             assert generator is not None
             state = generator.get_state().clone()
             e.add_request("b", [5], SamplingParams(max_tokens=1))
-            assert e.preemption.preempt(e.scheduler.requests["b"])
+            assert e.scheduler.preempt(e.scheduler.requests["b"])
             assert "a" in e.preemption.snapshots
             # Preemption suspends rather than terminates, so the runner keeps the
             # request's RNG slot: suspension is not a reset.
@@ -120,7 +154,8 @@ def test_lossless_preemption_preserves_looped_history():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("graph", [False, True])
-def test_fa4_prefill_uva_prefix_growth_and_bank_reuse(graph):
+@pytest.mark.parametrize("use_uva", [False, True])
+def test_fa4_prefill_uva_prefix_growth_and_bank_reuse(graph, use_uva):
     from vllm_rlt import ExecutionConfig, ExitConfig
 
     torch.manual_seed(21)
@@ -143,6 +178,7 @@ def test_fa4_prefill_uva_prefix_growth_and_bank_reuse(graph):
                 execution_config=ExecutionConfig(
                     async_scheduling=True,
                     prefill_uva=enabled,
+                    use_uva=use_uva,
                     static_buffers=graph,
                     pad_to_power_of_two=graph,
                     cuda_graphs=graph,
@@ -196,20 +232,27 @@ def test_priority_preempts_at_safe_boundary():
 
 
 @pytest.mark.gpu
-def test_prefill_uva_metadata_matches_reference_and_waits_for_consumer():
-    from vllm_rlt.worker.prefill_metadata import PrefillMetadataBank
+@pytest.mark.parametrize("use_uva", [False, True])
+def test_prefill_uva_metadata_matches_reference_and_waits_for_consumer(use_uva):
+    from vllm_rlt.worker.buffers import PackedMetadataBuffer
 
     c = KVCacheManager(
         2, 2, 64, 64, 16, 4, device="cuda", dtype=torch.bfloat16, backend="flash_attn_4"
     )
     assert c.allocate("a", 16) and c.allocate("b", 32)
-    bank = PrefillMetadataBank(c)
+    from vllm_rlt.worker.submission_queue import SubmissionQueue
+
+    queue = SubmissionQueue(max_pending=1)
+    queue.begin()
+    buffer = PackedMetadataBuffer(c.device, use_uva=use_uva)
     ids = ["a"] * 3 + ["b"] * 4
     positions = [0, 1, 2, 16, 17, 18, 19]
     tokens = [1, 2, 3, 4, 5, 6, 7]
-    bank.prepare(ids, positions, tokens)
+    depth_sets = [[depth] * len(ids) for depth in range(4)]
+    buffer.store(c.metadata_builder.build(ids, depth_sets, positions, packed=True), tokens)
+    device_tokens, metadata = buffer.upload()
     for depth in range(4):
-        actual = bank.metadata(depth)
+        actual = metadata[depth]
         expected = c._prepare_batch(ids, [depth] * len(ids), positions, packed_prefill=True)
         for name in [
             "position_ids",
@@ -223,15 +266,21 @@ def test_prefill_uva_metadata_matches_reference_and_waits_for_consumer():
         assert actual.max_seqlen_q == expected.max_seqlen_q
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    saved = torch.empty_like(bank.tokens)
+    saved = torch.empty_like(device_tokens)
     with torch.cuda.stream(stream):
         torch.cuda._sleep(20_000_000)
-        saved.copy_(bank.tokens)
-        bank.release()
-    bank.prepare(ids, positions, [9] * 7)
+        saved.copy_(device_tokens)
+        event = torch.cuda.Event()
+        event.record(stream)
+        queue.complete(event)
+    queue.begin()
+    buffer.store(c.metadata_builder.build(ids, depth_sets, positions, packed=True), [9] * 7)
+    device_tokens, _ = buffer.upload()
     assert saved.tolist() == tokens
-    assert bank.tokens.tolist() == [9] * 7
-    bank.release()
+    assert device_tokens.tolist() == [9] * 7
+    event = torch.cuda.Event()
+    event.record()
+    queue.complete(event)
 
 
 @pytest.mark.gpu
@@ -276,7 +325,7 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
     # (LIFO), so the victim resumes in another slot whose device token belongs
     # to a different request. Distinct prompts make a stale token visible.
     from vllm_rlt import ExecutionConfig, ExitConfig
-    from vllm_rlt.request import Stage
+    from vllm_rlt.request import RequestPhase
 
     torch.manual_seed(72)
     m = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to(device="cuda", dtype=torch.bfloat16)
@@ -295,15 +344,15 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
             exit_config=ExitConfig("trace", depths_by_request={"t": [4, 1, 2, 3, 4, 1, 2, 3]}),
             execution_config=ExecutionConfig(async_scheduling=True),
         )
-        select = e.preemption._select_preemption_victim
+        select = e.scheduler._select_preemption_victim
 
         def record_victim(*args, **kwargs):
             victim = select(*args, **kwargs)
             if victim is not None:
-                victim_stages.append(victim.stage)
+                victim_stages.append(victim.phase)
             return victim
 
-        e.preemption._select_preemption_victim = record_victim
+        e.scheduler._select_preemption_victim = record_victim
         for i in range(4):
             e.add_request(
                 str(i),
@@ -313,5 +362,37 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
             )
         results.append({rid: out.token_ids for rid, out in finish(e).items()})
         assert not e.preemption.snapshots and e.cache_manager.num_used_blocks == 0
-    assert Stage.PRELUDE in victim_stages
+    assert RequestPhase.PRELUDE in victim_stages
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_watermark_only_limits_incremental_admission(incremental):
+    from vllm_rlt.core.scheduler import Scheduler
+    from vllm_rlt.request import Request
+
+    cache = KVCacheManager(
+        1,
+        1,
+        4,
+        16,
+        2,
+        4,
+        incremental_allocation=incremental,
+        watermark_ratio=0.5,
+    )
+    scheduler = Scheduler(
+        SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8, prefill_chunk_size=4),
+        cache,
+    )
+    for request_id in ("a", "b"):
+        scheduler.add_request(Request(request_id, [1, 2, 3, 4], SamplingParams(max_tokens=1)))
+    scheduler._admit()
+    assert cache.watermark_blocks == (8 if incremental else 0)
+    assert scheduler.requests["a"].phase == RequestPhase.PREFILL
+    # Full allocation admits both requests into the 16-block pool despite the
+    # supplied ratio; incremental allocation retains the configured headroom.
+    assert scheduler.requests["b"].phase == (
+        RequestPhase.WAITING if incremental else RequestPhase.PREFILL
+    )
+    assert cache.num_free_blocks == (8 if incremental else 0)

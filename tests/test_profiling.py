@@ -335,7 +335,7 @@ def fake_pd():
     engine._profile_session = None
     engine._profile_recording = False
     engine._profile_statuses = {}
-    engine._profile_replies = {}
+    engine._profile_errors = []
     engine.transfers = {}
     return engine
 
@@ -346,35 +346,52 @@ def test_pd_acknowledgments_and_partial_failure_rollback(tmp_path):
     fail_decode = False
     recording = {}
 
+    from vllm_rlt.engine.llm_engine import StageClient
+
+    queued = []
+
     def send(name, kind, **fields):
-        sent.append((name, kind, fields))
-        if fail_decode and name == "d" and kind == "profile_start":
-            reply = {"error": "cannot start"}
-        else:
-            if kind != "profile_status":
-                recording[name] = kind == "profile_start"
-            reply = {
-                "result": {
-                    "recording": recording.get(name, False),
-                    "artifacts_complete": not recording.get(name, False),
+        assert kind == "control"
+        sent.append((name, fields["method"], fields))
+        queued.append((name, fields))
+
+    for name, peer in engine.peers.items():
+        client = StageClient.__new__(StageClient)
+        client.pending_controls = set()
+        client.replies = {}
+        client.send = lambda kind, _name=name, **fields: send(_name, kind, **fields)
+        peer.client = client
+
+    def poll():
+        # Both calls must be submitted before waiting for any worker response.
+        assert len(queued) == len(engine.peers)
+        for name, fields in queued:
+            method = fields["method"]
+            if fail_decode and name == "d" and method == "start_profile":
+                reply = {"error": "cannot start"}
+            else:
+                if method != "profile_status":
+                    recording[name] = method == "start_profile"
+                reply = {
+                    "result": {
+                        "recording": recording.get(name, False),
+                        "artifacts_complete": not recording.get(name, False),
+                    }
                 }
-            }
-        engine._message(
-            engine.peers[name],
-            dict(
-                kind="profile_reply",
+            client = engine.peers[name].client
+            client.replies[fields["control_id"]] = dict(
+                kind="reply",
                 control_id=fields["control_id"],
                 session_id=fields["session_id"],
                 **reply,
-            ),
-        )
+            )
+        queued.clear()
 
-    engine._send = send
-    engine._poll = lambda: None
+    engine._poll = poll
     status = engine.start_profile(config(tmp_path))
     assert status["recording"] and set(status["ranks"]) == {"0", "1"}
-    assert all(not entry[2]["scheduled"] for entry in sent)
-    assert {entry[2]["capture_time"] for entry in sent} == {status["capture_time"]}
+    assert all(not entry[2]["kwargs"]["scheduled"] for entry in sent)
+    assert {entry[2]["kwargs"]["capture_time"] for entry in sent} == {status["capture_time"]}
     assert (tmp_path / f"manifest-{status['capture_time']}.json").exists()
     assert not (tmp_path / status["session_id"]).exists()
     engine.stop_profile()
@@ -382,8 +399,12 @@ def test_pd_acknowledgments_and_partial_failure_rollback(tmp_path):
     fail_decode = True
     with pytest.raises(RuntimeError, match="cannot start"):
         engine.start_profile(config(tmp_path))
-    assert sent[-2][1] == sent[-1][1] == "profile_stop"
+    assert sent[-2][1] == sent[-1][1] == "stop_profile"
     assert "cannot start" in engine._profile_manifest()["errors"][0]
+    assert all(
+        not peer.client.pending_controls and not peer.client.replies
+        for peer in engine.peers.values()
+    )
 
 
 def test_serving_control_runs_on_owner_thread(tmp_path):
@@ -551,7 +572,7 @@ def test_invalid_profile_config_fails_before_loading_model(monkeypatch, entrypoi
         pytest.fail("profiling configuration must be validated before loading resources")
 
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", unexpected_load)
-    engine_name = "LLMEngine" if entrypoint == "serve" else "PDEngine"
+    engine_name = "StageClient" if entrypoint == "serve" else "PDEngine"
     monkeypatch.setattr(module, engine_name, unexpected_load)
     with pytest.raises(ValueError, match="output_dir"):
         module.load_engine(SimpleNamespace(profile=True))
@@ -637,3 +658,51 @@ def test_finish_drains_cycles_beyond_queue_capacity(tmp_path, monkeypatch):
         release.set()
         worker.finish(2)
         worker.wait(5)
+
+
+def test_worker_shared_control_validates_profile_session():
+    from vllm_rlt.engine.stage_config import StageConfig
+    from vllm_rlt.engine.worker import StageWorker
+
+    worker = StageWorker.__new__(StageWorker)
+    started, replies = [], []
+    session = None
+
+    def start_profile(config, **identity):
+        nonlocal session
+        started.append(identity)
+        session = identity["session_id"]
+        return dict(session_id=session, recording=True)
+
+    stopped = []
+    worker.engine = SimpleNamespace(
+        stage_config=StageConfig(role="decode"),
+        add_request=lambda *a: None,
+        abort_request=lambda *a: None,
+        stats=lambda: {},
+        start_profile=start_profile,
+        stop_profile=lambda: stopped.append(True),
+        profile_status=lambda: dict(session_id=session),
+        wait_for_profile_artifacts=lambda: {},
+    )
+    worker.send = lambda kind, **fields: replies.append(dict(kind=kind, **fields))
+    worker.command(
+        dict(
+            kind="control",
+            control_id="start",
+            method="start_profile",
+            session_id="current",
+            kwargs=dict(config={}, rank=1, managed_manifest=False),
+        )
+    )
+    assert started == [dict(rank=1, managed_manifest=False, session_id="current", role="decode")]
+    worker.command(
+        dict(kind="control", control_id="stale", method="stop_profile", session_id="previous")
+    )
+    assert not stopped and "session ID mismatch" in replies[-1]["error"]
+    worker.command(
+        dict(kind="control", control_id="stop", method="stop_profile", session_id="current")
+    )
+    assert stopped == [True]
+    assert all(reply["kind"] == "reply" for reply in replies)
+    assert replies[-1]["session_id"] == "current"

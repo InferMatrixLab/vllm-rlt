@@ -7,10 +7,10 @@ from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestPhase
 
 
-def engine(*, asynchronous=True, static=False, graph=False, shared=False):
+def engine(*, asynchronous=True, static=False, graph=False, shared=False, use_uva=True):
     torch.manual_seed(19)
     config = tiny_ouro_config(head_dim=64)
     return LLMEngine(
@@ -20,6 +20,7 @@ def engine(*, asynchronous=True, static=False, graph=False, shared=False):
         exit_config=ExitConfig("trace", depths_by_request={"a": [4, 1, 3, 2, 4, 1]}),
         execution_config=ExecutionConfig(
             async_scheduling=asynchronous,
+            use_uva=use_uva,
             multi_stream=True,
             static_buffers=static,
             pad_to_power_of_two=static,
@@ -46,8 +47,8 @@ def drain(e):
     "static,graph,shared", [(False, False, False), (True, True, False), (True, False, True)]
 )
 def test_resident_state_trace_refill_abort_and_slot_reuse(use_uva, static, graph, shared):
-    e = engine(static=static, graph=graph, shared=shared)
-    e.model_runner.async_state.use_uva = use_uva
+    e = engine(static=static, graph=graph, shared=shared, use_uva=use_uva)
+    assert e.model_runner.async_state.use_uva is use_uva
     reference = engine(asynchronous=False, shared=shared)
     params = SamplingParams(max_tokens=6, min_loops=1, ignore_eos=True)
     for round_index in range(3):
@@ -71,32 +72,46 @@ def test_resident_state_trace_refill_abort_and_slot_reuse(use_uva, static, graph
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("use_uva", [False, True])
-def test_bank_is_not_reused_until_its_final_gpu_reader_finishes(use_uva):
-    e = engine()
+@pytest.mark.parametrize("all_busy", [False, True])
+def test_routing_buffers_are_not_reused_until_their_final_gpu_reader_finishes(use_uva, all_busy):
+    e = engine(use_uva=use_uva)
     state = e.model_runner.async_state
-    state.use_uva = use_uva
     e.add_request("a", [2], SamplingParams(max_tokens=2, min_loops=1), trace_id="a")
     e.step()
     request = e.scheduler.requests["a"]
-    # Force wraparound while the first bank is still referenced by queued work.
-    bank = state.banks[state.index]
+    e.model_runner.synchronize()
+    # Force wraparound while the first buffer set is still referenced by queued work.
+    routing_buffers = state.routing_buffers[state.index]
     stream = torch.cuda.Stream()
     expected = torch.tensor([17, 23, 29], dtype=torch.int64)
-    bank.host[0].copy_(expected)
+    routing_buffers.host[0].copy_(expected)
     actual = torch.empty(3, dtype=torch.int64, device="cuda")
     from vllm_rlt.kernels.routing import gather_kernel
 
     with torch.cuda.stream(stream):
         slots = torch.zeros(1, dtype=torch.int64, device="cuda")
-        descriptor = bank.host if use_uva else bank.host.to("cuda", non_blocking=True)
+        descriptor = (
+            routing_buffers.host if use_uva else routing_buffers.host.to("cuda", non_blocking=True)
+        )
         # Warm this signature before the delay so JIT compilation cannot consume it.
         gather_kernel[(1, 1)](descriptor, slots, actual, 1, 3, 3, 3, 256)
         torch.cuda._sleep(150_000_000)
         gather_kernel[(1, 1)](descriptor, slots, actual, 1, 3, 3, 3, 256)
-        bank.record_done()
-    assert not bank.done.query()
+        routing_buffers.record_done()
+    assert not routing_buffers.done.query()
+    state.submissions.events.clear()
+    if all_busy:
+        # Fill the execution window: slot 0 cannot be overwritten before its
+        # consumer retires, even when no output ticket is collected.
+        for _ in state.routing_buffers:
+            state.submissions.complete(routing_buffers.done)
+    else:
+        state.submissions.complete(routing_buffers.done)
+        state.index = (state.index + 1) % len(state.routing_buffers)
     reused, _ = state.prepare([request], [0], [0], 1)
-    assert reused is bank and bank.done.query()
+    assert (reused is routing_buffers) is all_busy
+    # Retirement belongs to the execution window, never the rotating buffers.
+    stream.synchronize()
     assert torch.equal(actual.cpu(), expected)
     e.abort_request("a")
 
@@ -110,7 +125,7 @@ def test_execution_error_retires_routing_readers_before_request_reuse(monkeypatc
 
     def fail(batch, prepared=None):
         result = execute(batch, prepared)
-        if batch.stage == Stage.RECURRENT:
+        if batch.phase == RequestPhase.RECURRENT:
             torch.cuda._sleep(10_000_000)
             raise RuntimeError("injected failure after GPU submission")
         return result
@@ -137,8 +152,8 @@ def test_batched_exit_copies_only_target_positions_and_depths(use_uva):
         e.add_request(str(i), [2, 3], SamplingParams(max_tokens=2, min_loops=1), trace_id="a")
     e.scheduler._admit()
     requests = list(e.scheduler.requests.values())
-    bank, _ = runner.async_state.prepare(requests, [0, 1, 2], [1, 1, 1], 3)
-    bank.transfer()
+    routing_buffers, _ = runner.async_state.prepare(requests, [0, 1, 2], [1, 1, 1], 3)
+    routing_buffers.transfer()
     for layer in range(cache.num_layers):
         values = (
             torch.arange(3 * cache.num_kv_heads * cache.head_dim, device="cuda")
@@ -164,3 +179,48 @@ def test_batched_exit_copies_only_target_positions_and_depths(use_uva):
     assert torch.equal(cache.value_cache, expected_v)
     for request in requests:
         e.abort_request(request.request_id)
+
+
+@pytest.mark.gpu
+def test_page_table_growth_uploads_only_new_pages_from_reusable_pinned_storage():
+    from vllm_rlt.request import Request
+
+    e = engine()
+    state, cache = e.model_runner.async_state, e.cache_manager
+    request = Request("growth", [2], SamplingParams(max_tokens=7))
+    assert cache.allocate("growth", 8, initial_tokens=2)
+    try:
+        first, _ = state.prepare([request], [0], [0], 1)
+        assert len(first.table_updates.targets) == state.planes
+        assert len(first.table_updates.values) == state.planes
+        first.transfer()
+        first.record_done()
+        first.done.synchronize()
+        previous = state.tables[state.slots["growth"], :, :1].clone()
+        assert cache.ensure_capacity("growth", 4)
+        grown, _ = state.prepare([request], [0], [2], 1)
+        grown.transfer()
+        assert len(grown.table_updates.transfers.copies) == state.planes
+        assert all(table.numel() == 1 for table, _ in grown.table_updates.transfers.copies)
+        assert all(
+            target.storage_offset() % state.width == 1
+            for _, target in grown.table_updates.transfers.copies
+        )
+        assert all(table.is_pinned() for table, _ in grown.table_updates.transfers.copies)
+        assert all(
+            table.untyped_storage().data_ptr()
+            == grown.table_updates.contents.buffers[0].cpu.untyped_storage().data_ptr()
+            for table, _ in grown.table_updates.transfers.copies
+        )
+        grown.record_done()
+        grown.done.synchronize()
+        actual = state.tables[state.slots["growth"], :, :2]
+        expected = torch.tensor(cache._get_allocation("growth").block_tables, device="cuda")
+        assert torch.equal(actual, expected)
+        assert torch.equal(actual[:, :1], previous)
+        unchanged, _ = state.prepare([request], [0], [2], 1)
+        assert not unchanged.table_updates.targets
+    finally:
+        state.release("growth")
+        cache.free("growth")
+        e.close()

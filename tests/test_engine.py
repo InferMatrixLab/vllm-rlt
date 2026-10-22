@@ -7,7 +7,7 @@ from tests.helpers import tiny_ouro_config
 from vllm_rlt import LLM, CacheConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
+from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 
 
 def tiny_model():
@@ -22,7 +22,7 @@ def drain(engine, limit=1000):
             return outputs, trace
         emitted = engine.step()
         batch = engine.last_schedule
-        trace.append((batch.stage, tuple(i.request.request_id for i in batch.items)))
+        trace.append((batch.phase, tuple(i.request.request_id for i in batch.requests)))
         for output in emitted:
             if output.finished:
                 outputs[output.request_id] = output
@@ -50,7 +50,7 @@ def test_chunked_packed_generation_matches_serial(mode):
     assert [o.exit_depths for o in outputs] == [o.exit_depths for o in serial]
     assert outputs[0].exit_depths == [4, 2, 2, 2]
     assert outputs[1].exit_depths == [4, 4, 4, 4]
-    assert llm.engine.cache_manager.num_used_blocks == 0
+    assert llm.engine.stats()["used_blocks"] == 0
 
 
 def test_cumulative_gate_and_minimum_depth():
@@ -80,7 +80,7 @@ def test_refill_recycles_exited_token_before_slow_token_coda(mode):
     engine.add_request("fast", [1], SamplingParams(max_tokens=3, exit_threshold=0, ignore_eos=True))
     engine.add_request("slow", [2], SamplingParams(max_tokens=3, exit_threshold=1, ignore_eos=True))
     outputs, trace = drain(engine)
-    recurrent = [ids for stage, ids in trace if stage == Stage.RECURRENT]
+    recurrent = [ids for stage, ids in trace if stage == RequestPhase.RECURRENT]
     # In refill mode fast returns with its next token while slow is on its first.
     assert recurrent[:4] == (
         [("fast", "slow")] * 2 + [("slow", "fast")] * 2
@@ -96,7 +96,7 @@ def test_memory_pressure_waits_then_reuses_pages_and_abort_reclaims():
     for name in ["a", "b", "c"]:
         engine.add_request(name, [2, 3], params)
     engine.step()
-    assert engine.scheduler.requests["b"].stage == Stage.WAITING
+    assert engine.scheduler.requests["b"].phase == RequestPhase.WAITING
     assert engine.abort_request("b").finish_reason == "abort"
     assert engine.cache_manager.num_used_blocks == 8
     assert engine.abort_request("a").finished
@@ -141,7 +141,7 @@ def test_eos_finishes_without_extra_decode_and_invalid_requests_do_not_poison_qu
     outputs, trace = drain(engine)
     assert outputs["eos"].token_ids == [0]
     assert outputs["eos"].finish_reason == "stop"
-    assert [stage for stage, _ in trace] == [Stage.PREFILL, Stage.CODA]
+    assert [stage for stage, _ in trace] == [RequestPhase.PREFILL, RequestPhase.CODA]
     assert engine.cache_manager.num_used_blocks == 0
 
 
@@ -240,28 +240,35 @@ def test_greedy_sampling_never_acquires_a_generator(monkeypatch):
     assert engine.rng.peek("g") is None
 
 
-def test_sample_row_requests_the_generator_on_the_logits_device(monkeypatch):
-    # multinomial runs on the distribution's device, so the row helper must pass the
-    # logits device, not the model's. Moving the runner's own device to a different
-    # value makes the two sources distinguishable on a CPU-only machine; the spy
-    # below returns a real CPU generator, so no meta device is ever allocated.
+def test_coda_sampling_is_prepared_before_execution(monkeypatch):
+    from vllm_rlt.request import ExecutionBatch, Operation, StateSpan
+
     engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
     runner = engine.model_runner
-    runner.device = torch.device("meta")
+    params = SamplingParams(temperature=0.7, seed=3)
+    request = Request("r", [1], params)
+    request.hidden_state = torch.ones(engine.model.config.hidden_size)
+    batch = ExecutionBatch(Operation.CODA, (StateSpan(request, 0, 1, 0),))
     recorded = []
-    real_acquire = engine.rng.acquire
+    acquire = engine.rng.acquire
 
-    def spy(request_id, params, device):
-        recorded.append(device)
-        return real_acquire(request_id, params, torch.device("cpu"))
+    def spy(request_id, sampling, device):
+        recorded.append((sampling, device))
+        return acquire(request_id, sampling, device)
 
     monkeypatch.setattr(engine.rng, "acquire", spy)
-    logits = torch.linspace(1.0, -1.0, 8)
-    request = Request("r", [1], SamplingParams(temperature=0.7, seed=3))
-    token = runner._sample_row(logits, request)
-    assert recorded == [logits.device]
-    assert runner.device != logits.device
-    assert token.dim() == 0 and token.device == logits.device
+    prepared = runner.prepare_on_cpu(batch)
+    request.sampling_params = SamplingParams(temperature=1.2, seed=9)
+    prepared = runner.prepare_on_gpu(prepared)
+    assert recorded == [(params, runner.device)]
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("sampling generators must be resolved before execution")
+
+    monkeypatch.setattr(engine.rng, "acquire", unexpected)
+    token = runner._execute(None, prepared)
+    assert token.shape == (1,) and token.device == runner.device
+    engine.close()
 
 
 def test_engines_own_independent_rng_registries():
@@ -281,7 +288,7 @@ def test_execution_failure_releases_affected_requests(monkeypatch):
     def fail(_):
         raise RuntimeError("injected runner failure")
 
-    monkeypatch.setattr(engine.model_runner, "execute", fail)
+    monkeypatch.setattr(engine.executor, "submit", fail)
     with pytest.raises(RuntimeError, match="injected"):
         engine.step()
     assert not engine.has_unfinished_requests()
@@ -333,8 +340,9 @@ def test_repeated_short_arrivals_cannot_starve_existing_decode(mode):
         for _ in range(100):
             engine.step()
             batch = engine.last_schedule
-            if batch.stage == Stage.RECURRENT and any(
-                item.request.request_id == "long" for item in batch.items
+            if batch.phase == RequestPhase.RECURRENT and any(
+                scheduled_request.request.request_id == "long"
+                for scheduled_request in batch.requests
             ):
                 recurrent_steps += 1
             if request_id not in engine.scheduler.requests:
@@ -353,16 +361,16 @@ def test_failed_prefill_batch_does_not_consume_decode_fairness_budget(monkeypatc
         engine.add_request(rid, [1, 2], SamplingParams(max_tokens=2, ignore_eos=True))
     scheduler = engine.scheduler
     scheduler._admit()
-    scheduler.queues[Stage.PREFILL].remove("decode")
-    scheduler.enqueue(scheduler.requests["decode"], Stage.RECURRENT)
+    scheduler.queues[RequestPhase.PREFILL].remove("decode")
+    scheduler.enqueue(scheduler.requests["decode"], RequestPhase.RECURRENT)
     ensure_capacity = engine.cache_manager.ensure_capacity
     monkeypatch.setattr(
         engine.cache_manager, "ensure_capacity", lambda rid, frontier: rid != "prefill"
     )
     assert scheduler.schedule() is None
     monkeypatch.setattr(engine.cache_manager, "ensure_capacity", ensure_capacity)
-    assert scheduler.schedule().stage == Stage.PREFILL
-    assert scheduler.schedule().stage == Stage.RECURRENT
+    assert scheduler.schedule().phase == RequestPhase.PREFILL
+    assert scheduler.schedule().phase == RequestPhase.RECURRENT
 
 
 def test_failed_recurrent_batch_keeps_decode_due(monkeypatch):
@@ -371,15 +379,15 @@ def test_failed_recurrent_batch_keeps_decode_due(monkeypatch):
         engine.add_request(rid, [1, 2], SamplingParams(max_tokens=2, ignore_eos=True))
     scheduler = engine.scheduler
     scheduler._admit()
-    scheduler.queues[Stage.PREFILL].remove("decode")
-    scheduler.enqueue(scheduler.requests["decode"], Stage.RECURRENT)
-    assert scheduler.schedule().stage == Stage.PREFILL
+    scheduler.queues[RequestPhase.PREFILL].remove("decode")
+    scheduler.enqueue(scheduler.requests["decode"], RequestPhase.RECURRENT)
+    assert scheduler.schedule().phase == RequestPhase.PREFILL
     ensure_capacity = engine.cache_manager.ensure_capacity
     monkeypatch.setattr(engine.cache_manager, "ensure_capacity", lambda rid, frontier: False)
     assert scheduler.schedule() is None
-    scheduler.enqueue(scheduler.requests["prefill"], Stage.PREFILL)
+    scheduler.enqueue(scheduler.requests["prefill"], RequestPhase.PREFILL)
     monkeypatch.setattr(engine.cache_manager, "ensure_capacity", ensure_capacity)
-    assert scheduler.schedule().stage == Stage.RECURRENT
+    assert scheduler.schedule().phase == RequestPhase.RECURRENT
 
 
 def test_abort_removes_all_queued_work_and_serializes_reason():
@@ -388,8 +396,8 @@ def test_abort_removes_all_queued_work_and_serializes_reason():
     engine.scheduler._admit()
     request = engine.scheduler.requests["r"]
     # A delayed termination must remove every queued occurrence.
-    engine.scheduler.queues[Stage.PREFILL].append("r")
-    engine.scheduler.enqueue(request, Stage.RECURRENT)
+    engine.scheduler.queues[RequestPhase.PREFILL].append("r")
+    engine.scheduler.enqueue(request, RequestPhase.RECURRENT)
     output = engine.abort_request("r")
     assert request.finish_reason is FinishReason.ABORT
     assert type(output.finish_reason) is str and output.finish_reason == "abort"

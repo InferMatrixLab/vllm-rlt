@@ -1,6 +1,6 @@
 # PyTorch profiling
 
-Profiling is disabled by default. Collection options are independent and use PyTorch Profiler. Each rank exports its own trace. A background thread parses the completed files, creates a verified `.tar.gz` archive, and removes the standalone raw files. This implements the core interface proposed in [RFC #71](https://github.com/ThinkFlowLab/vllm-rlt/issues/71).
+Profiling is disabled by default. Collection options are independent and use PyTorch Profiler. Each rank exports its own trace. A background thread parses the completed files, creates a verified `.tar.gz` archive, and removes the standalone raw files. This implements the core interface proposed in [RFC #71](https://github.com/InferMatrixLab/vllm-rlt/issues/71).
 
 ## Offline CLI
 
@@ -33,19 +33,29 @@ An ordinary engine step is one `LLMEngine.step()` invocation, not necessarily on
 
 ## Python control
 
+`LLM` starts a spawned worker process. In Python scripts, create it inside
+`main()` and use the `if __name__ == "__main__":` guard shown below. The context
+manager closes the worker when inference finishes or raises.
+
 ```python
 from vllm_rlt import LLM, ProfileConfig
 
-config = ProfileConfig(
-    output_dir="/tmp/rlt-profiles",
-    activities=("cpu", "cuda"),
-    record_shapes=True,
-)
-with LLM("/path/to/model", device="cuda", attention_backend="triton") as llm:
-    llm.start_profile(config)  # Continuous collection until stop_profile().
-    outputs = llm.generate(["Explain matrix multiplication."])
-    llm.stop_profile()  # Enqueue artifacts; do not wait for parsing/compression.
-    status = llm.wait_for_profile_artifacts()
+
+def main():
+    config = ProfileConfig(
+        output_dir="/tmp/rlt-profiles",
+        activities=("cpu", "cuda"),
+        record_shapes=True,
+    )
+    with LLM("/path/to/model", device="cuda", attention_backend="triton") as llm:
+        llm.start_profile(config)  # Continuous collection until stop_profile().
+        outputs = llm.generate(["Explain matrix multiplication."])
+        llm.stop_profile()  # Enqueue artifacts; do not wait for parsing/compression.
+        status = llm.wait_for_profile_artifacts()
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 `start_profile(config, scheduled=True)` uses the configured step schedule. Plain `start_profile(config)` uses an explicitly controlled window. `profile_status()` reports the current session and per-cycle jobs. `wait_for_profile_artifacts(timeout=None)` waits after collection stops. Inspect errors and job states as well as `artifacts_complete`: processing can finish with a failed artifact. A new session cannot overlap an active session or unfinished processing from the previous session.

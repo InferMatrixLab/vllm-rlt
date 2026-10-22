@@ -19,7 +19,8 @@ from torch.nn import functional as F
 from vllm_rlt.layers import RMSNorm
 
 if TYPE_CHECKING:
-    from vllm_rlt.core.kv_cache_manager import KVCacheManager, _PreparedKVBatch
+    from vllm_rlt.core.kv_cache_manager import KVCacheManager
+    from vllm_rlt.worker.metadata import KVMetadata
 
 
 @dataclass(frozen=True)
@@ -248,7 +249,7 @@ class HuginnForCausalLM(nn.Module):
         return self.freqs_cis[0].index_select(0, batch.position_ids)
 
     def prelude_prepared(
-        self, tokens, batch: "_PreparedKVBatch", cache: "KVCacheManager", *, generators=None
+        self, tokens, batch: "KVMetadata", cache: "KVCacheManager", *, generators=None
     ):
         if generators is not None and len(generators) != len(tokens):
             raise ValueError("one request generator is required per token row")
@@ -292,7 +293,7 @@ class HuginnForCausalLM(nn.Module):
         return self.recurrent_prepared(hidden, batch, cache, compute_gate=compute_gate)
 
     def coda_prepared(
-        self, hidden, batch: "_PreparedKVBatch", cache: "KVCacheManager", *, compute_logits=True
+        self, hidden, batch: "KVMetadata", cache: "KVCacheManager", *, compute_logits=True
     ):
         state, _ = hidden.split(self.config.n_embd, dim=-1)
         state = self.transformer.ln_f(state)

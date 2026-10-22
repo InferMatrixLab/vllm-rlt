@@ -3,9 +3,12 @@
 import pytest
 import torch
 
-from tests.helpers import tiny_ouro_config
+from tests.helpers import (
+    bootstrap_speculation,
+    make_speculative_engine,
+    tiny_ouro_model,
+)
 from vllm_rlt import (
-    CacheConfig,
     ExecutionConfig,
     SamplingParams,
     SchedulerConfig,
@@ -13,26 +16,7 @@ from vllm_rlt import (
 )
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Request, Stage
-
-
-def tiny(device="cpu", dtype=torch.float32):
-    torch.manual_seed(123)
-    return OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=dtype)
-
-
-def make_engine(model, *, asynchronous=True, k=3, budget=16, prefix=False, multi_stream=True):
-    return LLMEngine(
-        model,
-        attention_backend="triton",
-        cache_config=CacheConfig(256, 2, enable_prefix_caching=prefix, incremental_allocation=True),
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=4, max_num_batched_tokens=budget, prefill_chunk_size=2
-        ),
-        execution_config=ExecutionConfig(async_scheduling=asynchronous, multi_stream=multi_stream),
-        speculative_config=SpeculativeConfig(k),
-    )
+from vllm_rlt.request import Request, RequestPhase
 
 
 def drain(engine):
@@ -45,42 +29,36 @@ def drain(engine):
     pytest.fail("async speculative engine failed to drain")
 
 
-def bootstrap(engine, rid="r", max_tokens=24, ignore_eos=True):
-    engine.add_request(rid, [2, 3, 4], SamplingParams(max_tokens=max_tokens, ignore_eos=ignore_eos))
-    for _ in range(30):
-        if engine.step():
-            return engine.scheduler.requests[rid]
-    pytest.fail("bootstrap did not produce a token")
-
-
 def test_scheduler_uses_upper_bound_and_releases_rejected_budget():
     scheduler = Scheduler(SchedulerConfig(), None, SpeculativeConfig(3))
     r = Request("r", [2, 3], SamplingParams(max_tokens=8), generated_token_ids=[4])
     r.num_output_placeholders = 4
-    item = scheduler._make_scheduled_item(r, Stage.SPECULATIVE, 16)
-    assert (item.token_start, item.token_count) == (6, 3)
+    scheduled_request = scheduler._make_scheduled_request(r, RequestPhase.SPECULATIVE, 16)
+    assert (scheduled_request.token_start, scheduled_request.token_count) == (6, 3)
     # One committed token instead of the four reserved: recover three slots.
     r.num_output_placeholders = 0
     r.generated_token_ids.append(5)
-    item = scheduler._make_scheduled_item(r, Stage.SPECULATIVE, 16)
-    assert (item.token_start, item.token_count) == (3, 4)
+    scheduled_request = scheduler._make_scheduled_request(r, RequestPhase.SPECULATIVE, 16)
+    assert (scheduled_request.token_start, scheduled_request.token_count) == (3, 4)
 
 
 def test_async_spec_rejects_cpu_before_cache_allocation():
-    with pytest.raises(ValueError, match="CUDA and Triton"):
-        make_engine(tiny())
+    with pytest.raises(ValueError, match="requires CUDA"):
+        make_speculative_engine(tiny_ouro_model())
 
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("k,budget", [(1, 1), (2, 7), (4, 16), (8, 32)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_async_matches_sync_with_ragged_limits_and_prefix_reuse(k, budget, dtype):
-    model = tiny("cuda", dtype)
+    model = tiny_ouro_model("cuda", dtype)
     params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in (1, 13, 8)]
     prompts = [[2, 3, 4, 5], [2, 3, 4, 7], [9]]
     results = []
     for asynchronous in (False, True):
-        e = make_engine(model, asynchronous=asynchronous, k=k, budget=budget, prefix=True)
+        e = make_speculative_engine(
+            model, asynchronous=asynchronous, k=k, budget=budget, prefix=True
+        )
         for repetition in range(2):
             for i, (prompt, p) in enumerate(zip(prompts, params)):
                 e.add_request(str(i), prompt, p)
@@ -96,9 +74,9 @@ def test_async_matches_sync_with_ragged_limits_and_prefix_reuse(k, budget, dtype
 @pytest.mark.gpu
 @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
 def test_second_round_executes_before_cpu_commit_at_every_rejection(accepted, monkeypatch):
-    model = tiny("cuda")
-    e = make_engine(model)
-    request = bootstrap(e)
+    model = tiny_ouro_model("cuda")
+    e = make_speculative_engine(model)
+    request = bootstrap_speculation(e)
     start = request.position
     calls = 0
 
@@ -142,9 +120,9 @@ def test_second_round_executes_before_cpu_commit_at_every_rejection(accepted, mo
 
 @pytest.mark.gpu
 def test_eos_discards_queued_round_and_request_id_can_be_reused(monkeypatch):
-    model = tiny("cuda")
-    e = make_engine(model)
-    bootstrap(e, ignore_eos=False)
+    model = tiny_ouro_model("cuda")
+    e = make_speculative_engine(model)
+    bootstrap_speculation(e, ignore_eos=False)
     coda = model.coda
     monkeypatch.setattr(
         model,
@@ -170,16 +148,16 @@ def test_eos_discards_queued_round_and_request_id_can_be_reused(monkeypatch):
 
 @pytest.mark.gpu
 def test_cancel_and_partial_submission_failure_reclaim_resources(monkeypatch):
-    model = tiny("cuda")
-    e = make_engine(model)
-    bootstrap(e)
+    model = tiny_ouro_model("cuda")
+    e = make_speculative_engine(model)
+    bootstrap_speculation(e)
     e.step()
     e.step()
     assert e.abort_request("r").finish_reason == "abort"
     drain(e)
     assert not e.speculative_runner.states
     assert e.cache_manager.num_used_blocks == 0
-    bootstrap(e)
+    bootstrap_speculation(e)
 
     def fail(*args, **kwargs):
         raise RuntimeError("injected target failure")
@@ -194,18 +172,17 @@ def test_cancel_and_partial_submission_failure_reclaim_resources(monkeypatch):
 
 @pytest.mark.gpu
 def test_async_rejects_random_sampling():
-    e = make_engine(tiny("cuda"))
+    e = make_speculative_engine(tiny_ouro_model("cuda"))
     with pytest.raises(ValueError, match="greedy"):
         e.add_request("r", [2], SamplingParams(temperature=0.8))
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("backend", ["torch", "flash_attn_4"])
-def test_async_rejects_other_backends_before_loading_attention(backend):
-    with pytest.raises(ValueError, match="CUDA and Triton"):
+def test_async_rejects_host_reading_attention():
+    with pytest.raises(ValueError, match="device_context_lengths"):
         LLMEngine(
-            tiny("cuda"),
-            attention_backend=backend,
+            tiny_ouro_model("cuda"),
+            attention_backend="torch",
             execution_config=ExecutionConfig(async_scheduling=True),
             speculative_config=SpeculativeConfig(3),
         )
@@ -213,9 +190,9 @@ def test_async_rejects_other_backends_before_loading_attention(backend):
 
 @pytest.mark.gpu
 def test_prefill_arrivals_interleave_with_inflight_rounds():
-    model = tiny("cuda", torch.bfloat16)
-    e = make_engine(model, budget=5, prefix=True)
-    bootstrap(e, max_tokens=17)
+    model = tiny_ouro_model("cuda", torch.bfloat16)
+    e = make_speculative_engine(model, budget=5, prefix=True)
+    bootstrap_speculation(e, max_tokens=17)
     e.step()
     e.step()
     assert len(e._pending_speculative) == 2
@@ -224,7 +201,7 @@ def test_prefill_arrivals_interleave_with_inflight_rounds():
     for i in (1, 2):
         e.add_request(str(i), prompts[i], SamplingParams(max_tokens=lengths[i], ignore_eos=True))
     actual = drain(e)
-    reference = make_engine(model, asynchronous=False, budget=5, prefix=True)
+    reference = make_speculative_engine(model, asynchronous=False, budget=5, prefix=True)
     for rid, prompt, length in zip(["r", "1", "2"], prompts, lengths):
         reference.add_request(rid, prompt, SamplingParams(max_tokens=length, ignore_eos=True))
     expected = drain(reference)
@@ -241,8 +218,8 @@ def test_prefill_arrivals_interleave_with_inflight_rounds():
 @pytest.mark.gpu
 @pytest.mark.parametrize("multi_stream", [False, True])
 def test_close_drains_both_submitted_rounds(multi_stream):
-    e = make_engine(tiny("cuda"), multi_stream=multi_stream)
-    bootstrap(e)
+    e = make_speculative_engine(tiny_ouro_model("cuda"), multi_stream=multi_stream)
+    bootstrap_speculation(e)
     e.step()
     e.step()
     assert len(e._pending_speculative) == 2
@@ -257,17 +234,17 @@ def test_close_drains_both_submitted_rounds(multi_stream):
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_two_round_kv_matches_serial_replay_at_every_depth(dtype):
-    model = tiny("cuda", dtype)
-    e = make_engine(model)
-    request = bootstrap(e)
+    model = tiny_ouro_model("cuda", dtype)
+    e = make_speculative_engine(model)
+    request = bootstrap_speculation(e)
     e.step()
     e.step()
-    results = [ticket.collect()[0][0] for ticket in e._pending_speculative]
+    results = [ticket.collect().speculative[0] for ticket in e._pending_speculative]
     tokens = request.prompt_token_ids + request.generated_token_ids
     tokens += [token for result in results for token in result.token_ids]
     # Last emitted token has not been forwarded; all earlier tokens have KV.
     tokens = tokens[:-1]
-    oracle = make_engine(model, asynchronous=False).cache_manager
+    oracle = make_speculative_engine(model, asynchronous=False).cache_manager
     assert oracle.allocate("serial", len(tokens))
     with torch.inference_mode():
         for position, token in enumerate(tokens):
@@ -303,7 +280,7 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     from types import SimpleNamespace
 
     from vllm_rlt.core.kv_cache_manager import KVCacheManager
-    from vllm_rlt.core.scheduler import ScheduledItem, SchedulerOutput
+    from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
     from vllm_rlt.worker.async_speculative import AsyncSpeculativeRunner
 
     cache = KVCacheManager(1, 1, 4, 64, 2, 4)
@@ -318,10 +295,10 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     runner.buffers = [buffer]
     requests = [Request(rid, [2], SamplingParams()) for rid in ("short", "long")]
     batch = SchedulerOutput(
-        Stage.SPECULATIVE,
+        RequestPhase.SPECULATIVE,
         [
-            ScheduledItem(requests[0], 1, 2),
-            ScheduledItem(requests[1], 7, 2),
+            ScheduledRequest(requests[0], 1, 2),
+            ScheduledRequest(requests[1], 7, 2),
         ],
     )
     _, _, host, device = runner._prepare_round(batch)
@@ -341,7 +318,7 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     # Simulate retirement, then shrink both dimensions using the same storage.
     buffer.leased = False
     before = buffer.host_tables.clone()
-    smaller = SchedulerOutput(Stage.SPECULATIVE, [ScheduledItem(requests[0], 0, 1)])
+    smaller = SchedulerOutput(RequestPhase.SPECULATIVE, [ScheduledRequest(requests[0], 0, 1)])
     _, _, host, device = runner._prepare_round(smaller)
     assert host.shape == device.shape == (1, 4, 1)
     assert host.is_contiguous() and device.is_contiguous()
@@ -370,7 +347,7 @@ def test_device_metadata_rejects_foreign_and_reused_allocations_without_host_rea
     with monkeypatch.context() as patch:
         patch.setattr(torch.Tensor, "item", forbidden)
         patch.setattr(torch.Tensor, "tolist", forbidden)
-        batch = cache._prepare_device_batch(**arguments)
+        batch = cache.metadata_builder.prepare_device(**arguments)
     assert not hasattr(batch, "owner")
     with pytest.raises(RuntimeError, match="stale"):
         foreign._require_live_batch(batch)
@@ -379,7 +356,7 @@ def test_device_metadata_rejects_foreign_and_reused_allocations_without_host_rea
     with pytest.raises(RuntimeError, match="stale"):
         cache._require_live_batch(batch)
     with pytest.raises(RuntimeError, match="stale"):
-        cache._prepare_device_batch(**arguments)
+        cache.metadata_builder.prepare_device(**arguments)
 
 
 @pytest.mark.gpu
@@ -388,7 +365,7 @@ def test_async_greedy_execution_never_acquires_a_generator(monkeypatch):
     # alone, so run a real request with a spy that fails on any acquire. This needs
     # a reserved device because AsyncSpeculativeRunner allocates CUDA streams; the
     # contract therefore stays pending for M7 3/3.
-    e = make_engine(tiny("cuda"))
+    e = make_speculative_engine(tiny_ouro_model("cuda"))
 
     def forbidden(*args, **kwargs):
         raise AssertionError("greedy speculative sampling must not acquire a generator")
@@ -406,7 +383,7 @@ def test_async_speculative_engine_shares_its_registry(multi_stream):
     # AsyncSpeculativeRunner allocates CUDA streams in its constructor, so this
     # wiring is only verifiable on a reserved device; a CPU construction or mock
     # would not exercise the object the engine actually holds.
-    e = make_engine(tiny("cuda"), multi_stream=multi_stream)
+    e = make_speculative_engine(tiny_ouro_model("cuda"), multi_stream=multi_stream)
     assert e.async_speculative
     assert e.speculative_runner.rng is e.rng
     assert e.model_runner.rng is e.rng

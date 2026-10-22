@@ -78,7 +78,7 @@ def generator(monkeypatch):
     generator.backend = "native"
     generator.exit = fixed_exit(4)
     generator.tokenizer = SimpleNamespace(eos_token_id=0, decode=lambda ids, **kw: "answer STOP")
-    generator.llm = SimpleNamespace(engine=Engine())
+    generator.engine = Engine()
     return generator
 
 
@@ -87,10 +87,10 @@ def test_stop_releases_request_without_an_extra_token(generator):
     assert result["token_ids"] == [10, 11]
     assert result["text"] == "answer "
     assert result["finish_reason"] == "stop"
-    assert generator.llm.engine.steps == 2
-    assert generator.llm.engine.aborts == 1
-    assert not generator.llm.engine.active
-    params = generator.llm.engine.params
+    assert generator.engine.steps == 2
+    assert generator.engine.aborts == 1
+    assert not generator.engine.active
+    params = generator.engine.params
     assert params.min_loops == params.max_loops == 4 and params.exit_threshold == 1
     assert result["exit_depths"] == [4, 4]
 
@@ -98,13 +98,13 @@ def test_stop_releases_request_without_an_extra_token(generator):
 @pytest.mark.parametrize("depths,fails", [((6, 6), False), ((6, 4), True)])
 def test_fixed_depth_follows_the_protocol_depth(generator, depths, fails):
     generator.exit = fixed_exit(6)
-    generator.llm.engine = Engine(depths=depths)
+    generator.engine = Engine(depths=depths)
     if fails:
         with pytest.raises(RuntimeError, match="full-depth"):
             generator.generate([1, 2], 8, ["STOP"])
         return
     result = generator.generate([1, 2], 8, ["STOP"])
-    params = generator.llm.engine.params
+    params = generator.engine.params
     assert params.min_loops == params.max_loops == 6
     assert result["exit_depths"] == [6, 6]
 
@@ -118,24 +118,46 @@ def test_model_depth_must_match_the_protocol():
         check_depth(SimpleNamespace(total_ut_steps=6), 4)
 
 
+def test_native_generator_owns_logits_check_and_releases_it(monkeypatch):
+    pytest.importorskip("lm_eval")
+    from unittest.mock import Mock
+
+    from benchmarks import gsm8k_backends as backends
+    from tests.helpers import tiny_ouro_model
+
+    model = tiny_ouro_model()
+    monkeypatch.setattr(backends.NativeModel, "from_pretrained", lambda *a, **kw: model)
+    engine = Mock()
+    factory = Mock(return_value=engine)
+    monkeypatch.setattr(backends, "StageEngine", factory)
+    generator = backends.Generator("native", "unused", None, 128, fixed_exit(4))
+    assert factory.call_args.args == (model,)
+    model.lm_head(torch.zeros(1, model.config.hidden_size))
+    with pytest.raises(FloatingPointError, match="Non-finite"):
+        model.lm_head(torch.full((1, model.config.hidden_size), float("nan")))
+    generator.close()
+    engine.close.assert_called_once()
+    assert not model.lm_head._forward_hooks
+
+
 def test_adaptive_exit_records_depths_below_four(generator):
     generator.exit = ADAPTIVE_EXIT
-    generator.llm.engine = Engine(depths=(4, 2))
+    generator.engine = Engine(depths=(4, 2))
     result = generator.generate([1, 2], 8, ["STOP"])
-    params = generator.llm.engine.params
+    params = generator.engine.params
     assert (params.min_loops, params.max_loops, params.exit_threshold) == (1, 4, 0.5)
     # Prefill produces the first token at full depth; decode may exit earlier.
     assert result["exit_depths"] == [4, 2]
-    assert generator.llm.engine.aborts == 1
+    assert generator.engine.aborts == 1
 
 
 @pytest.mark.parametrize("failure", ["execution", "depth"])
 def test_failure_releases_request(generator, failure):
-    generator.llm.engine.failure = failure
+    generator.engine.failure = failure
     with pytest.raises(RuntimeError):
         generator.generate([1, 2], 8, ["STOP"])
-    assert generator.llm.engine.aborts == 1
-    assert not generator.llm.engine.active
+    assert generator.engine.aborts == 1
+    assert not generator.engine.active
 
 
 class ReleaseModel:

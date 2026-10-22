@@ -258,7 +258,10 @@ The operation copies per-token, per-layer KV, rather than the final hidden state
 
 ## 5. Prefill execution order
 
-The current [ModelRunner._prefill()](../vllm_rlt/worker/model_runner.py) uses different execution orders for the two layouts.
+The shared [ModelRunner input preparation](../vllm_rlt/worker/model_runner.py)
+uses `_prepare_loop_inputs()` for LAST_EXITED and `_prepare_shared_loop_inputs()`
+for SHARED. Both enter the same submission and model-runtime interface; their
+causal KV semantics require different execution orders.
 
 `last_exited` can pack multiple prompt tokens within one chunk:
 

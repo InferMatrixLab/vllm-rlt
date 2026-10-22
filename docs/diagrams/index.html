@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vllm-rlt · Unified Stage Architecture</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f1f5f9;color:#0f172a;font:16px/1.65 system-ui,"Droid Sans Fallback",sans-serif}header{background:#0f172a;color:white;padding:28px max(24px,calc((100vw - 1440px)/2)) 24px}.eyebrow{color:#93c5fd;font-size:13px;letter-spacing:2px}h1{font-size:30px;margin:8px 0}header p{margin:0;color:#cbd5e1}main{max-width:1488px;margin:auto;padding:24px}nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}button{font:inherit;cursor:pointer;border:1px solid #cbd5e1;border-radius:9px;background:white;color:#334155;padding:10px 18px}button[aria-selected=true]{background:#2563eb;border-color:#2563eb;color:white}button:focus-visible,a:focus-visible{outline:3px solid #f59e0b;outline-offset:3px}.card{background:white;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;box-shadow:0 5px 20px #0f172a08}.bar{padding:18px 24px;border-bottom:1px solid #e2e8f0;display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}h2{margin:0;font-size:21px}.desc{font-size:14px;color:#64748b;margin:4px 0 0}.links{display:flex;gap:16px;font-size:14px}a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}.tools{display:flex;align-items:center;gap:12px;padding:12px 24px;background:#f8fafc;font-size:14px;color:#475569}.tools button{font-size:13px;padding:4px 12px}input{accent-color:#2563eb}.canvas{height:76vh;min-height:500px;overflow:auto;padding:24px;text-align:center}.canvas img{display:block;width:100%;max-width:none;height:auto;margin:auto}.panel[hidden]{display:none}.foot{font-size:13px;color:#64748b;padding:18px 4px}.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;margin-bottom:16px;color:#475569}.dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}.blue{background:#60a5fa}.green{background:#4ade80}.orange{background:#fb923c}.purple{background:#a78bfa}@media(max-width:650px){h1{font-size:24px}main{padding:14px}.canvas{padding:8px}.bar{padding:14px}.tools{flex-wrap:wrap;padding:10px}.canvas img{min-width:720px}}
+</style>
+</head>
+<body>
+<header><div class="eyebrow">VLLM-RLT / ARCHITECTURE</div><h1>Unified Stage Execution Architecture</h1><p>Stage is the deployment and resource boundary; loop is the unit of execution and scheduling within a stage.</p></header>
+<main>
+<nav role="tablist" aria-label="Select a diagram">
+<button role="tab" id="tab-architecture" aria-controls="architecture" aria-selected="true" data-panel="architecture">01 · Deployment architecture</button>
+<button role="tab" id="tab-overview" aria-controls="overview" aria-selected="false" data-panel="overview">02 · Scheduler overview</button>
+<button role="tab" id="tab-scheduler" aria-controls="scheduler" aria-selected="false" data-panel="scheduler">03 · Loop scheduling detail</button>
+<button role="tab" id="tab-scheduler-preemption-detail" aria-controls="scheduler-preemption-detail" aria-selected="false" data-panel="scheduler-preemption-detail">04 · Request state, KV pressure and restoration</button>
+<button role="tab" id="tab-scheduler-async-detail" aria-controls="scheduler-async-detail" aria-selected="false" data-panel="scheduler-async-detail">05 · Asynchronous execution and safe buffer reuse</button>
+<button role="tab" id="tab-scheduler-stage-handoff-detail" aria-controls="scheduler-stage-handoff-detail" aria-selected="false" data-panel="scheduler-stage-handoff-detail">06 · Request handoff between reusable stages</button>
+<button role="tab" id="tab-stage-components" aria-controls="stage-components" aria-selected="false" data-panel="stage-components">07 · Stage structure</button>
+</nav>
+<div class="legend"><span><i class="dot blue"></i>Engine and scheduling</span><span><i class="dot green"></i>On-device execution</span><span><i class="dot purple"></i>Request and KV state</span><span><i class="dot orange"></i>Cross-stage handoff</span></div>
+<section class="panel card" id="architecture" role="tabpanel" aria-labelledby="tab-architecture" >
+<div class="bar"><div><h2>Deployment architecture</h2><p class="desc">Each stage owns its requests, scheduler, executor and resources; speculation is a stage-local control policy.</p></div><div class="links"><a href="stage-architecture.svg" target="_blank" rel="noopener">Open SVG</a><a href="stage-architecture.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
+<div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom deployment architecture"></label><output>100%</output><button class="fit">Fit width</button><span>Scroll within the diagram, or open the SVG in a new window to zoom further.</span></div>
+<div class="canvas"><img src="stage-architecture.svg" alt="Deployment architecture: Each stage owns its requests, scheduler, executor and resources; speculation is a stage-local control policy."></div></section>
+<section class="panel card" id="overview" role="tabpanel" aria-labelledby="tab-overview" hidden>
+<div class="bar"><div><h2>Scheduler overview</h2><p class="desc">Follow A–F from top to bottom, then return to B along the left edge. Admission includes waiting, preemption and restoration; C separates prefill granularity from batching.</p></div><div class="links"><a href="scheduler-overview.svg" target="_blank" rel="noopener">Open SVG</a><a href="scheduler-overview.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
+<div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom scheduler overview"></label><output>100%</output><button class="fit">Fit width</button><a href="#scheduler" onclick="select('scheduler')">Expand Mixed: loop scheduling</a></div>
+<div class="canvas"><img src="scheduler-overview.svg" alt="Complete scheduler paths: admission, phase queues, policy selection, ordinary/speculative execution, pending results, PD transfer and retirement."></div></section>
+<section class="panel card" id="scheduler" role="tabpanel" aria-labelledby="tab-scheduler" hidden>
+<div class="bar"><div><h2>Loop-level scheduler</h2><p class="desc">Select individual loops, mix compatible requests, then regroup from independent progress.</p></div><div class="links"><a href="loop-scheduler.svg" target="_blank" rel="noopener">Open SVG</a><a href="loop-scheduler.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
+<div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom scheduler diagram"></label><output>100%</output><button class="fit">Fit width</button></div>
+<div class="canvas"><img src="loop-scheduler.svg" alt="Different request loop depths join one recurrent batch; independent progress changes the next batch."></div></section>
+<section class="panel card" id="scheduler-preemption-detail" role="tabpanel" aria-labelledby="tab-scheduler-preemption-detail" hidden>
+<div class="bar"><h2>Request state, KV pressure and restoration</h2><div class="links"><a href="scheduler-preemption-detail.svg" target="_blank" rel="noopener">Open SVG</a><a href="scheduler-preemption-detail.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
+<div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom Request state, KV pressure and restoration"></label><output>100%</output><button class="fit">Fit width</button></div>
+<div class="canvas"><img src="scheduler-preemption-detail.svg" alt="State by data kind"></div><div class="bar"><h2>Complete preemption policy</h2><a href="scheduler-victim-selection.png" target="_blank" rel="noopener">Open full-size policy diagram</a></div><div class="canvas"><img src="scheduler-victim-selection.svg" alt="Complete preemption triggers, protection, ranking, retry and restoration"></div></section>
+<section class="panel card" id="scheduler-async-detail" role="tabpanel" aria-labelledby="tab-scheduler-async-detail" hidden>
+<div class="bar"><h2>Asynchronous execution and safe buffer reuse</h2><div class="links"><a href="scheduler-async-detail.svg" target="_blank" rel="noopener">Open SVG</a><a href="scheduler-async-detail.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
+<div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom Asynchronous execution and safe buffer reuse"></label><output>100%</output><button class="fit">Fit width</button></div>
+<div class="canvas"><img src="scheduler-async-detail.svg" alt="Asynchronous execution and safe buffer reuse"></div></section>
+<section class="panel card" id="scheduler-stage-handoff-detail" role="tabpanel" aria-labelledby="tab-scheduler-stage-handoff-detail" hidden>
+<div class="bar"><h2>Request handoff between reusable stages</h2><div class="links"><a href="scheduler-stage-handoff-detail.svg" target="_blank" rel="noopener">Open SVG</a><a href="scheduler-stage-handoff-detail.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
+<div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom Request handoff between reusable stages"></label><output>100%</output><button class="fit">Fit width</button></div>
+<div class="canvas"><img src="scheduler-stage-handoff-detail.svg" alt="Request handoff between reusable stages"></div></section>
+<section class="panel card" id="stage-components" role="tabpanel" aria-labelledby="tab-stage-components" hidden>
+<div class="bar"><h2>Stage structure</h2><div class="links"><a href="stage-components.svg" target="_blank" rel="noopener">Open SVG</a><a href="stage-components.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
+<div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom Stage structure"></label><output>100%</output><button class="fit">Fit width</button></div>
+<div class="canvas"><img src="stage-components.svg" alt="Stage structure"></div></section>
+<p class="foot">Rendered offline; no network or Mermaid plugin required. For limitations, including arbitrary launch topologies and PD with speculation, see the <a href="../unified_execution.md">architecture guide</a>.</p>
+</main>
+<script>
+const tabs=[...document.querySelectorAll('[role=tab]')];
+function select(id){if(!document.getElementById(id)?.classList.contains('panel'))return;tabs.forEach(t=>t.setAttribute('aria-selected',String(t.dataset.panel===id)));document.querySelectorAll('.panel').forEach(p=>p.hidden=p.id!==id);}
+tabs.forEach(t=>t.addEventListener('click',()=>{select(t.dataset.panel);history.replaceState(null,'','#'+t.dataset.panel)}));
+document.querySelectorAll('.panel').forEach(p=>{const slider=p.querySelector('input'),out=p.querySelector('output'),img=p.querySelector('img');function zoom(){img.style.width=slider.value+'%';out.textContent=slider.value+'%'}slider.addEventListener('input',zoom);p.querySelector('.fit').addEventListener('click',()=>{slider.value=100;zoom()})});
+if(location.hash)select(location.hash.slice(1));
+</script></body></html>

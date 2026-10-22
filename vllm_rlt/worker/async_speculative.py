@@ -5,12 +5,13 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm_rlt.config import ExecutionConfig
 from vllm_rlt.core.kv_cache_manager import _Allocation
 from vllm_rlt.core.scheduler import SchedulerOutput
-from vllm_rlt.request import Request
+from vllm_rlt.request import Operation, Request
+from vllm_rlt.worker.executor import ForwardBatch
+from vllm_rlt.worker.output import ModelRunnerOutput, SpeculativeResult
 from vllm_rlt.worker.sampler import RngRegistry
-from vllm_rlt.worker.speculative import SpeculativeResult, SpeculativeRunner
+from vllm_rlt.worker.speculative import SpeculativeRunner
 
 
 @dataclass
@@ -49,33 +50,36 @@ class SpeculativeRoundTicket:
     states: tuple[SpeculativeRequestState, ...]
     rounds: tuple[int, ...]
     rows: int
-    cached: tuple[list[SpeculativeResult], list[int]] | None = None
+    cached: ModelRunnerOutput | None = None
     retired: bool = False
+
+    @property
+    def has_result(self):
+        return True
 
     def ready(self):
         assert self.buffer.copy_done is not None
         return self.buffer.copy_done.query()
 
-    def collect(self):
+    def collect(self) -> ModelRunnerOutput:
         if self.cached is None:
             if self.retired:
                 raise RuntimeError("cannot collect a retired speculative ticket")
             assert self.buffer.copy_done is not None
             self.buffer.copy_done.synchronize()
-            b = len(self.batch.items)
+            b = len(self.batch.requests)
             values = self.buffer.host_result[: self.rows + 2 * b].tolist()
             results, start = [], 0
-            for i, item in enumerate(self.batch.items):
+            for i, scheduled_request in enumerate(self.batch.requests):
                 accepted = values[self.rows + i]
                 results.append(
                     SpeculativeResult(
                         values[start : start + accepted + 1],
                         accepted,
-                        item.token_count - 1,
                     )
                 )
-                start += item.token_count
-            self.cached = (results, values[self.rows + b :])
+                start += scheduled_request.token_count
+            self.cached = ModelRunnerOutput(speculative=results, frontiers=values[self.rows + b :])
         return self.cached
 
     def retire(self, *, discard=False):
@@ -108,14 +112,15 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         config,
         scheduler,
         *,
-        multi_stream=True,
+        execution,
+        compute_stream,
+        copy_stream,
         rng: RngRegistry | None = None,
+        runtime=None,
     ):
-        super().__init__(model, cache, config, ExecutionConfig(), rng=rng)
-        self.compute_stream = torch.cuda.Stream(device=self.device)
-        self.copy_stream = (
-            torch.cuda.Stream(device=self.device) if multi_stream else self.compute_stream
-        )
+        super().__init__(model, cache, config, execution, rng=rng, runtime=runtime)
+        self.compute_stream = compute_stream
+        self.copy_stream = copy_stream
         self.compute_stream.wait_stream(torch.cuda.current_stream(self.device))
         self.buffers = [SpeculativeRoundBuffer(self, scheduler) for _ in range(2)]
         self.states: dict[str, SpeculativeRequestState] = {}
@@ -142,7 +147,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
     def _execute_recurrent_step(self, hidden, positions, tables, depth, allocations):
         table = tables[:, depth].contiguous()
         blocks = table.gather(1, (positions // self.cache.block_size)[:, None]).squeeze(1)
-        metadata = self.cache._prepare_device_batch(
+        metadata = self.metadata.prepare_device(
             allocations=allocations,
             position_ids=positions,
             write_blocks=blocks.long(),
@@ -150,28 +155,31 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             block_tables=table,
             context_lengths=(positions + 1).int(),
         )
-        hidden, _ = self.model.recurrent_prepared(
-            hidden,
-            metadata,
-            self.cache,
-            compute_gate=False,
+        forward = ForwardBatch(
+            Operation.RECURRENT, hidden=hidden, metadata=(metadata,), graphs=self.graphs
         )
-        return hidden
+        prepared = self.runtime.prepare(forward)
+        return self.runtime.forward(prepared).hidden
 
     def _prepare_round(self, batch):
         buffer = next((b for b in self.buffers if not b.leased), None)
         if buffer is None:
             raise RuntimeError("speculative buffers exhausted; retire an earlier round")
-        items = batch.items
-        if not items or any(item.token_count <= 0 for item in items):
+        scheduled_requests = batch.requests
+        if not scheduled_requests or any(
+            scheduled_request.token_count <= 0 for scheduled_request in scheduled_requests
+        ):
             raise ValueError("speculative round requires nonempty verification rows")
         allocations = tuple(
-            (item.request.request_id, self.cache._get_allocation(item.request.request_id))
-            for item in items
+            (
+                scheduled_request.request.request_id,
+                self.cache._get_allocation(scheduled_request.request.request_id),
+            )
+            for scheduled_request in scheduled_requests
         )
         page_counts = []
-        for item, (_, allocation) in zip(items, allocations):
-            upper = item.token_start + item.token_count
+        for scheduled_request, (_, allocation) in zip(scheduled_requests, allocations):
+            upper = scheduled_request.token_start + scheduled_request.token_count
             if upper > allocation.max_tokens or upper <= 0:
                 raise ValueError("speculative round exceeds reserved context")
             pages = math.ceil(upper / self.cache.block_size)
@@ -180,7 +188,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             page_counts.append(pages)
         # A prefix of flat reusable storage provides contiguous active views even
         # as request count/page width change. The previous copy must be retired.
-        shape = (len(items), self.cache.max_loops, max(page_counts))
+        shape = (len(scheduled_requests), self.cache.max_loops, max(page_counts))
         size = math.prod(shape)
         host_tables = buffer.host_tables[:size].view(shape)
         tables = buffer.tables[:size].view(shape)
@@ -192,18 +200,24 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         buffer.leased = True
         return buffer, allocations, host_tables, tables
 
-    def _draft(self, items, states, tables, allocations):
+    def _draft(self, scheduled_requests, states, tables, allocations):
         starts = [s.position.clone() for s in states]
-        candidates = [[] for _ in items]
-        hidden_rows = [[] for _ in items]
-        for offset in range(max(item.token_count for item in items)):
-            active = [i for i, item in enumerate(items) if offset < item.token_count]
+        candidates = [[] for _ in scheduled_requests]
+        hidden_rows = [[] for _ in scheduled_requests]
+        for offset in range(
+            max(scheduled_request.token_count for scheduled_request in scheduled_requests)
+        ):
+            active = [
+                i
+                for i, scheduled_request in enumerate(scheduled_requests)
+                if offset < scheduled_request.token_count
+            ]
             tokens = torch.stack(
                 [states[i].token if offset == 0 else candidates[i][-1] for i in active]
             )
             positions = torch.stack([starts[i] + offset for i in active])
             row_tables = torch.stack([tables[i] for i in active])
-            hidden = self.model.prelude(tokens)
+            hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=tokens)).hidden
             for depth in range(self.config.draft_loops):
                 hidden = self._execute_recurrent_step(
                     hidden, positions, row_tables, depth, allocations
@@ -211,38 +225,41 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             drafting = []
             for row, i in enumerate(active):
                 hidden_rows[i].append(hidden[row])
-                if offset + 1 < items[i].token_count:
+                if offset + 1 < scheduled_requests[i].token_count:
                     drafting.append((row, i))
             if drafting:
-                proposed = self.model.coda(
-                    torch.stack([hidden[row] for row, _ in drafting])
-                ).argmax(-1)
+                proposed = self._coda(torch.stack([hidden[row] for row, _ in drafting])).argmax(-1)
                 for row, (_, i) in enumerate(drafting):
                     candidates[i].append(proposed[row])
         return starts, candidates, hidden_rows
 
-    def _verify(self, items, starts, hidden_rows, tables, allocations):
+    def _verify(self, scheduled_requests, starts, hidden_rows, tables, allocations):
         positions = torch.cat(
             [
-                start + torch.arange(item.token_count, device=self.device)
-                for start, item in zip(starts, items)
+                start + torch.arange(scheduled_request.token_count, device=self.device)
+                for start, scheduled_request in zip(starts, scheduled_requests)
             ]
         )
         row_tables = torch.cat(
-            [tables[i : i + 1].expand(item.token_count, -1, -1) for i, item in enumerate(items)]
+            [
+                tables[i : i + 1].expand(scheduled_request.token_count, -1, -1)
+                for i, scheduled_request in enumerate(scheduled_requests)
+            ]
         )
         hidden = torch.stack([h for rows in hidden_rows for h in rows])
         for depth in range(self.config.draft_loops, self.config.target_loops):
             hidden = self._execute_recurrent_step(hidden, positions, row_tables, depth, allocations)
-        target = self.model.coda(hidden).argmax(-1)
+        target = self._coda(hidden).argmax(-1)
         return target
 
-    def _accept_and_update_state(self, items, states, starts, candidates, target, buffer):
+    def _accept_and_update_state(
+        self, scheduled_requests, states, starts, candidates, target, buffer
+    ):
         count = len(target)
         buffer.result[:count].copy_(target)
         start = 0
-        for i, (item, state) in enumerate(zip(items, states)):
-            rows = target[start : start + item.token_count]
+        for i, (scheduled_request, state) in enumerate(zip(scheduled_requests, states)):
+            rows = target[start : start + scheduled_request.token_count]
             if candidates[i]:
                 matches = torch.stack(candidates[i]) == rows[:-1]
                 accepted = matches.long().cumprod(0).sum()
@@ -253,28 +270,35 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             state.token.copy_(rows.gather(0, accepted.reshape(1)).squeeze(0))
             state.position.copy_(starts[i] + accepted + 1)
             buffer.result[count + i].copy_(accepted)
-            buffer.result[count + len(items) + i].copy_(state.position)
+            buffer.result[count + len(scheduled_requests) + i].copy_(state.position)
             state.submitted += 1
-            start += item.token_count
+            start += scheduled_request.token_count
         return count
 
     @torch.inference_mode()
-    def submit_round(self, batch):
+    def submit(self, batch):
         # 1. Reserve a slot and prepare only the active CPU page tables.
         buffer, allocations, host_tables, tables = self._prepare_round(batch)
-        items = batch.items
+        scheduled_requests = batch.requests
         # A partial submission may not record events. The engine drains both
         # owned streams before releasing allocations or recycling the slot.
         # 2. Submit computation; device state joins successive rounds.
         with torch.cuda.stream(self.compute_stream):
-            states = tuple(self._state(item.request, buffer) for item in items)
+            states = tuple(
+                self._state(scheduled_request.request, buffer)
+                for scheduled_request in scheduled_requests
+            )
             rounds = tuple(s.submitted for s in states)
             if any(s.submitted > s.delivered for s in states):
                 self.submitted_before_collect += 1
             tables.copy_(host_tables, non_blocking=True)
-            starts, candidates, hidden_rows = self._draft(items, states, tables, allocations)
-            target = self._verify(items, starts, hidden_rows, tables, allocations)
-            count = self._accept_and_update_state(items, states, starts, candidates, target, buffer)
+            starts, candidates, hidden_rows = self._draft(
+                scheduled_requests, states, tables, allocations
+            )
+            target = self._verify(scheduled_requests, starts, hidden_rows, tables, allocations)
+            count = self._accept_and_update_state(
+                scheduled_requests, states, starts, candidates, target, buffer
+            )
             buffer.compute_done = torch.cuda.Event()
             buffer.compute_done.record(self.compute_stream)
             for state in states:
@@ -282,12 +306,14 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         # 3. Transfer compact results after computation; collect waits here.
         with torch.cuda.stream(self.copy_stream):
             self.copy_stream.wait_event(buffer.compute_done)
-            n = count + 2 * len(items)
+            n = count + 2 * len(scheduled_requests)
             buffer.host_result[:n].copy_(buffer.result[:n], non_blocking=True)
             buffer.copy_done = torch.cuda.Event()
             buffer.copy_done.record(self.copy_stream)
-        self.stats.rounds += len(items)
-        self.stats.drafted_tokens += sum(item.token_count - 1 for item in items)
+        self.stats.rounds += len(scheduled_requests)
+        self.stats.drafted_tokens += sum(
+            scheduled_request.token_count - 1 for scheduled_request in scheduled_requests
+        )
         self.stats.verified_rows += count
         return SpeculativeRoundTicket(batch, buffer, states, rounds, count)
 
@@ -303,6 +329,17 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             if state.event is not None:
                 state.event.synchronize()
             del self.states[request.request_id]
+
+    def discard_buffers(self):
+        """Reset round storage after both streams drain and all tickets retire.
+
+        A failed submission may own a buffer without having returned a ticket.
+        The engine orders draining and ticket retirement; this runner owns the
+        remaining buffer cleanup. No host result needs to be decoded here.
+        """
+        for buffer in self.buffers:
+            buffer.keepalive.clear()
+            buffer.leased = False
 
     def synchronize(self):
         self.compute_stream.synchronize()

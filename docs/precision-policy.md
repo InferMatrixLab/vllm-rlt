@@ -7,7 +7,7 @@ Historical results retain their original dtype, bounds and limitations.
 ## Inference precision
 
 Follow the pinned Ouro release, distinguishing storage/output dtype from
-accumulation precision. The [source notes](https://github.com/hsliuustc0106/vllm-rlt/blob/0f091a985e13a207f4fa127a08d51a625d130ef5/docs/paper-notes.md#original-ouro-paper-and-precision-guidance)
+accumulation precision. The [source notes](https://github.com/InferMatrixLab/vllm-rlt/blob/0f091a985e13a207f4fa127a08d51a625d130ef5/docs/paper-notes.md#original-ouro-paper-and-precision-guidance)
 identify author guidance and project differences.
 
 | Operation | Precision requirement |
@@ -16,7 +16,7 @@ identify author guidance and project differences.
 | Attention | BF16 Q/K/V and output. The official eager path uses native-dtype QK/PV products and FP32 softmax cast back to query dtype; fused-kernel FP32 reductions/statistics/accumulation are explicit backend choices to validate. |
 | RMSNorm | Retain FP32 variance/reduction arithmetic, returning to the activation dtype at the defined boundary. |
 | RoPE | Retain FP32 frequencies, phase and trigonometric computation; cast the positional factors to the activation dtype as specified by the model. |
-| Gate and sampling probabilities | Use the pinned release as the reference. Its exit-distribution code has no explicit FP32 promotion; the current runner's FP32 sigmoid/host cumulative update is a project difference to validate. The sampling implementation is recorded in [`worker/sampler.py`](../vllm_rlt/worker/sampler.py): the non-greedy branch promotes logits to FP32 and processes them as `float()/temperature -> top-k -> top-p -> multinomial`, where top-k keeps `min(k, vocab_size)` candidates and top-p may trim that set further. Sampling itself adds no explicit host readback; the synchronous `ModelRunner.execute()` still reads its batch back with `.cpu().tolist()` after sampling. |
+| Gate and sampling probabilities | Use the pinned release as the reference. Its exit-distribution code has no explicit FP32 promotion; the current runner's FP32 sigmoid/host cumulative update is a project difference to validate. The sampling implementation is recorded in [`worker/sampler.py`](../vllm_rlt/worker/sampler.py): the non-greedy branch promotes logits to FP32 and processes them as `float()/temperature -> top-k -> top-p -> multinomial`, where top-k keeps `min(k, vocab_size)` candidates and top-p may trim that set further. Sampling itself adds no explicit host readback; `ModelRunner.submit()` stages CUDA results into pinned host buffers; `Submission.collect()` waits for completion and converts the result to a host list. |
 | Cache metadata and KV copies | Integer addresses/lengths; copy BF16 KV without changing its values. |
 
 ## Validation requirements
@@ -35,4 +35,4 @@ Passing FP32 or matching a few generated tokens does not qualify BF16 generally.
 Match dtype, hardware, workload and timed work across performance comparisons.
 Report preparation separately, retain raw observations and variability, and keep
 profiling outside throughput timing. Frozen milestone-specific budgets and
-thresholds belong to their [historical records](https://github.com/hsliuustc0106/vllm-rlt/releases/tag/implementation-notes-archive-20260913).
+thresholds belong to their [historical records](https://github.com/InferMatrixLab/vllm-rlt/releases/tag/implementation-notes-archive-20260913).

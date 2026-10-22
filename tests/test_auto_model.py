@@ -232,7 +232,7 @@ def test_pd_rejects_unapproved_download_before_spawning(monkeypatch):
 
     monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda *a, **k: None)
     spawn = Mock(side_effect=AssertionError("must reject before spawning"))
-    monkeypatch.setattr("vllm_rlt.pd.engine.mp.get_context", spawn)
+    monkeypatch.setattr("vllm_rlt.engine.worker.mp.get_context", spawn)
     with pytest.raises(RuntimeError, match="Download requires approval"):
         PDEngine("my-org/model")
     spawn.assert_not_called()
@@ -269,7 +269,7 @@ def test_serving_custom_repository_dispatches_from_config(
     )
     engine, actual = load_engine(args)
     try:
-        assert isinstance(engine.model, NanbeigeForCausalLM)
+        assert engine.model_config.model_type == "nanbeige"
         assert actual is tokenizer
         assert token_load.call_args.args == (args.model,)
         assert token_load.call_args.kwargs["revision"] == "tag"
@@ -291,7 +291,7 @@ def test_pd_downloads_in_parent_before_spawning(monkeypatch, checkpoint, confirm
         snapshot.assert_called_once()
         raise RuntimeError("stop before workers")
 
-    monkeypatch.setattr("vllm_rlt.pd.engine.mp.get_context", spawn)
+    monkeypatch.setattr("vllm_rlt.engine.worker.mp.get_context", spawn)
     with pytest.raises(RuntimeError, match="stop before workers"):
         PDEngine("custom-org/model")
 
