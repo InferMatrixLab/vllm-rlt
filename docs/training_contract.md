@@ -23,13 +23,14 @@ log-probability; top-N alternatives are not implemented.
 `PDEngine`, not a request field. `"raw_logprobs"` is the default: FP32 log-softmax
 of unscaled model logits. `"processed_logprobs"` scores the distribution the token
 was drawn from, after positive temperature and top-k/top-p filtering. Greedy
-requests return the raw score in either mode. Speculative decoding rejects
-`logprobs` requests at admission for now. Explicit `stop_token_ids` apply even
-with `ignore_eos=True`. `seed=None` resolves an independent seed in `[0, 2**63)`
-when the engine admits the request. The effective seed is returned in
-`sampling_params`, including for an abort before sampling. The default remains
-`seed=0`. [Rollout outputs](launching.md#rollout-outputs) states when replaying
-those parameters reproduces tokens and logprobs.
+requests return the raw score in either mode. Speculative outputs use the
+verified **target** policy's score, including correction/bonus tokens; proposal or
+rejection-residual probabilities are never exposed as the policy score. Explicit
+`stop_token_ids` apply even with `ignore_eos=True`. `seed=None` resolves an
+independent seed in `[0, 2**63)` when the engine admits the request. The
+effective seed is returned in `sampling_params`, including for an abort before
+sampling. The default remains `seed=0`. [Rollout outputs](launching.md#rollout-outputs)
+states when replaying those parameters reproduces tokens and logprobs.
 
 Publication requires an idle engine. Each chunk is checked for duplicate names,
 unknown names and mismatched shapes before that chunk is copied. `finish_weight_update`
@@ -52,8 +53,9 @@ without terminating the worker.
 
 Existing exit, async and speculative configuration rules still apply. Self-speculation
 uses a full-depth target. Selected-token scores are supported by synchronous and
-asynchronous decoding; synchronous and asynchronous self-speculation reject
-logprobs requests at admission for now. PD follows the same limits on its decode
-workers. Publication adds no such restriction to ordinary early-exit or async rollouts. Trainers must
+asynchronous decoding and by synchronous and cross-round asynchronous
+self-speculation; the latter is greedy-only, so it reports raw scores in both
+modes. PD follows the same rules on its decode workers. Publication
+adds no such restriction to ordinary early-exit or async rollouts. Trainers must
 replay full-depth prompt prefill and the returned decode depths rather than assume
 the entire sequence used K.

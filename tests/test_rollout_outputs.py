@@ -23,10 +23,12 @@ from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.engine import PDEngine, Peer
 from vllm_rlt.request import Operation, RequestOutput, RequestPhase
 from vllm_rlt.serving.protocol import CompletionRequest
+from vllm_rlt.worker.async_speculative import SpeculativeRoundTicket
 from vllm_rlt.worker.logprobs import token_logprob
 from vllm_rlt.worker.model_runner import ReadbackSlot, Submission
 from vllm_rlt.worker.output import ModelRunnerOutput, SpeculativeResult
 from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.speculative import _CommittedScores
 
 TRACES = {"a": [4, 1, 3, 2, 4, 1, 2, 3], "b": [4, 2, 1, 4, 3, 2, 1, 4]}  # Keyed by request ID.
 EXIT_MODES = [  # (async scheduling, exit config, exit_threshold) for every CPU exit policy.
@@ -653,11 +655,155 @@ def test_lagging_delivery_abort_and_id_reuse_keep_logprobs(
     assert not engine._pending_coda and not any(slot.leased for slot in slots)
 
 
-def test_speculative_admission_rejects_logprobs():
+@pytest.mark.parametrize(
+    "finish,max_tokens,count",
+    [("round", 9, 8), ("stop_token_ids", 9, 4), ("eos", 9, 5), ("length", 4, 3)],
+    ids=["length-at-round-end", "stop-id-mid-round", "eos-mid-round", "length-mid-round"],
+)
+def test_speculative_update_slices_logprobs(monkeypatch, finish, max_tokens, count):
     engine = LLMEngine(model(), speculative_config=SpeculativeConfig(3))
-    with pytest.raises(ValueError, match="speculative"):
-        engine.add_request("r", [2, 3], SamplingParams(logprobs=0))
-    assert not engine.has_unfinished_requests()
+    stops = [50] if finish == "stop_token_ids" else []
+    params = SamplingParams(max_tokens=max_tokens, ignore_eos=finish != "eos", stop_token_ids=stops)
+    engine.add_request("r", [2, 3], replace(params, logprobs=0))
+    # Each round accepts all but its last draft token; token t has logprob -1 - t / 100.
+    rounds = ([10, 11], [12, 50, 0, 13], [14, 15], [16, 17])
+    results = deque(SpeculativeResult(t, len(t) - 1, [-1 - i / 100 for i in t]) for t in rounds)
+    runner = engine.speculative_runner
+    monkeypatch.setattr(
+        runner, "_collect_round", lambda s: [results.popleft() for _ in s.batch.requests]
+    )
+    result = stream(engine)["r"][-1]
+    emitted = [10, 11, 12, 50, 0, 13, 14, 15][:count]
+    reason = "length" if finish in ("round", "length") else "stop"
+    assert (result.token_ids[1:], result.finish_reason) == (emitted, reason)
+    assert result.exit_depths == [4] * len(result.token_ids)
+    assert result.logprobs[1:] == [-1 - t / 100 for t in emitted]
+    assert math.isfinite(result.logprobs[0])
+    assert runner.stats.committed_tokens == len(emitted)
+
+
+SPECULATIVE_SAMPLING = {  # Greedy, truncated and unfiltered sampling.
+    "greedy": {},
+    "top_k_top_p": dict(temperature=0.8, top_k=7, top_p=0.8, seed=42),
+    "unfiltered": dict(temperature=1.0, seed=5),
+}
+
+
+def speculative_engine(m, logprobs_mode="raw_logprobs", **kwargs):
+    return LLMEngine(
+        m,
+        speculative_config=SpeculativeConfig(3),
+        cache_config=CacheConfig(256, 2),
+        logprobs_mode=logprobs_mode,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("logprobs_mode", LOGPROBS_MODES)
+def test_speculative_logprobs_match_full_depth_reference(monkeypatch, logprobs_mode):
+    """Every committed token (accepted, correction, bonus) is scored under the target p on
+    its verification row, which matches a teacher-forced forward at the model depth
+    numerically. The mixed batch puts greedy (raw-scored), sampled (processed-scored in
+    processed mode) and non-requesting rows in the same rounds."""
+    m = model()
+    prompts = [[2, 3], [7, 8, 9], [5], [4, 6]]
+    runs = {name: [rollout(max_tokens=12, **o)] * 4 for name, o in SPECULATIVE_SAMPLING.items()}
+    runs["mixed"] = [rollout(max_tokens=12, **o) for o in SPECULATIVE_SAMPLING.values()]
+    runs["mixed"].append(SamplingParams(max_tokens=12, ignore_eos=True))
+    kinds = set()  # (sampled, accepted every draft) of each committed round.
+    mixed_rounds = 0  # Rounds scoring both greedy and sampled requests.
+    for name, params in runs.items():
+        engine = speculative_engine(m, logprobs_mode)
+        runner = engine.speculative_runner
+
+        def recording(submission, collect=runner._collect_round):
+            nonlocal mixed_rounds
+            results = collect(submission)
+            greedy = set()
+            for scheduled_request, result in zip(submission.batch.requests, results):
+                request_params = scheduled_request.request.sampling_params
+                if request_params.logprobs is None:
+                    assert result.logprobs is None
+                    continue
+                assert len(result.logprobs) == len(result.token_ids)
+                sampled = request_params.temperature != 0
+                drafts = scheduled_request.token_count - 1
+                kinds.add((sampled, result.accepted_count == drafts))
+                greedy.add(not sampled)
+            mixed_rounds += len(greedy) == 2
+            return results
+
+        monkeypatch.setattr(runner, "_collect_round", recording)
+        outputs = generate(engine, prompts, params)
+        for prompt, output in zip(prompts, outputs):
+            check_aligned(output)
+            assert output.exit_depths == [4] * len(output.token_ids)
+            if output.logprobs is None:
+                continue
+            tokens = prompt + output.token_ids
+            rows = dense_reference(m, tokens, 4)[-1][2][len(prompt) - 1 : -1]
+            expected = [
+                token_logprob(row, output.sampling_params, torch.tensor(token), logprobs_mode)
+                for row, token in zip(rows, output.token_ids)
+            ]
+            assert output.logprobs == pytest.approx(torch.stack(expected).tolist(), abs=2e-5)
+        if name == "greedy":  # Greedy speculation equals the non-speculative engine.
+            native = generate(LLMEngine(m, logprobs_mode=logprobs_mode), prompts, params)
+            for actual, expected in zip(outputs, native):
+                assert_same(actual, expected, atol=2e-5)
+    # Both the correction (a rejected draft) and the bonus path were scored when sampling.
+    assert {(True, False), (True, True)} <= kinds
+    assert mixed_rounds > 0
+
+
+@pytest.mark.parametrize("logprobs_mode", LOGPROBS_MODES)
+def test_speculative_logprobs_change_no_token_and_replay_exactly(logprobs_mode):
+    m = model()
+    prompts = [[2, 3], [7, 8, 9]]
+    params = rollout(max_tokens=10, **SPECULATIVE_SAMPLING["top_k_top_p"])
+
+    def run(params):
+        return generate(speculative_engine(m, logprobs_mode), prompts, params)
+
+    first, second, quiet = run(params), run(params), run(replace(params, logprobs=None))
+    for a, b, q in zip(first, second, quiet):
+        assert_same(a, b)  # Same seed: bitwise tokens and logprobs.
+        # Scoring consumes no RNG, so the tokens do not depend on logprobs.
+        assert (a.token_ids, a.exit_depths) == (q.token_ids, q.exit_depths)
+        assert q.logprobs is None
+
+
+def test_speculative_rows_without_logprobs_skip_scoring(monkeypatch):
+    """Without a requesting row nothing is scored; a mixed round scores only its requesting
+    request's committed tokens."""
+    engine = speculative_engine(model())
+    runner, resolve, raw = engine.speculative_runner, _CommittedScores.resolve, []
+    collect, rounds = runner._collect_round, []  # Per round: IDs of the scored requests.
+
+    def recording(submission):
+        rounds.append(None)
+        results = collect(submission)
+        indices = rounds[-1]
+        rounds[-1] = {submission.batch.requests[i].request.request_id for i in indices}
+        return results
+
+    def resolving(scores, logits):
+        rounds[-1] = scores.raw_spans.keys() | scores.processed_spans.keys()
+        return resolve(scores, logits)
+
+    monkeypatch.setattr(runner, "_collect_round", recording)
+    monkeypatch.setattr(_CommittedScores, "resolve", resolving)
+    scoring_op = Sampler.raw_logprobs
+    monkeypatch.setattr(
+        Sampler, "raw_logprobs", staticmethod(lambda *a: raw.append(1) or scoring_op(*a))
+    )
+    params = SamplingParams(max_tokens=8, ignore_eos=True)
+    assert generate(engine, [[2, 3]], params)[0].logprobs is None
+    assert rounds and not any(rounds) and not raw  # No round scored or ran a scoring op.
+    rounds.clear()
+    quiet, loud = generate(engine, [[2, 3], [7, 8]], [params, replace(params, logprobs=0)])
+    assert quiet.logprobs is None and len(loud.logprobs) == len(loud.token_ids)
+    assert set().union(*rounds) == {loud.request_id}
 
 
 @pytest.mark.parametrize(
@@ -716,6 +862,45 @@ def test_async_speculative_collect_uses_shared_finish_rules(finish, max_tokens, 
     else:
         assert not engine.has_unfinished_requests()
         assert engine.cache_manager.num_used_blocks == 0
+
+
+def test_async_speculative_ticket_scores_only_requesting_rows():
+    """The async runner needs CUDA, so stub buffers drive SpeculativeRoundTicket.collect: in a
+    scored round each request that asked gets its committed rows' scores, the others None."""
+
+    class Done:
+        def query(self):
+            return True
+
+        def synchronize(self):
+            pass
+
+    def collect(logprobs_copied, wants):
+        # Two requests with 3 and 2 verification rows; 1 and 0 drafts accepted.
+        buffer = SimpleNamespace(
+            host_result=torch.tensor([7, 8, 9, 4, 5, 1, 0, 12, 20]),
+            host_logprobs=torch.tensor([-0.1, -0.2, -0.3, -0.4, -0.5]),
+            copy_done=Done(),
+        )
+        params = [SamplingParams(logprobs=0 if w else None) for w in wants]
+        requests = [
+            SimpleNamespace(request=SimpleNamespace(sampling_params=p), token_count=n)
+            for p, n in zip(params, (3, 2))
+        ]
+        batch = SimpleNamespace(requests=requests)
+        ticket = SpeculativeRoundTicket(
+            batch, buffer, (), (0, 0), 5, logprobs_copied=logprobs_copied
+        )
+        output = ticket.collect()
+        return output.speculative, output.frontiers
+
+    results, frontiers = collect(True, (True, False))
+    assert [r.token_ids for r in results] == [[7, 8], [4]] and frontiers == [12, 20]
+    assert results[0].logprobs == pytest.approx([-0.1, -0.2]) and results[1].logprobs is None
+    results, _ = collect(True, (False, True))
+    assert results[0].logprobs is None and results[1].logprobs == pytest.approx([-0.4])
+    results, _ = collect(False, (True, True))
+    assert [r.logprobs for r in results] == [None, None]
 
 
 def test_pd_coordinator_resolves_seeds_and_mirrors_logprobs():
@@ -935,6 +1120,44 @@ def test_gpu_async_speculative_stop_token_ids_match_sync():
             output.token_ids,
             output.finish_reason,
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("logprobs_mode", LOGPROBS_MODES)
+def test_gpu_speculative_logprobs_match_across_graphs_async_and_native(logprobs_mode):
+    """CUDA/Triton speculation scores like the non-speculative engine, with CUDA Graphs and
+    with cross-round async speculation (greedy); sampled rounds match with graphs on/off."""
+    m = model(device="cuda")
+    prompts = {"a": [2, 3, 4, 5], "b": [9], "c": [2, 3, 4, 7]}
+
+    def run(speculative=True, asynchronous=False, graphs=False, **overrides):
+        engine = LLMEngine(
+            m,
+            attention_backend="triton",
+            cache_config=CacheConfig(256, 2, incremental_allocation=True),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4, max_num_batched_tokens=16, prefill_chunk_size=2
+            ),
+            execution_config=ExecutionConfig(async_scheduling=asynchronous, cuda_graphs=graphs),
+            speculative_config=SpeculativeConfig(3) if speculative else None,
+            logprobs_mode=logprobs_mode,
+        )
+        for rid, prompt in prompts.items():
+            engine.add_request(rid, prompt, rollout(max_tokens=16, **overrides))
+        outputs = final(stream(engine))
+        if speculative and graphs:
+            assert engine.speculative_runner.coda_graphs.captures > 0
+        engine.close()
+        return outputs
+
+    native = run(speculative=False)
+    for variant in (run(), run(graphs=True), run(asynchronous=True)):
+        for rid, expected in native.items():
+            assert_same(variant[rid], expected, atol=1e-4)
+    sampled = SPECULATIVE_SAMPLING["top_k_top_p"]
+    eager, graphed = run(**sampled), run(graphs=True, **sampled)
+    for rid, expected in eager.items():
+        assert_same(graphed[rid], expected, atol=1e-4)
 
 
 @pytest.mark.gpu

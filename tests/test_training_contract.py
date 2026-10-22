@@ -22,7 +22,7 @@ from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.engine import PDEngine
 
 
-@pytest.mark.parametrize("asynchronous,speculative", [(False, False), (True, False)])
+@pytest.mark.parametrize("asynchronous,speculative", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("mode", ["raw_logprobs", "processed_logprobs"])
 @pytest.mark.parametrize("temperature", [0, 0.7])
 def test_selected_scores_match_dense_target_and_keep_tokens(
@@ -142,7 +142,7 @@ def test_publication_waits_for_requests_and_remote_transfer_leases():
         engine.close()
 
 
-@pytest.mark.parametrize("speculative", [False])
+@pytest.mark.parametrize("speculative", [False, True])
 def test_explicit_stop_applies_with_ignore_eos_and_scores_align(speculative):
     llm = LocalLLM(
         tiny_ouro_model(),
