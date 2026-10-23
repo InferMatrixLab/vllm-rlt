@@ -272,6 +272,89 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
     assert actual == wavefront_refill == original_mixed == separated == expected
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_random_sampling_tracks_only_committed_tokens_under_mixed_loops(device, asynchronous):
+    # Mixed recurrent batches carry rows at different depths (and prefill rows).
+    # Only a CODA may draw a token, so the sampler must run exactly once per
+    # committed token and the per-request stream must replay identically to the
+    # non-mixed schedule.
+    from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig
+    from vllm_rlt.engine.llm_engine import LLMEngine
+
+    params = SamplingParams(
+        max_tokens=6,
+        max_loops=3,
+        temperature=0.8,
+        top_k=7,
+        top_p=0.9,
+        seed=17,
+        ignore_eos=True,
+    )
+
+    def run(mode):
+        torch.manual_seed(123)
+        engine = LLMEngine(
+            OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=torch.float32),
+            attention_backend="triton" if device == "cuda" else "torch",
+            cache_config=CacheConfig(128, 2),
+            scheduler_config=SchedulerConfig(
+                mode=mode,
+                max_num_seqs=3,
+                max_num_batched_tokens=5,
+                prefill_chunk_size=4,
+            ),
+            execution_config=ExecutionConfig(
+                atomic_prefill=False,
+                async_scheduling=asynchronous,
+                static_buffers=asynchronous,
+                pad_to_power_of_two=asynchronous,
+            ),
+            exit_config=ExitConfig("ouro_delayed" if asynchronous else "ouro"),
+        )
+        samples = []
+        sampler = engine.model_runner.sampler
+        sample = sampler.sample
+
+        def record(logits, sampling, generator):
+            samples.append(generator)
+            return sample(logits, sampling, generator)
+
+        sampler.sample = record
+        for name, prompt in (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10])):
+            engine.add_request(name, prompt, params)
+        outputs = {}
+        mixed = []
+        try:
+            for _ in range(300):
+                for output in engine.step():
+                    if output.finished:
+                        outputs[output.request_id] = (
+                            output.token_ids,
+                            output.exit_depths,
+                        )
+                batch = engine.last_schedule
+                if batch is not None and batch.is_mixed:
+                    phases = {batch.phase_for(item) for item in batch.requests}
+                    if len(phases) == 2:
+                        mixed.append(batch)
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail("mixed scheduling stalled")
+        finally:
+            engine.close()
+        committed = sum(len(token_ids) for token_ids, _ in outputs.values())
+        assert len(samples) == committed
+        assert all(generator.device.type == torch.device(device).type for generator in samples)
+        return outputs, mixed
+
+    expected, _ = run("refill")
+    actual, mixed = run("mixed")
+    assert mixed
+    assert actual == expected
+
+
 def mixed_ready_engine():
     from tests.helpers import make_prefill_engine
 

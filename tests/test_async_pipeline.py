@@ -122,6 +122,75 @@ def test_prelude_consumes_device_sample_before_cpu_delivery(monkeypatch, device,
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("multi_stream", [False, True])
+def test_random_async_sample_reaches_the_next_prelude_before_cpu_delivery(
+    monkeypatch, device, multi_stream
+):
+    # Same pipeline ordering as the greedy test above, but the token comes from a
+    # real per-request CUDA generator. The next prelude must consume that device
+    # sample while its host delivery is still held back.
+    params = SamplingParams(
+        max_tokens=4,
+        temperature=0.8,
+        top_k=7,
+        top_p=0.9,
+        seed=11,
+        ignore_eos=True,
+        exit_threshold=1,
+    )
+    replay = make_engine(device=device, multi_stream=multi_stream)
+    replay.add_request("a", [2], params)
+    expected = drain(replay)
+    replay.close()
+
+    engine = make_engine(device=device, multi_stream=multi_stream)
+    try:
+        engine.add_request("a", [2], params)
+        engine.step()
+        engine.step()
+        ticket = engine._pending_coda[0]
+        real_event, held = ticket.event, HeldEvent()
+        ticket.event = held  # Hold only host delivery; keep device dependencies.
+        request = engine.scheduler.requests["a"]
+        generator = engine.rng.peek("a")
+        assert generator is not None
+        assert generator.device.type == torch.device(device).type
+        state = generator.get_state().clone()
+        assert request.generated_token_ids == []
+        assert request.num_output_placeholders == 1
+
+        observed = []
+        original = engine.model.prelude
+
+        def prelude(tokens):
+            assert tokens.device == ticket.device_values.device
+            observed.append(tokens)
+            return original(tokens)
+
+        monkeypatch.setattr(engine.model, "prelude", prelude)
+        engine.step()
+        assert engine.last_schedule.phase == RequestPhase.PRELUDE
+        assert not held.complete and not request.generated_token_ids
+        engine.step()
+        assert engine.last_schedule.phase == RequestPhase.RECURRENT
+        assert not held.complete and not request.generated_token_ids
+        assert engine.rng.peek("a") is generator
+        engine.model_runner.synchronize()
+        assert torch.equal(observed[0], ticket.device_values)
+        ticket.event = real_event
+        actual = drain(engine)
+        assert actual[-1].token_ids == expected[-1].token_ids
+        assert actual[-1].exit_depths == expected[-1].exit_depths
+        assert len(actual[-1].token_ids) == params.max_tokens
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(engine.model_runner.device)
+        # Termination dropped the slot, but the stream this request used advanced.
+        assert not torch.equal(generator.get_state(), state)
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 @pytest.mark.parametrize("static", [False, True])
 def test_delayed_eos_discards_next_work_and_reclaims_after_gpu_completion(
     monkeypatch, device, static

@@ -1328,6 +1328,58 @@ def test_cuda_split_prefill_matches_atomic(async_scheduling, multi_stream, wavef
     assert split_cached_output.exit_depths == atomic_cached_output.exit_depths
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_random_sampling_matches_across_atomic_and_split_prefill(device):
+    # Prefill chunks and recurrent loops never sample; only the CODA consumes the
+    # per-request generator. A seeded request must therefore replay the same
+    # token/exit trajectory whether its prompt was prefilled atomically or split.
+    params = SamplingParams(
+        max_tokens=4,
+        max_loops=3,
+        temperature=0.8,
+        top_k=7,
+        top_p=0.9,
+        seed=42,
+        ignore_eos=True,
+    )
+
+    def run(atomic):
+        torch.manual_seed(321)
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        engine = LLMEngine(
+            OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=dtype),
+            attention_backend="triton" if device == "cuda" else "torch",
+            cache_config=CacheConfig(128, 2),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
+            ),
+            execution_config=ExecutionConfig(atomic_prefill=atomic, async_scheduling=True),
+            exit_config=ExitConfig("ouro_delayed"),
+        )
+        samples = []
+        sampler = engine.model_runner.sampler
+        sample = sampler.sample
+
+        def record(logits, sampling, generator):
+            samples.append(generator)
+            return sample(logits, sampling, generator)
+
+        sampler.sample = record
+        try:
+            engine.add_request("run", [1, 2, 3, 4, 5], params)
+            output = drain_request(engine)
+        finally:
+            engine.close()
+        assert len(samples) == len(output.token_ids)
+        assert all(generator.device.type == torch.device(device).type for generator in samples)
+        return output
+
+    atomic = run(True)
+    split = run(False)
+    assert split.token_ids == atomic.token_ids
+    assert split.exit_depths == atomic.exit_depths
+
+
 @pytest.mark.gpu
 def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
     from vllm_rlt.worker.buffers import execution_buffer_bytes
