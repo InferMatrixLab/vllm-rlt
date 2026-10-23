@@ -434,6 +434,81 @@ def test_stage_client_cuda_async_generation_and_close(speculative, device):
     assert client.stats()["used_blocks"] == 0
 
 
+@pytest.mark.gpu
+def test_stage_client_cuda_random_sampling_reuses_external_id_with_a_new_generation():
+    from vllm_rlt.engine.llm_engine import StageClient
+
+    client = StageClient(
+        tiny_ouro_config(head_dim=64),
+        device="cuda",
+        dtype="bfloat16",
+        seed=123,
+        cache_config=CacheConfig(128, 4),
+        attention_backend="triton",
+    )
+    params = SamplingParams(max_tokens=3, temperature=0.8, top_k=5, seed=9, ignore_eos=True)
+    long_params = SamplingParams(max_tokens=60, temperature=0.8, top_k=5, seed=9, ignore_eos=True)
+    try:
+        client.add_request("reuse", [1, 2, 3], params)
+        first = drain(client)["reuse"]
+        assert len(first[0]) == params.max_tokens
+
+        # Let the worker advance this request's RNG slot before aborting. Aborting
+        # must drop that slot in the worker, not only in the parent process.
+        client.add_request("reuse", [1, 2, 3], long_params)
+        old_generation = client.requests["reuse"]
+        for _ in range(200):
+            if client.step():
+                break
+        else:
+            pytest.fail("worker produced no output before abort")
+        client.abort_request("reuse")
+        assert "reuse" not in client.requests
+
+        client.add_request("reuse", [1, 2, 3], params)
+        new_generation = client.requests["reuse"]
+        # The external ID is reused, but the execution identity is not.
+        assert new_generation != old_generation
+        reused = drain(client)["reuse"]
+        # The dropped slot restarts from the request seed instead of continuing
+        # the aborted stream.
+        assert reused == first
+        assert client.stats()["used_blocks"] == 0
+    finally:
+        client.close()
+
+
+@pytest.mark.gpu
+def test_public_llm_cuda_random_sampling_reaches_the_worker():
+    from vllm_rlt import LLM
+
+    torch.manual_seed(123)
+    llm = LLM(
+        tiny_ouro_config(head_dim=64),
+        device="cuda",
+        dtype="bfloat16",
+        attention_backend="triton",
+        cache_config=CacheConfig(128, 4),
+    )
+    params = SamplingParams(
+        max_tokens=4, temperature=0.8, top_k=5, top_p=0.9, seed=7, ignore_eos=True
+    )
+    try:
+        first = llm.generate([[1, 2, 3]], params)[0]
+        second = llm.generate([[1, 2, 3]], params)[0]
+        # StageClient maps external IDs to internal generations and back, so the
+        # caller still sees its own request IDs on both outputs.
+        assert (first.request_id, second.request_id) == ("0", "1")
+        assert len(first.token_ids) == params.max_tokens
+        assert len(second.token_ids) == params.max_tokens
+        # The worker dropped the finished request's slot, so the same seed replays
+        # its stream across two independent requests.
+        assert second.token_ids == first.token_ids
+        assert llm.engine.process.is_alive()
+    finally:
+        llm.close()
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_connector_becoming_ready_after_selection_is_not_a_scheduler_stall(asynchronous):
     from unittest.mock import Mock
