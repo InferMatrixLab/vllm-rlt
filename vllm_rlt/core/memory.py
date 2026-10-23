@@ -4,8 +4,10 @@ import math
 
 import torch
 
+from vllm_rlt.config import cuda_graph_rows
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.worker.buffers import execution_buffer_bytes
+from vllm_rlt.worker.cuda_graph import speculative_capture_sizes
 
 
 def budget_blocks(available_bytes, bytes_per_block):
@@ -17,8 +19,39 @@ def budget_blocks(available_bytes, bytes_per_block):
     return blocks
 
 
+def graph_memory_reserve(model, scheduler, execution, speculative=None):
+    """Headroom per pool plus retained speculative coda logits across all entries.
+
+    This is a conservative planning allowance, not an allocator upper bound.
+    Explicit KV capacities bypass automatic planning as before.
+    """
+    if not execution.cuda_graphs:
+        return 0
+    pools = 1 + bool(getattr(model, "requires_boundary_kv", False))
+    retained_logits = 0
+    if speculative is not None:
+        pools += 2
+        rows = min(
+            cuda_graph_rows(execution),
+            scheduler.max_num_seqs * (speculative.num_speculative_tokens + 1),
+            scheduler.max_num_batched_tokens,
+        )
+        entries = min(rows, execution.cuda_graph_max_graphs)
+        # Each entry retains a separate full-vocabulary output, even though the
+        # graph allocator pool can reuse intermediate storage between replays.
+        retained_rows = (
+            sum(speculative_capture_sizes(execution, scheduler, speculative))
+            if execution.async_scheduling
+            else entries * rows
+        )
+        retained_logits = (
+            retained_rows * model.config.vocab_size * next(model.parameters()).element_size()
+        )
+    return pools * execution.cuda_graph_memory_reserve_bytes + retained_logits
+
+
 @torch.inference_mode()
-def plan_cache(model, cache, scheduler, execution, backend):
+def plan_cache(model, cache, scheduler, execution, backend, *, speculative=None):
     parameter = next(model.parameters())
     config, device = model.config, parameter.device
     per_block = (
@@ -111,7 +144,7 @@ def plan_cache(model, cache, scheduler, execution, backend):
     )
     budget = min(free_before, int(total * cache.gpu_memory_utilization) - reserved)
     concurrent_peak = peak * (2 if execution.async_scheduling and execution.multi_stream else 1)
-    graph_reserve = execution.cuda_graph_memory_reserve_bytes if execution.cuda_graphs else 0
+    graph_reserve = graph_memory_reserve(model, scheduler, execution, speculative)
     budget -= (
         concurrent_peak
         + context_scratch

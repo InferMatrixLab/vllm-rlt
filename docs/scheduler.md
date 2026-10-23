@@ -188,7 +188,7 @@ Read the upper diagram by data kind, from running to suspended to resumed.
 Green lanes retain runtime state; tensor lanes show CPU copies; the bottom
 metadata lane shows new physical mappings rather than reuse of old addresses.
 Hidden/token copies apply when those tensors exist. Physical block IDs are
-illustrative. 
+illustrative.
 
 #### Complete preemption policy
 

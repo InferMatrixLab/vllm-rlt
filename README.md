@@ -96,6 +96,18 @@ for supported combinations and limitations.
   across GPUs on one host, with NIXL KV transfer and overlap between chunked
   prefill computation and transfer.
 
+Fixed-depth greedy Ouro asynchronous self-speculation supports opt-in core/LM-head
+CUDA Graphs with compatible paged attention backends and row buckets captured at
+startup. All asynchronous speculation now defaults to adaptive drafts, with or without Graphs: K is a
+per-round maximum; `draft_policy="fixed"` / `--draft-policy fixed` retains fixed
+K. Synchronous speculation is unchanged. In reviewer-run H100 Ouro-1.4B BF16
+64/64 input/output trials at C64–256, adaptive K=2/4 defaults deliver
+1.04–1.20× native async Graph end-to-end throughput, including the tail; fixed
+K=4 ranges from 0.98–1.08×. These results apply to `c3a97d3` and are workload
+specific; they have not been rerun after the StageEngine/ModelRuntime integration.
+BF16 padding can change greedy continuations relative to unpadded
+execution. See [configuration, validation and original H100 table](docs/async-speculative.md#cuda-graph-execution).
+
 The default runtime uses synchronous execution; Ouro uses its original gate.
 Advanced execution and cache features are opt-in; see the guides below for
 supported combinations.

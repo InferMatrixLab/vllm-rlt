@@ -8,9 +8,7 @@ import torch
 
 from tests.helpers import (
     bootstrap_speculation,
-    make_speculative_engine,
     tiny_ouro_config,
-    tiny_ouro_model,
 )
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig, SpeculativeConfig
 from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
@@ -75,7 +73,7 @@ def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True
         OuroForCausalLM(tiny_ouro_config()).eval(),
         cache_config=CacheConfig(num_blocks=128, block_size=4),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
-        speculative_config=SpeculativeConfig(num_speculative_tokens=2),
+        speculative_config=SpeculativeConfig(num_speculative_tokens=2, draft_policy="fixed"),
     )
     params = SamplingParams(max_tokens=6, min_loops=4, max_loops=4, ignore_eos=True)
     engine.add_request("r", [2], params)
@@ -152,15 +150,20 @@ def test_discard_waits_for_copy_without_interpreting_payload():
 @pytest.mark.gpu
 @pytest.mark.parametrize("decode_failure", [False, True])
 @torch.inference_mode()
-def test_cuda_serving_two_completed_rounds_isolate_decode_failure(monkeypatch, decode_failure):
-    engine = make_speculative_engine(tiny_ouro_model("cuda"), k=2)
+@pytest.mark.parametrize("graphs", [False, True])
+def test_cuda_serving_two_completed_rounds_isolate_decode_failure(
+    monkeypatch, decode_failure, graphs
+):
+    from tests.test_async_speculative import make_engine, tiny
+
+    engine = make_engine(tiny("cuda"), k=2, graphs=graphs)
     try:
         bootstrap_speculation(engine, max_tokens=6)
         # Force full acceptance, so the two real queued rounds produce both
         # an intermediate snapshot and the terminal snapshot in the same tick.
         monkeypatch.setattr(
-            engine.model,
-            "coda",
+            engine.speculative_runner,
+            "_coda",
             lambda h: torch.zeros(len(h), engine.model.config.vocab_size, device=h.device),
         )
         engine.step()
@@ -212,8 +215,11 @@ def test_cuda_serving_two_completed_rounds_isolate_decode_failure(monkeypatch, d
 @pytest.mark.gpu
 @pytest.mark.parametrize("bad_second", [False, True])
 @torch.inference_mode()
-def test_cuda_failure_cleanup_preserves_error_and_releases_real_buffers(bad_second):
-    engine = make_speculative_engine(tiny_ouro_model("cuda"), k=2)
+@pytest.mark.parametrize("graphs", [False, True])
+def test_cuda_failure_cleanup_preserves_error_and_releases_real_buffers(bad_second, graphs):
+    from tests.test_async_speculative import make_engine, tiny
+
+    engine = make_engine(tiny("cuda"), k=2, graphs=graphs)
     try:
         bootstrap_speculation(engine)
         engine.step()

@@ -148,6 +148,9 @@ class Scheduler:
         # device state; queue transitions remain owned by this scheduler.
         self.suspend_callback = None
         self.resume_callback = None
+        # Optional async speculative draft policy; None keeps the configured K.
+        self.draft_tokens = None
+        self._round_drafts = speculative_config.num_speculative_tokens if speculative_config else 0
         # Optional connector readiness and export predicates. Never mutate queues or blocks.
         self.execution_ready = None
         self.exports_request = None
@@ -586,7 +589,7 @@ class Scheduler:
             # K candidates plus one bonus distribution. At the output limit,
             # K=0 is an ordinary fixed-depth step and needs no extra KV slot.
             remaining = request.sampling_params.max_tokens - request.num_scheduled_outputs
-            count = min(self.speculative_config.num_speculative_tokens + 1, remaining, token_budget)
+            count = min(self._round_drafts + 1, remaining, token_budget)
             return ScheduledRequest(request, request.position, count)
         if phase == RequestPhase.RECURRENT:
             return ScheduledRequest(request, request.position, depth=request.loops_done)
@@ -635,6 +638,22 @@ class Scheduler:
         token_budget = self.config.max_num_batched_tokens
         scheduled_requests = []
         selected: set[str] = set()
+        if RequestPhase.SPECULATIVE in phases and self.speculative_config is not None:
+            self._round_drafts = self.speculative_config.num_speculative_tokens
+            if self.draft_tokens is not None:
+                starts = []
+                for rid in self.queues[RequestPhase.SPECULATIVE]:
+                    request = self.requests[rid]
+                    if (
+                        request.num_speculative_rounds < 2
+                        and request.num_scheduled_outputs < request.sampling_params.max_tokens
+                        and (eligible is None or eligible(request))
+                    ):
+                        starts.append(request.position)
+                        if len(starts) == self.config.max_num_seqs:
+                            break
+                if starts:
+                    self._round_drafts = self.draft_tokens(starts)
         for phase in phases:
             queue = self.queues[phase]
             remaining = len(queue)

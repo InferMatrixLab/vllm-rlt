@@ -146,7 +146,7 @@ def make_speculative_engine(
             max_num_seqs=4, max_num_batched_tokens=budget, prefill_chunk_size=2
         ),
         execution_config=ExecutionConfig(async_scheduling=asynchronous, multi_stream=multi_stream),
-        speculative_config=SpeculativeConfig(k),
+        speculative_config=SpeculativeConfig(k, draft_policy="fixed"),
     )
 
 
