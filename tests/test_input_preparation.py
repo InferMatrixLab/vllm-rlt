@@ -20,6 +20,7 @@ from vllm_rlt.worker.metadata import KVMetadata
         ("cpu", "last_exited", "torch", False),
         pytest.param("cuda", "shared", "triton", False, marks=pytest.mark.gpu),
         pytest.param("cuda", "last_exited", "triton", False, marks=pytest.mark.gpu),
+        pytest.param("cuda", "last_exited", "triton", True, marks=pytest.mark.gpu),
         pytest.param("cuda", "last_exited", "flash_attn_4", False, marks=pytest.mark.gpu),
         pytest.param("cuda", "last_exited", "flash_attn_4", True, marks=pytest.mark.gpu),
     ],

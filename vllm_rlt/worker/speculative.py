@@ -128,7 +128,8 @@ class SpeculativeRunner:
         self.coda_graphs = CodaGraphs(model, execution) if execution.cuda_graphs else None
 
     def _packed(self, packed):
-        return packed and self.cache.attention_capabilities.packed_prefill
+        capabilities = self.cache.attention_capabilities
+        return packed and capabilities.packed_prefill and capabilities.packed_matches_decode
 
     def _prepare_inputs(self, batch):
         """Plan all host-known inputs, then publish one snapshot per dtype."""

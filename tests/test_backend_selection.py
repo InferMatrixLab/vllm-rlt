@@ -169,14 +169,42 @@ def test_flash_device_lengths_and_graph_requirements(packages, monkeypatch, sm, 
     assert selected.info["selected_backend"] == backend
 
 
+@pytest.mark.parametrize("requested", ["triton", "auto"])
+def test_triton_packed_prefill_is_per_selection_opt_in(packages, monkeypatch, requested):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    packages.difference_update(
+        {"flash_attn.cute", "flash_attn_3.flash_attn_interface", "flash_attn"}
+    )
+    args = (requested, torch.device("cuda"), torch.bfloat16, 128, 16)
+    default = create_backend(*args)
+    packed = create_backend(*args, required_capabilities=BackendCapabilities(packed_prefill=True))
+    later = create_backend(*args)
+    assert default.info["selected_backend"] == packed.info["selected_backend"] == "triton"
+    assert not default.capabilities.packed_prefill
+    assert packed.capabilities.packed_prefill
+    assert not packed.capabilities.packed_matches_decode
+    assert not later.capabilities.packed_prefill
+
+
 def test_packed_prefill_requires_declared_support(packages, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
     packages.remove("flash_attn.cute")
+    # Without FA4, auto skips FA3/FA2 and selects Triton's packed paged prefill.
+    backend = create_backend(
+        "auto",
+        torch.device("cuda"),
+        torch.bfloat16,
+        128,
+        16,
+        required_capabilities=BackendCapabilities(packed_prefill=True),
+    )
+    assert backend.info["selected_backend"] == "triton"
+    assert backend.capabilities.packed_prefill
     with pytest.raises(ValueError, match="packed_prefill"):
         create_backend(
-            "auto",
-            torch.device("cuda"),
-            torch.bfloat16,
+            "torch",
+            torch.device("cpu"),
+            torch.float32,
             128,
             16,
             required_capabilities=BackendCapabilities(packed_prefill=True),
