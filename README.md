@@ -100,6 +100,11 @@ The default runtime uses synchronous execution; Ouro uses its original gate.
 Advanced execution and cache features are opt-in; see the guides below for
 supported combinations.
 
+An [experimental deferred Ouro runner](docs/recipes/ouro_deferred.md) groups deep
+loops across response positions with true per-loop KV. It provides a standalone
+mixed-readout experiment and an eager same-readout reference; real-weight BF16
+quality, memory and speed qualification are still required.
+
 ## Model Support
 
 | Checkpoint | Implementation | Documented validation scope | Guide |
