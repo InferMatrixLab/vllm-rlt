@@ -260,6 +260,70 @@ execution. The first generated token comes from full-depth prefill, reflected
 in `exit_depths`. For dynamic arrivals, stepwise output, and cancellation, see
 the [architecture overview](unified_execution.md).
 
+### Rollout outputs
+
+RL trainers can request, for each generated token, its log-probability under the
+policy that sampled it (RFC [#70](https://github.com/InferMatrixLab/vllm-rlt/issues/70)).
+Names follow vLLM.
+
+| Option | Default | Contract |
+| --- | --- | --- |
+| `SamplingParams.logprobs` | `None` | `0` adds `output.logprobs`, the FP32 log-probability of each sampled token. Positive values (top-k alternatives) raise `ValueError` for now. |
+| `SamplingParams.seed` | `0` | `None` asks the engine for a fresh 63-bit seed from OS entropy at `add_request`, consuming neither the torch nor the Python global RNG. `output.sampling_params` reports the effective parameters, including the seed the request's generator is created with. |
+| `SamplingParams.stop_token_ids` | `()` | Emitting one finishes the request with `stop`, even with `ignore_eos=True`; `finish_reason` does not say which stop ID or EOS matched. The token stays in `token_ids`; `LLM.generate` omits its text. IDs outside the vocabulary are rejected. |
+| `logprobs_mode` of `LLM`, `StageEngine` (`LLMEngine`), `PDEngine` | `"raw_logprobs"` | `"raw_logprobs"` is `log_softmax` of the CODA logits. `"processed_logprobs"` is `log_softmax` of the logits sampling draws from (temperature, then top-k, then top-p); greedy rows report the raw value, as vLLM does. No CLI flag yet. |
+
+Every output of a request with `logprobs=0`, including streamed, `stop`, `length`
+and `abort` outputs, has `len(logprobs) == len(token_ids) == len(exit_depths)`.
+Requesting logprobs consumes no RNG and changes no token or exit depth. Replaying
+the reported `sampling_params` reproduces tokens and logprobs bitwise only with the
+same batch composition, configuration and hardware. A resumed preempted request or
+a prefix-cache hit matches the uninterrupted cold run numerically, not necessarily
+bitwise, because the batch composition (and, for a prefix hit, the prefill
+chunking) changes. Huginn is the exception: it draws its random recurrent-state
+initialization from the request's generator, greedy requests included, so its
+`seed` matters even at `temperature=0`, and the draws depend on how the prompt is
+split into prefill chunks. When the chunking changes, for example under memory
+pressure, a Huginn request's tokens and logprobs can differ, not just numerically.
+
+`logprobs[i]` is conditional on `exit_depths[i]`: the policy is the model truncated
+at that loop depth. A teacher-forced recompute therefore has to replay the depths:
+
+- Prompt positions run at the model depth and the input `token_ids[i]` (position
+  `len(prompt) + i`) runs `exit_depths[i + 1]` loops, so the input depths are
+  `[depth] * len(prompt) + exit_depths[1:]`. The last generated token is never an
+  input.
+- Under `last_exited` KV, a token that exited at depth `d` has its depth-`d` KV
+  copied into the deeper loop planes, and later tokens attend to those copies. An
+  ordinary full-depth forward matches only rollouts whose `exit_depths` all equal
+  the model depth: `exit_threshold=1` and `max_loops` equal to the model depth, in
+  a non-`trace` exit mode (`trace` takes its depths from `depths_by_request`).
+- Under `shared` KV, positions read earlier tokens' final retained KV at every
+  loop depth (see [KV layout examples](kv_layout_computation.md)), so no ordinary
+  forward reproduces the logprobs, even at full depth.
+- Huginn's logprobs also depend on its random recurrent-state initialization, which
+  shares the request's generator with sampling, so no ordinary forward reproduces
+  them either.
+
+Under [speculative decoding](async-speculative.md), every `exit_depths` entry is
+`target_loops`, and each committed token is scored on its target verification row.
+This covers an accepted draft token, the correction after a rejection, and the bonus
+token. The draft distribution q never enters `logprobs`:
+
+- Verification resumes from the hidden state and KV that the draft loops computed
+  with the same weights. The scores therefore match a full-depth forward
+  numerically, not necessarily bitwise. The rollout replays like any other
+  full-depth rollout.
+- A correction is drawn from the residual `(p - q)+`. The round's output is still
+  distributed as p, so its policy logprob is `log p[token]`.
+- For a given seed, the sampled tokens depend on q, because draft draws and
+  rejection tests consume the request's generator. The logprob of a given token
+  does not depend on q. Greedy tokens do not depend on it either.
+- Cross-round async speculation is greedy-only, so it reports raw values in both
+  modes.
+
+The HTTP API does not accept `logprobs`, `stop_token_ids` or `seed: null` yet.
+
 ## Troubleshooting
 
 | Symptom | What to check |

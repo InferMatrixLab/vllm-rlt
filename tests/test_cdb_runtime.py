@@ -1,5 +1,6 @@
 """End-to-end checks of cache semantics, delayed exits and scheduling progress."""
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -455,6 +456,8 @@ def test_synthetic_replay_variants_preserve_outputs():
     assert trace["depths_by_request"]["A"] == [4, 2, 2, 2, 2, 2]
     assert len(results) == 8
     assert all(r["seconds"] > 0 for r in results)
+    # --trace-out/--trace-in round-trip the trace through JSON.
+    assert len(benchmark(trace=json.loads(json.dumps(trace)))[1]) == 8
     with pytest.raises(ValueError, match="does not match"):
         benchmark(layout="shared", trace=trace)
 

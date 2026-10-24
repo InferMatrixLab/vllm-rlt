@@ -18,7 +18,8 @@ from vllm_rlt.models import OuroConfig, resolve_model_config
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
-from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.sampling_params import SamplingParams, resolve_seed
+from vllm_rlt.worker.logprobs import check_logprobs_mode
 
 from .config import PDConfig
 from .connector import PDStageConnector
@@ -68,7 +69,9 @@ class PDEngine:
         revision=None,
         seed=0,
         speculative_config=None,
+        logprobs_mode="raw_logprobs",
     ):
+        check_logprobs_mode(logprobs_mode)
         self.speculative_config = speculative_config
         if isinstance(model, (str, Path)):
             model, revision, _ = resolve_model_config(model, revision=revision)
@@ -135,6 +138,7 @@ class PDEngine:
                         speculative_config=speculative_config if role == "decode" else None,
                         execution_config=execution,
                         attention_backend=attention_backend,
+                        logprobs_mode=logprobs_mode,
                     )
                     self.peers[name] = Peer(name, role, client)
             deadline = time.monotonic() + self.config.startup_timeout
@@ -223,6 +227,8 @@ class PDEngine:
                 output = replace(m["output"], request_id=w.request.request_id)
                 w.request.generated_token_ids = list(output.token_ids)
                 w.request.exit_depths = list(output.exit_depths)
+                if output.logprobs is not None:
+                    w.request.logprobs = list(output.logprobs)
                 w.timings.setdefault("first_token", now)
                 self.outputs.append(output)
                 if output.finished:
@@ -270,7 +276,8 @@ class PDEngine:
             raise ValueError("request ID must be nonempty and unique among active requests")
         if len(self.transfers) >= self.config.max_pending_requests:
             raise ValueError("PD pending-request limit reached")
-        params = sampling_params or SamplingParams()
+        # P and D receive the same resolved params; only D samples.
+        params = resolve_seed(sampling_params or SamplingParams())
         cfg = self.model_config
         if self.speculative_config is not None:
             if (
@@ -286,6 +293,8 @@ class PDEngine:
             type(t) is not int or not 0 <= t < cfg.vocab_size for t in prompt_token_ids
         ):
             raise ValueError("prompt must contain valid model token IDs")
+        if any(t >= cfg.vocab_size for t in params.stop_token_ids):
+            raise ValueError("stop_token_ids must be within the model vocabulary")
         maximum = params.max_loops or cfg.total_ut_steps
         if maximum > cfg.total_ut_steps or params.min_loops > maximum:
             raise ValueError("requested loop bounds exceed model depth")

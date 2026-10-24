@@ -12,6 +12,7 @@ import torch
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.engine.worker import start_stage_worker
+from vllm_rlt.worker.logprobs import check_logprobs_mode
 
 LLMEngine = StageEngine
 
@@ -39,6 +40,8 @@ class StageClient:
         wait_for_ready=True,
         **engine_options,
     ):
+        if "logprobs_mode" in engine_options:  # Fail before starting a worker.
+            check_logprobs_mode(engine_options["logprobs_mode"])
         # An explicitly supplied model is a weight source, never a second runner.
         # Checkpoint paths load directly inside the worker without a host copy.
         if isinstance(model, torch.nn.Module):

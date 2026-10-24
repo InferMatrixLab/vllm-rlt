@@ -14,6 +14,10 @@ unchanged (``float()/temperature`` -> top-k -> top-p -> ``multinomial``).
 caller obtained from ``RngRegistry``. The registry is the single owner of RNG
 creation, lookup and lifetime, and the engine shares one instance between its
 runners.
+
+Rollout logprobs (``worker/logprobs.py``) score sampled tokens with
+``Sampler.raw_logprobs``, on ``Sampler.processed_logits`` in processed mode. That
+module imports this one, never the reverse.
 """
 
 import torch
@@ -25,14 +29,15 @@ class Sampler:
     """Greedy / top-k / top-p sampling for one logits row."""
 
     @staticmethod
-    def probabilities(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
-        """Return the temperature/top-k/top-p distribution for one logits row.
+    def processed_logits(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
+        """Return the FP32 temperature/top-k/top-p logits for one logits row.
 
         ``params`` is assumed to be validated by ``SamplingParams.__post_init__``.
         Greedy decoding has no temperature-scaled distribution, so it is a caller
-        error rather than a silent argmax. Top-k keeps exactly ``k`` candidates
-        (or every token when ``k`` reaches the vocabulary); top-p may trim that
-        support further.
+        error rather than a silent argmax. Excluded tokens are ``-inf``. Top-k
+        keeps exactly ``k`` candidates (or every token when ``k`` reaches the
+        vocabulary); top-p may trim that support further. ``probabilities`` (CODA
+        and speculative sampling) and processed logprobs share this arithmetic.
         """
         if params.temperature == 0:
             raise ValueError("greedy decoding has no temperature-scaled distribution")
@@ -52,12 +57,29 @@ class Sampler:
             remove[1:] = remove[:-1].clone()
             remove[0] = False
             logits = logits.scatter(0, indices, sorted_logits.masked_fill(remove, -torch.inf))
-        return logits.softmax(-1)
+        return logits
+
+    @staticmethod
+    def probabilities(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
+        """Return the temperature/top-k/top-p distribution for one logits row.
+
+        It is the softmax of ``processed_logits``, which rejects greedy decoding.
+        """
+        return Sampler.processed_logits(logits, params).softmax(-1)
 
     @staticmethod
     def draw(probs: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
         """Draw one token from a normalized distribution as a 0-dim long tensor."""
         return torch.multinomial(probs, 1, generator=generator).squeeze(0)
+
+    @staticmethod
+    def raw_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+        """FP32 [rows] log-probabilities of ``token_ids`` [rows] under ``logits`` [rows, vocab].
+
+        Scoring consumes no RNG and keeps the result on the logits device.
+        """
+        logprobs = torch.log_softmax(logits, -1, dtype=torch.float32)
+        return logprobs.gather(-1, token_ids[:, None]).squeeze(-1)
 
     def sample(
         self,
@@ -79,6 +101,28 @@ class Sampler:
         if generator is None:
             raise ValueError("non-greedy sampling requires a generator")
         return self.draw(self.probabilities(logits, params), generator)
+
+    def sample_with_logprob(
+        self,
+        logits: torch.Tensor,
+        params: SamplingParams,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``sample()`` plus the 0-dim FP32 processed logprob of the drawn token.
+
+        The logprob is ``log_softmax`` of the same processed logits the token is
+        drawn from, so it equals ``token_logprob(..., "processed_logprobs")``
+        without rebuilding them; greedy rows report the unscaled distribution.
+        Tokens, generator requirements and RNG consumption are those of ``sample()``.
+        """
+        if params.temperature == 0:
+            token = logits.argmax()
+            return token, self.raw_logprobs(logits[None], token.view(1))[0]
+        if generator is None:
+            raise ValueError("non-greedy sampling requires a generator")
+        processed = self.processed_logits(logits, params)
+        token = self.draw(processed.softmax(-1), generator)
+        return token, self.raw_logprobs(processed[None], token.view(1))[0]
 
 
 class RngRegistry:
@@ -105,11 +149,15 @@ class RngRegistry:
         """Return the request's generator, creating it on ``device`` if needed.
 
         The caller passes the device of the distribution it will sample from, so
-        ``multinomial`` and its generator agree. An existing generator is returned
-        as-is and never migrated.
+        ``multinomial`` and its generator agree. A new generator is seeded with
+        ``params.seed``, which must be engine-resolved, so its ``initial_seed()``
+        is the seed the request's outputs report. An existing generator is
+        returned as-is and never reseeded or migrated.
         """
         generator = self.generators.get(request_id)
         if generator is None:
+            if params.seed is None:  # Engines resolve seed=None at admission.
+                raise ValueError("seed=None must be resolved by the engine before sampling")
             generator = torch.Generator(device=device).manual_seed(params.seed)
             self.generators[request_id] = generator
         return generator

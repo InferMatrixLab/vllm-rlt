@@ -266,7 +266,7 @@ def test_coda_sampling_is_prepared_before_execution(monkeypatch):
         pytest.fail("sampling generators must be resolved before execution")
 
     monkeypatch.setattr(engine.rng, "acquire", unexpected)
-    token = runner._execute(None, prepared)
+    token = runner._execute(None, prepared).values
     assert token.shape == (1,) and token.device == runner.device
     engine.close()
 
