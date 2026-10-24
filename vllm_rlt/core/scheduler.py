@@ -778,7 +778,9 @@ class Scheduler:
                 request.request_id, request.prompt_token_ids, request.num_prefilled_tokens, event
             )
             if final:
-                request.loops_done = self.total_ut_steps
+                # The request's prompt-depth frontier may be shallower than
+                # the model's maximum decode depth.
+                request.loops_done = len(request.prefill_depth_ranges) or self.total_ut_steps
             self.enqueue(
                 request, self._prompt_destination(request) if final else RequestPhase.PREFILL
             )

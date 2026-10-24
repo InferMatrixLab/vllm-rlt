@@ -17,7 +17,8 @@ from vllm_rlt.worker.buffers import (
     stage_metadata,
 )
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
-from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
+from vllm_rlt.worker.executor import ForwardBatch, ForwardResult, ModelRuntime
+from vllm_rlt.worker.loopcd import Reference, active, extrapolate
 from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
@@ -172,6 +173,21 @@ class ModelRunner:
         self.rng = rng if rng is not None else RngRegistry()
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
+        self.loopcd_references = {}
+        self.loopcd_stats = dict(
+            captures=0,
+            guided_rows=0,
+            head_calls=0,
+            head_rows=0,
+            skipped_prompt_head_calls=0,
+            skipped_prompt_head_rows=0,
+            reference_peak_bytes=0,
+            prefill_core_rows=0,
+            prefill_submitted_rows=0,
+            decode_core_rows=0,
+            decode_submitted_rows=0,
+        )
+        self.prefill_depth = self.execution_config.prefill_depth or model.config.total_ut_steps
         scheduler = scheduler_config or SchedulerConfig()
         self.graphs = (
             RecurrentGraphs(
@@ -184,8 +200,16 @@ class ModelRunner:
             else None
         )
         self.coda_graphs = (
-            CodaGraphs(model, self.execution_config, cache_manager)
-            if self.graphs is not None and getattr(model, "requires_boundary_kv", False)
+            CodaGraphs(
+                model,
+                self.execution_config,
+                cache_manager if getattr(model, "requires_boundary_kv", False) else None,
+            )
+            if self.graphs is not None
+            and (
+                getattr(model, "requires_boundary_kv", False)
+                or (self.execution_config.loopcd and not self.execution_config.async_scheduling)
+            )
             else None
         )
         self.input_buffers: dict[torch.dtype, StagedInputTensor] = {
@@ -598,6 +622,142 @@ class ModelRunner:
         for row, request in enumerate(requests):
             hidden[row].copy_(request.hidden_state)
         return hidden
+
+    def _capture_loopcd(self, requests, hidden, depths, positions, indices, *, prefill=False):
+        if not self.execution_config.loopcd:
+            return
+        for row, (request, depth, position, index) in enumerate(
+            zip(requests, depths, positions, indices)
+        ):
+            if not active(request.sampling_params):
+                continue
+            if prefill and row + 1 < len(requests) and requests[row + 1] is request:
+                continue
+            cd = request.sampling_params.loopcd
+            loop = cd.prefill_loop if prefill else cd.reference_loop
+            if depth + 1 == loop:
+                self.loopcd_references[request.request_id] = Reference(
+                    request, position, index, loop, hidden[row].clone()
+                )
+                self.loopcd_stats["captures"] += 1
+        size = sum(
+            ref.hidden.numel() * ref.hidden.element_size()
+            for ref in self.loopcd_references.values()
+        )
+        self.loopcd_stats["reference_peak_bytes"] = max(
+            self.loopcd_stats["reference_peak_bytes"], size
+        )
+
+    def _count_core(self, effective, submitted, *, prefill=False):
+        if self.execution_config.loopcd:
+            phase = "prefill" if prefill else "decode"
+            self.loopcd_stats[phase + "_core_rows"] += effective
+            self.loopcd_stats[phase + "_submitted_rows"] += submitted
+
+    def _coda(self, hidden):
+        forward = ForwardBatch(Operation.CODA, hidden=hidden, graphs=self.coda_graphs)
+        return self.runtime.forward(self.runtime.prepare(forward)).logits
+
+    def _loopcd_readout(self, hidden, requests, positions, indices):
+        # Padding is needed by the core, but never by the output projections.
+        hidden = hidden[: len(requests)]
+        if not self.execution_config.loopcd:
+            return self._coda(hidden)
+        references = []
+        for request, position, index in zip(requests, positions, indices):
+            ref = None
+            if active(request.sampling_params):
+                cd = request.sampling_params.loopcd
+                loop = cd.prefill_loop if index == 0 else cd.reference_loop
+                ref = self.loopcd_references.get(request.request_id)
+                if ref is None:
+                    raise RuntimeError("LoopCD reference missing at readout")
+                ref.check(request, position, index, loop)
+            references.append(ref)
+        guided = hidden
+        for row, ref in enumerate(references):
+            if ref is None or requests[row].sampling_params.loopcd.implementation == "two_head":
+                continue
+            if guided is hidden:
+                guided = hidden.clone()
+            guided[row] = extrapolate(
+                hidden[row], ref.hidden, requests[row].sampling_params.loopcd.strength
+            )
+        logits = self._coda(guided)
+        self.loopcd_stats["head_calls"] += 1
+        self.loopcd_stats["head_rows"] += logits.shape[0]
+        weak_rows = [
+            row
+            for row, ref in enumerate(references)
+            if ref is not None and requests[row].sampling_params.loopcd.implementation == "two_head"
+        ]
+        if weak_rows:
+            weak = self._coda(torch.stack([references[row].hidden for row in weak_rows]))
+            logits = logits.float()
+            for row, value in zip(weak_rows, weak):
+                logits[row] = extrapolate(
+                    logits[row], value.float(), requests[row].sampling_params.loopcd.strength
+                )
+            self.loopcd_stats["head_calls"] += 1
+            self.loopcd_stats["head_rows"] += len(weak_rows)
+        self.loopcd_stats["guided_rows"] += sum(ref is not None for ref in references)
+        return logits
+
+    def _forward_loopcd(self, batch, prepared, entry):
+        """Observe original recurrence boundaries without changing recurrent feedback."""
+        forward = entry.forward
+        if forward.operation == Operation.CODA:
+            if not forward.compute_logits or forward.prelude_coda_kv_metadata is not None:
+                return self.runtime.forward(forward)
+            return ForwardResult(
+                hidden=forward.hidden,
+                logits=self._loopcd_readout(
+                    forward.hidden,
+                    [span.request for span in batch.spans],
+                    prepared.positions,
+                    prepared.output_indices,
+                ),
+            )
+        if forward.operation == Operation.PRELUDE and batch.loop_count:
+            requests = entry.requests
+            positions = [
+                position
+                for span in batch.spans
+                for position in range(span.token_start, span.token_start + span.token_count)
+            ]
+            # LoopCD is admitted only for atomic LAST_EXITED prefill, whose rows
+            # retain span order. Run the same prepared calls one depth at a time
+            # so the selected reference is captured before a later loop overwrites it.
+            result = self.runtime.forward(
+                replace(forward, metadata=(), graphs=None, graph_calls=())
+            )
+            for depth, kv in enumerate(forward.metadata):
+                recurrent = ForwardBatch(Operation.RECURRENT, hidden=result.hidden, metadata=(kv,))
+                result = self.runtime.forward(recurrent)
+                self._count_core(len(requests), len(result.hidden), prefill=True)
+                self._capture_loopcd(
+                    requests,
+                    result.hidden,
+                    [depth] * len(requests),
+                    positions,
+                    [0] * len(requests),
+                    prefill=True,
+                )
+            return result
+        if forward.operation == Operation.PRELUDE:
+            for span in batch.spans:
+                self.loopcd_references.pop(span.request.request_id, None)
+        result = self.runtime.forward(forward)
+        if forward.operation == Operation.RECURRENT:
+            self._count_core(batch.num_rows, len(result.hidden))
+            self._capture_loopcd(
+                [span.request for span in batch.spans],
+                result.hidden,
+                prepared.depths,
+                prepared.positions,
+                prepared.output_indices,
+            )
+        return result
 
     def _prepare_prefill_coda(self, ids, positions, requests, kv=None):
         if not getattr(self.model, "requires_boundary_kv", False):
@@ -1088,7 +1248,11 @@ class ModelRunner:
             forward = entry.forward
             if entry.hidden_rows is not None:
                 forward = replace(forward, hidden=hidden[entry.hidden_rows])
-            result = self.runtime.forward(forward)
+            result = (
+                self._forward_loopcd(batch, prepared, replace(entry, forward=forward))
+                if self.execution_config.loopcd
+                else self.runtime.forward(forward)
+            )
             hidden = result.hidden
             if forward.operation in (Operation.PRELUDE, Operation.RECURRENT):
                 if entry.outputs is None:
@@ -1349,6 +1513,7 @@ class ModelRunner:
         event = self.events.pop(request_id, None)
         if event is not None:
             event.synchronize()
+        self.loopcd_references.pop(request_id, None)
         self.prompt_token_owners.pop(request_id, None)
         if self.async_state is not None:
             self.async_state.release(request_id)

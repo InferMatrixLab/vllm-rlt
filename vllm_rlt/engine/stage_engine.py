@@ -13,6 +13,7 @@ from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
 from vllm_rlt.worker.executor import Executor
+from vllm_rlt.worker.loopcd import active, reserved_bytes, validate
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry
@@ -58,6 +59,20 @@ class StageEngine:
                 raise ValueError("Huginn prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
+        self.prefill_depth = self.execution_config.prefill_depth or config.total_ut_steps
+        if self.prefill_depth > config.total_ut_steps:
+            raise ValueError("prefill_depth exceeds the model's supported depth")
+        if self.execution_config.prefill_depth is not None and (
+            not self.execution_config.atomic_prefill
+            or cache_config.layout != "last_exited"
+            or cache_config.enable_prefix_caching
+            or self.execution_config.async_scheduling
+            or speculative_config is not None
+        ):
+            raise ValueError(
+                "prefill_depth override requires atomic synchronous last_exited "
+                "without prefix/speculation"
+            )
         if getattr(model, "requires_boundary_kv", False):
             if not self.execution_config.atomic_prefill:
                 raise ValueError("Huginn requires atomic prefill")
@@ -138,6 +153,9 @@ class StageEngine:
             scheduler_config,
             self.execution_config,
             attention.info["selected_backend"],
+        )
+        self.memory_plan["loopcd_reserve_bytes"] = reserved_bytes(
+            config, scheduler_config, self.execution_config, parameter.element_size()
         )
         self.cache_manager = KVCacheManager(
             num_layers=config.num_hidden_layers,
@@ -282,6 +300,19 @@ class StageEngine:
         max_loops = params.max_loops or config.total_ut_steps
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
+        validate(
+            self.model,
+            params,
+            self.execution_config,
+            self.cache_manager,
+            self.scheduler.config,
+            self.exit_config,
+            self.speculative_config,
+        )
+        if active(params) and (
+            self.connector is not None or self.stage_config.role != "prefill_decode"
+        ):
+            raise ValueError("LoopCD P/D reference transfer is not implemented")
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
@@ -299,7 +330,7 @@ class StageEngine:
             trace = self._exit_traces[key]
             if (
                 len(trace) < params.max_tokens
-                or trace[0] != config.total_ut_steps
+                or trace[0] != self.prefill_depth
                 or any(
                     type(d) is not int or not params.min_loops <= d <= max_loops
                     for d in trace[1 : params.max_tokens]
@@ -307,6 +338,15 @@ class StageEngine:
             ):
                 raise ValueError(
                     "exit trace must cover every output and obey prefill/decode bounds"
+                )
+        # The first output comes from prefill. Later tokens require prompt KV
+        # history at every recurrent depth they can visit.
+        if params.max_tokens > 1:
+            decode_depth = max(trace[1 : params.max_tokens]) if trace else max_loops
+            if decode_depth > self.prefill_depth:
+                raise ValueError(
+                    f"decode depth {decode_depth} exceeds prefill_depth {self.prefill_depth}; "
+                    "increase prefill_depth or reduce decode depth"
                 )
         capacity = len(prompt_token_ids) + params.max_tokens - 1
         if capacity > config.max_position_embeddings:
@@ -327,7 +367,7 @@ class StageEngine:
                 # Prefill always runs the model's full depth, whatever decode
                 # loop bound the request asks for.
                 prefill_depth_ranges=Request.prefill_boundaries(
-                    len(prompt_token_ids), config.total_ut_steps
+                    len(prompt_token_ids), self.prefill_depth
                 ),
             )
         )

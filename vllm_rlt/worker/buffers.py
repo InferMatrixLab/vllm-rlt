@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from vllm_rlt.worker.loopcd import reserved_bytes
 from vllm_rlt.worker.metadata import KVLayout, KVMetadata
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import UvaBackedTensor, copy_tensor, use_uva_on
@@ -30,7 +31,7 @@ def execution_buffer_bytes(config, scheduler, cache, execution, element_size):
         rows = 1 << (rows - 1).bit_length()
     width = math.ceil(config.max_position_embeddings / cache.block_size)
     hidden = config.hidden_size * element_size
-    total = 0
+    total = reserved_bytes(config, scheduler, execution, element_size)
     if execution.static_buffers:
         # Existing prefill/eager workspaces remain separate from async buffer sets.
         total += 4 * rows * (hidden + 4 * width + 36) + scheduler.max_num_seqs * hidden

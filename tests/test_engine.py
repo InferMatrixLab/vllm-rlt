@@ -1,10 +1,19 @@
 import math
+from dataclasses import replace
 
 import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import LLM, CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import (
+    LLM,
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    LoopCDParams,
+    SamplingParams,
+    SchedulerConfig,
+)
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
@@ -415,3 +424,140 @@ def test_finish_reason_preserves_public_string_values(reason):
     output = RequestOutput.from_request(request)
     assert output.finished and type(output.finish_reason) is str
     assert output.finish_reason == reason.value
+
+
+@pytest.mark.parametrize("strength", [None, 0.0, 0.3])
+@pytest.mark.parametrize("max_loops", [3, None])
+@torch.inference_mode()
+def test_decode_deeper_than_prefill_rejected_before_admission(strength, max_loops):
+    guidance = None if strength is None else LoopCDParams(strength=strength)
+    engine = LLMEngine(
+        tiny_model(),
+        cache_config=CacheConfig(num_blocks=128, block_size=4),
+        execution_config=ExecutionConfig(loopcd=bool(strength), prefill_depth=2),
+    )
+    params = SamplingParams(
+        max_tokens=3,
+        min_loops=max_loops or 4,
+        max_loops=max_loops,
+        ignore_eos=True,
+        loopcd=guidance,
+    )
+    with pytest.raises(ValueError, match="decode depth .* exceeds prefill_depth 2"):
+        engine.add_request("r", [4, 7, 9], params)
+    assert not engine.scheduler.requests
+    assert not engine.has_unfinished_requests()
+    assert engine.cache_manager.num_used_blocks == 0
+    assert not engine.model_runner.loopcd_references
+
+    # Rejected admission must leave the ID available for a valid continuation.
+    engine.add_request("r", [4, 7, 9], replace(params, min_loops=2, max_loops=2))
+    outputs, _ = drain(engine)
+    assert outputs["r"].exit_depths == [2, 2, 2]
+    assert len(outputs["r"].token_ids) == 3
+    assert engine.cache_manager.num_used_blocks == 0
+    assert not engine.model_runner.loopcd_references
+    engine.close()
+
+
+@pytest.mark.parametrize("strength", [None, 0.0, 0.3])
+@torch.inference_mode()
+def test_prefill_history_allows_shallower_decode(strength):
+    engine = LLMEngine(
+        tiny_model(),
+        cache_config=CacheConfig(num_blocks=128, block_size=4),
+        execution_config=ExecutionConfig(loopcd=bool(strength), prefill_depth=4),
+    )
+    engine.add_request(
+        "r",
+        [4, 7, 9],
+        SamplingParams(
+            max_tokens=3,
+            min_loops=3,
+            max_loops=3,
+            ignore_eos=True,
+            loopcd=None if strength is None else LoopCDParams(strength=strength),
+        ),
+    )
+    outputs, _ = drain(engine)
+    assert outputs["r"].exit_depths == [4, 3, 3]
+    assert len(outputs["r"].token_ids) == 3
+    assert engine.cache_manager.num_used_blocks == 0
+    assert not engine.model_runner.loopcd_references
+    engine.close()
+
+
+@pytest.mark.parametrize("mode", ["ouro", "ouro_delayed", "random_lookahead"])
+def test_prefill_history_checks_adaptive_decode_bound(mode):
+    engine = LLMEngine(
+        tiny_model(),
+        execution_config=ExecutionConfig(prefill_depth=2),
+        exit_config=ExitConfig(mode=mode),
+    )
+    params = SamplingParams(max_tokens=3, min_loops=1, max_loops=4, exit_threshold=0.7)
+    with pytest.raises(ValueError, match="decode depth 4 exceeds prefill_depth 2"):
+        engine.add_request("r", [4, 7, 9], params)
+    assert not engine.scheduler.requests
+    assert engine.cache_manager.num_used_blocks == 0
+    engine.close()
+
+
+@pytest.mark.parametrize("trace", [[2, 3, 2], [2, 2, 3]])
+def test_prefill_history_rejects_deeper_trace_before_admission(trace):
+    engine = LLMEngine(
+        tiny_model(),
+        execution_config=ExecutionConfig(prefill_depth=2),
+        exit_config=ExitConfig(mode="trace", depths_by_request={"profile": trace}),
+    )
+    params = SamplingParams(max_tokens=3, min_loops=1, max_loops=4)
+    with pytest.raises(ValueError, match="decode depth 3 exceeds prefill_depth 2"):
+        engine.add_request("r", [4, 7, 9], params, trace_id="profile")
+    assert not engine.scheduler.requests
+    assert engine.cache_manager.num_used_blocks == 0
+    engine.close()
+
+
+@torch.inference_mode()
+def test_prefill_history_uses_only_requested_trace_depths():
+    engine = LLMEngine(
+        tiny_model(),
+        execution_config=ExecutionConfig(prefill_depth=2),
+        exit_config=ExitConfig(mode="trace", depths_by_request={"profile": [2, 1, 2, 4]}),
+    )
+    engine.add_request(
+        "r",
+        [4, 7, 9],
+        SamplingParams(max_tokens=3, min_loops=1, ignore_eos=True),
+        trace_id="profile",
+    )
+    outputs, _ = drain(engine)
+    assert outputs["r"].exit_depths == [2, 1, 2]
+    assert len(outputs["r"].token_ids) == 3
+    assert engine.cache_manager.num_used_blocks == 0
+    engine.close()
+
+
+@pytest.mark.parametrize("strength", [None, 0.0, 0.3])
+@torch.inference_mode()
+def test_prefill_only_output_does_not_require_decode_history(strength):
+    engine = LLMEngine(
+        tiny_model(),
+        execution_config=ExecutionConfig(loopcd=bool(strength), prefill_depth=2),
+    )
+    engine.add_request(
+        "r",
+        [4, 7, 9],
+        SamplingParams(
+            max_tokens=1,
+            min_loops=4,
+            max_loops=4,
+            ignore_eos=True,
+            loopcd=None if strength is None else LoopCDParams(strength=strength),
+        ),
+    )
+    outputs, _ = drain(engine)
+    assert outputs["r"].exit_depths == [2]
+    assert len(outputs["r"].token_ids) == 1
+    assert engine.cache_manager.num_used_blocks == 0
+    assert not engine.model_runner.loopcd_references
+    engine.close()

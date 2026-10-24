@@ -271,6 +271,8 @@ class PDEngine:
         if len(self.transfers) >= self.config.max_pending_requests:
             raise ValueError("PD pending-request limit reached")
         params = sampling_params or SamplingParams()
+        if params.loopcd is not None and params.loopcd.strength != 0:
+            raise ValueError("LoopCD P/D reference transfer is not implemented")
         cfg = self.model_config
         if self.speculative_config is not None:
             if (

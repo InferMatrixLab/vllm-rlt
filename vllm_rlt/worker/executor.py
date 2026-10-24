@@ -92,6 +92,12 @@ class Executor:
                 raise ValueError("speculative submission requires a configured round controller")
             return self.speculation.submit(scheduled_batch)
         batch = build_execution_batch(scheduled_batch, self.runner.model.config.total_ut_steps)
+        if (
+            batch.operation == Operation.PRELUDE
+            and batch.loop_count
+            and batch.loop_count != self.runner.prefill_depth
+        ):
+            batch = replace(batch, loop_count=self.runner.prefill_depth)
         return self.runner.submit(scheduled_batch, batch=batch)
 
 

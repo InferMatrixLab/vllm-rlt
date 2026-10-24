@@ -120,9 +120,14 @@ class ExecutionConfig:
     # recurrence depth. Atomic prefill keeps mainline behavior and remains the
     # default until the split path is feature-complete.
     atomic_prefill: bool = True
+    loopcd: bool = False
+    prefill_depth: int | None = None
 
     def __post_init__(self):
+        if self.prefill_depth is not None:
+            _positive("prefill_depth", self.prefill_depth)
         for name in (
+            "loopcd",
             "prefill_uva",
             "use_uva",
             "atomic_prefill",
