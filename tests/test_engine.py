@@ -21,10 +21,10 @@ def model_dtype(device):
     return torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
 
 
-def make_engine(device, *, cache_config=None, **kwargs):
+def make_engine(device, *, dtype=None, cache_config=None, **kwargs):
     """Build the production StageEngine on CPU or a scheduler-reserved device."""
     return LLMEngine(
-        tiny_model(device, model_dtype(device)),
+        tiny_model(device, dtype or model_dtype(device)),
         cache_config=cache_config or CacheConfig(64, 2),
         attention_backend="triton" if torch.device(device).type == "cuda" else "torch",
         **kwargs,
@@ -266,14 +266,19 @@ def test_greedy_sampling_never_acquires_a_generator(device, monkeypatch):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_coda_sampling_is_prepared_before_execution(device, monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_coda_sampling_is_prepared_before_execution(device, dtype, monkeypatch):
     from vllm_rlt.request import ExecutionBatch, Operation, StateSpan
 
-    engine = make_engine(device, cache_config=CacheConfig(64, 2))
+    engine = make_engine(device, dtype=dtype, cache_config=CacheConfig(64, 2))
     runner = engine.model_runner
     params = SamplingParams(temperature=0.7, seed=3)
     request = Request("r", [1], params)
-    request.hidden_state = torch.ones(engine.model.config.hidden_size, device=runner.device)
+    # The synthetic hidden row feeds the model's LM head directly, so it must
+    # carry the model parameter device and dtype (BF16 on the CUDA variant). The
+    # CPU BF16 case pins this without a GPU.
+    request.hidden_state = next(engine.model.parameters()).new_ones(engine.model.config.hidden_size)
+    assert request.hidden_state.dtype == next(engine.model.parameters()).dtype
     batch = ExecutionBatch(Operation.CODA, (StateSpan(request, 0, 1, 0),))
     recorded = []
     acquire = engine.rng.acquire

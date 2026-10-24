@@ -355,6 +355,106 @@ def test_random_sampling_tracks_only_committed_tokens_under_mixed_loops(device, 
     assert actual == expected
 
 
+@pytest.mark.gpu
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_bf16_mixed_random_sampling_replays_once_per_committed_token(asynchronous):
+    # BF16 is the main inference configuration, and BF16 reduction order can make
+    # cross-schedule token equality unreliable. Acceptance here is the sampling
+    # contract instead: every committed token drew exactly once, every request
+    # kept one CUDA generator, and the same mixed path replays exactly for a fixed
+    # seed. The FP32 test above remains the cross-mode diagnostic.
+    from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig
+    from vllm_rlt.engine.llm_engine import LLMEngine
+
+    params = SamplingParams(
+        max_tokens=6,
+        max_loops=3,
+        temperature=0.8,
+        top_k=7,
+        top_p=0.9,
+        seed=17,
+        ignore_eos=True,
+    )
+
+    def run():
+        torch.manual_seed(123)
+        engine = LLMEngine(
+            OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
+            attention_backend="triton",
+            cache_config=CacheConfig(128, 2),
+            scheduler_config=SchedulerConfig(
+                mode="mixed",
+                max_num_seqs=3,
+                max_num_batched_tokens=5,
+                prefill_chunk_size=4,
+            ),
+            execution_config=ExecutionConfig(
+                atomic_prefill=False,
+                async_scheduling=asynchronous,
+                static_buffers=True,
+                pad_to_power_of_two=True,
+            ),
+            exit_config=ExitConfig("ouro_delayed" if asynchronous else "ouro"),
+        )
+        samples, generators = [], {}
+        sampler = engine.model_runner.sampler
+        sample = sampler.sample
+
+        def record(logits, sampling, generator):
+            samples.append(generator)
+            return sample(logits, sampling, generator)
+
+        sampler.sample = record
+        for name, prompt in (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10])):
+            engine.add_request(name, prompt, params)
+        outputs, mixed = {}, 0
+        try:
+            for _ in range(300):
+                for output in engine.step():
+                    if output.finished:
+                        outputs[output.request_id] = (
+                            output.token_ids,
+                            output.exit_depths,
+                        )
+                batch = engine.last_schedule
+                if (
+                    batch is not None
+                    and batch.is_mixed
+                    and len({batch.phase_for(item) for item in batch.requests}) == 2
+                ):
+                    mixed += 1
+                for rid in engine.scheduler.requests:
+                    generator = engine.rng.peek(rid)
+                    if generator is not None:
+                        generators.setdefault(rid, generator)
+                        assert generators[rid] is generator
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail("BF16 mixed scheduling stalled")
+        finally:
+            engine.close()
+        committed = 0
+        counts = {id(generator): 0 for generator in generators.values()}
+        for generator in samples:
+            counts[id(generator)] += 1
+        assert set(generators) == set(outputs)
+        for request_id, (token_ids, _) in outputs.items():
+            committed += len(token_ids)
+            # Each request drew exactly once per committed token: a mixed
+            # recurrent/prefill batch must not add or duplicate draws.
+            assert counts[id(generators[request_id])] == len(token_ids)
+        assert len(samples) == committed
+        assert all(generator.device.type == "cuda" for generator in samples)
+        assert not engine.rng.generators
+        return outputs, mixed
+
+    first, first_mixed = run()
+    second, _ = run()
+    assert first_mixed > 0
+    assert first == second
+
+
 def mixed_ready_engine():
     from tests.helpers import make_prefill_engine
 
