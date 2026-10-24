@@ -14,7 +14,7 @@ from pathlib import Path
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.engine.stage_config import StageConfig
-from vllm_rlt.models import OuroConfig, resolve_model_config
+from vllm_rlt.models import resolve_model_config
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
@@ -22,6 +22,28 @@ from vllm_rlt.sampling_params import SamplingParams
 
 from .config import PDConfig
 from .connector import PDStageConnector
+
+
+@dataclass(frozen=True)
+class PDModelInfo:
+    """Model metadata required by the CPU coordinator, not a model config."""
+
+    vocab_size: int
+    total_ut_steps: int
+    max_position_embeddings: int
+
+    @classmethod
+    def from_ready(cls, info):
+        """Adopt the coordinator-consumed limits from a stage's ready report."""
+        model = info["model"]
+        names = ("vocab_size", "total_ut_steps", "max_position_embeddings")
+        invalid = [name for name in names if type(model.get(name)) is not int]
+        if invalid:
+            raise ValueError(
+                f"stage {info['stage_id']} model metadata lacks {invalid}; "
+                "PD coordinator cannot validate requests for this model family"
+            )
+        return cls(**{name: model[name] for name in names})
 
 
 @dataclass
@@ -142,7 +164,7 @@ class PDEngine:
             fingerprints = {p.client.info["fingerprint"] for p in self.peers.values()}
             if len(fingerprints) != 1:
                 raise ValueError("P/D model weights or KV configuration do not match")
-            self.model_config = OuroConfig(**next(iter(self.peers.values())).client.info["model"])
+            self.model_config = PDModelInfo.from_ready(next(iter(self.peers.values())).client.info)
             for peer in self.peers.values():
                 self._send(
                     peer.name,

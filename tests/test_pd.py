@@ -105,6 +105,87 @@ def test_pd_configuration_validation(options):
         PDConfig(**options)
 
 
+def test_pd_coordinator_model_metadata_is_model_neutral():
+    from dataclasses import asdict
+
+    from tests.helpers import tiny_nanbeige_config
+    from vllm_rlt.models import HuginnConfig
+    from vllm_rlt.pd.engine import PDModelInfo
+
+    def ready(config):
+        return dict(stage_id="stage-0", model=asdict(config))
+
+    for config in (tiny_ouro_config(), tiny_nanbeige_config()):
+        info = PDModelInfo.from_ready(ready(config))
+        assert info == PDModelInfo(
+            config.vocab_size, config.total_ut_steps, config.max_position_embeddings
+        )
+    # Huginn derives loop/context limits through properties, which asdict omits
+    # from the ready payload: fail at startup, not at request validation.
+    with pytest.raises(ValueError, match="model metadata lacks"):
+        PDModelInfo.from_ready(ready(HuginnConfig()))
+    payload = ready(tiny_ouro_config())
+    payload["model"]["vocab_size"] = True
+    with pytest.raises(ValueError, match="model metadata lacks"):
+        PDModelInfo.from_ready(payload)
+
+
+def test_pd_nanbeige_startup_uses_worker_limits_for_request_validation(monkeypatch):
+    from dataclasses import asdict
+    from unittest.mock import Mock
+
+    from tests.helpers import tiny_nanbeige_config
+    from vllm_rlt.pd.engine import PDEngine
+
+    config = tiny_nanbeige_config()
+
+    def ready_client(model, *, stage_config, **options):
+        # Replace only the process boundary. The coordinator still constructs,
+        # adopts worker metadata, connects peers and validates real requests.
+        assert model is config
+        return Mock(
+            ready=True,
+            connected=True,
+            stopped=True,
+            info=dict(
+                kind="ready",
+                stage_id=stage_config.stage_id,
+                role=stage_config.role,
+                model=asdict(model),
+                model_type=model.to_dict()["model_type"],
+                fingerprint="same-model-and-cache",
+                info={"agent": stage_config.stage_id},
+                num_blocks=64,
+                block_size=16,
+                depths=model.total_ut_steps,
+            ),
+        )
+
+    clients = Mock(side_effect=ready_client)
+    monkeypatch.setattr("vllm_rlt.pd.engine.StageClient", clients)
+    with PDEngine(config, attention_backend="triton") as engine:
+        assert clients.call_count == 2
+        # Accept the upper vocabulary/context boundaries at Nanbeige's depth.
+        params = SamplingParams(
+            max_tokens=config.max_position_embeddings, max_loops=config.total_ut_steps
+        )
+        engine.add_request("valid", [config.vocab_size - 1], params)
+        assert engine.has_request("valid")
+        with pytest.raises(ValueError, match="valid model token IDs"):
+            engine.add_request("bad_token", [config.vocab_size], params)
+        with pytest.raises(ValueError, match="loop bounds exceed model depth"):
+            engine.add_request(
+                "bad_depth", [1], SamplingParams(max_loops=config.total_ut_steps + 1)
+            )
+        with pytest.raises(ValueError, match="exceeds context capacity"):
+            engine.add_request(
+                "bad_context", [1], SamplingParams(max_tokens=config.max_position_embeddings + 1)
+            )
+        assert engine.request_ids() == ("valid",)
+    assert engine.closed
+    assert not engine.has_unfinished_requests()
+
+
 def drain(engine):
     outputs = {}
     deadline = time.monotonic() + 90
