@@ -43,6 +43,7 @@ class StageEngine:
         speculative_config=None,
         stage_config=None,
         connector: StageConnector | None = None,
+        wise_config=None,
     ):
         self.model = model
         self.stage_config = stage_config or StageConfig()
@@ -156,6 +157,10 @@ class StageEngine:
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
         )
+        if wise_config is not None:
+            self._init_wise(wise_config, speculative_config, config, parameter)
+        elif speculative_config is not None and speculative_config.draft_attention == "wise":
+            raise ValueError("draft_attention='wise' requires wise_config")
         self.scheduler = Scheduler(
             scheduler_config,
             self.cache_manager,
@@ -223,6 +228,40 @@ class StageEngine:
         if scheduler_config.enable_preemption:
             self.scheduler.suspend_callback = self.preemption.suspend
             self.scheduler.resume_callback = self.preemption.resume
+
+    def _init_wise(self, wise_config, speculative_config, config, parameter):
+        """WISE working-set decode (vllm_rlt.wise) on this engine's cache."""
+        from vllm_rlt.wise import WiseState
+
+        backend = self.cache_manager.backend
+        if backend not in ("triton", "flash_attn_2", "flash_attn_3", "flash_attn_4"):
+            raise ValueError("WISE decode requires Triton or FlashAttention 2/3/4 attention")
+        if max(wise_config.reuse_depths) >= config.total_ut_steps:
+            raise ValueError("WISE reuse depths exceed the model's recurrent depth")
+        if speculative_config is not None:
+            if self.async_speculative:
+                raise ValueError("a WISE draft supports synchronous speculative decoding only")
+            if (
+                speculative_config.draft_attention != "wise"
+                or tuple(range(speculative_config.draft_loops)) != wise_config.discovery_depths
+                or tuple(range(speculative_config.draft_loops, speculative_config.target_loops))
+                != wise_config.reuse_depths
+            ):
+                raise ValueError(
+                    "with speculation, WISE is the draft only: draft_attention='wise' and "
+                    "draft/target loops must match the discovery/reuse depths"
+                )
+        wise = WiseState(
+            wise_config,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            parameter.device,
+            head_dim=config.head_dim,
+        )
+        wise.draft_only = speculative_config is not None
+        if backend != "triton" and wise_config.kernel == "auto":
+            wise.flash = self.cache_manager.attention.kernel
+        self.cache_manager.wise = wise
 
     @property
     def connector(self):

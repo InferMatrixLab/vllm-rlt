@@ -151,12 +151,19 @@ class SpeculativeRunner:
                 layouts, lambda values, dtype: self.input_buffers[dtype].append(values)
             )
 
+        wise = self.config.draft_attention == "wise"
         steps = []
         for offset in range(max(span.token_count for span in requests)):
             active = [i for i, span in enumerate(requests) if offset < span.token_count]
             ids = [requests[i].request.request_id for i in active]
             positions = [requests[i].token_start + offset for i in active]
-            steps.append((active, metadata(ids, positions, range(self.config.draft_loops))))
+            # A WISE draft also runs the remaining loops (sparse) for its readout.
+            reuse = (
+                metadata(ids, positions, range(self.config.draft_loops, self.config.target_loops))
+                if wise
+                else ()
+            )
+            steps.append((active, metadata(ids, positions, range(self.config.draft_loops)), reuse))
         ids, positions = [], []
         for span in requests:
             ids.extend([span.request.request_id] * span.token_count)
@@ -169,9 +176,18 @@ class SpeculativeRunner:
             tokens.shape, tokens.stride(), tokens.storage_offset()
         )
         steps = [
-            (active, tuple(self.metadata.bind(kv, uploaded) for kv in layouts))
-            for active, layouts in steps
+            (
+                active,
+                tuple(self.metadata.bind(kv, uploaded) for kv in layouts),
+                tuple(self.metadata.bind(kv, uploaded) for kv in reuse),
+            )
+            for active, layouts, reuse in steps
         ]
+        if wise:
+            # Every draft row is a WISE decode row; verification stays dense.
+            for active, layouts, reuse in steps:
+                for kv in layouts + reuse:
+                    self.cache.wise.mark(kv, [True] * len(active))
         verification = tuple(self.metadata.bind(kv, uploaded) for kv in verification)
         return tokens, steps, verification
 
@@ -230,7 +246,7 @@ class SpeculativeRunner:
         # prelude input, and all of them are read back once after verification.
         drafted = []
         # Each step consumes the previous step's GPU-resident sampled IDs.
-        for offset, (active, metadata) in enumerate(steps):
+        for offset, (active, metadata, reuse) in enumerate(steps):
             hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=inputs)).hidden
             hidden = self._recurrent(hidden, metadata)
             drafting = []
@@ -240,6 +256,10 @@ class SpeculativeRunner:
                     drafting.append((row, i))
             if not drafting:
                 break
+            if reuse:
+                # Shared dense discovery loops above; WISE-sparse remaining loops
+                # only for the draft readout. Verification overwrites their KV.
+                hidden = self._recurrent(hidden, reuse)
             logits = self._coda(torch.stack([hidden[row] for row, _ in drafting]))
             inputs = logits.argmax(-1)
             for row, (_, i) in enumerate(drafting):
