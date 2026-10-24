@@ -270,6 +270,28 @@ zero watermark in non-incremental mode, see [scheduler admission](scheduler.md#a
 Pool sizing establishes physical capacity; scheduler admission decides how much
 of that capacity can safely be promised to new work.
 
+## FP8 KV cache
+
+`CacheConfig(kv_cache_dtype="fp8_e4m3")` (CLI `--kv-cache-dtype fp8_e4m3`) stores K and V as
+float8 e4m3 codes with one float32 scale per (block, layer, token, KV head) vector
+(`scale = amax / 448`). Values are quantized when written and dequantized by the attention
+backend when read, so a block costs `head_dim + 4` bytes per vector instead of
+`head_dim * element_size`: 51.6% of BF16 at `head_dim=128`, and automatic sizing or
+`--kv-cache-memory-bytes` admits about 1.94x as many tokens. The default `"auto"` stores the
+model dtype and leaves every existing path unchanged.
+
+- Supported: Torch (reference) and Triton attention; synchronous and asynchronous scheduling;
+  CUDA graphs (quantized writes are captured); LAST_EXITED finalize copies, including the
+  asynchronous finalize kernel, copy codes and scales; preemption snapshots carry the scales;
+  `KVCacheManager.read` returns dequantized values.
+- Triton writes with one fused quantize-and-store kernel per layer. The Torch backend quantizes
+  with Torch ops and is the reference; both writers produce the same codes and scales.
+- Rejected: FlashAttention backends (the `fp8_kv` backend capability; `auto` selects Triton)
+  and PD transfer, which does not yet move the scales.
+- Each layer writes the current token's K/V before attending, so attention reads the current
+  token in FP8 as well. Accuracy should be checked per model and workload; adaptive exits can
+  change where a token exits because the gate sees slightly different attention.
+
 ## Replay and validation commands
 
 Trace mode expects `depths_by_request`, with one depth per output: full prefill depth first, then each decode input's exit depth. Admission validates coverage and loop bounds. Request IDs must match the trace. The public engine replay fixes depth decisions; token generation still follows the configured sampler.

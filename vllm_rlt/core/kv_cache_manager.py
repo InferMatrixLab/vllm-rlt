@@ -4,6 +4,10 @@ LAST-EXITED copies the last computed per-layer KV into skipped deeper planes.
 SHARED overwrites a single plane and needs no exit copies. Optional incremental
 allocation separates logical capacity from physical pages. Immutable full-depth
 prompt blocks can be shared through the prefix cache.
+
+With ``kv_cache_dtype="fp8_e4m3"`` the pool stores K/V as float8 e4m3 with one
+float32 scale per (block, layer, token, KV head) vector: values are quantized on
+write and dequantized by the attention backends on read.
 """
 
 import hashlib
@@ -26,6 +30,33 @@ from vllm_rlt.attention import (
 from vllm_rlt.request import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
+
+KV_CACHE_DTYPES = ("auto", "fp8_e4m3")
+FP8_E4M3_MAX = 448.0
+
+
+def kv_bytes_per_block(
+    num_layers, block_size, num_kv_heads, head_dim, element_size, kv_cache_dtype
+):
+    """Physical bytes of one block (K and V for all layers), including FP8 scales."""
+    if kv_cache_dtype not in KV_CACHE_DTYPES:
+        raise ValueError(f"kv_cache_dtype must be one of {KV_CACHE_DTYPES}")
+    vector = head_dim * element_size if kv_cache_dtype == "auto" else head_dim + 4
+    return 2 * num_layers * block_size * num_kv_heads * vector
+
+
+def quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-vector symmetric e4m3: x [..., head_dim] -> (codes, float32 scale [...])."""
+    x = x.float()
+    # A reciprocal multiply, as CUDA division by a scalar does anyway: CPU, CUDA and
+    # the fused Triton writer then produce the same scale bits.
+    scale = (x.abs().amax(-1) * (1.0 / FP8_E4M3_MAX)).clamp_min(torch.finfo(torch.float32).tiny)
+    codes = (x / scale.unsqueeze(-1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+    return codes.to(torch.float8_e4m3fn), scale
+
+
+def dequantize_fp8(codes: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return (codes.float() * scale.unsqueeze(-1)).to(dtype)
 
 
 @dataclass
@@ -75,6 +106,9 @@ class KVSnapshot:
     written: list[list[_WrittenPositions]]
     keys: torch.Tensor
     values: torch.Tensor
+    # FP8 pools only: per-vector scales, laid out like keys/values minus head_dim.
+    key_scales: torch.Tensor | None = None
+    value_scales: torch.Tensor | None = None
 
 
 class KVCacheManager:
@@ -103,6 +137,7 @@ class KVCacheManager:
         recurrent_layers: Sequence[int] | None = None,
         *,
         attention: AttentionBackend | None = None,
+        kv_cache_dtype: str = "auto",
     ):
         for name, value in (
             ("num_layers", num_layers),
@@ -120,6 +155,9 @@ class KVCacheManager:
             raise ValueError("KV dtype must be float32, float16, or bfloat16")
         if layout not in {"last_exited", "shared"}:
             raise ValueError("unsupported KV layout")
+        if kv_cache_dtype not in KV_CACHE_DTYPES:
+            raise ValueError(f"kv_cache_dtype must be one of {KV_CACHE_DTYPES}")
+        self.kv_cache_dtype = kv_cache_dtype
         self.layout = layout
         self.recurrent_layers = (
             tuple(range(num_layers)) if recurrent_layers is None else tuple(recurrent_layers)
@@ -140,9 +178,17 @@ class KVCacheManager:
         )
         self.attention_info = self.attention.info
         self.backend = self.attention_info["selected_backend"]
+        if kv_cache_dtype != "auto" and not getattr(self.attention.capabilities, "fp8_kv", False):
+            raise ValueError(f"the {self.attention_info['backend']} backend does not read FP8 KV")
         shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
-        self.key_cache = torch.empty(shape, device=self.device, dtype=dtype)
+        storage = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else dtype
+        self.key_cache = torch.empty(shape, device=self.device, dtype=storage)
         self.value_cache = torch.empty_like(self.key_cache)
+        # One scale per stored vector; None for an unquantized pool.
+        self.key_scale = self.value_scale = None
+        if kv_cache_dtype == "fp8_e4m3":
+            self.key_scale = torch.ones(shape[:-1], device=self.device, dtype=torch.float32)
+            self.value_scale = torch.ones_like(self.key_scale)
         # Resolve an implicit CUDA index to the actual storage device once.
         self.device = self.key_cache.device
         self._free_blocks = list(reversed(range(num_blocks)))
@@ -174,13 +220,13 @@ class KVCacheManager:
 
     @property
     def bytes_per_block(self) -> int:
-        return (
-            2
-            * self.num_layers
-            * self.block_size
-            * self.num_kv_heads
-            * self.head_dim
-            * self.key_cache.element_size()
+        return kv_bytes_per_block(
+            self.num_layers,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            self.key_cache.element_size(),
+            self.kv_cache_dtype,
         )
 
     def required_blocks(self, max_tokens: int) -> int:
@@ -477,17 +523,23 @@ class KVCacheManager:
         if allocation.transfer_leases:
             raise RuntimeError("cannot snapshot KV during a transfer")
         blocks = [b for table in allocation.block_tables for b in table]
-        keys = torch.empty((len(blocks), *self.key_cache.shape[1:]), dtype=self.dtype)
+        keys = torch.empty((len(blocks), *self.key_cache.shape[1:]), dtype=self.key_cache.dtype)
         values = torch.empty_like(keys)
         for row, block in enumerate(blocks):
             keys[row].copy_(self.key_cache[block])
             values[row].copy_(self.value_cache[block])
+        key_scales = value_scales = None
+        if self.key_scale is not None:
+            key_scales = self.key_scale[blocks].cpu()
+            value_scales = self.value_scale[blocks].cpu()
         return KVSnapshot(
             max_tokens=allocation.max_tokens,
             pages=len(allocation.block_tables[0]),
             written=deepcopy(allocation.written),
             keys=keys,
             values=values,
+            key_scales=key_scales,
+            value_scales=value_scales,
         )
 
     def restore(self, request_id: str, snapshot: KVSnapshot) -> None:
@@ -504,10 +556,15 @@ class KVCacheManager:
             raise ValueError("snapshot page count does not match the allocation")
         if any(w.prefix or w.pending for plane in allocation.written for w in plane):
             raise RuntimeError("cannot restore into an allocation that already holds KV")
+        if (self.key_scale is None) != (snapshot.key_scales is None):
+            raise ValueError("snapshot KV dtype does not match the pool")
         blocks = [b for table in allocation.block_tables for b in table]
         for row, block in enumerate(blocks):
             self.key_cache[block].copy_(snapshot.keys[row])
             self.value_cache[block].copy_(snapshot.values[row])
+            if self.key_scale is not None:
+                self.key_scale[block].copy_(snapshot.key_scales[row])
+                self.value_scale[block].copy_(snapshot.value_scales[row])
         allocation.written = deepcopy(snapshot.written)
 
     def _plane(self, depth: int) -> int:
@@ -669,8 +726,7 @@ class KVCacheManager:
         if isinstance(batch, DeviceKVMetadata):
             self._validate_tensor(k, len(batch.position_ids), "k")
             self._validate_tensor(v, len(batch.position_ids), "v")
-            self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
-            self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+            self._store_layer(layer, batch.write_blocks, batch.write_offsets, k, v)
             return
         if not batch.writable:
             raise ValueError("a read-only prepared KV batch cannot be written")
@@ -678,10 +734,45 @@ class KVCacheManager:
         self._validate_tensor(v, len(batch.position_ids), "v")
         if not batch.rows:
             return
-        self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
-        self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
+        rows = len(batch.rows)
+        self._store_layer(layer, batch.write_blocks, batch.write_offsets, k[:rows], v[:rows])
         for allocation, depth, position in batch.rows:
             allocation.written[self._plane(depth)][layer].add(position)
+
+    def _store_layer(self, layer, blocks, offsets, k, v) -> None:
+        """Write one layer's K/V rows, quantizing them for an FP8 pool."""
+        if self.key_scale is None:
+            self.key_cache[blocks, layer, offsets] = k
+            self.value_cache[blocks, layer, offsets] = v
+            return
+        if self.backend == "triton":
+            # One fused launch instead of about 20 small kernels per layer write.
+            from vllm_rlt.kernels.triton_attention import store_fp8
+
+            store_fp8(
+                k,
+                v,
+                self.key_cache[:, layer],
+                self.value_cache[:, layer],
+                self.key_scale[:, layer],
+                self.value_scale[:, layer],
+                blocks,
+                offsets,
+                FP8_E4M3_MAX,
+            )
+            return
+        k_codes, k_scale = quantize_fp8(k)
+        v_codes, v_scale = quantize_fp8(v)
+        self.key_cache[blocks, layer, offsets] = k_codes
+        self.value_cache[blocks, layer, offsets] = v_codes
+        self.key_scale[blocks, layer, offsets] = k_scale
+        self.value_scale[blocks, layer, offsets] = v_scale
+
+    def _layer_scales(self, layer) -> dict:
+        """Extra attention arguments for one layer: its scales, or nothing."""
+        if self.key_scale is None:
+            return {}
+        return dict(key_scale=self.key_scale[:, layer], value_scale=self.value_scale[:, layer])
 
     def _require_prefix(self, allocation, layer, depth, length):
         written = allocation.written[self._plane(depth)][layer]
@@ -720,6 +811,7 @@ class KVCacheManager:
                 self.value_cache[:, layer],
                 batch.block_tables,
                 batch.context_lengths,
+                **self._layer_scales(layer),
             )
         if not batch.rows:
             return torch.empty_like(q)
@@ -741,6 +833,7 @@ class KVCacheManager:
             self.value_cache[:, layer],
             batch.block_tables,
             batch.context_lengths,
+            **self._layer_scales(layer),
         )
 
     @torch.no_grad()
@@ -757,18 +850,16 @@ class KVCacheManager:
         ]
         # Basic-index copies avoid a blocking host->device index tensor on the
         # boundary stream. That transfer would serialize final core and routing.
+        tensors = [self.key_cache, self.value_cache]
+        if self.key_scale is not None:
+            tensors += [self.key_scale, self.value_scale]
         for destination in destinations:
-            if len(self.recurrent_layers) == self.num_layers:
-                self.key_cache[destination, :, offset].copy_(self.key_cache[source, :, offset])
-                self.value_cache[destination, :, offset].copy_(self.value_cache[source, :, offset])
-            else:
-                for layer in self.recurrent_layers:
-                    self.key_cache[destination, layer, offset].copy_(
-                        self.key_cache[source, layer, offset]
-                    )
-                    self.value_cache[destination, layer, offset].copy_(
-                        self.value_cache[source, layer, offset]
-                    )
+            for tensor in tensors:
+                if len(self.recurrent_layers) == self.num_layers:
+                    tensor[destination, :, offset].copy_(tensor[source, :, offset])
+                else:
+                    for layer in self.recurrent_layers:
+                        tensor[destination, layer, offset].copy_(tensor[source, layer, offset])
         self._record_finalized(allocation, position, exit_depth)
 
     @torch.no_grad()
@@ -792,4 +883,11 @@ class KVCacheManager:
         )
         blocks = table[positions // self.block_size]
         offsets = positions % self.block_size
-        return self.key_cache[blocks, layer, offsets], self.value_cache[blocks, layer, offsets]
+        keys = self.key_cache[blocks, layer, offsets]
+        values = self.value_cache[blocks, layer, offsets]
+        if self.key_scale is None:
+            return keys, values
+        return (
+            dequantize_fp8(keys, self.key_scale[blocks, layer, offsets], self.dtype),
+            dequantize_fp8(values, self.value_scale[blocks, layer, offsets], self.dtype),
+        )

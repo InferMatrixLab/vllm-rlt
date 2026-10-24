@@ -1323,6 +1323,27 @@ class ModelRunner:
                 *cache.key_cache.stride()[:3],
                 256,
             )
+            if cache.key_scale is not None:
+                # FP8 pools: the same copy for the per-vector scales.
+                finalize_kernel[
+                    (
+                        len(copies),
+                        cache.max_loops,
+                        math.ceil(cache.num_layers * cache.num_kv_heads / 256),
+                    )
+                ](
+                    routing_buffers.descriptor,
+                    self.async_state.tables,
+                    cache.key_scale,
+                    cache.value_scale,
+                    self.async_state.width,
+                    cache.max_loops,
+                    cache.block_size,
+                    cache.num_layers,
+                    cache.num_kv_heads,
+                    *cache.key_scale.stride()[:3],
+                    256,
+                )
             routing_buffers.record_done()
             for request in copies:
                 self.events[request.request_id] = routing_buffers.done

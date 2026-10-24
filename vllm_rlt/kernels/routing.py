@@ -171,7 +171,9 @@ def finalize_kernel(
         offset = (x // CHANNELS) * LAYER_STRIDE + (pos % PAGE) * TOKEN_STRIDE + x % CHANNELS
         src = source.to(tl.int64) * BLOCK_STRIDE + offset
         dst = dest.to(tl.int64) * BLOCK_STRIDE + offset
-        k = tl.load(K + src, x < LAYERS * CHANNELS, 0)
-        v = tl.load(V + src, x < LAYERS * CHANNELS, 0)
+        # No fill value: masked lanes are never stored, and an integer fill cannot be
+        # cast to an FP8 pool's element type.
+        k = tl.load(K + src, x < LAYERS * CHANNELS)
+        v = tl.load(V + src, x < LAYERS * CHANNELS)
         tl.store(K + dst, k, x < LAYERS * CHANNELS)
         tl.store(V + dst, v, x < LAYERS * CHANNELS)

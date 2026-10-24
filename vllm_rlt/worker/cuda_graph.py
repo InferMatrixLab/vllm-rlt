@@ -39,9 +39,7 @@ class _DeviceCache:
         self.cache = cache
 
     def _write_prepared(self, layer, batch, k, v):
-        cache = self.cache
-        cache.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
-        cache.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+        self.cache._store_layer(layer, batch.write_blocks, batch.write_offsets, k, v)
 
     def _attend_prepared(self, layer, batch, q):
         cache = self.cache
@@ -61,6 +59,7 @@ class _DeviceCache:
             cache.value_cache[:, layer],
             batch.block_tables,
             batch.context_lengths,
+            **cache._layer_scales(layer),
         )
 
 

@@ -15,8 +15,13 @@ def torch_paged_attention(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reference attention over [physical block, token, KV head, dimension]."""
+    """Reference attention over [physical block, token, KV head, dimension].
+
+    FP8 pools pass per-vector scales shaped [physical block, token, KV head].
+    """
     output = torch.empty_like(q)
     block_size = key_cache.shape[1]
     head_groups = q.shape[1] // key_cache.shape[2]
@@ -28,8 +33,13 @@ def torch_paged_attention(
         token_positions = torch.arange(length, device=q.device)
         blocks = block_tables[row, token_positions // block_size]
         offsets = token_positions % block_size
-        keys = key_cache[blocks, offsets].repeat_interleave(head_groups, dim=1)
-        values = value_cache[blocks, offsets].repeat_interleave(head_groups, dim=1)
+        keys = key_cache[blocks, offsets].float()
+        values = value_cache[blocks, offsets].float()
+        if key_scale is not None:
+            keys = keys * key_scale[blocks, offsets].unsqueeze(-1)
+            values = values * value_scale[blocks, offsets].unsqueeze(-1)
+        keys = keys.repeat_interleave(head_groups, dim=1)
+        values = values.repeat_interleave(head_groups, dim=1)
         scores = torch.einsum("hd,thd->ht", q[row].float(), keys.float()) * scale
         probabilities = torch.softmax(scores, dim=-1)
         output[row] = torch.einsum("ht,thd->hd", probabilities, values.float()).to(q.dtype)
@@ -42,6 +52,8 @@ def triton_paged_attention(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch explicitly to Triton, with no silent reference fallback."""
     if q.device.type != "cuda":
@@ -51,4 +63,6 @@ def triton_paged_attention(
     # Keep Triton optional and avoid loading its runtime for CPU-only callers.
     from vllm_rlt.kernels.triton_attention import paged_attention
 
-    return paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
+    return paged_attention(
+        q, key_cache, value_cache, block_tables, context_lengths, key_scale, value_scale
+    )

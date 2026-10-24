@@ -41,6 +41,12 @@ def add_runtime_args(parser):
         help="Split prompt prefill into a staged prelude plus one boundary per recurrence depth",
     )
     parser.add_argument("--kv-layout", choices=["last_exited", "shared"], default="last_exited")
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=["auto", "fp8_e4m3"],
+        default="auto",
+        help="fp8_e4m3 stores KV as FP8 with per-vector scales (Torch/Triton attention)",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
     parser.add_argument("--memory-reserve-bytes", type=int, default=256 * 1024 * 1024)
@@ -95,6 +101,7 @@ def runtime_configs(args):
             num_blocks=args.num_blocks,
             block_size=args.block_size,
             layout=args.kv_layout,
+            kv_cache_dtype=args.kv_cache_dtype,
             gpu_memory_utilization=args.gpu_memory_utilization,
             kv_cache_memory_bytes=args.kv_cache_memory_bytes,
             memory_reserve_bytes=args.memory_reserve_bytes,

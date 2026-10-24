@@ -88,6 +88,10 @@ class PDEngine:
         d_cache = decode_cache_config or CacheConfig()
         if (p_cache.layout, p_cache.block_size) != (d_cache.layout, d_cache.block_size):
             raise ValueError("P and D must use the same KV layout and block size")
+        if "fp8_e4m3" in (p_cache.kv_cache_dtype, d_cache.kv_cache_dtype):
+            raise ValueError(
+                "PD transfer does not yet carry FP8 KV scales; use kv_cache_dtype='auto'"
+            )
         if attention_backend not in ("triton", "flash_attn", "flash_attn_4"):
             raise ValueError("PD supports CUDA Triton or paged FA4 attention")
         self.scheduling_policy = p_scheduler.policy
