@@ -197,6 +197,9 @@ The same flags work with the single-device server. A streaming event may contain
 multiple committed tokens. See [RFC #43](https://github.com/InferMatrixLab/vllm-rlt/issues/43)
 for the design.
 
+For the unmerged alternate-branch experiment, including the evaluated policies
+and measurements, see the [PR #59 findings](runtime-history.md#alternate-branch-experiment-pr-59).
+
 ## SHARED prefill semantics
 
 SHARED retains one physical KV plane and completes every loop for a prompt
