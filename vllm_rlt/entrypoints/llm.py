@@ -1,13 +1,15 @@
+from collections.abc import Iterable
 from dataclasses import replace
 
 import torch
 
-from vllm_rlt.engine.llm_engine import StageClient
+from vllm_rlt.engine.llm_engine import LLMEngine, StageClient
 from vllm_rlt.models import (
     load_tokenizer,
     resolve_model_config,
     resolve_model_source,
 )
+from vllm_rlt.pd.engine import PDEngine
 from vllm_rlt.sampling_params import SamplingParams
 
 
@@ -30,6 +32,11 @@ class LLM:
         speculative_config=None,
     ):
         self._tokenizer_source = None
+        if isinstance(model, (LLMEngine, StageClient, PDEngine)):
+            self.tokenizer = tokenizer
+            self.engine = model
+            self._next_request_id = 0
+            return
         if isinstance(model, str):
             tokenizer_source = resolve_model_source(model)
             model, revision, _ = resolve_model_config(model, revision=revision)
@@ -100,6 +107,27 @@ class LLM:
 
     def start_profile(self, config, *, scheduled=False):
         return self.engine.start_profile(config, scheduled=scheduled)
+
+    def start_weight_update(self, version: int | None = None):
+        self.engine.start_weight_update(version)
+
+    def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        self.engine.update_weights(weights)
+
+    def finish_weight_update(self):
+        self.engine.finish_weight_update()
+
+    def get_weight_version(self) -> int:
+        return self.engine.get_weight_version()
+
+    def reset_prefix_cache(self):
+        self.engine.reset_prefix_cache()
+
+    def pause_generation(self):
+        self.engine.pause_generation()
+
+    def resume_generation(self):
+        self.engine.resume_generation()
 
     def stop_profile(self):
         return self.engine.stop_profile()

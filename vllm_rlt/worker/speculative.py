@@ -291,6 +291,11 @@ class SpeculativeRunner:
                 )
                 start += scheduled_request.token_count
                 results.append(SpeculativeResult(tokens, accepted))
+                if request.sampling_params.logprobs is not None:
+                    results[-1].log_probs.extend(
+                        Sampler.selected_logprob(row, token, request.sampling_params).detach().cpu()
+                        for row, token in zip(rows, tokens)
+                    )
                 continue
             start += scheduled_request.token_count
             # Sampling keeps sequential rejection; RNG consumption order is unchanged.
@@ -314,4 +319,9 @@ class SpeculativeRunner:
                 )
                 tokens.append(int(token.item()))
             results.append(SpeculativeResult(tokens, accepted))
+            if request.sampling_params.logprobs is not None:
+                results[-1].log_probs.extend(
+                    Sampler.selected_logprob(row, token, request.sampling_params).detach().cpu()
+                    for row, token in zip(rows, tokens)
+                )
         return results

@@ -101,6 +101,7 @@ class PreparedExecution:
     packed_metadata: PackedMetadataBuffer | None = None
     sampling_params: tuple = ()
     sampling_generators: tuple = ()
+    log_probs: list | None = None
 
 
 @dataclass
@@ -115,6 +116,7 @@ class Submission:
     positions: tuple[int, ...] = ()
     output_indices: tuple[int, ...] = ()
     operation: Operation | None = None
+    log_probs: tuple = ()
 
     def __del__(self):
         if self.slot is not None:
@@ -138,6 +140,11 @@ class Submission:
         self.cached = ModelRunnerOutput(
             gate_scores=values if is_recurrent else None,
             token_ids=values if is_coda else None,
+            log_probs=[
+                score.detach().cpu() if score is not None else None for score in self.log_probs
+            ]
+            if self.log_probs
+            else None,
             completion=self.event,
             depths=self.depths,
             output_indices=self.output_indices,
@@ -867,7 +874,13 @@ class ModelRunner:
                 prepared, gate_indices=self.input_buffers[torch.int64].append(gate_rows)
             )
         if batch.operation == Operation.CODA:
-            prepared = replace(prepared, sampling_params=tuple(r.sampling_params for r in requests))
+            prepared = replace(
+                prepared,
+                sampling_params=tuple(r.sampling_params for r in requests),
+                log_probs=[]
+                if any(r.sampling_params.logprobs is not None for r in requests)
+                else None,
+            )
         if batch.operation == Operation.PRELUDE and batch.loop_count:
             packed_metadata = (
                 self.packed_metadata_buffers[self.submissions.slot]
@@ -1116,6 +1129,15 @@ class ModelRunner:
                         )
                     ]
                 )
+                if prepared.log_probs is not None:
+                    prepared.log_probs.extend(
+                        self.sampler.selected_logprob(row, token, params)
+                        if params.logprobs is not None
+                        else None
+                        for row, token, params in zip(
+                            result.logits, values, prepared.sampling_params
+                        )
+                    )
                 if prepared.routing is not None:
                     prepared.routing.scatter(values, tokens=True)
         return values
@@ -1251,6 +1273,7 @@ class ModelRunner:
                 positions=prepared.positions,
                 output_indices=prepared.output_indices,
                 operation=batch.operation,
+                log_probs=tuple(prepared.log_probs or ()),
             )
         except Exception:
             self._synchronize_submission(stream, prepared)

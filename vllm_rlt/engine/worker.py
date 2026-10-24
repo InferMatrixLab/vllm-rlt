@@ -89,6 +89,13 @@ class StageWorker:
                 "add_request": self.engine.add_request,
                 "abort_request": self.engine.abort_request,
                 "stats": self.engine.stats,
+                "get_weight_version": self.engine.get_weight_version,
+                "pause_generation": self.engine.pause_generation,
+                "resume_generation": self.engine.resume_generation,
+                "reset_prefix_cache": self.engine.reset_prefix_cache,
+                "start_weight_update": self.engine.start_weight_update,
+                "update_weights": self.engine.update_weights,
+                "finish_weight_update": self.engine.finish_weight_update,
                 "start_profile": self.engine.start_profile,
                 "stop_profile": self.engine.stop_profile,
                 "profile_status": self.engine.profile_status,
@@ -96,6 +103,11 @@ class StageWorker:
             }
             method = command["method"]
             session_id = command.get("session_id")
+            admission_paused = method == "add_request" and (
+                self.engine._paused
+                or self.engine._update_version is not None
+                or self.engine._update_failed
+            )
             try:
                 if session_id is not None and method in (
                     "stop_profile",
@@ -115,11 +127,23 @@ class StageWorker:
                 else:
                     result = methods[method](*command.get("args", ()), **kwargs)
             except Exception as exc:
-                if not isinstance(exc, (ValueError, KeyError)) and method not in (
-                    "start_profile",
-                    "stop_profile",
-                    "profile_status",
-                    "wait_for_profile_artifacts",
+                if (
+                    not isinstance(exc, (ValueError, KeyError))
+                    and not admission_paused
+                    and method
+                    not in (
+                        "get_weight_version",
+                        "pause_generation",
+                        "resume_generation",
+                        "reset_prefix_cache",
+                        "start_weight_update",
+                        "update_weights",
+                        "finish_weight_update",
+                        "start_profile",
+                        "stop_profile",
+                        "profile_status",
+                        "wait_for_profile_artifacts",
+                    )
                 ):
                     raise
                 self.send(
