@@ -27,6 +27,7 @@ from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Operation, Request, RequestPhase
 from vllm_rlt.worker.executor import build_execution_batch
+from vllm_rlt.worker.model_runner import ExecutionOutput
 
 TOTAL_DEPTHS = 4
 
@@ -587,7 +588,7 @@ def test_cuda_submit_readback_failure_releases_batch_input_buffers(monkeypatch):
 
     def execute_with_result(batch, prepared):
         original_execute(batch, prepared)
-        return torch.zeros(1, device=runner.device, dtype=torch.float32)
+        return ExecutionOutput(torch.zeros(1, device=runner.device, dtype=torch.float32))
 
     monkeypatch.setattr(runner, "_execute", execute_with_result)
 
@@ -1955,7 +1956,7 @@ def test_mixed_hidden_buffers_wait_for_strided_decode_and_chunk_producers(multi_
             hidden = prepared.batch_inputs.hidden
             captured.append(hidden.clone())
             runner._store_hidden(batch, hidden + 1, prepared)
-            return None
+            return ExecutionOutput(None)
 
         runner._execute = consume
         try:

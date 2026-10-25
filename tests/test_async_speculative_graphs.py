@@ -190,8 +190,8 @@ def test_failed_graph_round_drains_readers_and_releases_buffers(backend, monkeyp
         runner = engine.speculative_runner
         verify = runner._verify
 
-        def fail_after_verify(*args):
-            verify(*args)
+        def fail_after_verify(*args, **kwargs):
+            verify(*args, **kwargs)
             raise RuntimeError("failed after graph submission")
 
         monkeypatch.setattr(runner, "_verify", fail_after_verify)

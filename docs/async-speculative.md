@@ -244,8 +244,12 @@ use the reserved allocation and stream-ordered writes instead. Only completed
 full prompt pages are eligible for prefix caching.
 
 Every ticket owns its result buffer and page-table snapshot until compute and
-copy events complete. EOS/length stopping is applied in output order on the CPU;
-one already-submitted later round can finish but its outputs are discarded.
+copy events complete. For rounds where a request asked for `logprobs`, each
+verification row's FP32 raw logprob of its argmax is copied with the round's
+results on the same event. Committed tokens are exactly those argmaxes. EOS,
+`stop_token_ids` and length stopping (`Scheduler._record_token`) is applied in
+output order on the CPU; one
+already-submitted later round can finish but its outputs are discarded.
 Cancellation removes scheduling eligibility immediately. KV allocations and
 device state survive until their final GPU user completes. Request object
 identity isolates stale tickets when a request ID is reused.

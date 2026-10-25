@@ -18,10 +18,22 @@ from vllm_rlt.worker.buffers import (
 )
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
+from vllm_rlt.worker.logprobs import processed_logprobs, truncates
 from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import StagedInputTensor, TensorTransfer, UvaBuffer, pinned_tensor
+
+
+class ExecutionOutput(NamedTuple):
+    """One submission's device outputs.
+
+    ``values`` holds RECURRENT exit scores or CODA sampled IDs, else None.
+    ``logprobs`` holds CODA FP32 logprobs of those IDs when a row asked, else None.
+    """
+
+    values: torch.Tensor | None
+    logprobs: torch.Tensor | None = None
 
 
 @dataclass
@@ -115,10 +127,14 @@ class Submission:
     positions: tuple[int, ...] = ()
     output_indices: tuple[int, ...] = ()
     operation: Operation | None = None
+    # CODA: FP32 logprobs of the sampled IDs, read back on the same event.
+    logprobs: torch.Tensor | None = None
+    logprob_slot: ReadbackSlot | None = None
 
     def __del__(self):
-        if self.slot is not None:
-            self.slot.leased = False
+        for slot in (self.slot, self.logprob_slot):
+            if slot is not None:
+                slot.leased = False
 
     @property
     def has_result(self):
@@ -133,19 +149,23 @@ class Submission:
         if self.event is not None:
             self.event.synchronize()
         values = self.values.tolist() if self.values is not None else None
+        logprobs = self.logprobs.tolist() if self.logprobs is not None else None
         is_coda = self.operation == Operation.CODA
         is_recurrent = self.operation == Operation.RECURRENT
         self.cached = ModelRunnerOutput(
             gate_scores=values if is_recurrent else None,
             token_ids=values if is_coda else None,
+            logprobs=logprobs if is_coda else None,
             completion=self.event,
             depths=self.depths,
             output_indices=self.output_indices,
         )
-        self.values = None
-        if self.slot is not None:
-            self.slot.leased = False
-            self.slot = None
+        self.values = self.logprobs = None
+        for name in ("slot", "logprob_slot"):
+            slot = getattr(self, name)
+            if slot is not None:
+                slot.leased = False
+                setattr(self, name, None)
         return self.cached
 
 
@@ -160,6 +180,7 @@ class ModelRunner:
         scheduler_config=None,
         staged_prefill=None,
         rng: RngRegistry | None = None,
+        logprobs_mode="raw_logprobs",
     ):
         self.model = model.eval()
         self.cache_manager = cache_manager
@@ -171,6 +192,7 @@ class ModelRunner:
         # Sampling RNG state lives with the engine, which shares this registry
         # between the CODA runner and the speculative runner.
         self.rng = rng if rng is not None else RngRegistry()
+        self.logprobs_mode = logprobs_mode
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
         scheduler = scheduler_config or SchedulerConfig()
@@ -237,6 +259,7 @@ class ModelRunner:
             ):
                 stream.wait_stream(torch.cuda.current_stream(self.device))
         self.readback_slots = []
+        self.logprob_slots = []
         if self.device.type == "cuda":
             # cudaHostAlloc during submission can serialize streams. Allocate all
             # readback storage before work starts, retaining leases until consumed.
@@ -247,6 +270,19 @@ class ModelRunner:
                             pinned_tensor(scheduler.max_num_batched_tokens, dtype, self.device)
                         )
                     )
+            # A separate pool keeps exit-score leases from starving CODA logprobs: a
+            # request whose CODA output is undelivered can already run its next
+            # token's recurrent loops, so it can hold both kinds of lease at once.
+            # A CODA ticket keeps its logprob lease until it is delivered or dropped.
+            # Each pending ticket holds a request with an undelivered output (at most
+            # one per request), so with the new ticket at most max_num_seqs leases are
+            # live; a stale ticket of an aborted request is still delivered (its
+            # results are ignored) or dropped on failure. The +4 is headroom, as for
+            # the exit-score pool.
+            for _ in range(scheduler.max_num_seqs + 4):
+                self.logprob_slots.append(
+                    ReadbackSlot(pinned_tensor(scheduler.max_num_seqs, torch.float32, self.device))
+                )
         # Retire the oldest consumer BEFORE preparing another batch's inputs.
         # All rotating prefill pools share this maximum in-flight depth.
         self.submissions = SubmissionQueue()
@@ -1093,12 +1129,12 @@ class ModelRunner:
         return tokens
 
     @torch.inference_mode()
-    def _execute(self, scheduled_batch, prepared):
+    def _execute(self, scheduled_batch, prepared) -> ExecutionOutput:
         return self._execute_batch(prepared.batch, prepared)
 
-    def _execute_batch(self, batch: ExecutionBatch, prepared):
+    def _execute_batch(self, batch: ExecutionBatch, prepared) -> ExecutionOutput:
         hidden = None
-        values = None
+        values = logprobs = None
         for entry in prepared.forwards:
             forward = entry.forward
             if entry.hidden_rows is not None:
@@ -1123,21 +1159,49 @@ class ModelRunner:
                         )
                         values = selected.float().sigmoid()
             elif forward.compute_logits:
-                values = torch.stack(
-                    [
-                        self.sampler.sample(row, params, generator)
-                        for row, params, generator in zip(
-                            result.logits, prepared.sampling_params, prepared.sampling_generators
-                        )
-                    ]
-                )
+                params, generators = prepared.sampling_params, prepared.sampling_generators
+                if any(p.logprobs is not None for p in params):
+                    values, logprobs = self._sample_with_logprobs(result.logits, params, generators)
+                else:
+                    values = torch.stack(
+                        [
+                            self.sampler.sample(row, p, generator)
+                            for row, p, generator in zip(result.logits, params, generators)
+                        ]
+                    )
                 if prepared.routing is not None:
                     prepared.routing.scatter(values, tokens=True)
-        return values
+        return ExecutionOutput(values, logprobs)
 
-    def _readback_slot(self, result):
+    def _sample_with_logprobs(self, logits, params, generators):
+        """Sampled IDs [rows] and FP32 logprobs [rows] of them under ``self.logprobs_mode``.
+
+        Raw mode scores every row in one batched op. Processed mode samples a requesting
+        top-k/top-p row through ``Sampler.sample_with_logprob``, which scores the processed
+        logits it drew from, and scores the other requesting rows in temperature batches
+        (``processed_logprobs``); no row rebuilds its processed logits. All other rows
+        sample through ``Sampler.sample``. Both draw identically, so tokens and RNG use do
+        not depend on logprobs. Values of rows that did not request logprobs are arbitrary.
+        """
+        rows = len(params)
+        if self.logprobs_mode == "raw_logprobs":
+            token_ids = torch.stack(
+                [self.sampler.sample(row, p, g) for row, p, g in zip(logits, params, generators)]
+            )
+            return token_ids, Sampler.raw_logprobs(logits[:rows], token_ids)
+        tokens, truncated = [], {}
+        for index, (row, p, generator) in enumerate(zip(logits, params, generators)):
+            if p.logprobs is not None and truncates(p):
+                token, truncated[index] = self.sampler.sample_with_logprob(row, p, generator)
+            else:
+                token = self.sampler.sample(row, p, generator)
+            tokens.append(token)
+        token_ids = torch.stack(tokens)
+        return token_ids, processed_logprobs(logits[:rows], params, token_ids, truncated)
+
+    def _readback_slot(self, result, slots=None):
         pending = None
-        for slot in self.readback_slots:
+        for slot in self.readback_slots if slots is None else slots:
             if slot.storage.dtype != result.dtype or slot.leased:
                 continue
             if slot.event is None or slot.event.query():
@@ -1150,6 +1214,13 @@ class ModelRunner:
             pending.leased = True
             return pending
         raise RuntimeError("readback buffers exhausted; retire completed submissions")
+
+    @staticmethod
+    def _copy_to_host(values, slot, stream):
+        values.record_stream(stream)
+        host = slot.storage[: values.numel()].view(values.shape)
+        host.copy_(values, non_blocking=True)
+        return host
 
     def _synchronize_submission(self, stream, prepared):
         if self.device.type != "cuda":
@@ -1186,7 +1257,7 @@ class ModelRunner:
         stream = self.core_stream if batch.loop_count else self.boundary_stream
         prepared = None
         routing_finish_attempted = False
-        slot = None
+        slot = logprob_slot = None
         try:
             if self.submissions.begin() and split_prefill:
                 self.split_prefill_submission_waits += 1
@@ -1206,7 +1277,7 @@ class ModelRunner:
                     self._wait_for_requests(batch, stream)
                 prepared = self.prepare_on_gpu(prepared)
                 try:
-                    result = self._execute(scheduled_batch, prepared)
+                    result, logprobs = self._execute(scheduled_batch, prepared)
                 finally:
                     if prepared.routing is not None:
                         routing_finish_attempted = True
@@ -1240,17 +1311,22 @@ class ModelRunner:
                     event = compute_done
                     if result is not None:
                         slot = self._readback_slot(result)
+                        if logprobs is not None:
+                            logprob_slot = self._readback_slot(logprobs, self.logprob_slots)
                         readback_stream = self.readback_stream or compute_stream
                         with torch.cuda.stream(readback_stream):
                             if readback_stream != compute_stream:
                                 readback_stream.wait_event(compute_done)
-                            result.record_stream(readback_stream)
-                            host = slot.storage[: result.numel()].view(result.shape)
-                            host.copy_(result, non_blocking=True)
+                            result = self._copy_to_host(result, slot, readback_stream)
+                            if logprobs is not None:
+                                logprobs = self._copy_to_host(
+                                    logprobs, logprob_slot, readback_stream
+                                )
                             event = torch.cuda.Event()
                             event.record(readback_stream)
-                        slot.event = event
-                        result = host
+                        for leased in (slot, logprob_slot):
+                            if leased is not None:
+                                leased.event = event
                     for span in batch.spans:
                         self.events[span.request.request_id] = compute_done
                     self.submissions.complete(compute_done)
@@ -1266,6 +1342,8 @@ class ModelRunner:
                 positions=prepared.positions,
                 output_indices=prepared.output_indices,
                 operation=batch.operation,
+                logprobs=logprobs,
+                logprob_slot=logprob_slot,
             )
         except Exception:
             self._synchronize_submission(stream, prepared)
@@ -1282,8 +1360,9 @@ class ModelRunner:
                         routing_finish_attempted = True
                         prepared.routing.record_done()
             finally:
-                if slot is not None:
-                    slot.leased = False
+                for leased in (slot, logprob_slot):
+                    if leased is not None:
+                        leased.leased = False
             raise
         finally:
             if prepared is not None and prepared.workspace is not None:

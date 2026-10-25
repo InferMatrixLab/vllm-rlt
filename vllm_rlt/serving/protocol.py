@@ -61,7 +61,6 @@ class CompletionRequest:
     def parse(cls, body, model):
         if not isinstance(body, dict):
             raise ValueError("request body must be a JSON object")
-        params_keys = {field.name for field in fields(SamplingParams)}
         neutral = {
             "n": 1,
             "best_of": 1,
@@ -74,6 +73,9 @@ class CompletionRequest:
             "suffix": None,
             "logit_bias": None,
         }
+        # Rollout fields stay offline-only until the token-in/token-out API (#70).
+        params_keys = {field.name for field in fields(SamplingParams)} - neutral.keys()
+        params_keys -= {"stop_token_ids"}
         allowed = (
             params_keys
             | neutral.keys()
@@ -119,6 +121,8 @@ class CompletionRequest:
                 raise ValueError(f"{key} must be a finite number")
         if "ignore_eos" in params and type(params["ignore_eos"]) is not bool:
             raise ValueError("ignore_eos must be a boolean")
+        if "seed" in params and params["seed"] is None:
+            raise ValueError("seed must be an integer in [0, 2**63)")
         trace_id = body.get("trace_id")
         if "trace_id" in body and (not isinstance(trace_id, str) or not trace_id):
             raise ValueError("trace_id must be a nonempty string")

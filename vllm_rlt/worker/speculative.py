@@ -5,7 +5,7 @@ outputs; Scheduler applies returned tokens and KV commits; Engine coordinates cl
 """
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -27,6 +27,56 @@ class SpeculativeStats:
     accepted_tokens: int = 0
     committed_tokens: int = 0
     verified_rows: int = 0
+
+
+@dataclass
+class _CommittedScores:
+    """Committed tokens of one round to score, read back together at the end.
+
+    Raw-scored tokens name their verification row in the round's logits; processed-scored
+    tokens bring the FP32 processed logits their p was normalized from. Spans map a
+    result index to its tokens' contiguous slice within its group.
+    """
+
+    raw_rows: list[int] = field(default_factory=list)
+    raw_tokens: list[int] = field(default_factory=list)
+    raw_spans: dict[int, slice] = field(default_factory=dict)
+    processed_logits: list[torch.Tensor] = field(default_factory=list)
+    processed_tokens: list[int] = field(default_factory=list)
+    processed_spans: dict[int, slice] = field(default_factory=dict)
+
+    def add_raw(self, index, first_row, tokens):
+        start = len(self.raw_tokens)
+        self.raw_spans[index] = slice(start, start + len(tokens))
+        self.raw_rows.extend(range(first_row, first_row + len(tokens)))
+        self.raw_tokens.extend(tokens)
+
+    def add_processed(self, index, processed_logits, tokens):
+        start = len(self.processed_tokens)
+        self.processed_spans[index] = slice(start, start + len(tokens))
+        self.processed_logits.extend(processed_logits)
+        self.processed_tokens.extend(tokens)
+
+    def resolve(self, logits) -> dict[int, list[float]]:
+        """Map each added result index to its tokens' FP32 logprobs.
+
+        At most two batched scoring ops and one host readback; none if nothing was added.
+        """
+        parts = []
+        if self.raw_tokens:
+            rows = torch.tensor(self.raw_rows, device=logits.device)
+            tokens = torch.tensor(self.raw_tokens, device=logits.device)
+            parts.append(Sampler.raw_logprobs(logits[rows], tokens))
+        if self.processed_tokens:
+            tokens = torch.tensor(self.processed_tokens, device=logits.device)
+            parts.append(Sampler.raw_logprobs(torch.stack(self.processed_logits), tokens))
+        if not parts:
+            return {}
+        values = torch.cat(parts).tolist()
+        raw, processed = values[: len(self.raw_tokens)], values[len(self.raw_tokens) :]
+        scores = {index: raw[span] for index, span in self.raw_spans.items()}
+        scores.update((index, processed[span]) for index, span in self.processed_spans.items())
+        return scores
 
 
 def greedy_accept(candidates, targets):
@@ -107,6 +157,7 @@ class SpeculativeRunner:
         *,
         runtime=None,
         compute_stream=None,
+        logprobs_mode="raw_logprobs",
     ):
         self.model, self.cache, self.config = model, cache, config
         self.metadata = cache.metadata_builder
@@ -121,6 +172,7 @@ class SpeculativeRunner:
         # The engine injects one registry per engine so both sampling paths share
         # each request's RNG slot.
         self.rng = rng if rng is not None else RngRegistry()
+        self.logprobs_mode = logprobs_mode
         self.stats = SpeculativeStats()
         self.graphs = (
             RecurrentGraphs(model, cache, execution, False) if execution.cuda_graphs else None
@@ -282,37 +334,71 @@ class SpeculativeRunner:
                 candidates[i].append(candidate)
             start += len(rows)
         targets = values[start:]
-        results, start = [], 0
+        committed, scores, start = [], _CommittedScores(), 0
         for i, scheduled_request in enumerate(scheduled_requests):
             rows = logits[start : start + scheduled_request.token_count]
-            request = scheduled_request.request
-            if request.sampling_params.temperature == 0:
+            params = scheduled_request.request.sampling_params
+            # Greedy rows report raw values in both modes (vLLM). Processed scores of
+            # sampled rows reuse the processed logits p was normalized from.
+            score_processed = (
+                params.logprobs is not None
+                and params.temperature != 0
+                and self.logprobs_mode == "processed_logprobs"
+            )
+            if params.temperature == 0:
                 tokens, accepted = greedy_accept(
                     candidates[i], targets[start : start + scheduled_request.token_count]
                 )
-                start += scheduled_request.token_count
-                results.append(SpeculativeResult(tokens, accepted))
-                continue
-            start += scheduled_request.token_count
-            # Sampling keeps sequential rejection; RNG consumption order is unchanged.
-            tokens, accepted = [], 0
-            for offset, candidate in enumerate(candidates[i]):
-                p = Sampler.probabilities(rows[offset], request.sampling_params)
-                token, accept = rejection_sample(
-                    candidate,
-                    p,
-                    proposals[i][offset],
-                    self._acquire_generator(request, rows[offset]),
-                )
-                tokens.append(token)
-                if not accept:
-                    break
-                accepted += 1
             else:
-                token = Sampler.draw(
-                    Sampler.probabilities(rows[-1], request.sampling_params),
-                    self._acquire_generator(request, rows[-1]),
+                tokens, accepted, processed = self._sample_round(
+                    scheduled_request.request,
+                    rows,
+                    candidates[i],
+                    proposals[i],
+                    score_processed=score_processed,
                 )
-                tokens.append(int(token.item()))
-            results.append(SpeculativeResult(tokens, accepted))
-        return results
+            # Token j was committed on verification row j.
+            if score_processed:
+                scores.add_processed(i, processed, tokens)
+            elif params.logprobs is not None:
+                scores.add_raw(i, start, tokens)
+            start += scheduled_request.token_count
+            committed.append((tokens, accepted))
+        logprobs = scores.resolve(logits)
+        return [
+            SpeculativeResult(tokens, accepted, logprobs.get(i))
+            for i, (tokens, accepted) in enumerate(committed)
+        ]
+
+    def _sample_round(self, request, rows, candidates, proposals, *, score_processed=False):
+        """Return (tokens, accepted, processed) by sequential rejection over ``rows``.
+
+        RNG consumption order is unchanged. With ``score_processed``, ``processed`` holds
+        the FP32 processed logits of the row each committed token was drawn on, one per
+        token; otherwise it is None. A correction is drawn from the residual (p - q)+,
+        but the round's output is distributed as p, so every token is scored under p.
+        """
+        params = request.sampling_params
+        processed = [] if score_processed else None
+
+        def target(row):
+            if processed is None:
+                return Sampler.probabilities(row, params)
+            processed.append(Sampler.processed_logits(row, params))
+            return processed[-1].softmax(-1)
+
+        tokens, accepted = [], 0
+        for offset, candidate in enumerate(candidates):
+            token, accept = rejection_sample(
+                candidate,
+                target(rows[offset]),
+                proposals[offset],
+                self._acquire_generator(request, rows[offset]),
+            )
+            tokens.append(token)
+            if not accept:
+                return tokens, accepted, processed
+            accepted += 1
+        token = Sampler.draw(target(rows[-1]), self._acquire_generator(request, rows[-1]))
+        tokens.append(int(token.item()))
+        return tokens, accepted, processed
