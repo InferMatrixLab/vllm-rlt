@@ -353,7 +353,13 @@ def test_random_sampling_tracks_only_committed_tokens_under_mixed_loops(device, 
                 batch = engine.last_schedule
                 if batch is not None and batch.is_mixed:
                     phases = {batch.phase_for(item) for item in batch.requests}
-                    if len(phases) == 2:
+                    # Only RECURRENT + PREFILLING_RECURRENT proves mixed loop/depth
+                    # execution; a prelude-only mix would not exercise the sampled
+                    # recurrent path this test targets.
+                    if phases == {
+                        RequestPhase.RECURRENT,
+                        RequestPhase.PREFILLING_RECURRENT,
+                    }:
                         mixed.append(batch)
                 if not engine.has_unfinished_requests():
                     break
@@ -458,7 +464,8 @@ def test_bf16_mixed_random_sampling_replays_once_per_committed_token(asynchronou
                 if (
                     batch is not None
                     and batch.is_mixed
-                    and len({batch.phase_for(item) for item in batch.requests}) == 2
+                    and {batch.phase_for(item) for item in batch.requests}
+                    == {RequestPhase.RECURRENT, RequestPhase.PREFILLING_RECURRENT}
                 ):
                     mixed += 1
                 track()
@@ -484,8 +491,11 @@ def test_bf16_mixed_random_sampling_replays_once_per_committed_token(asynchronou
         return outputs, mixed
 
     first, first_mixed = run()
-    second, _ = run()
+    second, second_mixed = run()
+    # Each replay must actually execute recurrent + prefilling-recurrent batches;
+    # a prelude-only mix would leave the mixed sampling path unverified.
     assert first_mixed > 0
+    assert second_mixed > 0
     assert first == second
 
 
