@@ -1956,7 +1956,7 @@ def test_mixed_hidden_buffers_wait_for_strided_decode_and_chunk_producers(multi_
             hidden = prepared.batch_inputs.hidden
             captured.append(hidden.clone())
             runner._store_hidden(batch, hidden + 1, prepared)
-            return None
+            return ExecutionOutput(None)
 
         runner._execute = consume
         try:
