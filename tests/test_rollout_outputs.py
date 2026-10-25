@@ -1125,8 +1125,9 @@ def test_gpu_async_speculative_stop_token_ids_match_sync():
 @pytest.mark.gpu
 @pytest.mark.parametrize("logprobs_mode", LOGPROBS_MODES)
 def test_gpu_speculative_logprobs_match_across_graphs_async_and_native(logprobs_mode):
-    """CUDA/Triton speculation scores like the non-speculative engine, with CUDA Graphs and
-    with cross-round async speculation (greedy); sampled rounds match with graphs on/off."""
+    """CUDA/Triton speculation scores like the non-speculative engine, with CUDA Graphs, with
+    cross-round async speculation, and with both (greedy); sampled rounds match with graphs
+    on/off."""
     m = model(device="cuda")
     prompts = {"a": [2, 3, 4, 5], "b": [9], "c": [2, 3, 4, 7]}
 
@@ -1151,7 +1152,12 @@ def test_gpu_speculative_logprobs_match_across_graphs_async_and_native(logprobs_
         return outputs
 
     native = run(speculative=False)
-    for variant in (run(), run(graphs=True), run(asynchronous=True)):
+    for variant in (
+        run(),
+        run(graphs=True),
+        run(asynchronous=True),
+        run(asynchronous=True, graphs=True),
+    ):
         for rid, expected in native.items():
             assert_same(variant[rid], expected, atol=1e-4)
     sampled = SPECULATIVE_SAMPLING["top_k_top_p"]
