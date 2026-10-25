@@ -305,7 +305,6 @@ def test_random_sampling_tracks_only_committed_tokens_under_mixed_loops(device, 
                 prefill_chunk_size=4,
             ),
             execution_config=ExecutionConfig(
-                atomic_prefill=False,
                 async_scheduling=asynchronous,
                 static_buffers=asynchronous,
                 pad_to_power_of_two=asynchronous,
@@ -321,11 +320,29 @@ def test_random_sampling_tracks_only_committed_tokens_under_mixed_loops(device, 
             return sample(logits, sampling, generator)
 
         sampler.sample = record
-        for name, prompt in (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10])):
-            engine.add_request(name, prompt, params)
+        prompts = (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10]))
         outputs = {}
         mixed = []
         try:
+            if mode == "mixed":
+                # Upstream mixed scheduling only forms combined batches when a
+                # resident decode row is already recurring while the long prompt
+                # is prefilling, so stage the short request first.
+                engine.add_request(prompts[0][0], prompts[0][1], params)
+                for _ in range(40):
+                    for output in engine.step():
+                        if output.finished:
+                            outputs[output.request_id] = (
+                                output.token_ids,
+                                output.exit_depths,
+                            )
+                    if engine.scheduler.requests["short"].phase == RequestPhase.RECURRENT:
+                        break
+                else:
+                    pytest.fail("decode request did not reach recurrent work")
+                prompts = prompts[1:]
+            for name, prompt in prompts:
+                engine.add_request(name, prompt, params)
             for _ in range(300):
                 for output in engine.step():
                     if output.finished:
@@ -387,9 +404,10 @@ def test_bf16_mixed_random_sampling_replays_once_per_committed_token(asynchronou
                 max_num_seqs=3,
                 max_num_batched_tokens=5,
                 prefill_chunk_size=4,
+                # Exercise the mainline wavefront chunked-prefill path in BF16.
+                wavefront_chunked_prefill=True,
             ),
             execution_config=ExecutionConfig(
-                atomic_prefill=False,
                 async_scheduling=asynchronous,
                 static_buffers=True,
                 pad_to_power_of_two=True,
@@ -404,11 +422,31 @@ def test_bf16_mixed_random_sampling_replays_once_per_committed_token(asynchronou
             samples.append(generator)
             return sample(logits, sampling, generator)
 
+        def track():
+            for rid in engine.scheduler.requests:
+                generator = engine.rng.peek(rid)
+                if generator is not None:
+                    generators.setdefault(rid, generator)
+                    assert generators[rid] is generator
+
         sampler.sample = record
-        for name, prompt in (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10])):
-            engine.add_request(name, prompt, params)
+        prompts = (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10]))
         outputs, mixed = {}, 0
         try:
+            engine.add_request(prompts[0][0], prompts[0][1], params)
+            for _ in range(40):
+                for output in engine.step():
+                    if output.finished:
+                        outputs[output.request_id] = (
+                            output.token_ids,
+                            output.exit_depths,
+                        )
+                track()
+                if engine.scheduler.requests["short"].phase == RequestPhase.RECURRENT:
+                    break
+            else:
+                pytest.fail("decode request did not reach recurrent work")
+            engine.add_request(prompts[1][0], prompts[1][1], params)
             for _ in range(300):
                 for output in engine.step():
                     if output.finished:
@@ -423,11 +461,7 @@ def test_bf16_mixed_random_sampling_replays_once_per_committed_token(asynchronou
                     and len({batch.phase_for(item) for item in batch.requests}) == 2
                 ):
                     mixed += 1
-                for rid in engine.scheduler.requests:
-                    generator = engine.rng.peek(rid)
-                    if generator is not None:
-                        generators.setdefault(rid, generator)
-                        assert generators[rid] is generator
+                track()
                 if not engine.has_unfinished_requests():
                     break
             else:

@@ -1332,7 +1332,8 @@ def test_cuda_split_prefill_matches_atomic(async_scheduling, multi_stream, wavef
 def test_random_sampling_matches_across_atomic_and_split_prefill(device):
     # Prefill chunks and recurrent loops never sample; only the CODA consumes the
     # per-request generator. A seeded request must therefore replay the same
-    # token/exit trajectory whether its prompt was prefilled atomically or split.
+    # token/exit trajectory whether its prompt was prefilled atomically or with
+    # wavefront chunked prefill.
     params = SamplingParams(
         max_tokens=4,
         max_loops=3,
@@ -1351,9 +1352,12 @@ def test_random_sampling_matches_across_atomic_and_split_prefill(device):
             attention_backend="triton" if device == "cuda" else "torch",
             cache_config=CacheConfig(128, 2),
             scheduler_config=SchedulerConfig(
-                max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
+                max_num_seqs=2,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=2,
+                wavefront_chunked_prefill=not atomic,
             ),
-            execution_config=ExecutionConfig(atomic_prefill=atomic, async_scheduling=True),
+            execution_config=ExecutionConfig(async_scheduling=True),
             exit_config=ExitConfig("ouro_delayed"),
         )
         samples = []
