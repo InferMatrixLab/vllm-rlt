@@ -257,11 +257,10 @@ class PDEngine:
             del self.transfers[w.tid]
 
     def _blocks(self, peer, tokens):
-        return (
-            (tokens + peer.client.info["block_size"] - 1)
-            // peer.client.info["block_size"]
-            * peer.client.info["depths"]
-        )
+        info = peer.client.info
+        pages = (tokens + info["block_size"] - 1) // info["block_size"]
+        # Packed planes need fewer physical blocks per page than depths.
+        return pages * info.get("blocks_per_page", info["depths"])
 
     def add_request(self, request_id, prompt_token_ids, sampling_params=None, *, trace_id=None):
         if self.closed or self.failure:

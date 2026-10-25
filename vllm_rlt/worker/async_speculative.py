@@ -195,7 +195,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         table_view = host_tables.numpy()
         table_view.fill(0)
         for i, ((_, allocation), pages) in enumerate(zip(allocations, page_counts)):
-            for depth, table in enumerate(allocation.block_tables):
+            for depth, table in enumerate(self.cache.entry_tables(allocation)):
                 table_view[i, depth, :pages] = table[:pages]
         buffer.leased = True
         return buffer, allocations, host_tables, tables

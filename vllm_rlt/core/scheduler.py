@@ -398,7 +398,7 @@ class Scheduler:
             if cache.incremental_allocation and not reserve_outputs
             else capacity
         )
-        required = cache.required_blocks(budget_tokens) - len(prefix) * cache.storage_depths
+        required = cache.required_blocks(budget_tokens) - len(prefix) * cache.physical_planes
         reserved = self._reserved_growth_blocks(reserve_outputs=reserve_outputs)
         # Allow an otherwise idle engine to start a large request.
         admission_headroom_blocks = cache.watermark_blocks if active_count else 0

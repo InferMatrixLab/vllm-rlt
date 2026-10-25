@@ -71,6 +71,7 @@ class StageWorker:
             num_blocks=cache.num_blocks,
             block_size=cache.block_size,
             depths=cache.storage_depths,
+            blocks_per_page=cache.physical_planes,
             max_active_requests=active_limit,
             watermark_blocks=cache.watermark_blocks,
         )

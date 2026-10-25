@@ -655,7 +655,9 @@ class ModelRunner:
             for row, span in enumerate(active):
                 position = span.token_start + offset
                 positions.append(position)
-                blocks.append(base.rows[row][0].block_tables[0][position // cache.block_size])
+                blocks.append(
+                    cache.entry_tables(base.rows[row][0])[0][position // cache.block_size]
+                )
                 tokens.append(span.input_tokens[offset])
                 contexts.append(position + 1)
             size = self._size(len(active))
@@ -1323,9 +1325,9 @@ class ModelRunner:
                     self.boundary_stream.wait_event(event)
             routing_buffers.descriptor = routing_buffers.routing.stage(routing_buffers.count)
             channels = cache.num_kv_heads * cache.head_dim
-            finalize_kernel[
-                (len(copies), cache.max_loops, math.ceil(cache.num_layers * channels / 256))
-            ](
+            # Packed planes copy only the recurrent slots of flattened page entries.
+            first_layer, layers = cache.finalize_layers
+            finalize_kernel[(len(copies), cache.max_loops, math.ceil(layers * channels / 256))](
                 routing_buffers.descriptor,
                 self.async_state.tables,
                 cache.key_cache,
@@ -1333,9 +1335,11 @@ class ModelRunner:
                 self.async_state.width,
                 cache.max_loops,
                 cache.block_size,
-                cache.num_layers,
+                first_layer,
+                layers,
                 channels,
-                *cache.key_cache.stride()[:3],
+                cache.entry_stride,
+                *cache.key_cache.stride()[1:3],
                 256,
             )
             routing_buffers.record_done()

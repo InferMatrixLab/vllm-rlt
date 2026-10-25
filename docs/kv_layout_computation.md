@@ -304,3 +304,22 @@ shared:      ceil(T/B) physical blocks
 The cache pool is preallocated using `num_blocks`. With the same `num_blocks`, both layouts allocate the same KV tensor bytes; `shared` allows that pool to cover more token positions. Early exit under `last_exited` does not automatically release deeper storage because those positions retain the copied history.
 
 `shared` reduces block demand and eliminates finalization copies, but sequential prefill positions within a request can limit performance. The layout alone does not establish which implementation is faster. Because historical attention inputs differ, the layouts are not interchangeable as a lossless memory optimization, and this example does not establish an accuracy ranking.
+
+## 7. Plane packing for partially recurrent models
+
+Huginn runs a prelude and a coda once per token and repeats only the recurrent block. Prelude and coda attention use depth 0. A `last_exited` block in any deeper plane therefore holds live KV only in the recurrent layers' slots; the other layer slots are allocated but never written or read. For Huginn-0125 (2 prelude, 4 recurrent, 2 coda layers, 32 depths) 124 of 256 layer slots per logical page are dead.
+
+When the recurrent layers are contiguous and occupy at most half of the layers, `CacheConfig(pack_recurrent_planes=True)` (the default) stores `k = num_layers // num_recurrent_layers` deeper planes in one physical block. Each packed plane uses its own slot range. Plane 0 still holds every layer:
+
+```text
+physical planes per page = 1 + ceil((D - 1) / k)       # Huginn-0125: 1 + ceil(31 / 2) = 17
+plane 0 page entry       = physical_block * num_layers
+plane d >= 1 page entry  = physical_block * num_layers + member * num_recurrent - first_recurrent
+member                   = (d - 1) % k,  physical plane = 1 + (d - 1) // k
+```
+
+`get_block_table(request_id, depth)` returns these page entries. A layer's K/V for a row lives at page `entry + layer` of the layer-flattened cache `key_cache.view(num_blocks * num_layers, block_size, kv_heads, head_dim)`. Writes, attention, CUDA graphs, the device-resident routing tables and finalization (the Triton `finalize_kernel` copies `finalize_layers` slots from each entry with `entry_stride`) add the layer to the entry instead of indexing the layer axis. The stored values and the attention arithmetic are unchanged; only addresses move, so packed and unpacked execution produce bitwise-identical tokens and KV. Nothing is copied or recomputed.
+
+`plane_block_tables` and the allocation views count physical planes, so `required_blocks` shrinks by `D / physical planes` (1.88x for Huginn-0125) and the same KV pool holds that many more tokens. `transfer_slots` reports each physical plane's live slot range. PD sends only those slots, packed or not: 132 of 256 layer slots per Huginn-0125 page, and the coordinator prices reservations in `blocks_per_page` physical blocks.
+
+Models whose layers all recur (Ouro, Nanbeige) are unaffected: `k` is 1 and every path keeps the unpacked addressing. A non-recurrent layer may be accessed only at depth 0 in a packed cache; the manager rejects any other access because those slots belong to another plane.

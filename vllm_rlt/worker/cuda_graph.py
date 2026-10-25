@@ -39,29 +39,22 @@ class _DeviceCache:
         self.cache = cache
 
     def _write_prepared(self, layer, batch, k, v):
-        cache = self.cache
-        cache.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
-        cache.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+        self.cache._store_layer(layer, batch.write_blocks, batch.write_offsets, k, v)
 
     def _attend_prepared(self, layer, batch, q):
         cache = self.cache
+        keys, values, tables = cache._layer_kv(layer, batch.block_tables)
         if batch.cu_seqlens_q is not None:
             return cache.attention.prefill(
                 q,
-                cache.key_cache[:, layer],
-                cache.value_cache[:, layer],
-                batch.block_tables,
+                keys,
+                values,
+                tables,
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
             )
-        return cache.attention(
-            q,
-            cache.key_cache[:, layer],
-            cache.value_cache[:, layer],
-            batch.block_tables,
-            batch.context_lengths,
-        )
+        return cache.attention(q, keys, values, tables, batch.context_lengths)
 
 
 def _graph_entry(hidden, batch, cache, max_position_embeddings):

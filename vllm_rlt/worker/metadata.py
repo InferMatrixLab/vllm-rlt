@@ -144,7 +144,7 @@ class MetadataBuilder:
         """Resolve physical addresses and reject aliased writes across query rows."""
         cache = self.cache
         blocks = [
-            allocation.block_tables[cache._plane(depth)][position // cache.block_size]
+            cache._entries(allocation, depth)[position // cache.block_size]
             for allocation, depth, position in rows
         ]
         if offsets is None:
@@ -197,7 +197,7 @@ class MetadataBuilder:
             blocks, _ = self._write_addresses(rows, offsets=offsets, for_write=for_write)
             attention = plan_attention_metadata(
                 AttentionRows(
-                    block_tables=[a.block_tables[cache._plane(d)] for a, d, _ in rows],
+                    block_tables=[cache._entries(a, d) for a, d, _ in rows],
                     positions=positions,
                     sequence_keys=[(id(a), d) for a, d, _ in rows] if packed else None,
                 ),

@@ -18,13 +18,18 @@ class Transfer:
 def kv_segments(info, tables, start, end):
     """Map valid token ranges to contiguous byte segments, preserving every depth.
 
-    A full physical block holds all layers. Partial blocks need one range per
-    layer; unused tail bytes are never sent or advertised as initialized.
+    ``tables`` has one physical block table per physical plane and
+    ``plane_slots`` each plane's live layer slots (default: every layer). A full
+    page sends its live slots as one range; partial pages need one range per
+    slot. Unused tail bytes and dead layer slots are never sent.
     """
     page = info["block_size"]
     if not 0 <= start < end:
         raise ValueError("invalid KV range")
-    for table in tables:
+    slots = info.get("plane_slots") or ((0, info["num_layers"]),) * len(tables)
+    if len(slots) != len(tables):
+        raise ValueError("one live slot range is required per physical plane")
+    for table, (first, last) in zip(tables, slots):
         if end > len(table) * page:
             raise ValueError("KV range exceeds allocation")
         for logical in range(start // page, (end - 1) // page + 1):
@@ -36,9 +41,13 @@ def kv_segments(info, tables, start, end):
             for base in (info["key_ptr"], info["value_ptr"]):
                 address = base + block * info["block_bytes"]
                 if lo == 0 and hi == page:
-                    yield (address, info["block_bytes"], info["device"])
+                    yield (
+                        address + first * info["layer_bytes"],
+                        (last - first) * info["layer_bytes"],
+                        info["device"],
+                    )
                 else:
-                    for layer in range(info["num_layers"]):
+                    for layer in range(first, last):
                         yield (
                             address + layer * info["layer_bytes"] + lo * info["token_bytes"],
                             (hi - lo) * info["token_bytes"],
@@ -90,6 +99,7 @@ class NixlConnector:
             block_size=cache.block_size,
             num_layers=cache.num_layers,
             depths=cache.storage_depths,
+            plane_slots=tuple(tuple(slot) for slot in cache.transfer_slots),
             block_bytes=k.stride(0) * element,
             layer_bytes=k.stride(1) * element,
             token_bytes=k.stride(2) * element,
@@ -111,6 +121,9 @@ class NixlConnector:
         for key in ("block_size", "num_layers", "depths", "block_bytes", "hidden_bytes"):
             if peer[key] != self.info[key]:
                 raise ValueError(f"PD KV geometry mismatch: {key}")
+        # Slot ranges may arrive as lists after serialization.
+        if [list(s) for s in peer["plane_slots"]] != [list(s) for s in self.info["plane_slots"]]:
+            raise ValueError("PD KV geometry mismatch: plane_slots")
         self.peers[name] = peer
 
     def submit(self, transfer_id, sequence, peer, local, remote, size):

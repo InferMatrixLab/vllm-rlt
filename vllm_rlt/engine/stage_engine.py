@@ -161,6 +161,7 @@ class StageEngine:
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
+            pack_recurrent_planes=cache_config.pack_recurrent_planes,
         )
         self.scheduler = Scheduler(
             scheduler_config,

@@ -4,9 +4,17 @@ LAST-EXITED copies the last computed per-layer KV into skipped deeper planes.
 SHARED overwrites a single plane and needs no exit copies. Optional incremental
 allocation separates logical capacity from physical pages. Immutable full-depth
 prompt blocks can be shared through the prefix cache.
+
+Plane packing: when only a contiguous subset of layers recurs (Huginn's core
+between a prelude and coda), planes deeper than zero leave the other layer
+slots of every block unused. Packing stores several such planes in one physical
+block, each in its own slot range, and addresses a row's layer as page
+``entry + layer`` of the layer-flattened cache. Nothing is copied or recomputed;
+only block tables change.
 """
 
 import hashlib
+import math
 import struct
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -53,10 +61,32 @@ class _WrittenPositions:
 @dataclass
 class _Allocation:
     max_tokens: int
+    # Physical blocks, one table per physical plane.
     block_tables: tuple[tuple[int, ...], ...]
     written: list[list[_WrittenPositions]]
     transfer_leases: set[str] = field(default_factory=set)
     release_requested: bool = False
+    # Packed layouts only: per logical plane, the layer-flattened page entry of
+    # each logical page (physical block * layers + plane slot base).
+    entry_tables: tuple[tuple[int, ...], ...] | None = None
+
+
+def plane_packing(num_layers, recurrent_layers, max_loops, layout="last_exited", enabled=True):
+    """How many depth planes share one physical block (1 means no packing)."""
+    layers = sorted(range(num_layers) if recurrent_layers is None else recurrent_layers)
+    contiguous = layers == list(range(layers[0], layers[0] + len(layers)))
+    factor = num_layers // len(layers)
+    if not enabled or layout != "last_exited" or max_loops < 2 or not contiguous or factor < 2:
+        return 1
+    return factor
+
+
+def physical_planes(num_layers, recurrent_layers, max_loops, layout="last_exited", enabled=True):
+    """Physical blocks per logical page across every depth plane."""
+    if layout != "last_exited":
+        return 1
+    factor = plane_packing(num_layers, recurrent_layers, max_loops, layout, enabled)
+    return max_loops if factor == 1 else 1 + math.ceil((max_loops - 1) / factor)
 
 
 @dataclass(frozen=True)
@@ -103,6 +133,7 @@ class KVCacheManager:
         recurrent_layers: Sequence[int] | None = None,
         *,
         attention: AttentionBackend | None = None,
+        pack_recurrent_planes: bool = False,
     ):
         for name, value in (
             ("num_layers", num_layers),
@@ -133,6 +164,13 @@ class KVCacheManager:
         ):
             raise ValueError("recurrent_layers must be valid cache layer indices")
         self.storage_depths = max_loops if layout == "last_exited" else 1
+        self.plane_packing = plane_packing(
+            num_layers, self.recurrent_layers, max_loops, layout, pack_recurrent_planes
+        )
+        self.physical_planes = physical_planes(
+            num_layers, self.recurrent_layers, max_loops, layout, pack_recurrent_planes
+        )
+        self._recurrent_set = frozenset(self.recurrent_layers)
         self.device = torch.device(device)
         self.dtype = dtype
         self.attention = attention or create_backend(
@@ -143,6 +181,9 @@ class KVCacheManager:
         shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
         self.key_cache = torch.empty(shape, device=self.device, dtype=dtype)
         self.value_cache = torch.empty_like(self.key_cache)
+        # Layer-flattened views: page (block * num_layers + layer) is one layer's block.
+        self._flat_keys = self.key_cache.view(-1, block_size, num_kv_heads, head_dim)
+        self._flat_values = self.value_cache.view(-1, block_size, num_kv_heads, head_dim)
         # Resolve an implicit CUDA index to the actual storage device once.
         self.device = self.key_cache.device
         self._free_blocks = list(reversed(range(num_blocks)))
@@ -186,7 +227,85 @@ class KVCacheManager:
     def required_blocks(self, max_tokens: int) -> int:
         if not isinstance(max_tokens, Integral) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
-        return ((max_tokens + self.block_size - 1) // self.block_size) * self.storage_depths
+        return ((max_tokens + self.block_size - 1) // self.block_size) * self.physical_planes
+
+    @property
+    def transfer_slots(self) -> tuple[tuple[int, int], ...]:
+        """Per physical plane, the layer slot range holding live KV.
+
+        Plane zero holds every layer. Deeper planes hold only recurrent layers,
+        in their own slots when unpacked or packed from slot zero when packed.
+        """
+        full = (0, self.num_layers)
+        if self.physical_planes == 1:
+            return (full,)
+        count = len(self.recurrent_layers)
+        if self.plane_packing > 1:
+            deeper = self.storage_depths - 1
+            return (full,) + tuple(
+                (0, min(self.plane_packing, deeper - group * self.plane_packing) * count)
+                for group in range(self.physical_planes - 1)
+            )
+        layers = sorted(self.recurrent_layers)
+        if layers != list(range(layers[0], layers[0] + count)):
+            return (full,) * self.physical_planes
+        return (full,) + ((layers[0], layers[0] + count),) * (self.physical_planes - 1)
+
+    @property
+    def entry_stride(self) -> int:
+        """Element stride between consecutive page entries of ``get_block_table``."""
+        return self.key_cache.stride(1 if self.plane_packing > 1 else 0)
+
+    @property
+    def finalize_layers(self) -> tuple[int, int]:
+        """Layer slot range an early-exit copy moves: ``(first, count)``."""
+        if self.plane_packing > 1:
+            return min(self.recurrent_layers), len(self.recurrent_layers)
+        return 0, self.num_layers
+
+    @staticmethod
+    def entry_tables(allocation: _Allocation) -> tuple[tuple[int, ...], ...]:
+        """Per logical plane, the page entries rows address (physical blocks unless packed)."""
+        if allocation.entry_tables is None:
+            return allocation.block_tables
+        return allocation.entry_tables
+
+    def _entries(self, allocation: _Allocation, depth: int) -> tuple[int, ...]:
+        """Page entries a row at ``depth`` addresses: physical blocks unless packed."""
+        return self.entry_tables(allocation)[self._plane(depth)]
+
+    def _refresh_entries(self, allocation: _Allocation) -> None:
+        if self.plane_packing == 1:
+            return
+        tables = [tuple(b * self.num_layers for b in allocation.block_tables[0])]
+        count, first = len(self.recurrent_layers), min(self.recurrent_layers)
+        for plane in range(1, self.storage_depths):
+            group, member = divmod(plane - 1, self.plane_packing)
+            base = member * count - first
+            physical = allocation.block_tables[1 + group]
+            tables.append(tuple(b * self.num_layers + base for b in physical))
+        allocation.entry_tables = tuple(tables)
+
+    def _layer_kv(self, layer: int, tables: torch.Tensor):
+        """K/V block views and tables for one layer's attention call."""
+        if self.plane_packing == 1:
+            return self.key_cache[:, layer], self.value_cache[:, layer], tables
+        return self._flat_keys, self._flat_values, tables + layer
+
+    def _store_layer(self, layer, blocks, offsets, k, v) -> None:
+        if self.plane_packing == 1:
+            self.key_cache[blocks, layer, offsets] = k
+            self.value_cache[blocks, layer, offsets] = v
+        else:
+            self._flat_keys[blocks + layer, offsets] = k
+            self._flat_values[blocks + layer, offsets] = v
+
+    def _require_packed_layer(self, layer, rows) -> None:
+        # A boundary layer exists only in plane zero; elsewhere its slots belong
+        # to another packed plane.
+        if self.plane_packing > 1 and layer not in self._recurrent_set:
+            if any(self._plane(row[1]) for row in rows):
+                raise ValueError("non-recurrent layers have KV only at depth zero")
 
     def _drop_refs(self, blocks):
         for b in blocks:
@@ -296,14 +415,14 @@ class KVCacheManager:
         claimed = [b for group in prefix for b in group]
         for b in claimed:
             self._refs[b] += 1
-        fresh = self._claim((pages - len(prefix)) * self.storage_depths)
+        fresh = self._claim((pages - len(prefix)) * self.physical_planes)
         if fresh is None:
             self._drop_refs(claimed)
             return False
         tail = pages - len(prefix)
         tables = tuple(
             tuple(g[d] for g in prefix) + tuple(fresh[d * tail : (d + 1) * tail])
-            for d in range(self.storage_depths)
+            for d in range(self.physical_planes)
         )
         length = len(prefix) * self.block_size
         self._allocations[request_id] = _Allocation(
@@ -314,6 +433,7 @@ class KVCacheManager:
                 for _ in range(self.storage_depths)
             ],
         )
+        self._refresh_entries(self._allocations[request_id])
         self.prefix_queries += 1
         self.prefix_hits += length
         return True
@@ -326,13 +446,14 @@ class KVCacheManager:
         extra = pages - len(allocation.block_tables[0])
         if extra <= 0:
             return True
-        blocks = self._claim(extra * self.storage_depths)
+        blocks = self._claim(extra * self.physical_planes)
         if blocks is None:
             return False
         allocation.block_tables = tuple(
             t + tuple(blocks[d * extra : (d + 1) * extra])
             for d, t in enumerate(allocation.block_tables)
         )
+        self._refresh_entries(allocation)
         return True
 
     def truncate_suffix(self, request_id: str, frontier: int) -> None:
@@ -397,18 +518,20 @@ class KVCacheManager:
 
     def allocated_blocks(self, request_id: str) -> int:
         """How many physical blocks this request holds, counting every plane."""
-        return len(self._get_allocation(request_id).block_tables[0]) * self.storage_depths
+        return len(self._get_allocation(request_id).block_tables[0]) * self.physical_planes
 
     def get_block_table(self, request_id: str, depth: int) -> tuple[int, ...]:
+        """Page entries for ``depth``: physical blocks, or flattened pages when packed."""
         self._validate_depth(depth)
-        return self._get_allocation(request_id).block_tables[self._plane(depth)]
+        return self._entries(self._get_allocation(request_id), depth)
 
     def plane_block_tables(self, request_id: str) -> tuple[tuple[int, ...], ...]:
-        """One block table per plane.
+        """One physical block table per physical plane.
 
-        This tuple is indexed by plane, not by loop depth. LAST_EXITED has
-        ``max_loops`` planes and SHARED has one, so ``tables[2]`` fails under
-        SHARED while ``get_block_table(rid, 2)`` works under both layouts.
+        This tuple is indexed by physical plane, not by loop depth. LAST_EXITED
+        has ``max_loops`` planes (fewer when packed) and SHARED has one, so
+        ``tables[2]`` fails under SHARED while ``get_block_table(rid, 2)`` works
+        under both layouts. ``transfer_slots`` gives each plane's live layers.
         """
         return self._get_allocation(request_id).block_tables
 
@@ -669,8 +792,7 @@ class KVCacheManager:
         if isinstance(batch, DeviceKVMetadata):
             self._validate_tensor(k, len(batch.position_ids), "k")
             self._validate_tensor(v, len(batch.position_ids), "v")
-            self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
-            self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+            self._store_layer(layer, batch.write_blocks, batch.write_offsets, k, v)
             return
         if not batch.writable:
             raise ValueError("a read-only prepared KV batch cannot be written")
@@ -678,8 +800,9 @@ class KVCacheManager:
         self._validate_tensor(v, len(batch.position_ids), "v")
         if not batch.rows:
             return
-        self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
-        self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
+        self._require_packed_layer(layer, batch.rows)
+        rows = len(batch.rows)
+        self._store_layer(layer, batch.write_blocks, batch.write_offsets, k[:rows], v[:rows])
         for allocation, depth, position in batch.rows:
             allocation.written[self._plane(depth)][layer].add(position)
 
@@ -714,34 +837,25 @@ class KVCacheManager:
         self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
         if isinstance(batch, DeviceKVMetadata):
-            return self.attention(
-                q,
-                self.key_cache[:, layer],
-                self.value_cache[:, layer],
-                batch.block_tables,
-                batch.context_lengths,
-            )
+            keys, values, tables = self._layer_kv(layer, batch.block_tables)
+            return self.attention(q, keys, values, tables, batch.context_lengths)
         if not batch.rows:
             return torch.empty_like(q)
+        self._require_packed_layer(layer, batch.rows)
         for allocation, depth, position in batch.rows:
             self._require_prefix(allocation, layer, depth, position + 1)
+        keys, values, tables = self._layer_kv(layer, batch.block_tables)
         if batch.cu_seqlens_q is not None:
             return self.attention.prefill(
                 q,
-                self.key_cache[:, layer],
-                self.value_cache[:, layer],
-                batch.block_tables,
+                keys,
+                values,
+                tables,
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
             )
-        return self.attention(
-            q,
-            self.key_cache[:, layer],
-            self.value_cache[:, layer],
-            batch.block_tables,
-            batch.context_lengths,
-        )
+        return self.attention(q, keys, values, tables, batch.context_lengths)
 
     @torch.no_grad()
     def finalize_token(self, request_id: str, position: int, exit_depth: int) -> None:
@@ -750,13 +864,23 @@ class KVCacheManager:
         if self.layout == "shared":
             return
         logical_page, offset = divmod(position, self.block_size)
-        source = allocation.block_tables[self._plane(exit_depth)][logical_page]
+        source = self._entries(allocation, exit_depth)[logical_page]
         destinations = [
-            allocation.block_tables[self._plane(depth)][logical_page]
+            self._entries(allocation, depth)[logical_page]
             for depth in range(exit_depth + 1, self.max_loops)
         ]
         # Basic-index copies avoid a blocking host->device index tensor on the
         # boundary stream. That transfer would serialize final core and routing.
+        if self.plane_packing > 1:
+            # Packed recurrent layers are contiguous pages of the flattened cache.
+            first, last = min(self.recurrent_layers), max(self.recurrent_layers) + 1
+            for destination in destinations:
+                for cache in (self._flat_keys, self._flat_values):
+                    cache[destination + first : destination + last, offset].copy_(
+                        cache[source + first : source + last, offset]
+                    )
+            self._record_finalized(allocation, position, exit_depth)
+            return
         for destination in destinations:
             if len(self.recurrent_layers) == self.num_layers:
                 self.key_cache[destination, :, offset].copy_(self.key_cache[source, :, offset])
@@ -787,9 +911,11 @@ class KVCacheManager:
             raise ValueError("read length exceeds the request's reserved token budget")
         self._require_prefix(allocation, layer, depth, length)
         positions = torch.arange(length, device=self.device)
-        table = torch.tensor(
-            allocation.block_tables[self._plane(depth)], device=self.device, dtype=torch.long
-        )
+        table = torch.tensor(self._entries(allocation, depth), device=self.device, dtype=torch.long)
         blocks = table[positions // self.block_size]
         offsets = positions % self.block_size
+        if self.plane_packing > 1:
+            self._require_packed_layer(layer, ((allocation, depth, 0),))
+            pages = blocks + layer
+            return self._flat_keys[pages, offsets], self._flat_values[pages, offsets]
         return self.key_cache[blocks, layer, offsets], self.value_cache[blocks, layer, offsets]

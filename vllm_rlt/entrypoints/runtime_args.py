@@ -35,6 +35,12 @@ def add_runtime_args(parser):
         help="Copy metadata to the GPU instead of reading mapped host memory",
     )
     parser.add_argument("--kv-layout", choices=["last_exited", "shared"], default="last_exited")
+    parser.add_argument(
+        "--no-pack-recurrent-planes",
+        action="store_false",
+        dest="pack_recurrent_planes",
+        help="Keep one physical block per depth plane even when only some layers recur",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
     parser.add_argument("--memory-reserve-bytes", type=int, default=256 * 1024 * 1024)
@@ -94,6 +100,7 @@ def runtime_configs(args):
             num_blocks=args.num_blocks,
             block_size=args.block_size,
             layout=args.kv_layout,
+            pack_recurrent_planes=args.pack_recurrent_planes,
             gpu_memory_utilization=args.gpu_memory_utilization,
             kv_cache_memory_bytes=args.kv_cache_memory_bytes,
             memory_reserve_bytes=args.memory_reserve_bytes,

@@ -628,6 +628,7 @@ def test_pd_reservations_are_reported_before_worker_acknowledgments():
         num_blocks=64,
         block_size=2,
         depths=4,
+        blocks_per_page=4,
         watermark_blocks=0,
         info={"agent": "test"},
     )
@@ -642,3 +643,43 @@ def test_pd_reservations_are_reported_before_worker_acknowledgments():
     assert engine.stats() == dict(requests=1, reserved_blocks=20)
     assert len(messages) == 1 and messages[0][0] == ("decode", "reserve")
     assert not hasattr(engine, "cache_manager") and not hasattr(engine, "scheduler")
+
+
+@pytest.mark.parametrize("pack", [False, True])
+def test_segments_send_exactly_live_huginn_slots(pack):
+    # Prelude 0, recurrent 1-2, coda 3; five depths.
+    c = KVCacheManager(4, 2, 8, 64, 4, 5, recurrent_layers=(1, 2), pack_recurrent_planes=pack)
+    c.allocate("a", 9)
+    k = c.key_cache
+    info = dict(
+        block_size=4,
+        num_blocks=64,
+        num_layers=4,
+        device=0,
+        block_bytes=k.stride(0) * 4,
+        layer_bytes=k.stride(1) * 4,
+        token_bytes=k.stride(2) * 4,
+        key_ptr=0,
+        value_ptr=10**9,
+        plane_slots=c.transfer_slots,
+    )
+    expected = set()
+    for depth in range(5):
+        for token in range(2, 9):
+            for layer in range(4) if depth == 0 else (1, 2):
+                page = c.get_block_table("a", depth)[token // 4]
+                if not pack:
+                    page = page * 4 + layer
+                else:
+                    page += layer
+                for base in (0, 10**9):
+                    pos = base + page * info["layer_bytes"] + (token % 4) * info["token_bytes"]
+                    expected.update(range(pos, pos + info["token_bytes"]))
+    actual = set()
+    segments = list(kv_segments(info, c.plane_block_tables("a"), 2, 9))
+    for address, size, _ in segments:
+        assert not actual & set(range(address, address + size))
+        actual.update(range(address, address + size))
+    assert actual == expected
+    # Huginn-0125 shape: live bytes are 132 of 256 layer planes either way.
+    assert len(expected) == 2 * 7 * (4 + 4 * 2) * info["token_bytes"]
