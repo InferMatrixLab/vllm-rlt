@@ -35,8 +35,6 @@ successive recurrent calls ("waves").
 | B | | | 0 | 1 | 2 | 3 | | |
 | C | | | | | 0 | 1 | 2 | 3 |
 
-![Baseline and loop-level speculative scheduling](assets/loop-schedule-comparison.svg)
-
 Offset `o` enters at wave `o*d`, after its parent's draft head chose its input, and
 advances one depth per wave. A child therefore starts `d` waves after its parent,
 so at every layer the same-depth KV of earlier positions is written before the
