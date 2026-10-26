@@ -45,6 +45,10 @@ class _DeviceCache:
 
     def _attend_prepared(self, layer, batch, q):
         cache = self.cache
+        if getattr(batch, "wise", None) is not None:
+            return cache.wise.attend_static(
+                layer, batch, q, cache.key_cache[:, layer], cache.value_cache[:, layer]
+            )
         if batch.cu_seqlens_q is not None:
             return cache.attention.prefill(
                 q,
@@ -81,8 +85,18 @@ def _graph_entry(hidden, batch, cache, max_position_embeddings):
                 else None
             ),
             max_seqlen_q=batch.max_seqlen_q,
+            wise=None,
         ),
     )
+
+
+def _attach_wise(entry, cache):
+    """Give a WISE decode graph its own static modes, slots and scratch."""
+    metadata = entry.metadata
+    metadata.wise = cache.wise.static_inputs(
+        len(metadata.context_lengths), metadata.block_tables, metadata.context_lengths
+    )
+    return entry
 
 
 def _copy_graph_inputs(entry, hidden, batch):
@@ -119,14 +133,24 @@ class RecurrentGraphs:
     def select(self, hidden, batch):
         count = _query_count(batch)
         packed = batch.cu_seqlens_q is not None
+        wise = self.cache.wise is not None and not packed and self.cache.wise.is_decode(batch)
         if len(batch.position_ids) != count:
-            batch = replace(
+            trimmed = replace(
                 batch,
                 position_ids=batch.position_ids[:count],
                 context_lengths=batch.context_lengths[:count],
                 block_tables=batch.block_tables[:count],
             )
-        key = (count, len(batch.context_lengths), batch.max_seqlen_q if packed else 1, packed)
+            if wise:
+                self.cache.wise.inherit(trimmed, batch)
+            batch = trimmed
+        # WISE and dense decode capture different attention; never replay one as the other.
+        key = (
+            count,
+            len(batch.context_lengths),
+            batch.max_seqlen_q if packed else 1,
+            "wise" if wise else packed,
+        )
         frontier = {}
         contiguous = True
         host_rows = () if isinstance(batch, DeviceKVMetadata) else batch.rows
@@ -153,6 +177,8 @@ class RecurrentGraphs:
             entry = _graph_entry(
                 hidden, batch, self.cache, self.model.config.max_position_embeddings
             )
+            if wise:
+                _attach_wise(entry, self.cache)
             entry.graph = None
             self.entries[key] = entry
         return PreparedGraph(batch, entry)
@@ -179,6 +205,8 @@ class RecurrentGraphs:
             if self.last_event is not None:
                 stream.wait_event(self.last_event)
             _copy_graph_inputs(entry, hidden, batch)
+            if entry.metadata.wise is not None:
+                cache.wise.copy_static(entry.metadata.wise, batch)
             if entry.graph is None:
                 proxy = _DeviceCache(cache)
                 entry.graph, entry.output = _capture(
