@@ -1,5 +1,8 @@
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
+
+import torch
 
 from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
@@ -46,6 +49,11 @@ class StageEngine:
         connector: StageConnector | None = None,
     ):
         self.model = model
+        self._weight_version = 0
+        self._update_version = None
+        self._update_failed = False
+        self._updated_names = set()
+        self._paused = False
         self.stage_config = stage_config or StageConfig()
         self.profiling = Profiler(next(model.parameters()).device)
         cache_config = cache_config or CacheConfig()
@@ -273,11 +281,15 @@ class StageEngine:
 
     def _add_request(self, request_id, prompt_token_ids, sampling_params, *, trace_id=None):
         """Validate and register a stage-local request from either ingress path."""
+        if self._update_version is not None or self._update_failed or self._paused:
+            raise RuntimeError("Generation admission is paused")
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
         if self.async_speculative and params.temperature != 0:
             raise ValueError("async speculative decoding currently requires greedy sampling")
+        if self.async_speculative and params.logprobs is not None:
+            raise ValueError("async speculative decoding does not yet support logprobs")
         if request_id in self._retiring_speculative:
             self._retire_speculative(wait=True, request_id=request_id)
         config = self.model.config
@@ -285,9 +297,12 @@ class StageEngine:
             raise ValueError("prompt must contain at least one token")
         if any(type(t) is not int or not 0 <= t < config.vocab_size for t in prompt_token_ids):
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
+        if any(t >= config.vocab_size for t in params.stop_token_ids):
+            raise ValueError("stop token IDs must be within the model vocabulary")
         max_loops = params.max_loops or config.total_ut_steps
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
+        params = replace(params, max_loops=max_loops, top_k=min(params.top_k, config.vocab_size))
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
@@ -330,6 +345,7 @@ class StageEngine:
                 list(prompt_token_ids),
                 params,
                 exit_trace=trace,
+                weight_version=self._weight_version,
                 # Prefill always runs the model's full depth, whatever decode
                 # loop bound the request asks for.
                 prefill_depth_ranges=Request.prefill_boundaries(
@@ -337,6 +353,69 @@ class StageEngine:
                 ),
             )
         )
+
+    def get_weight_version(self) -> int:
+        return self._weight_version
+
+    def pause_generation(self):
+        # Existing requests can drain through step(); no new requests are admitted.
+        self._paused = True
+
+    def resume_generation(self):
+        if self._update_version is not None or self._update_failed:
+            raise RuntimeError("Complete the weight update before resuming generation")
+        self._paused = False
+
+    def reset_prefix_cache(self):
+        if self.has_unfinished_requests() or getattr(self.connector, "has_pending", False):
+            raise RuntimeError("Finish active requests before resetting cached KV")
+        self.model_runner.synchronize()
+        self.cache_manager.reset_prefix_cache()
+
+    def start_weight_update(self, version: int | None = None):
+        if self.has_unfinished_requests() or getattr(self.connector, "has_pending", False):
+            raise RuntimeError("Weight updates require an idle engine")
+        latest = max(self._weight_version, self._update_version or 0)
+        version = latest + 1 if version is None else version
+        if type(version) is not int or version <= latest:
+            raise ValueError("Weight version must increase")
+        self.reset_prefix_cache()
+        self._update_version, self._update_failed = version, False
+        self._updated_names.clear()
+
+    @torch.no_grad()
+    def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        if self._update_version is None or self._update_failed:
+            raise RuntimeError("Start a full weight update first")
+        parameters = dict(self.model.named_parameters())
+        try:
+            weights = list(weights)
+            names = [name for name, _ in weights]
+            if len(set(names)) != len(names) or self._updated_names.intersection(names):
+                raise ValueError("Duplicate weight in full update")
+            for name, value in weights:
+                if name not in parameters or value.shape != parameters[name].shape:
+                    raise ValueError(f"Weight name or shape mismatch: {name}")
+            for name, value in weights:
+                parameters[name].copy_(value)
+            self._updated_names.update(names)
+        except Exception:
+            # A failed transfer may have copied some tensors. A fresh full update
+            # is the only recovery; generation never sees that mixed policy.
+            self._update_failed = True
+            raise
+
+    def finish_weight_update(self):
+        if self._update_version is None or self._update_failed:
+            raise RuntimeError("No successful weight update to finish")
+        if self._updated_names != dict(self.model.named_parameters()).keys():
+            raise ValueError("Full update must include every physical parameter")
+        device = next(self.model.parameters()).device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self._weight_version, self._update_version = self._update_version, None
+        self._updated_names.clear()
+        return self._weight_version
 
     def request_ids(self):
         return tuple(self.scheduler.requests)
@@ -398,6 +477,8 @@ class StageEngine:
         return self.profiling.wait(timeout)
 
     def step(self) -> list[RequestOutput]:
+        if self._update_version is not None or self._update_failed:
+            raise RuntimeError("Generation is unavailable during a weight update")
         if not self.profiling.recording:
             return self._step()
         try:

@@ -1194,7 +1194,9 @@ class Scheduler:
         request.generated_token_ids.append(token)
         request.exit_depths.append(depth)
         params = request.sampling_params
-        if token in self.eos_token_ids and not params.ignore_eos:
+        if token in params.stop_token_ids or (
+            token in self.eos_token_ids and not params.ignore_eos
+        ):
             request.finish_reason = FinishReason.STOP
         elif len(request.generated_token_ids) >= params.max_tokens:
             request.finish_reason = FinishReason.LENGTH
@@ -1294,6 +1296,8 @@ class Scheduler:
                         raise RuntimeError("invalid pending output count")
                     request.num_output_placeholders -= 1
                 depth = result.depths[row] if delivered else request.loops_done
+                if request.sampling_params.logprobs is not None:
+                    request.log_probs.append(result.log_probs[row])
                 if self._record_token(request, result.token_ids[row], depth):
                     update.finished.append(request)
                 elif not delivered:
@@ -1317,7 +1321,9 @@ class Scheduler:
                             "speculative GPU frontier disagrees with committed prefix"
                         )
                 emitted = 0
-                for token in spec.token_ids:
+                for index, token in enumerate(spec.token_ids):
+                    if request.sampling_params.logprobs is not None:
+                        request.log_probs.append(spec.log_probs[index])
                     emitted += 1
                     if self._record_token(request, token, self.speculative_config.target_loops):
                         update.finished.append(request)
