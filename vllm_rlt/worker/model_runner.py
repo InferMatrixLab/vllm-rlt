@@ -54,7 +54,7 @@ class BatchInputBuffers:
 
 class InputSegment(NamedTuple):
     state_slot: int
-    chunk_offset: int
+    hidden_row_offset: int
     token_count: int
     batch_row_start: int
     keep_intermediate: bool
@@ -159,6 +159,7 @@ class ModelRunner:
         exit_config=None,
         execution_config=None,
         scheduler_config=None,
+        staged_prefill=None,
         rng: RngRegistry | None = None,
     ):
         self.model = model.eval()
@@ -211,7 +212,6 @@ class ModelRunner:
                 torch.nn.init.zeros_(head.bias)
             self.lookahead_head = head.to(device=self.device, dtype=parameter.dtype).eval()
             self.lookahead_head.requires_grad_(False)
-        self.split_prefill = not self.execution_config.atomic_prefill
         self.core_stream = self.boundary_stream = self.copy_stream = self.readback_stream = None
         if self.device.type == "cuda":
             self.core_stream = torch.cuda.Stream(device=self.device)
@@ -261,14 +261,15 @@ class ModelRunner:
         self.states = None
         # Prompt hidden states staged between split-prefill scheduling boundaries.
         # Sized by the same helper the memory plan reserves with.
-        stage_rows = prefill_stage_rows(model.config, scheduler, self.execution_config)
+        stage_rows = prefill_stage_rows(model.config, scheduler, staged_prefill=staged_prefill)
+        self.staged_prefill = stage_rows > 0
         self.prefill_states = (
             torch.empty(
                 (scheduler.max_num_seqs, stage_rows, model.config.hidden_size),
                 device=self.device,
                 dtype=parameter.dtype,
             )
-            if self.split_prefill
+            if self.staged_prefill
             else None
         )
         prefill_rows = scheduler.max_num_batched_tokens
@@ -280,13 +281,15 @@ class ModelRunner:
                 device=self.device,
                 dtype=parameter.dtype,
             )
-            if self.split_prefill
+            if self.staged_prefill
             else None
         )
         self.batch_input_buffers = (
             [
                 BatchInputBuffers(
-                    scheduler.max_num_seqs,
+                    scheduler.max_num_batched_tokens
+                    if scheduler.wavefront_chunked_prefill
+                    else scheduler.max_num_seqs,
                     max(scheduler.max_num_batched_tokens, scheduler.prefill_chunk_size),
                     self.device,
                     parameter.dtype,
@@ -294,7 +297,7 @@ class ModelRunner:
                 )
                 for _ in range(MAX_CONCURRENT_SUBMISSIONS)
             ]
-            if self.split_prefill
+            if self.staged_prefill
             else []
         )
         # Immutable prompt rows are filled once per request/runner-slot lifetime.
@@ -305,7 +308,7 @@ class ModelRunner:
                 torch.int64,
                 self.device,
             )
-            if self.split_prefill
+            if self.staged_prefill
             else None
         )
         self.prompt_token_owners = {}
@@ -396,18 +399,22 @@ class ModelRunner:
         max_rows = 0
         for index, span in enumerate(batch.spans):
             state_slot = self._ensure_request_slot(span.request)
-            chunk_offset = span.token_start - span.chunk_start
+            hidden_row_offset = (
+                span.prefill_hidden_row_offset
+                if span.prefill_hidden_row_offset is not None
+                else span.token_start - span.chunk_start
+            )
             keep_intermediate = span.retain_chunk
             segment = InputSegment(
                 state_slot,
-                chunk_offset,
+                hidden_row_offset,
                 span.token_count,
                 row_start,
                 keep_intermediate,
             )
             buffers.segments.np[index] = (
                 segment.state_slot,
-                segment.chunk_offset,
+                segment.hidden_row_offset,
                 segment.token_count,
                 segment.batch_row_start,
                 int(segment.keep_intermediate),
@@ -452,8 +459,14 @@ class ModelRunner:
             slot = self._ensure_request_slot(request)
             chunk = None
             if span.chunk_start is not None:
-                start = span.token_start - span.chunk_start
-                chunk = self.prefill_states[slot, start : start + span.token_count]
+                hidden_row_offset = (
+                    span.prefill_hidden_row_offset
+                    if span.prefill_hidden_row_offset is not None
+                    else span.token_start - span.chunk_start
+                )
+                chunk = self.prefill_states[
+                    slot, hidden_row_offset : hidden_row_offset + span.token_count
+                ]
                 source = chunk
             else:
                 source = request.hidden_state
@@ -531,7 +544,7 @@ class ModelRunner:
             hidden[start:end].copy_(
                 self.prefill_states[
                     segment.state_slot,
-                    segment.chunk_offset : segment.chunk_offset + segment.token_count,
+                    segment.hidden_row_offset : segment.hidden_row_offset + segment.token_count,
                 ]
             )
         return hidden
@@ -540,6 +553,8 @@ class ModelRunner:
         metadata = prepared.batch_inputs
         if metadata.mixed:
             self._mixed_hidden(hidden, prepared, scatter=True)
+            return
+        if not any(span.retain_chunk for span in prepared.batch.spans):
             return
         if self.device.type == "cuda":
             from vllm_rlt.kernels.routing import scatter_segments_kernel
@@ -569,7 +584,7 @@ class ModelRunner:
                     continue
                 self.prefill_states[
                     segment.state_slot,
-                    segment.chunk_offset : segment.chunk_offset + segment.token_count,
+                    segment.hidden_row_offset : segment.hidden_row_offset + segment.token_count,
                 ].copy_(
                     hidden[segment.batch_row_start : segment.batch_row_start + segment.token_count]
                 )

@@ -56,12 +56,12 @@ class SchedulingPolicy:
 class PromptOnlyPolicy(SchedulingPolicy):
     """Select prompt work only; resource ownership and execution stay shared."""
 
-    def __init__(self, config, *, atomic_prefill):
+    def __init__(self, config, *, staged_prefill):
         super().__init__(config)
         self.PREFILL_WORKS = (
-            (WorkKey.PROMPT_ATOMIC,)
-            if atomic_prefill
-            else (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
+            (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
+            if staged_prefill
+            else (WorkKey.PROMPT_ATOMIC,)
         )
 
     def schedule(self, scheduler, *, prefer_recurrent=False):
@@ -144,12 +144,12 @@ class NoRefillPolicy(SchedulingPolicy):
 class SpeculativePolicy(SchedulingPolicy):
     """Schedule draft/verify rounds with independently chunked prompt work."""
 
-    def __init__(self, config, *, atomic_prefill=True):
+    def __init__(self, config):
         super().__init__(config)
         self.PREFILL_WORKS = (
-            (WorkKey.PROMPT_ATOMIC,)
-            if atomic_prefill
-            else (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
+            (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
+            if requires_staged_prefill(config, produces_tokens=True)
+            else (WorkKey.PROMPT_ATOMIC,)
         )
 
     def schedule(self, scheduler, *, prefer_recurrent=False):
@@ -169,7 +169,7 @@ class SpeculativePolicy(SchedulingPolicy):
 
 
 class SplitPrefillPolicy(RefillPolicy):
-    """Refill ordering where each prompt recurrence depth is its own batch."""
+    """Refill ordering for staged prompt work and recurrent depth boundaries."""
 
     PREFILL_WORKS = (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
 
@@ -188,24 +188,39 @@ class MixedPolicy(SplitPrefillPolicy):
 def create_scheduling_policy(
     scheduler_config: SchedulerConfig,
     speculative_config: SpeculativeConfig | None,
-    atomic_prefill: bool = True,
     *,
     produces_tokens: bool = True,
 ) -> SchedulingPolicy:
-    """Pick one policy and reject combinations no policy implements."""
+    """Pick one policy; reject combinations no policy implements yet.
+
+    Failing here keeps an unimplemented mode from silently changing
+    semantics or returning an empty schedule forever.
+    """
+    staged_prefill = requires_staged_prefill(scheduler_config, produces_tokens=produces_tokens)
+
+    # Prompt-only phases do not use prompt/generation interleaving rules.
     if not produces_tokens:
-        return PromptOnlyPolicy(scheduler_config, atomic_prefill=atomic_prefill)
+        return PromptOnlyPolicy(
+            scheduler_config,
+            staged_prefill=requires_staged_prefill(scheduler_config, produces_tokens=False),
+        )
+
+    # The remaining compatibility checks apply to generation scheduling.
     if scheduler_config.mode == "mixed":
-        if atomic_prefill or speculative_config is not None:
-            raise ValueError("mixed scheduling requires non-atomic, non-speculative work")
-    elif not atomic_prefill and speculative_config is None and scheduler_config.mode != "refill":
-        raise ValueError("split prefill currently implements refill scheduling only")
+        if speculative_config is not None:
+            raise ValueError("mixed scheduling does not support speculative work")
+    elif staged_prefill and speculative_config is None and scheduler_config.mode != "refill":
+        raise ValueError("staged prefill currently implements refill or mixed scheduling")
 
     if scheduler_config.mode == "mixed":
         return MixedPolicy(scheduler_config)
     if speculative_config is not None:
-        return SpeculativePolicy(scheduler_config, atomic_prefill=atomic_prefill)
-    if atomic_prefill:
-        policy_cls = RefillPolicy if scheduler_config.mode == "refill" else NoRefillPolicy
-        return policy_cls(scheduler_config)
-    return SplitPrefillPolicy(scheduler_config)
+        return SpeculativePolicy(scheduler_config)
+    if staged_prefill:
+        return SplitPrefillPolicy(scheduler_config)
+    policy_cls = RefillPolicy if scheduler_config.mode == "refill" else NoRefillPolicy
+    return policy_cls(scheduler_config)
+
+
+def requires_staged_prefill(config: SchedulerConfig, *, produces_tokens: bool = True) -> bool:
+    return config.wavefront_chunked_prefill or (produces_tokens and config.mode == "mixed")

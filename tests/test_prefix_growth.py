@@ -87,7 +87,7 @@ def test_incremental_growth_matches_reserved_generation():
 
 @pytest.mark.parametrize("stage", [WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT])
 def test_incremental_split_prefill_reserves_prompt_growth(stage):
-    prompt = list(range(1, 9))
+    prompt = list(range(1, 18))
     e = LLMEngine(
         model(),
         cache_config=CacheConfig(64, 2, incremental_allocation=True),
@@ -96,8 +96,9 @@ def test_incremental_split_prefill_reserves_prompt_growth(stage):
             max_num_batched_tokens=2,
             prefill_chunk_size=2,
             enable_preemption=True,
+            wavefront_chunked_prefill=True,
         ),
-        execution_config=ExecutionConfig(atomic_prefill=False),
+        execution_config=ExecutionConfig(),
     )
     try:
         e.add_request("split", prompt, SamplingParams(max_tokens=1, ignore_eos=True))
@@ -105,7 +106,10 @@ def test_incremental_split_prefill_reserves_prompt_growth(stage):
         request = e.scheduler.requests["split"]
         assert e.scheduler.pending_work(request) is WorkKey.PROMPT_PRELUDE
         if stage is WorkKey.PROMPT_RECURRENT:
-            e.step()
+            for _ in range(8):
+                if e.scheduler.pending_work(request) is WorkKey.PROMPT_RECURRENT:
+                    break
+                e.step()
             assert e.scheduler.pending_work(request) is WorkKey.PROMPT_RECURRENT
 
         allocated = e.cache_manager.allocated_blocks(request.request_id)

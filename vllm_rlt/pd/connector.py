@@ -188,7 +188,10 @@ class PDStageConnector:
         transfer = self.transfers[request.request_id]
         if transfer.request is not request:
             raise RuntimeError("stale transfer generation")
-        if work == WorkKey.PROMPT_PRELUDE:
+        if work == WorkKey.PROMPT_PRELUDE or (
+            work == WorkKey.PROMPT_RECURRENT
+            and self.engine.scheduler.config.wavefront_chunked_prefill
+        ):
             transfer.transfer_overlaps += self.transport.busy(transfer.tid)
         if not progress.chunk_complete:
             transfer.last_event = event

@@ -125,6 +125,7 @@ def test_independent_stage_resources_preserve_output_after_import(atomic, asynch
             d.cache_manager.value_cache[dst].copy_(p.cache_manager.value_cache[src])
     assert d.accept_import(target, source.hidden_state.clone())
     assert d.scheduler.requests["r"] is target
+    assert target.prefill_reclaimable_tokens == len(prompt)
     assert p.release_transfer(source)
     local.add_request("r", prompt, params)
     assert drain(d) == drain(local)
@@ -255,20 +256,20 @@ def test_spawned_mixed_worker_matches_local_without_connector(asynchronous):
     import multiprocessing
 
     from vllm_rlt.engine.worker import worker_main
+    from vllm_rlt.models import ModelConfig
 
     local = make_stage_engine(mixed=True, asynchronous=asynchronous)
     options = dict(
         seed=123,
         dtype="float32",
         revision=None,
+        model_config=ModelConfig(tiny_ouro_config()),
         engine=dict(
             cache_config=CacheConfig(128, 2),
             scheduler_config=SchedulerConfig(
                 mode="mixed", max_num_seqs=3, max_num_batched_tokens=4, prefill_chunk_size=3
             ),
-            execution_config=ExecutionConfig(
-                atomic_prefill=False, async_scheduling=asynchronous, static_buffers=True
-            ),
+            execution_config=ExecutionConfig(async_scheduling=asynchronous, static_buffers=True),
             exit_config=ExitConfig("ouro_delayed" if asynchronous else "ouro"),
         ),
     )
@@ -297,6 +298,7 @@ def test_spawned_mixed_worker_matches_local_without_connector(asynchronous):
         ready = receive()
         assert ready["kind"] == "ready"
         assert ready["role"] == "prefill_decode"
+        assert "model" not in ready and "model_type" not in ready
         assert "info" not in ready  # No registered transport or PD handshake.
         params = SamplingParams(max_tokens=3, ignore_eos=True)
         for request_id, tokens in (("a", [1, 2, 3, 4, 5]), ("b", [2, 3])):
@@ -562,6 +564,9 @@ def test_module_weight_source_preserves_explicit_deployment(
     _, device, weights, settings = launch.call_args.args
     assert device == expected_device
     assert settings["dtype"] == expected_dtype
+    assert not client.ready
+    assert client.model_config.model_specific_config is model.config
+    assert settings["model_config"] is client.model_config
     assert weights is not model
     assert next(weights.parameters()).device.type == "cpu"
     client.closed = True
@@ -597,8 +602,9 @@ def test_transfer_reservation_preserves_active_prompt_growth(receiving, preempti
             max_num_batched_tokens=2,
             prefill_chunk_size=2,
             enable_preemption=preemption,
+            wavefront_chunked_prefill=True,
         ),
-        execution_config=ExecutionConfig(atomic_prefill=False),
+        execution_config=ExecutionConfig(),
     )
     params = SamplingParams(max_tokens=1, ignore_eos=True)
     try:

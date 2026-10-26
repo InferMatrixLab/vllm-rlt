@@ -7,7 +7,7 @@ from tests.helpers import tiny_ouro_config
 from vllm_rlt import SamplingParams, SchedulerConfig
 from vllm_rlt.core.execution import ExecutionBatch, Operation, StateSpan, WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
-from vllm_rlt.core.scheduler import Scheduler, SchedulerOutput
+from vllm_rlt.core.scheduler import ScheduledRequest, Scheduler, SchedulerOutput
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Request, RequestStatus
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime, build_execution_batch
@@ -15,6 +15,30 @@ from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime, build_execution
 
 def make_span(name, start, count, depth):
     return StateSpan(Request(name, [1], SamplingParams()), start, count, depth)
+
+
+def test_mixed_decode_batch_yields_after_one_loop_without_queued_decode(monkeypatch):
+    scheduler = Scheduler(SchedulerConfig(mode="mixed"), None, total_ut_steps=4)
+    scheduled = [
+        ScheduledRequest(
+            Request("decode", [1, 2], SamplingParams()),
+            WorkKey.DECODE_RECURRENT,
+            token_start=2,
+            depth=1,
+        ),
+        ScheduledRequest(
+            Request("prompt", [3, 4], SamplingParams()),
+            WorkKey.PROMPT_RECURRENT,
+            token_start=0,
+            token_count=2,
+            depth=0,
+            chunk_start=0,
+        ),
+    ]
+    monkeypatch.setattr(scheduler, "has_ready_work", lambda work: False)
+    monkeypatch.setattr(scheduler, "_max_contiguous_prefill_loops", lambda item: 4)
+
+    assert scheduler._planned_loop_count(scheduled) == 1
 
 
 def make_cache(config, layout):
@@ -146,7 +170,7 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
     from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig
     from vllm_rlt.engine.llm_engine import LLMEngine
 
-    def run(mode, atomic=False):
+    def run(mode, wavefront=False):
         torch.manual_seed(123)
         engine = LLMEngine(
             OuroForCausalLM(tiny_ouro_config()).to(
@@ -159,9 +183,9 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
                 max_num_seqs=3,
                 max_num_batched_tokens=5,
                 prefill_chunk_size=4,
+                wavefront_chunked_prefill=wavefront,
             ),
             execution_config=ExecutionConfig(
-                atomic_prefill=atomic,
                 cuda_graphs=graphs,
                 async_scheduling=asynchronous,
                 static_buffers=padded,
@@ -169,7 +193,29 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
             ),
             exit_config=ExitConfig(mode="ouro_delayed" if asynchronous else "ouro"),
         )
-        for name, prompt in (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10])):
+        prompts = (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10]))
+        if mode == "mixed":
+            engine.add_request(
+                "short",
+                [1],
+                SamplingParams(
+                    max_tokens=6,
+                    max_loops=3,
+                    ignore_eos=True,
+                    exit_threshold=0.6,
+                ),
+            )
+            for _ in range(40):
+                engine.step()
+                if (
+                    engine.scheduler.pending_work(engine.scheduler.requests["short"])
+                    == WorkKey.DECODE_RECURRENT
+                ):
+                    break
+            else:
+                pytest.fail("decode request did not reach recurrent work")
+            prompts = prompts[1:]
+        for name, prompt in prompts:
             engine.add_request(
                 name,
                 prompt,
@@ -205,9 +251,18 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
             if batch is not None and batch.is_mixed:
                 works = {item.work for item in batch.requests}
                 if len(works) == 2:
+                    recurrent_mix = works == {
+                        WorkKey.DECODE_RECURRENT,
+                        WorkKey.PROMPT_RECURRENT,
+                    }
                     # Both storage kinds pass through a single model invocation.
                     if not graphs:
                         assert calls == [batch.num_tokens]
+                    elif not recurrent_mix:
+                        assert works == {
+                            WorkKey.DECODE_PRELUDE,
+                            WorkKey.PROMPT_PRELUDE,
+                        }
                     assert batch.num_tokens <= 5
                     mixed.append(batch)
             if not engine.has_unfinished_requests():
@@ -217,11 +272,13 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
         assert engine.cache_manager.num_used_blocks == 0
         return outputs, mixed
 
-    expected, _ = run("refill", atomic=True)
+    expected, _ = run("refill")
     separated, _ = run("refill")
-    actual, mixed = run("mixed")
-    assert mixed
-    assert actual == separated == expected
+    original_mixed, original_batches = run("mixed")
+    wavefront_refill, _ = run("refill", wavefront=True)
+    actual, mixed = run("mixed", wavefront=True)
+    assert original_batches and mixed
+    assert actual == wavefront_refill == original_mixed == separated == expected
 
 
 def mixed_ready_engine():
@@ -235,8 +292,17 @@ def mixed_ready_engine():
             prefill_chunk_size=4,
         )
     )
-    for name, prompt in (("short", [1]), ("long", list(range(2, 11)))):
-        engine.add_request(name, prompt, SamplingParams(max_tokens=6, ignore_eos=True))
+    engine.add_request("short", [1], SamplingParams(max_tokens=6, ignore_eos=True))
+    for _ in range(40):
+        engine.step()
+        if (
+            engine.scheduler.pending_work(engine.scheduler.requests["short"])
+            == WorkKey.DECODE_RECURRENT
+        ):
+            break
+    else:
+        pytest.fail("decode request did not reach recurrent work")
+    engine.add_request("long", list(range(2, 11)), SamplingParams(max_tokens=6, ignore_eos=True))
     for _ in range(100):
         batch = engine.scheduler.schedule()
         works = batch.works if batch is not None else frozenset()
@@ -405,8 +471,8 @@ def test_continuous_loop_range_matches_yielding_each_loop(chunked, padded):
         engine = LLMEngine(
             OuroForCausalLM(tiny_ouro_config()),
             cache_config=CacheConfig(64, 2),
+            scheduler_config=SchedulerConfig(wavefront_chunked_prefill=chunked),
             execution_config=ExecutionConfig(
-                atomic_prefill=False,
                 static_buffers=padded,
                 pad_to_power_of_two=padded,
             ),

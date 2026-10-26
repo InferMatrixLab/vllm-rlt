@@ -22,6 +22,7 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
     spans = []
     batch_operation = None
     batch_loop_count = None
+    planned_loops = scheduled_batch.loop_count
     for scheduled_request in scheduled_batch.requests:
         work = scheduled_request.work
         request = scheduled_request.request
@@ -30,9 +31,13 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
             raise ValueError(f"work {work.name} is handled by the speculative runner")
         chunk = work in (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
         prompt_input = work in (WorkKey.PROMPT_ATOMIC, WorkKey.PROMPT_PRELUDE)
-        loop_count = (
-            total_depths if work == WorkKey.PROMPT_ATOMIC else int(operation == Operation.RECURRENT)
-        )
+        loop_count = planned_loops
+        if loop_count is None:
+            loop_count = (
+                total_depths
+                if work == WorkKey.PROMPT_ATOMIC
+                else int(operation == Operation.RECURRENT)
+            )
         if batch_operation is None:
             batch_operation, batch_loop_count = operation, loop_count
         elif operation != batch_operation or loop_count != batch_loop_count:
@@ -59,14 +64,18 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
                 token_count=scheduled_request.token_count,
                 depth=depth,
                 chunk_start=scheduled_request.chunk_start if chunk else None,
-                retain_chunk=chunk and (work == WorkKey.PROMPT_PRELUDE or depth + 1 < total_depths),
+                retain_chunk=chunk
+                and (work == WorkKey.PROMPT_PRELUDE or depth + loop_count < total_depths),
                 retain_last=scheduled_request.completes_prompt if chunk else True,
                 emit_gate=work == WorkKey.DECODE_RECURRENT,
                 input_tokens=tuple(
                     request.prompt_token_ids[position : position + scheduled_request.token_count]
                 )
-                if prompt_input and not chunk
+                if prompt_input and (not chunk or loop_count > 0)
                 else None,
+                prefill_hidden_row_offset=(
+                    scheduled_request.prefill_hidden_row_offset if chunk else None
+                ),
             )
         )
     if batch_operation is None:

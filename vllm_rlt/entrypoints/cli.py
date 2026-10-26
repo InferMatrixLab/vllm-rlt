@@ -125,6 +125,7 @@ def main():
             max_num_batched_tokens=args.max_num_batched_tokens,
             mode=args.mode,
             prefill_chunk_size=getattr(args, "prefill_chunk_size", 128),
+            wavefront_chunked_prefill=getattr(args, "wavefront_chunked_prefill", False),
             max_prefill_batches_before_decode=getattr(args, "max_prefill_batches_before_decode", 1),
             admission_scan_limit=getattr(args, "admission_scan_limit", 64),
             max_admission_bypasses=getattr(args, "max_admission_bypasses", 8),

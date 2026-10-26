@@ -12,10 +12,83 @@ from safetensors.torch import save_file
 from tests.helpers import tiny_nanbeige_config, tiny_ouro_config
 from vllm_rlt.models import (
     AutoModelForCausalLM,
+    ModelConfig,
     NanbeigeForCausalLM,
     OuroForCausalLM,
+    prepare_model,
     resolve_local_model_path,
 )
+
+
+@pytest.mark.parametrize("family", ["ouro", "nanbeige", "huginn"])
+def test_entry_config_preserves_properties_and_checkpoint_weights(tmp_path, monkeypatch, family):
+    from tests.test_huginn import tiny_huginn_config
+    from vllm_rlt.models import HuginnForCausalLM
+
+    config_factory, model_cls = {
+        "ouro": (tiny_ouro_config, OuroForCausalLM),
+        "nanbeige": (tiny_nanbeige_config, NanbeigeForCausalLM),
+        "huginn": (tiny_huginn_config, HuginnForCausalLM),
+    }[family]
+    concrete = config_factory()
+    original = model_cls(concrete)
+    (tmp_path / "config.json").write_text(json.dumps(concrete.to_dict()))
+    save_file(
+        {key: value.clone() for key, value in original.state_dict().items()},
+        tmp_path / "model.safetensors",
+    )
+    source, revision, config = prepare_model(tmp_path)
+    assert config.total_ut_steps == concrete.total_ut_steps
+    assert config.max_position_embeddings == concrete.max_position_embeddings
+    assert config.vocab_size == concrete.vocab_size
+    assert ModelConfig(concrete).model_specific_config is concrete
+    assert prepare_model(original)[2].model_specific_config is original.config
+    with pytest.raises(ValueError, match="do not match"):
+        prepare_model(original, model_config=ModelConfig(tiny_ouro_config(vocab_size=99)))
+
+    # Neither the Auto factory nor the family loader may reconstruct configuration.
+    (tmp_path / "config.json").unlink()
+    resolver = Mock(side_effect=AssertionError("configuration resolved twice"))
+    monkeypatch.setattr("vllm_rlt.models.resolve_model_config", resolver)
+    loaded = AutoModelForCausalLM.from_pretrained(
+        source, revision=revision, model_config=config, dtype=torch.float32
+    )
+    assert loaded.config is config.model_specific_config
+    for key, value in original.state_dict().items():
+        torch.testing.assert_close(loaded.state_dict()[key], value, rtol=0, atol=0)
+    resolver.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "model_cls,config_factory",
+    [
+        (OuroForCausalLM, tiny_ouro_config),
+        (NanbeigeForCausalLM, tiny_nanbeige_config),
+    ],
+)
+def test_stage_checkpoint_uses_entry_config_after_spawn(tmp_path, model_cls, config_factory):
+    from vllm_rlt.config import CacheConfig
+    from vllm_rlt.engine.llm_engine import StageClient
+
+    concrete = config_factory()
+    model = model_cls(concrete)
+    save_file(model.state_dict(), tmp_path / "model.safetensors")
+    # No config.json exists: the child must use the supplied, pickled configuration.
+    config = ModelConfig(concrete)
+    client = StageClient(
+        tmp_path,
+        model_config=config,
+        dtype="float32",
+        attention_backend="torch",
+        cache_config=CacheConfig(64, 2),
+    )
+    try:
+        assert client.model_config is config
+        assert client.ready
+        assert "model" not in client.info and "model_type" not in client.info
+        assert client.stats()["requests"] == 0
+    finally:
+        client.close()
 
 
 @pytest.fixture

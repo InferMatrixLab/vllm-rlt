@@ -136,7 +136,10 @@ routes a speculative selection to the local round controller. StageEngine
 constructs these objects; Executor references them rather than creating another
 model/KV owner. Runners manage preparation, buffers, stream/event dependencies,
 execution and result storage; the ordinary runner also handles sampling after
-CODA. A returned ticket does not imply device completion.
+CODA. A returned ticket does not imply device completion. The
+[sync vs async speculation timeline](async-speculative.md#timeline-synchronous-versus-asynchronous-speculation)
+shows how GPU-owned next-token state lets consecutive rounds overlap result
+readback and CPU commit within this same stage.
 
 **Shared execution and resources.** ModelRunner constructs ModelRuntime and the
 speculative controller references that same runtime. Both use the worker-loaded
@@ -156,6 +159,20 @@ and optional stream overlap remain execution choices behind this interface.
 | Input buffers, GPU events and readback storage | Runner/controller owners, retained until consumers finish |
 | Preemption snapshots | Engine-owned PreemptionManager, invoked through scheduler callbacks |
 | Transport staging and remote-access lifetime | Connector; local Request/KV changes are coordinated through StageEngine |
+
+**Model configuration.** Deployment entry points construct a shared `ModelConfig`
+from the resolved checkpoint JSON, an existing concrete config, or `module.config`
+before spawning workers. It retains the concrete model config and delegates common
+request limits, including derived properties. StageClient and the PD coordinator
+retain it; spawned workers receive copies. Checkpoint workers load weights using
+the concrete config without reparsing JSON; config-only inputs construct models,
+and module inputs retain their supplied weights. Models and StageEngine continue
+to use the concrete config. Configuration is treated as read-only after initialization.
+Worker `ready` messages report runtime capacity and transport information, not a
+serialized model config. PD still verifies worker-computed weight/KV fingerprints
+before connecting peers; static configuration does not prove runtime compatibility.
+PD validates model-family support before spawning workers and explicitly rejects
+unsupported families.
 
 **Connector and deployment.** Worker calls `connector.progress()` independently
 of engine progress. Connector readiness/backpressure reaches Scheduler through
@@ -376,5 +393,5 @@ and are not mixed into these charts.
 | Which loops can share a batch, and when does a request wait? | [Loop-level scheduler](scheduler.md) |
 | How are inputs prepared, transferred and executed? | [Runtime execution and configuration](runtime.md) |
 | Which KV history does a loop read, and who retains it? | [Model semantics](design.md) and [KV management](kv_cache_walkthrough.md) |
-| How do draft/verify rounds advance asynchronously? | [Asynchronous speculation](async-speculative.md) |
+| How do draft/verify rounds advance asynchronously? | [Sync vs async timeline](async-speculative.md#timeline-synchronous-versus-asynchronous-speculation) |
 | How do I launch and serve a configuration? | [First-run guide](launching.md) and [HTTP serving](serving.md) |

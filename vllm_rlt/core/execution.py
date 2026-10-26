@@ -39,6 +39,7 @@ class StateSpan:
     # None addresses the request's single resident hidden row. Otherwise the
     # span addresses [token_start - chunk_start, ...] in its resident chunk.
     chunk_start: int | None = None
+    prefill_hidden_row_offset: int | None = None
     retain_chunk: bool = False
     retain_last: bool = True
     emit_gate: bool = False

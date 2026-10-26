@@ -1,5 +1,6 @@
 """Bounded recurrent-core graphs; request bookkeeping and sampling stay eager."""
 
+import gc
 import math
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -21,6 +22,10 @@ def _capture(hidden, stream, pool, run):
         for _ in range(2):
             run()
     stream.synchronize()
+    # torch.cuda.graph no longer collects garbage before capture. Do it here, so
+    # an allocation inside the capture cannot run the collector and free an earlier
+    # engine's cyclic CUDA state (graphs, streams, pinned buffers) mid-capture.
+    gc.collect()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, pool=pool, stream=stream):
         output = run()

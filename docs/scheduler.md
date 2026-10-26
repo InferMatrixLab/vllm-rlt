@@ -60,22 +60,23 @@ scheduling eligibility; execution events order the actual device consumers.
 Selection combines different decisions; the implementation class names are not
 peer conceptual choices:
 
-- **Prefill granularity — atomic or split:** does a prompt chunk finish all its
-  recurrent depths in one submission, or yield at loop boundaries?
+- **Prefill boundary — full depth or scheduler yield:** does this batch finish
+  every remaining recurrent depth locally, or return at a loop boundary for a
+  concrete scheduling decision?
 - **Batching — refill or no-refill:** can prompt work replenish ongoing
   generation, or must the current cohort drain first? **Mixed** additionally
   combines compatible prompt and decode recurrent spans in the same batch;
   refilling alone does not imply a mixed batch.
 
 The ordinary-generation rows in C show currently supported combinations:
-atomic with refill/no-refill, and split with refill/mixed. These are compatibility
-rules, not a claim that the two dimensions mean the same thing.
-`SplitPrefillPolicy` uses refill ordering with split prompt work;
-`MixedPolicy` extends that behavior with recurrent co-batching.
+full-depth prompt chunks with refill/no-refill, and scheduler-selected depth
+boundaries with refill/mixed. These are compatibility rules, not a claim that
+the two dimensions mean the same thing. `SplitPrefillPolicy` is selected when
+WCPB requires staged prompt work; `MixedPolicy` adds recurrent co-batching.
 
 Prompt-only is a stage-role constraint. Speculation selects a local draft/verify
-controller; it currently requires refill, supports atomic/split prefill subject
-to model constraints, and excludes mixed. See
+controller; it currently requires refill, uses full-depth prompt chunks unless
+WCPB is enabled, and excludes mixed. See
 [policies and execution granularity](#policies-and-execution-granularity).
 
 The colored tiles illustrate a mixed recurrent batch: R1 is a prompt span at
@@ -232,7 +233,10 @@ There is no dedicated queue containing snapshots. `Scheduler.waiting` contains r
 logical state must not be confused with physical-address metadata that becomes
 invalid when GPU resources are reassigned.
 
-For split prefill, `_rewind_split_prefill()` first resets an unfinished chunk to `num_prefilled_tokens` and returns `WorkKey.PROMPT_PRELUDE`. The snapshot therefore records the rewound work, not necessarily the loop at which the request was interrupted. The unfinished chunk is replayed after restoration.
+For split prefill, `_rewind_split_prefill()` first resets an unfinished chunk to
+`num_prefilled_tokens` and returns `WorkKey.PROMPT_PRELUDE`. The snapshot therefore
+records the rewound work, not necessarily the loop at which the request was
+interrupted. WCPB also resets its ring origin to this full-depth frontier.
 
 #### Current policy: triggers and eligibility
 
@@ -443,7 +447,8 @@ The runner submits one recurrent batch and waits on the preceding device events
 of its members, deduplicating shared events. It does not execute three separate
 request forwards, combine their KV histories, or require their depths to match.
 PRELUDE and CODA are different operations and are not packed into this recurrent
-submission. Current mixed scheduling requires non-atomic, non-speculative work.
+submission. Mixed scheduling excludes speculative work and uses a depth boundary
+when ready decode work can join prompt recurrent work.
 
 Logical progress then branches per request: A can continue at depth 2; B can enter
 CODA if its exit is established; C can continue its prompt span at depth 1.
@@ -476,9 +481,22 @@ Atomic prefill can execute PRELUDE plus all recurrent loops in one submission,
 retaining the same preparation, dependency and completion contract. Therefore
 one arrow between model operations does not always mean a new scheduler submission.
 
+With WCPB enabled, one request can stage up to `total_ut_steps` chunks and retain
+one ready chunk per recurrence depth. For four depths, after chunk 0 completes
+depth 0, the next recurrent batch can contain `chunk0@depth1` and
+`chunk1@depth0`; the following batch can add `chunk2@depth0`. A task is ready
+only when its hidden input exists and all earlier KV rows at that same
+LAST_EXITED depth are valid. The request's full-depth frontier advances only
+through final-depth work, and a ring slot is reusable only after its chunk
+finishes that depth. The implementation flattens selected token rows for the
+model call and keeps each chunk/depth range in its metadata.
+
 Speculative draft/verify execution uses its own round controller. Its host decision
 points and buffer ownership must be read from that controller; the ordinary
-runner timeline is not a complete speculative-round diagram.
+runner timeline is not a complete speculative-round diagram. See the
+[sync vs async speculation timeline](async-speculative.md#timeline-synchronous-versus-asynchronous-speculation)
+for CPU submission/commit, compute and copy streams, and overlapping round
+lifetimes under the two-ticket limit.
 
 | Dependency | What must be ready? | Where it is enforced |
 | --- | --- | --- |
@@ -600,9 +618,11 @@ exit decisions. The scheduler can then form a different batch. Prompt tokens
 still traverse the full model depth; mixing does not apply decode early exit to
 prompt rows.
 
-PRELUDE and CODA are selected separately. Mixed scheduling currently combines
-`DECODE_RECURRENT` and `PROMPT_RECURRENT`, not arbitrary operations or speculative
-verification rows.
+Without WCPB, PRELUDE and CODA are selected separately. With WCPB, MixedPolicy
+may combine decode PRELUDE rows with prompt-chunk PRELUDE rows because both use
+the same operation. Mixed recurrent batches combine `RECURRENT` and
+`PROMPT_RECURRENT` spans, including multiple depths from one prompt request;
+CODA and speculative verification remain separate operations.
 
 ## Who owns each decision?
 
@@ -728,22 +748,25 @@ independent, peer configuration dimensions.
 | `RefillPolicy` | Prefer ready PRELUDE, eligible CODA and due recurrent work; admit and interleave prompt work |
 | `NoRefillPolicy` | Prepare a cohort, drain its recurrence, then process CODA before filling the next cohort |
 | `SplitPrefillPolicy` | Refill ordering with separate `PROMPT_PRELUDE` and `PROMPT_RECURRENT` scheduling boundaries |
-| `MixedPolicy` | If both recurrent queues have ready work, select generation rows first and fill with prompt spans; otherwise use split-prefill ordering |
+| `MixedPolicy` | If both recurrent queues have ready work, select generation rows first and fill with prompt spans; otherwise use split-prefill ordering or the WCPB full-depth plan |
 | `SpeculativePolicy` | Select CODA bootstrap, prompt work and local draft/verify rounds, with a prefill fairness bound |
 
 `create_scheduling_policy()` first handles prompt-only stages, then checks
 compatible generation configurations and selects a policy. Mixed generation
-requires `atomic_prefill=False` and no speculative configuration. Split prefill
-requires LAST_EXITED KV at engine construction; model-specific restrictions
-still apply. Ordinary split generation currently uses refill or mixed, not
-no-refill. Speculative generation requires refill.
+selects staged prompt work automatically and excludes speculative configuration.
+WCPB also requires staged prompt state. Both require LAST_EXITED KV; model
+restrictions still apply. Speculative generation requires refill.
 
-Atomic prefill changes the scheduling boundary, not the execution architecture.
-An atomic prompt chunk runs its prelude and all recurrent depths locally in one
-submission. Split prefill yields between operations/depths. Both bind into the
-same execution path. Chunk size and loop submission size are distinct choices.
-The current split path retains one staged prompt chunk per request; it does not
-stage the next chunk while the current chunk still needs its hidden rows.
+`SchedulerOutput.loop_count` is the actual execution boundary. A regular prompt
+chunk runs its prelude and all recurrent depths locally in one submission.
+Mixed mode inserts a boundary when ready decode work can join prompt recurrent
+work, and it returns after every depth in such a mixed batch. With no ready
+decode work, the prompt batch can run through its remaining depths. WCPB always
+returns after one depth to regroup ready chunks. Chunk size and loop submission
+size are distinct choices; WCPB retains up to one staged chunk per model depth.
+Ordinary prompt chunks already end at the scheduler's configured chunk boundary,
+where decode/speculative work and admission or preemption are reconsidered.
+Merely having waiters or enabling preemption does not split a chunk's recurrence.
 
 Fairness counts nonempty scheduled batches, not attempts or GPU completions.
 Prompt batches increment the configured prefill counter; generation RECURRENT

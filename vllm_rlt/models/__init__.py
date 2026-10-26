@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from .config import ModelConfig, prepare_model
 from .huginn import HuginnConfig, HuginnForCausalLM
 from .nanbeige import NanbeigeConfig, NanbeigeForCausalLM
 from .ouro import OuroConfig, OuroForCausalLM
@@ -136,14 +137,19 @@ class AutoModelForCausalLM:
     @classmethod
     def _dispatch_from_config(
         cls,
-        config_data: dict[str, Any],
+        config_data: dict[str, Any] | ModelConfig,
         path_or_repo: str | Path,
         *,
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
     ):
-        model_type = config_data.get("model_type", "").lower()
+        config = (
+            config_data
+            if isinstance(config_data, ModelConfig)
+            else ModelConfig.from_dict(config_data)
+        )
+        model_type = config.model_type
         model_cls = MODEL_MAPPING.get(model_type)
         if model_cls is None:
             supported = sorted(MODEL_MAPPING.keys())
@@ -152,7 +158,11 @@ class AutoModelForCausalLM:
                 f"Supported types: {supported}"
             )
         return model_cls.from_pretrained(
-            path_or_repo, revision=revision, device=device, dtype=dtype
+            path_or_repo,
+            revision=revision,
+            device=device,
+            dtype=dtype,
+            config=config.model_specific_config,
         )
 
     @classmethod
@@ -160,17 +170,22 @@ class AutoModelForCausalLM:
         cls,
         path_or_repo: str | Path,
         *,
+        model_config: ModelConfig | None = None,
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
     ):
-        source, resolved_revision, config = resolve_model_config(path_or_repo, revision=revision)
+        source, resolved_revision, config = prepare_model(
+            path_or_repo, revision=revision, model_config=model_config
+        )
         return cls._dispatch_from_config(
             config, source, revision=resolved_revision, device=device, dtype=dtype
         )
 
 
 __all__ = [
+    "ModelConfig",
+    "prepare_model",
     "OuroConfig",
     "OuroForCausalLM",
     "NanbeigeConfig",

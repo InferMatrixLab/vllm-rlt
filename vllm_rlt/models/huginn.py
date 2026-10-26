@@ -310,6 +310,7 @@ class HuginnForCausalLM(nn.Module):
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
+        config: HuginnConfig | None = None,
     ) -> "HuginnForCausalLM":
         """Strictly stream safetensors into a meta model without Hub code execution."""
         from safetensors import safe_open
@@ -322,7 +323,10 @@ class HuginnForCausalLM(nn.Module):
 
             source, _, _ = resolve_model_config(path_or_repo, revision=revision)
             folder = Path(source)
-        config = HuginnConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        if config is None:
+            config = HuginnConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        elif not isinstance(config, HuginnConfig):
+            raise TypeError("config must be a HuginnConfig")
         index_path = folder / "model.safetensors.index.json"
         index = json.loads(index_path.read_text())["weight_map"] if index_path.is_file() else None
         if index is None:

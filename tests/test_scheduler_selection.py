@@ -22,7 +22,7 @@ def model():
     return OuroForCausalLM(tiny_ouro_config())
 
 
-def engine(max_num_seqs=2, atomic_prefill=True, **scheduler_options):
+def engine(max_num_seqs=2, **scheduler_options):
     return LLMEngine(
         model(),
         cache_config=CacheConfig(64, 2),
@@ -31,7 +31,7 @@ def engine(max_num_seqs=2, atomic_prefill=True, **scheduler_options):
             enable_preemption=True,
             **scheduler_options,
         ),
-        execution_config=ExecutionConfig(atomic_prefill=atomic_prefill),
+        execution_config=ExecutionConfig(),
     )
 
 
@@ -65,6 +65,28 @@ def test_batch_selection_is_never_preempted_by_a_later_item(monkeypatch):
     assert [scheduled_request.request.request_id for scheduled_request in batch.requests] == ["a"]
     assert e.preemption.preemptions == 0
     assert batch.requests[0].work == WorkKey.PROMPT_ATOMIC
+
+
+def test_wavefront_does_not_schedule_a_candidate_preempted_during_selection(monkeypatch):
+    e = engine(wavefront_chunked_prefill=True, prefill_chunk_size=2)
+    for name in ("a", "b"):
+        e.add_request(name, [1, 2, 3, 4], params())
+    e.scheduler._admit()
+    # A needs B's pages. B is already in the local candidate list when suspended.
+    monkeypatch.setattr(
+        e.cache_manager,
+        "ensure_capacity",
+        lambda rid, frontier: rid == "a" and not e.cache_manager.has_allocation("b"),
+    )
+
+    batch = e.scheduler.take_works((WorkKey.PROMPT_PRELUDE,))
+
+    assert {item.request.request_id for item in batch.requests} == {"a"}
+    assert e.preemption.preemptions == 1
+    assert list(e.scheduler.waiting) == ["b"]
+    assert not e.scheduler.work_queues[WorkKey.PROMPT_PRELUDE]
+    assert e.scheduler.requests["b"].status == RequestStatus.WAITING
+    e.close()
 
 
 def test_direct_take_does_not_inherit_an_earlier_batch_selection(monkeypatch):
@@ -118,10 +140,9 @@ def test_reused_request_id_is_not_protected_by_the_previous_request():
 
 
 @pytest.mark.parametrize("boundary", [WorkKey.DECODE_PRELUDE, WorkKey.DECODE_CODA])
-@pytest.mark.parametrize("atomic_prefill", [True, False], ids=["atomic", "split"])
-def test_refill_runs_boundary_restored_during_admission(boundary, atomic_prefill):
+def test_refill_runs_boundary_restored_during_admission(boundary):
     """A sole resumed boundary must run in the admission step that restores it."""
-    e = engine(max_num_seqs=1, atomic_prefill=atomic_prefill)
+    e = engine(max_num_seqs=1)
     e.add_request("resumed", [1, 2], params(max_tokens=3))
     request = e.scheduler.requests["resumed"]
     for _ in range(20):

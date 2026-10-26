@@ -7,6 +7,7 @@ from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
+from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.engine.connector import StageConnector
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
@@ -59,9 +60,14 @@ class StageEngine:
                 raise ValueError("Huginn prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
+        staged_prefill = requires_staged_prefill(
+            scheduler_config, produces_tokens=self.stage_config.produces_tokens
+        )
         if getattr(model, "requires_boundary_kv", False):
-            if not self.execution_config.atomic_prefill:
-                raise ValueError("Huginn requires atomic prefill")
+            if staged_prefill:
+                raise ValueError(
+                    "Huginn does not support staged prefill required by this scheduler"
+                )
             if self.execution_config.async_scheduling or self.execution_config.prefill_uva:
                 raise ValueError("Huginn requires synchronous scheduling without prefill UVA")
             if speculative_config is not None:
@@ -77,7 +83,9 @@ class StageEngine:
                 raise ValueError("speculative decoding requires fixed-depth ouro exit mode")
             if self.async_speculative and parameter.device.type != "cuda":
                 raise ValueError("async speculative decoding requires CUDA")
-            if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
+            if scheduler_config.mode != "refill" or (
+                self.async_speculative and scheduler_config.enable_preemption
+            ):
                 raise ValueError(
                     "speculative decoding requires refill scheduling without preemption"
                 )
@@ -113,9 +121,8 @@ class StageEngine:
             parameter.device.type != "cuda" or cache_config.layout != "last_exited"
         ):
             raise ValueError("prefill_uva requires CUDA packed prefill with last_exited KV")
-        if not self.execution_config.atomic_prefill:
-            if cache_config.layout != "last_exited":
-                raise ValueError("split prefill requires last_exited KV planes")
+        if staged_prefill and cache_config.layout != "last_exited":
+            raise ValueError("staged prefill requires last_exited KV planes")
         attention = create_backend(
             attention_backend,
             parameter.device,
@@ -137,6 +144,7 @@ class StageEngine:
             scheduler_config,
             self.execution_config,
             attention.info["selected_backend"],
+            staged_prefill=staged_prefill,
         )
         self.cache_manager = KVCacheManager(
             num_layers=config.num_hidden_layers,
@@ -159,7 +167,6 @@ class StageEngine:
             scheduler_config,
             self.cache_manager,
             speculative_config,
-            atomic_prefill=self.execution_config.atomic_prefill,
             produces_tokens=self.stage_config.produces_tokens,
             total_ut_steps=config.total_ut_steps,
             eos_token_id=config.eos_token_id,
@@ -176,6 +183,7 @@ class StageEngine:
             exit_config=self.exit_config,
             execution_config=self.execution_config,
             scheduler_config=scheduler_config,
+            staged_prefill=self.scheduler.staged_prefill,
             rng=self.rng,
         )
         self.speculative_runner = (
@@ -478,6 +486,8 @@ class StageEngine:
                 start=(
                     scheduled_request.token_start
                     if work == WorkKey.PROMPT_ATOMIC
+                    else progress.transfer_start
+                    if progress.transfer_start is not None
                     else scheduled_request.chunk_start
                 ),
                 progress=progress,
@@ -506,7 +516,8 @@ class StageEngine:
         count = len(prompt_token_ids)
         hit = plan.cached_tokens
         request.num_prefilled_tokens = request.num_preluded_tokens = hit
-        request.prefill_chunk_start = hit
+        request.prefill_window_origin = hit
+        request.prefill_reclaimable_tokens = hit
         request.prefill_depth_ranges[:] = Request.prefill_boundaries(
             count, self.model.config.total_ut_steps, start=hit
         )
@@ -572,6 +583,8 @@ class StageEngine:
         self.cache_manager.mark_imported_prefix(request.request_id, count, start=cached_tokens)
         self.cache_manager.publish_prefix(request.request_id, request.prompt_token_ids, count)
         request.num_prefilled_tokens = request.num_preluded_tokens = count
+        request.prefill_window_origin = count
+        request.prefill_reclaimable_tokens = count
         request.loops_done = self.model.config.total_ut_steps
         request.hidden_state = hidden
         # Keep RECEIVING until the scheduler grants a compute slot. The lease
@@ -585,7 +598,8 @@ class StageEngine:
             return work
         frontier = request.num_prefilled_tokens
         request.num_preluded_tokens = frontier
-        request.prefill_chunk_start = frontier
+        request.prefill_window_origin = frontier
+        request.prefill_reclaimable_tokens = frontier
         request.prefill_depth_ranges[:] = Request.prefill_boundaries(
             len(request.prompt_token_ids),
             self.model.config.total_ut_steps,

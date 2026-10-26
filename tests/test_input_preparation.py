@@ -21,6 +21,7 @@ from vllm_rlt.worker.metadata import KVMetadata
         ("cpu", "last_exited", "torch", False),
         pytest.param("cuda", "shared", "triton", False, marks=pytest.mark.gpu),
         pytest.param("cuda", "last_exited", "triton", False, marks=pytest.mark.gpu),
+        pytest.param("cuda", "last_exited", "triton", True, marks=pytest.mark.gpu),
         pytest.param("cuda", "last_exited", "flash_attn_4", False, marks=pytest.mark.gpu),
         pytest.param("cuda", "last_exited", "flash_attn_4", True, marks=pytest.mark.gpu),
     ],
@@ -41,7 +42,7 @@ def test_loop_preparation_reuses_growing_storage_and_only_saves_final_hidden(
         model,
         cache_config=CacheConfig(128, 16 if backend == "flash_attn_4" else 2, layout=layout),
         execution_config=ExecutionConfig(
-            atomic_prefill=True, static_buffers=True, pad_to_power_of_two=True, prefill_uva=uva
+            static_buffers=True, pad_to_power_of_two=True, prefill_uva=uva
         ),
         exit_config=ExitConfig("ouro"),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
@@ -343,8 +344,8 @@ def test_cpu_preparation_defers_transfers_and_hidden_gather(monkeypatch, device,
     e = LLMEngine(
         tiny_ouro_model().to(device),
         cache_config=CacheConfig(64, 2),
-        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
-        execution_config=ExecutionConfig(atomic_prefill=False),
+        scheduler_config=SchedulerConfig(mode="mixed", max_num_seqs=1, max_num_batched_tokens=4),
+        execution_config=ExecutionConfig(),
         attention_backend="triton" if device == "cuda" else "torch",
     )
     runner = e.model_runner
@@ -536,10 +537,12 @@ def test_forward_consumes_prepared_inputs(
         cache_config=CacheConfig(128, 2, layout=layout),
         exit_config=ExitConfig("random_lookahead"),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=3, max_num_batched_tokens=8, prefill_chunk_size=3
+            mode="refill" if atomic else "mixed",
+            max_num_seqs=3,
+            max_num_batched_tokens=8,
+            prefill_chunk_size=3,
         ),
         execution_config=ExecutionConfig(
-            atomic_prefill=atomic,
             static_buffers=static_buffers,
             pad_to_power_of_two=static_buffers,
             async_scheduling=async_scheduling,
