@@ -54,6 +54,26 @@ def test_enqueue_work_requires_registered_active_request_and_unique_pending_work
     e.close()
 
 
+def test_pending_work_index_tracks_enqueue_selection_and_removal():
+    e = engine()
+    e.add_request("r", [1, 2], params())
+    e.scheduler._admit()
+    request = e.scheduler.requests["r"]
+    assert e.scheduler.pending_work(request) is WorkKey.PROMPT_ATOMIC
+    assert e.scheduler.pending_works == {"r": WorkKey.PROMPT_ATOMIC}
+
+    batch = e.scheduler.take_works((WorkKey.PROMPT_ATOMIC,))
+    assert batch is not None
+    assert e.scheduler.pending_work(request) is None
+    assert not e.scheduler.pending_works
+
+    e.scheduler.enqueue_work(request, WorkKey.DECODE_CODA)
+    assert e.scheduler.remove_pending_work(request) is WorkKey.DECODE_CODA
+    assert not e.scheduler.pending_works
+    assert all("r" not in queue for queue in e.scheduler.work_queues.values())
+    e.close()
+
+
 def test_batch_selection_is_never_preempted_by_a_later_item(monkeypatch):
     """Selecting A must stop B's capacity failure from evicting A."""
     e = engine()
@@ -64,7 +84,19 @@ def test_batch_selection_is_never_preempted_by_a_later_item(monkeypatch):
     batch = e.scheduler.take_works((WorkKey.PROMPT_ATOMIC,))
     assert [scheduled_request.request.request_id for scheduled_request in batch.requests] == ["a"]
     assert e.preemption.preemptions == 0
-    assert batch.requests[0].work == WorkKey.PROMPT_ATOMIC
+    assert e.scheduler.requests["a"].status == RequestStatus.ACTIVE
+
+
+def test_batch_selection_reports_a_duplicate_request_in_one_queue():
+    e = engine(max_num_seqs=3)
+    for request_id in ("a", "b"):
+        e.add_request(request_id, [1, 2], params())
+    e.scheduler._admit()
+    e.scheduler.work_queues[WorkKey.PROMPT_ATOMIC].append("a")
+
+    with pytest.raises(RuntimeError, match="queued more than once"):
+        e.scheduler.take_works((WorkKey.PROMPT_ATOMIC,))
+    e.close()
 
 
 def test_wavefront_does_not_schedule_a_candidate_preempted_during_selection(monkeypatch):
@@ -124,6 +156,34 @@ def test_request_selected_in_an_earlier_batch_is_still_preemptable():
     e.add_request("requester", [3, 4], params())
     assert e.scheduler.preempt(e.scheduler.requests["requester"])
     assert "victim" in e.preemption.snapshots
+
+
+def test_waiting_resident_victim_can_be_offloaded_without_changing_queue_position():
+    e = engine(max_num_seqs=1, policy="priority")
+    e.add_request("low", [1, 2], SamplingParams(max_tokens=3, priority=10))
+    e.scheduler._admit()
+    e.add_request("high", [3, 4], SamplingParams(max_tokens=1, priority=0))
+    low = e.scheduler.requests["low"]
+    high = e.scheduler.requests["high"]
+
+    assert e.scheduler.preempt(high, priority_only=True)
+    assert low.status == RequestStatus.WAITING
+    assert e.cache_manager.has_allocation("low")
+    waiting = list(e.scheduler.waiting)
+    assert e.preemption.snapshots["low"]["kv"] is None
+
+    assert e.scheduler.preempt(high, waiting_only=True)
+    assert list(e.scheduler.waiting) == waiting
+    assert not e.cache_manager.has_allocation("low")
+    assert e.preemption.snapshots["low"]["kv"] is not None
+    assert e.preemption.preemptions == 1
+
+    e.abort_request("high")
+    e.scheduler._admit()
+    assert low.status == RequestStatus.ACTIVE
+    assert e.scheduler.has_admission_slot(low)
+    assert e.preemption.resumptions == 1
+    e.close()
 
 
 def test_reused_request_id_is_not_protected_by_the_previous_request():

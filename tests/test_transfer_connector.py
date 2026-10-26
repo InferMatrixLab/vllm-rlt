@@ -186,7 +186,7 @@ def test_commit_validation_and_late_write_rejection():
     engine.close()
 
 
-def test_ack_alone_cannot_release_unsubmitted_or_locally_pending_export():
+def test_ack_alone_cannot_release_locally_pending_export():
     engine = make_stage_engine()
     connector = make_connector(engine, slots=1)
     transfer = reserve(connector, "out", receiving=False)
@@ -213,6 +213,27 @@ def test_ack_alone_cannot_release_unsubmitted_or_locally_pending_export():
     connector.transport.busy.return_value = False
     connector.progress()
     assert connector.free_slots == [0]
+    assert engine.cache_manager.num_used_blocks == 0
+    engine.close()
+
+
+def test_unsubmitted_export_does_not_consume_compute_slot_or_retire_on_ack():
+    engine = make_stage_engine()
+    connector = make_connector(engine, slots=1)
+    transfer = reserve(connector, "unsubmitted", receiving=False)
+    assert transfer.request.status == RequestStatus.WAITING
+    assert not engine.scheduler.has_admission_slot(transfer.request)
+    assert engine.scheduler.has_admission_capacity()
+
+    connector.acknowledge(transfer.tid)
+    connector.progress()
+    assert transfer.tid in connector.transfers
+    assert not transfer.request.compute_released
+    assert engine.cache_manager.has_transfer_lease(transfer.tid)
+
+    connector.cancel(transfer.tid)
+    connector.progress()
+    assert transfer.tid not in connector.transfers
     assert engine.cache_manager.num_used_blocks == 0
     engine.close()
 

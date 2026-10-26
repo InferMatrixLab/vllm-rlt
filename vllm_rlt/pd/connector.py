@@ -402,7 +402,7 @@ class PDStageConnector:
                 if (
                     transfer.acknowledged
                     and transfer.committed
-                    and not self.engine.scheduler.has_admission_slot(transfer.request)
+                    and transfer.request.compute_released
                     and not self.transport.busy(transfer.tid)
                 ):
                     self._remove(transfer)

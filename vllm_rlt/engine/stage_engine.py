@@ -230,6 +230,7 @@ class StageEngine:
         if scheduler_config.enable_preemption:
             self.scheduler.suspend_callback = self.preemption.suspend
             self.scheduler.resume_callback = self.preemption.resume
+            self.scheduler.has_preemption_snapshot = self.preemption.has_snapshot
 
     @property
     def connector(self):
@@ -546,6 +547,7 @@ class StageEngine:
         self.model_runner.release(request.request_id)
         request.hidden_state = None
         self.scheduler.release_admission_slot(request)
+        request.compute_released = True
         return True
 
     def release_transfer(self, request):
@@ -733,7 +735,8 @@ class StageEngine:
             # If the preceding core is still running, boundary work can overlap
             # the independent next core. Once it has completed, refill first:
             # splitting on a briefly pending coda readback fragments the batch.
-            prefer_recurrent=self._overlap_boundary
+            prefer_recurrent=self.scheduler.config.mode != "mixed"
+            and self._overlap_boundary
             and any(
                 WorkKey.DECODE_RECURRENT in t.batch.works and not t.ready() for t in self._inflight
             )

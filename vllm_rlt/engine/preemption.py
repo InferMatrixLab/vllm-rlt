@@ -20,6 +20,9 @@ class PreemptionManager:
         """Discard saved state; normal request cleanup releases any resident KV."""
         self.snapshots.pop(request_id, None)
 
+    def has_snapshot(self, request_id: str) -> bool:
+        return request_id in self.snapshots
+
     def suspend(self, victim, *, offload_kv=True):
         """Release a runner slot, optionally reclaiming KV capacity as well.
 

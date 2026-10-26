@@ -184,6 +184,15 @@ class MixedPolicy(SplitPrefillPolicy):
             return RECURRENT_WORKS
         return (work,)
 
+    def schedule(self, scheduler, *, prefer_recurrent=False):
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT) and (
+            self.has_ready_exact_work(scheduler, WorkKey.PROMPT_RECURRENT)
+        ):
+            return scheduler.take_works(RECURRENT_WORKS)
+        if prefer_recurrent and self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT):
+            return scheduler.take_works((WorkKey.DECODE_RECURRENT,))
+        return super().schedule(scheduler, prefer_recurrent=prefer_recurrent)
+
 
 def create_scheduling_policy(
     scheduler_config: SchedulerConfig,

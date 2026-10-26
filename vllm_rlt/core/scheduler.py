@@ -162,11 +162,13 @@ class Scheduler:
         self.requests: dict[str, Request] = {}
         self.waiting: deque[str] = deque()
         self.work_queues: dict[WorkKey, deque[str]] = {work: deque() for work in WorkKey}
+        self.pending_works: dict[str, WorkKey] = {}
         self.admission_slots: set[str] = set()
         # Bound by Engine when preemption is enabled. These callbacks can copy
         # device state; queue transitions remain owned by this scheduler.
         self.suspend_callback = None
         self.resume_callback = None
+        self.has_preemption_snapshot = None
         # Optional connector readiness and export predicates. Never mutate queues or blocks.
         self.execution_ready = None
         self.exports_request = None
@@ -234,23 +236,18 @@ class Scheduler:
             raise ValueError("only the registered request can enter a work queue")
         if request.status != RequestStatus.ACTIVE:
             raise ValueError("only active requests can enter a work queue")
-        if self.pending_work(request) is not None:
+        if request.request_id in self.pending_works:
             raise ValueError(f"request {request.request_id!r} already has pending work")
         self.work_queues[work].append(request.request_id)
+        self.pending_works[request.request_id] = work
 
     def pending_work(self, request: Request) -> WorkKey | None:
-        for work, queue in self.work_queues.items():
-            if request.request_id in queue:
-                return work
-        return None
+        return self.pending_works.get(request.request_id)
 
     def remove_pending_work(self, request: Request) -> WorkKey | None:
-        pending = None
-        for work, queue in self.work_queues.items():
-            if request.request_id in queue:
-                pending = work if pending is None else pending
-                while request.request_id in queue:
-                    queue.remove(request.request_id)
+        pending = self.pending_works.pop(request.request_id, None)
+        if pending is not None:
+            self.work_queues[pending].remove(request.request_id)
         return pending
 
     def _remove_queued_request(self, request: Request):
@@ -323,7 +320,12 @@ class Scheduler:
             or request.status == RequestStatus.RECEIVING
             or (
                 request.status == RequestStatus.WAITING
-                and (priority_only or not self.cache_manager.has_allocation(request.request_id))
+                and (
+                    priority_only
+                    or not self.cache_manager.has_allocation(request.request_id)
+                    or self.has_preemption_snapshot is None
+                    or not self.has_preemption_snapshot(request.request_id)
+                )
             )
             or request.status == RequestStatus.TRANSFERRING
             or request.status == RequestStatus.FINISHED
@@ -331,7 +333,7 @@ class Scheduler:
                 request.status == RequestStatus.ACTIVE
                 and (
                     request.request_id not in self.admission_slots
-                    or self.pending_work(request) is None
+                    or request.request_id not in self.pending_works
                 )
             )
             or request.num_output_placeholders
@@ -390,8 +392,10 @@ class Scheduler:
         )
         if victim is None:
             return False
+        was_waiting = victim.status == RequestStatus.WAITING
         self.suspend_callback(victim, offload_kv=not priority_only)
-        self.park_waiting(victim)
+        if not was_waiting:
+            self.park_waiting(victim)
         return True
 
     def _ensure_admission_slot(self, request: Request) -> bool:
@@ -560,6 +564,12 @@ class Scheduler:
         admission increments earlier blocked requests' bypass counts; reaching
         the limit stops further bypasses so active requests can drain.
         """
+        if not self.waiting:
+            return
+        if not self.has_admission_capacity() and (
+            self.config.policy != "priority" or self.suspend_callback is None
+        ):
+            return
         waiting = self._order_waiting_requests()
         deferred = []
         scan_count = min(len(waiting), self.config.admission_scan_limit)
@@ -793,7 +803,9 @@ class Scheduler:
                 remaining -= 1
                 request = self.requests[queue.popleft()]
                 if request.request_id in selected:
-                    continue
+                    raise RuntimeError(
+                        f"request {request.request_id!r} is queued more than once in a batch"
+                    )
                 if eligible is not None and not eligible(request):
                     queue.append(request.request_id)
                     continue
@@ -825,6 +837,7 @@ class Scheduler:
                         queue.append(request.request_id)
                         continue
                 # Selecting A must prevent B's later capacity check from evicting A.
+                self.pending_works.pop(request.request_id, None)
                 selected.add(request.request_id)
                 scheduled_requests.append(scheduled_request)
                 token_budget -= scheduled_request.token_count
@@ -1002,12 +1015,19 @@ class Scheduler:
             tasks.sort(key=lambda item: (item[0], item[1].token_start))
             scheduled_requests.extend(scheduled_request for _, scheduled_request in tasks)
 
-        for request in candidates:
-            # Growing another candidate may have suspended this request and put
-            # it in WAITING. It must not also return to its old prompt queue.
-            if request.request_id in added or request.status != RequestStatus.ACTIVE:
-                while request.request_id in queue:
-                    queue.remove(request.request_id)
+        # Remove selected and suspended candidates in one queue pass. Other
+        # candidates retain their pending work and queue position.
+        removed = {
+            request.request_id
+            for request in candidates
+            if request.request_id in added or request.status != RequestStatus.ACTIVE
+        }
+        if removed:
+            queue_copy = [request_id for request_id in queue if request_id not in removed]
+            queue.clear()
+            queue.extend(queue_copy)
+            for request_id in removed:
+                self.pending_works.pop(request_id, None)
         return token_budget
 
     def schedule(self, *, prefer_recurrent=False) -> SchedulerOutput | None:

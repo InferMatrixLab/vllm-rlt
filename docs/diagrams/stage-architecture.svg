@@ -118,5 +118,5 @@
 <rect x="390" y="1005" width="1020" height="66" rx="10" fill="#f1f4f8" stroke="#dce3eb" stroke-width="1.5"/>
 <text x="900" y="1045" class="body muted" text-anchor="middle">Owned resources: model · KV cache · request state · reusable buffers</text>
 <text x="40" y="1151" class="small muted" text-anchor="start">Blue: scheduler-driven execution and feedback. Gray inside Execution: model operation order. Dashed gray: stage transfer.</text>
-<text x="40" y="1182" class="tiny muted" text-anchor="start">Mixed = compatible recurrent work across requests, prefill/decode phases and loop depths within one stage. Speculative rounds are not included.</text>
+<text x="40" y="1182" class="tiny muted" text-anchor="start">Mixed = compatible recurrent work across requests, prompt/decode work and loop depths within one stage. Speculative rounds are not included.</text>
 </svg>

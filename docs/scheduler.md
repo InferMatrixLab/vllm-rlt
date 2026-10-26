@@ -428,7 +428,7 @@ forward chains. Panel B shows one mixed recurrent selection:
 | B | One decode token | 1 | 3 |
 | C | A prefill span | 4 | 0 |
 
-`MixedPolicy` considers decode and prompt recurrent queues.
+`MixedPolicy` first considers decode and prompt recurrent queues together.
 `Scheduler.take_works((WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT))`
 checks eligibility, shared token/sequence budgets and KV
 capacity, retaining each selected request's token range and depth. The example
@@ -448,7 +448,9 @@ of its members, deduplicating shared events. It does not execute three separate
 request forwards, combine their KV histories, or require their depths to match.
 PRELUDE and CODA are different operations and are not packed into this recurrent
 submission. Mixed scheduling excludes speculative work and uses a depth boundary
-when ready decode work can join prompt recurrent work.
+when ready decode work can join prompt recurrent work. Compatible decode and
+prompt PRELUDE rows may also share a boundary-zero batch; async input routing
+keeps their request-state and chunk-state sources distinct.
 
 Logical progress then branches per request: A can continue at depth 2; B can enter
 CODA if its exit is established; C can continue its prompt span at depth 1.
@@ -618,11 +620,14 @@ exit decisions. The scheduler can then form a different batch. Prompt tokens
 still traverse the full model depth; mixing does not apply decode early exit to
 prompt rows.
 
-Without WCPB, PRELUDE and CODA are selected separately. With WCPB, MixedPolicy
-may combine decode PRELUDE rows with prompt-chunk PRELUDE rows because both use
-the same operation. Mixed recurrent batches combine `RECURRENT` and
-`PROMPT_RECURRENT` spans, including multiple depths from one prompt request;
-CODA and speculative verification remain separate operations.
+MixedPolicy prioritizes a ready `DECODE_RECURRENT` + `PROMPT_RECURRENT` batch
+before refill's PRELUDE, CODA, admission and fairness decisions. Its compatible
+PRELUDE group can also combine decode and prompt rows because both use the same
+operation and recurrent boundary zero; CODA remains separate. Async mixed-PRELUDE
+execution stores prompt rows in chunk state and decode rows in request state, then
+the following recurrent batch routes them through their usual state paths.
+Compatible recurrent spans can have different depths, and WCPB may contribute
+multiple spans from one prompt request.
 
 ## Who owns each decision?
 
@@ -748,7 +753,7 @@ independent, peer configuration dimensions.
 | `RefillPolicy` | Prefer ready PRELUDE, eligible CODA and due recurrent work; admit and interleave prompt work |
 | `NoRefillPolicy` | Prepare a cohort, drain its recurrence, then process CODA before filling the next cohort |
 | `SplitPrefillPolicy` | Refill ordering with separate `PROMPT_PRELUDE` and `PROMPT_RECURRENT` scheduling boundaries |
-| `MixedPolicy` | If both recurrent queues have ready work, select generation rows first and fill with prompt spans; otherwise use split-prefill ordering or the WCPB full-depth plan |
+| `MixedPolicy` | First combine ready decode and prompt recurrent work; otherwise use refill ordering, with compatible decode/prompt PRELUDE grouping and separate CODA |
 | `SpeculativePolicy` | Select CODA bootstrap, prompt work and local draft/verify rounds, with a prefill fairness bound |
 
 `create_scheduling_policy()` first handles prompt-only stages, then checks
@@ -759,9 +764,11 @@ restrictions still apply. Speculative generation requires refill.
 
 `SchedulerOutput.loop_count` is the actual execution boundary. A regular prompt
 chunk runs its prelude and all recurrent depths locally in one submission.
-Mixed mode inserts a boundary when ready decode work can join prompt recurrent
-work, and it returns after every depth in such a mixed batch. With no ready
-decode work, the prompt batch can run through its remaining depths. WCPB always
+Mixed mode first selects compatible recurrent work when both decode and prompt
+queues are ready; it returns after every depth in such a mixed batch. Otherwise
+it follows refill ordering. Decode and prompt PRELUDE rows may share one
+boundary-zero batch. With no ready decode work, the prompt batch can run through
+its remaining depths. WCPB always
 returns after one depth to regroup ready chunks. Chunk size and loop submission
 size are distinct choices; WCPB retains up to one staged chunk per model depth.
 Ordinary prompt chunks already end at the scheduler's configured chunk boundary,
@@ -769,12 +776,22 @@ where decode/speculative work and admission or preemption are reconsidered.
 Merely having waiters or enabling preemption does not split a chunk's recurrence.
 
 Fairness counts nonempty scheduled batches, not attempts or GPU completions.
-Prompt batches increment the configured prefill counter; generation RECURRENT
-or SPECULATIVE resets it. In a mixed selection, a selected generation recurrent
-row causes the recurrent accounting rule to apply. If only prompt rows actually
-fit, prompt accounting applies. PRELUDE/CODA do not change the counter.
+Prompt work increments the configured prefill counter; generation RECURRENT or
+SPECULATIVE resets it. A mixed PRELUDE batch containing prompt rows counts as
+prompt work, while decode PRELUDE-only and CODA-only batches do not change the
+counter. In mixed recurrent selection, a selected generation recurrent row
+causes the recurrent accounting rule to apply; if only prompt rows fit, prompt
+accounting applies.
 `prefer_recurrent` is an overlap hint, not a CUDA-event query. No-refill instead
 uses its own FILL/CORE/CODA cohort state.
+
+**Python API migration.** `RequestPhase` and `Request.stage` were removed.
+Lifecycle callers use `RequestStatus`; scheduling callers use `WorkKey`, and
+model calls use `Operation` from `vllm_rlt.core.execution`. `ExecutionBatch` and
+`StateSpan` also live in `vllm_rlt.core.execution`. Downstream code importing
+these types from `vllm_rlt.request` must update its imports; no compatibility
+aliases are provided. `benchmarks.cdb_runtime` trace entries also changed from
+the `stage` key to `works`; trace consumers must update their schema handling.
 
 ## Imported requests use the same admission path
 
@@ -782,6 +799,8 @@ A destination stage creates its own local Request during transfer reservation;
 subsequent chunk notifications reuse that object. `reserve_transfer()` reserves
 the whole prompt mapping under the same growth budget used for local requests,
 then pins the allocation. It does not grant a compute slot.
+An unadmitted outgoing reservation therefore does not count against
+`max_num_seqs`; admission acquires its slot when the scheduler selects it.
 
 After the connector verifies commit and all expected transfer completions,
 `accept_import()` places the existing request in the shared admission queue.

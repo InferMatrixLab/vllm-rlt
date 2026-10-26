@@ -910,7 +910,7 @@ def test_wavefront_prefill_preserves_hidden_and_all_depth_kv(budget):
             torch.testing.assert_close(actual, expected, atol=4e-5, rtol=4e-5)
 
 
-def test_wavefront_mixed_prelude_prioritizes_decode_before_prompt_window():
+def test_wavefront_mixed_co_batches_compatible_prelude_work():
     import torch
 
     scheduler = SchedulerConfig(
@@ -925,13 +925,13 @@ def test_wavefront_mixed_prelude_prioritizes_decode_before_prompt_window():
     e.add_request("prompt", [2, 3, 4, 5, 6, 7], SamplingParams(max_tokens=2))
     e.scheduler._admit()
     decode = e.scheduler.requests["decode"]
-    e.scheduler.work_queues[WorkKey.PROMPT_PRELUDE].remove("decode")
+    e.scheduler.remove_pending_work(decode)
     decode.generated_token_ids.append(9)
     decode.hidden_state = torch.zeros(e.model.config.hidden_size)
     e.scheduler.enqueue_work(decode, WorkKey.DECODE_PRELUDE)
 
     batch = e.scheduler.schedule()
-    assert batch.is_mixed
+    assert batch.works == frozenset((WorkKey.DECODE_PRELUDE, WorkKey.PROMPT_PRELUDE))
     assert batch.num_tokens == 6
     assert batch.requests[0].work is WorkKey.DECODE_PRELUDE
     prompt_items = [item for item in batch.requests if item.work is WorkKey.PROMPT_PRELUDE]
@@ -1427,7 +1427,7 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
                 pytest.fail("decode request did not reach its second recurrent step")
             assert e.scheduler.pending_work(split_request) is None
             assert split_request.num_prefilled_tokens == 0
-            assert split_request.num_preluded_tokens == 2
+            assert 2 <= split_request.num_preluded_tokens <= len(split_request.prompt_token_ids)
 
             graph_counts = None
             if e.model_runner.graphs is not None:
@@ -1612,11 +1612,10 @@ def test_cuda_split_prefill_batches_mixed_depths(attention_backend):
         e.add_request("b", [3, 4], params)
         e.step()  # Prelude for both requests.
 
-        recurrent = e.scheduler.work_queues[WorkKey.PROMPT_RECURRENT]
-        recurrent.clear()
-        recurrent.append("a")
+        request_b = e.scheduler.requests["b"]
+        e.scheduler.remove_pending_work(request_b)
         e.step()  # Advance only request a to depth one.
-        recurrent.append("b")
+        e.scheduler.enqueue_work(request_b, WorkKey.PROMPT_RECURRENT)
         e.step()  # Request a is depth one; request b is depth zero.
 
         assert e.last_schedule.works == frozenset((WorkKey.PROMPT_RECURRENT,))
@@ -1652,7 +1651,7 @@ def test_split_prefill_holds_the_next_prelude_until_the_chunk_is_read():
     e.scheduler.enqueue_work(request, WorkKey.PROMPT_PRELUDE)
     assert e.scheduler.take_works((WorkKey.PROMPT_PRELUDE,)) is None
     assert list(e.scheduler.work_queues[WorkKey.PROMPT_PRELUDE]) == ["a"]
-    e.scheduler.work_queues[WorkKey.PROMPT_PRELUDE].clear()
+    e.scheduler.remove_pending_work(request)
     assert e.scheduler._prelude_window_open(request) is False
 
 

@@ -228,6 +228,7 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
             )
         outputs = {}
         mixed = []
+        recurrent_mixed = []
         calls = []
         prelude = engine.model.prelude
         recurrent = engine.model.recurrent_prepared
@@ -251,24 +252,22 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
             if batch is not None and batch.is_mixed:
                 works = {item.work for item in batch.requests}
                 if len(works) == 2:
-                    recurrent_mix = works == {
-                        WorkKey.DECODE_RECURRENT,
-                        WorkKey.PROMPT_RECURRENT,
-                    }
-                    # Both storage kinds pass through a single model invocation.
+                    if works == {WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT}:
+                        recurrent_mixed.append(batch)
+                    elif works == {WorkKey.DECODE_PRELUDE, WorkKey.PROMPT_PRELUDE}:
+                        assert batch.loop_count == 0
+                    else:
+                        pytest.fail(f"unexpected mixed work batch: {works}")
                     if not graphs:
                         assert calls == [batch.num_tokens]
-                    elif not recurrent_mix:
-                        assert works == {
-                            WorkKey.DECODE_PRELUDE,
-                            WorkKey.PROMPT_PRELUDE,
-                        }
                     assert batch.num_tokens <= 5
                     mixed.append(batch)
             if not engine.has_unfinished_requests():
                 break
         else:
             pytest.fail("mixed scheduling stalled")
+        if mode == "mixed":
+            assert recurrent_mixed
         assert engine.cache_manager.num_used_blocks == 0
         return outputs, mixed
 
@@ -279,6 +278,81 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
     actual, mixed = run("mixed", wavefront=True)
     assert original_batches and mixed
     assert actual == wavefront_refill == original_mixed == separated == expected
+
+
+@pytest.mark.parametrize(
+    "device,graphs",
+    [
+        ("cpu", False),
+        pytest.param("cuda", False, marks=pytest.mark.gpu),
+        pytest.param("cuda", True, marks=pytest.mark.gpu),
+    ],
+)
+def test_mixed_async_prelude_batches_decode_and_prompt_rows(device, graphs):
+    from tests.helpers import LocalLLM as LLM
+    from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig
+    from vllm_rlt.engine.llm_engine import LLMEngine
+
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    torch.manual_seed(123)
+    e = LLMEngine(
+        OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=dtype),
+        attention_backend="triton" if device == "cuda" else "torch",
+        cache_config=CacheConfig(128, 2),
+        scheduler_config=SchedulerConfig(
+            mode="mixed",
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            wavefront_chunked_prefill=True,
+        ),
+        execution_config=ExecutionConfig(
+            async_scheduling=True,
+            cuda_graphs=graphs,
+            cuda_graph_max_batch_size=4,
+        ),
+        exit_config=ExitConfig(mode="ouro_delayed"),
+    )
+    outputs = {}
+    decode_params = SamplingParams(max_tokens=2, min_loops=2, max_loops=2, ignore_eos=True)
+    prompt_params = SamplingParams(max_tokens=1, ignore_eos=True)
+    try:
+        e.add_request("decode", [2, 3], decode_params)
+        decode = e.scheduler.requests["decode"]
+        for _ in range(100):
+            e.step()
+            if e.scheduler.pending_work(decode) is WorkKey.DECODE_PRELUDE:
+                break
+        else:
+            pytest.fail("decode request did not reach its next PRELUDE")
+
+        e.add_request("prompt", [4, 5, 6, 7], prompt_params)
+        e.scheduler._admit()
+        e.step()
+        assert e.last_schedule.works == frozenset((WorkKey.DECODE_PRELUDE, WorkKey.PROMPT_PRELUDE))
+        assert e.last_schedule.loop_count == 0
+
+        for _ in range(100):
+            for output in e.step():
+                if output.finished:
+                    outputs[output.request_id] = output
+            if len(outputs) == 2:
+                break
+        assert set(outputs) == {"decode", "prompt"}
+        assert e.cache_manager.num_used_blocks == 0
+        torch.manual_seed(123)
+        reference = LLM(
+            OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=dtype),
+            attention_backend="triton" if device == "cuda" else "torch",
+        ).generate([[2, 3], [4, 5, 6, 7]], [decode_params, prompt_params])
+        assert [outputs[rid].token_ids for rid in ("decode", "prompt")] == [
+            result.token_ids for result in reference
+        ]
+        assert [outputs[rid].exit_depths for rid in ("decode", "prompt")] == [
+            result.exit_depths for result in reference
+        ]
+    finally:
+        e.close()
 
 
 def mixed_ready_engine():
@@ -528,20 +602,16 @@ def test_invalid_loop_range_fails_before_writing_kv():
     torch.testing.assert_close(cache.key_cache, before)
 
 
-def test_mixed_attempt_with_one_selected_phase_is_not_a_mixed_batch():
-    from dataclasses import replace
-
+def test_mixed_recurrent_work_keeps_priority_over_coda():
     engine, batch = mixed_ready_engine()
     for item in batch.requests:
         engine.scheduler.enqueue_work(item.request, item.work)
-    compatible = {WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT}
-    for work, queue in engine.scheduler.work_queues.items():
-        if work not in compatible:
-            queue.clear()
-    engine.scheduler.config = replace(engine.scheduler.config, max_num_batched_tokens=1)
+    engine.add_request("other", [5, 6], SamplingParams(max_tokens=2, ignore_eos=True))
+    engine.scheduler._admit()
+    coda = engine.scheduler.requests["other"]
+    engine.scheduler.remove_pending_work(coda)
+    engine.scheduler.enqueue_work(coda, WorkKey.DECODE_CODA)
     selected = engine.scheduler.schedule()
     assert selected is not None
-    assert {item.work for item in selected.requests} == {WorkKey.DECODE_RECURRENT}
-    assert selected.works == frozenset((WorkKey.DECODE_RECURRENT,))
-    assert not selected.is_mixed
+    assert selected.works == frozenset((WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT))
     engine.close()
