@@ -505,12 +505,15 @@ class _RecordingChannel:
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 def test_worker_release_drops_the_aborted_rng_entry(device):
     from vllm_rlt.engine.worker import StageWorker
+    from vllm_rlt.models import ModelConfig
 
     channel = _RecordingChannel()
+    config = tiny_ouro_config(head_dim=64)
     options = dict(
         seed=123,
         dtype="bfloat16" if device == "cuda" else "float32",
         revision=None,
+        model_config=ModelConfig(config),
         engine=dict(
             attention_backend="triton" if device == "cuda" else "torch",
             cache_config=CacheConfig(128, 4),
@@ -521,7 +524,7 @@ def test_worker_release_drops_the_aborted_rng_entry(device):
         StageConfig(stage_id="local"),
         device,
         channel,
-        tiny_ouro_config(head_dim=64),
+        config,
         options,
     )
     engine = worker.engine
