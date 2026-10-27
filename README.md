@@ -234,6 +234,12 @@ speedup claims or a production qualification. The complete campaign includes
 failures; configuration, provenance and metric definitions are in the
 [detailed report](docs/unified_execution.md#measured-serving-performance).
 
+The [September 2026 synchronous self-speculation evaluation](docs/speculative_evaluation.md)
+measures Ouro-1.4B BF16 on one H800: paired decode speedups range from 0.86×
+to 1.62× across 32 workloads, and exact greedy outputs agree for every request
+in 15 workloads. The report details the setup, regressions, and unresolved
+output differences.
+
 Earlier measurements remain available in
 [PR #30](https://github.com/InferMatrixLab/vllm-rlt/pull/30) and
 [PR #31](https://github.com/InferMatrixLab/vllm-rlt/pull/31); their workloads and timing
