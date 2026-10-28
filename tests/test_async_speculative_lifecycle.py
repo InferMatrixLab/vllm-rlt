@@ -377,7 +377,7 @@ def test_ticket_result_format_does_not_depend_on_statistics(mode, with_stats):
 
     request = Request("r", [1], SamplingParams(max_tokens=8))
     batch = SchedulerOutput(
-        RequestPhase.SPECULATIVE, [ScheduledRequest(request, token_start=1, token_count=2)]
+        [ScheduledRequest(request, WorkKey.SPECULATIVE, token_start=1, token_count=2)]
     )
     values = [11, 0, 1, 2, 1, 1] if mode == "pipeline" else [11, 12, 0, 2]
     buffer = SimpleNamespace(

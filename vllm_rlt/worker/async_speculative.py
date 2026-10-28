@@ -11,7 +11,7 @@ import torch
 from vllm_rlt.core.execution import Operation
 from vllm_rlt.core.kv_cache_manager import _Allocation
 from vllm_rlt.core.scheduler import SchedulerOutput
-from vllm_rlt.request import Operation, Request
+from vllm_rlt.request import Request
 from vllm_rlt.worker.cuda_graph import (
     CodaGraphs,
     DeviceRecurrentGraphs,

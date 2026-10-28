@@ -3,7 +3,6 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 from vllm_rlt.attention import BackendCapabilities, create_backend
-from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.config import (
     CacheConfig,
     ExecutionConfig,
@@ -11,6 +10,7 @@ from vllm_rlt.config import (
     SchedulerConfig,
     resolve_cuda_graph_rows,
 )
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
@@ -733,7 +733,7 @@ class StageEngine:
         if (
             self.pipeline_speculative
             and self.scheduler.config.enable_preemption
-            and self.scheduler.queues[RequestPhase.WAITING]
+            and self.scheduler.waiting
         ):
             while self._pending_speculative:
                 outputs.extend(self._collect_speculative())

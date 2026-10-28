@@ -1480,16 +1480,16 @@ class Scheduler:
                 request.num_output_placeholders += 1
                 if request.num_scheduled_outputs < request.sampling_params.max_tokens:
                     update.next_prelude.append(row)
-                    self.enqueue(request, RequestPhase.PRELUDE)
-            elif phase == WorkKey.SPECULATIVE:
+                    self.enqueue_work(request, WorkKey.DECODE_PRELUDE)
+            elif work == WorkKey.SPECULATIVE:
                 request.num_speculative_rounds += 1
                 request.num_output_placeholders += (
                     1
                     if self.speculative_config.mode == "pipeline"
                     else scheduled_request.token_count
                 )
-                self.enqueue(request, RequestPhase.SPECULATIVE)
-            elif phase == WorkKey.DECODE_RECURRENT:
+                self.enqueue_work(request, WorkKey.SPECULATIVE)
+            elif work == WorkKey.DECODE_RECURRENT:
                 consume_signal = (
                     request.loops_done > 0
                     and request.sampling_params.exit_threshold < 1
