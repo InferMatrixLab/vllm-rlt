@@ -1427,7 +1427,11 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
                 pytest.fail("decode request did not reach its second recurrent step")
             assert e.scheduler.pending_work(split_request) is None
             assert split_request.num_prefilled_tokens == 0
-            assert 2 <= split_request.num_preluded_tokens <= len(split_request.prompt_token_ids)
+            # WCPB stages prompt chunks in a prelude wavefront: with
+            # total_ut_steps=4, prefill_chunk_size=2 and a 4-token budget, both
+            # of this prompt's chunks are staged together. num_prefilled_tokens
+            # stays 0 because the final recurrent depth has not completed.
+            assert split_request.num_preluded_tokens == 4
 
             graph_counts = None
             if e.model_runner.graphs is not None:

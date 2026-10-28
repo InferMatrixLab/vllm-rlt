@@ -141,6 +141,11 @@ CODA. A returned ticket does not imply device completion. The
 shows how GPU-owned next-token state lets consecutive rounds overlap result
 readback and CPU commit within this same stage.
 
+**Pipelined speculation (experimental).** `--speculative-mode pipeline` reuses
+the shared speculative runner to advance tokens at different recurrent depths.
+See [pipelined self-speculation](async-speculative.md#pipelined-self-speculation)
+for configuration, state lifetimes, and token-level acceptance/rejection diagrams.
+
 **Shared execution and resources.** ModelRunner constructs ModelRuntime and the
 speculative controller references that same runtime. Both use the worker-loaded
 model, the engine's KV manager and shared RNG registry. The runtime executes the

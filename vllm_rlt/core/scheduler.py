@@ -337,6 +337,7 @@ class Scheduler:
                 )
             )
             or request.num_output_placeholders
+            or request.num_speculative_rounds
             or request.request_id in excluded
         ):
             return False
@@ -1384,7 +1385,11 @@ class Scheduler:
             elif work == WorkKey.SPECULATIVE:
                 spec = result.speculative[row]
                 if result.frontiers is not None:
-                    request.num_output_placeholders -= scheduled_request.token_count
+                    request.num_output_placeholders -= (
+                        1
+                        if self.speculative_config.mode == "pipeline"
+                        else scheduled_request.token_count
+                    )
                     request.num_speculative_rounds -= 1
                     if request.num_output_placeholders < 0 or request.num_speculative_rounds < 0:
                         raise RuntimeError("invalid speculative reservation count")
@@ -1406,7 +1411,10 @@ class Scheduler:
                     if result.frontiers is None:
                         # The final correction/bonus token has not been forwarded.
                         self.cache_manager.truncate_suffix(
-                            request.request_id, scheduled_request.token_start + emitted
+                            request.request_id,
+                            spec.kv_frontier
+                            if spec.kv_frontier is not None
+                            else scheduled_request.token_start + emitted,
                         )
                         request.loops_done = 0
                     if self.pending_work(request) is None:
@@ -1472,12 +1480,16 @@ class Scheduler:
                 request.num_output_placeholders += 1
                 if request.num_scheduled_outputs < request.sampling_params.max_tokens:
                     update.next_prelude.append(row)
-                    self.enqueue_work(request, WorkKey.DECODE_PRELUDE)
-            elif work == WorkKey.SPECULATIVE:
-                request.num_output_placeholders += scheduled_request.token_count
+                    self.enqueue(request, RequestPhase.PRELUDE)
+            elif phase == WorkKey.SPECULATIVE:
                 request.num_speculative_rounds += 1
-                self.enqueue_work(request, WorkKey.SPECULATIVE)
-            elif work == WorkKey.DECODE_RECURRENT:
+                request.num_output_placeholders += (
+                    1
+                    if self.speculative_config.mode == "pipeline"
+                    else scheduled_request.token_count
+                )
+                self.enqueue(request, RequestPhase.SPECULATIVE)
+            elif phase == WorkKey.DECODE_RECURRENT:
                 consume_signal = (
                     request.loops_done > 0
                     and request.sampling_params.exit_threshold < 1

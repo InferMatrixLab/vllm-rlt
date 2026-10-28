@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 def _positive(name, value):
@@ -102,6 +102,35 @@ class ExitConfig:
             raise ValueError("exit seed must be an integer in [0, 2**63)")
 
 
+DEFAULT_CUDA_GRAPH_ROWS = 128
+
+
+def cuda_graph_rows(execution):
+    """Row limit of an execution config, with the unset default applied."""
+    return execution.cuda_graph_max_batch_size or DEFAULT_CUDA_GRAPH_ROWS
+
+
+def resolve_cuda_graph_rows(execution, scheduler, speculative=None):
+    """Fix an unset row limit before graphs or memory planning read it.
+
+    Async speculative rounds hold up to max_num_seqs * (K + 1) verification rows,
+    bounded by the token budget. An unset limit covers them, never below the
+    default, so bootstrap/native coverage cannot shrink. Explicit limits stay.
+    """
+    if execution.cuda_graph_max_batch_size is not None:
+        return execution
+    rows = DEFAULT_CUDA_GRAPH_ROWS
+    if speculative is not None and execution.async_scheduling:
+        rows = max(
+            rows,
+            min(
+                scheduler.max_num_batched_tokens,
+                scheduler.max_num_seqs * (speculative.num_speculative_tokens + 1),
+            ),
+        )
+    return replace(execution, cuda_graph_max_batch_size=rows)
+
+
 @dataclass(frozen=True)
 class ExecutionConfig:
     async_scheduling: bool = False
@@ -111,8 +140,11 @@ class ExecutionConfig:
     static_buffers: bool = False
     pad_to_power_of_two: bool = False
     cuda_graphs: bool = False
-    cuda_graph_max_batch_size: int = 128
+    # None derives the row limit: async speculation covers every scheduled
+    # verification row; other paths keep DEFAULT_CUDA_GRAPH_ROWS.
+    cuda_graph_max_batch_size: int | None = None
     cuda_graph_max_graphs: int = 16
+    # Automatic KV planning reserves this headroom per graph pool.
     cuda_graph_memory_reserve_bytes: int = 1024**3
     # Shared switch for mapped pinned-memory reads; unsupported devices copy instead.
     use_uva: bool = True
@@ -132,11 +164,9 @@ class ExecutionConfig:
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
-        for name in (
-            "cuda_graph_max_batch_size",
-            "cuda_graph_max_graphs",
-            "cuda_graph_memory_reserve_bytes",
-        ):
+        if self.cuda_graph_max_batch_size is not None:
+            _positive("cuda_graph_max_batch_size", self.cuda_graph_max_batch_size)
+        for name in ("cuda_graph_max_graphs", "cuda_graph_memory_reserve_bytes"):
             _positive(name, getattr(self, name))
         if self.pad_to_power_of_two and not self.static_buffers:
             raise ValueError("padding requires static_buffers")
@@ -149,9 +179,14 @@ class SpeculativeConfig:
     num_speculative_tokens: int
     draft_loops: int = 2
     target_loops: int = 4
+    mode: str = "block"
 
     def __post_init__(self):
         for name in ("num_speculative_tokens", "draft_loops", "target_loops"):
             _positive(name, getattr(self, name))
+        if self.mode not in ("block", "pipeline"):
+            raise ValueError("speculative mode must be block or pipeline")
+        if self.mode == "pipeline" and self.target_loops % self.draft_loops:
+            raise ValueError("pipeline draft_loops must divide target_loops")
         if self.draft_loops >= self.target_loops:
             raise ValueError("draft_loops must be smaller than target_loops")

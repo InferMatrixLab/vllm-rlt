@@ -16,6 +16,7 @@ def add_runtime_args(parser):
         type=int,
         help="Enable fixed-loop self-speculation with K draft tokens",
     )
+    parser.add_argument("--speculative-mode", choices=["block", "pipeline"], default="block")
     parser.add_argument("--draft-loops", type=int, default=2)
     parser.add_argument("--target-loops", type=int, default=4)
     parser.add_argument("--enable-prefix-caching", action="store_true")
@@ -52,9 +53,19 @@ def add_runtime_args(parser):
         action="store_true",
         help="Capture decode/wavefront recurrent cores and speculative coda; sampling stays eager",
     )
-    parser.add_argument("--cuda-graph-max-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--cuda-graph-max-batch-size",
+        type=int,
+        default=None,
+        help="Graph row limit; unset covers async speculative verification rows, else 128",
+    )
     parser.add_argument("--cuda-graph-max-graphs", type=int, default=16)
-    parser.add_argument("--cuda-graph-memory-reserve-bytes", type=int, default=1024**3)
+    parser.add_argument(
+        "--cuda-graph-memory-reserve-bytes",
+        type=int,
+        default=1024**3,
+        help="Automatic KV planning headroom per CUDA Graph pool (plus retained spec logits)",
+    )
     parser.add_argument(
         "--single-stream",
         action="store_true",
@@ -84,6 +95,7 @@ def runtime_configs(args):
             num_speculative_tokens=args.speculative_tokens,
             draft_loops=args.draft_loops,
             target_loops=args.target_loops,
+            mode=args.speculative_mode,
         )
         if args.speculative_tokens is not None
         else None,

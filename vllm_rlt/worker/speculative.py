@@ -5,12 +5,13 @@ outputs; Scheduler applies returned tokens and KV commits; Engine coordinates cl
 """
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
 from vllm_rlt.core.execution import Operation
 from vllm_rlt.core.scheduler import SchedulerOutput
+from vllm_rlt.request import Operation, Request
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
@@ -72,6 +73,7 @@ class SpeculativeSubmission:
     proposals: list
     event: object = None
     cached: ModelRunnerOutput | None = None
+    pipeline: "PipelineStep | None" = None
 
     @property
     def has_result(self):
@@ -87,13 +89,57 @@ class SpeculativeSubmission:
             stream = self.runner.compute_stream
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
                 self.cached = ModelRunnerOutput(
-                    speculative=self.runner._collect_round(self),
+                    speculative=(
+                        self.runner._collect_pipeline(self)
+                        if self.pipeline is not None
+                        else self.runner._collect_round(self)
+                    ),
                     completion=self.event,
                 )
+            self.pipeline = None
             self.logits = None
             self.drafted.clear()
             self.proposals.clear()
         return self.cached
+
+
+@dataclass
+class PipelineToken:
+    """One input token retained across submissions, with its next loop depth."""
+
+    position: int
+    token: int
+    depth: int = 0
+    hidden: torch.Tensor | None = None
+    candidate: int | None = None
+
+
+@dataclass
+class PipelineState:
+    request: Request
+    position: int
+    tokens: list[PipelineToken]
+    pending: bool = False
+
+    def to(self, device):
+        """Own hidden copies for suspension; never borrow graph/runner buffers."""
+        return replace(
+            self,
+            tokens=[
+                replace(
+                    token, hidden=None if token.hidden is None else token.hidden.to(device).clone()
+                )
+                for token in self.tokens
+            ],
+        )
+
+
+@dataclass
+class PipelineStep:
+    states: list[PipelineState]
+    tokens: list[PipelineToken]
+    endpoints: list[int]
+    decisions: torch.Tensor
 
 
 class SpeculativeRunner:
@@ -111,6 +157,7 @@ class SpeculativeRunner:
         self.model, self.cache, self.config = model, cache, config
         self.metadata = cache.metadata_builder
         self.runtime = runtime if runtime is not None else ModelRuntime(model, cache)
+        self.pipeline_states: dict[str, PipelineState] = {}
         self.device = next(model.parameters()).device
         self.compute_stream = compute_stream
         self.submissions = SubmissionQueue()
@@ -211,8 +258,11 @@ class SpeculativeRunner:
                 if self.compute_stream is not None
                 else nullcontext()
             ):
-                inputs, steps, verification = self._prepare_inputs(batch)
-                submission = self._submit_round(batch, inputs, steps, verification)
+                if self.config.mode == "pipeline":
+                    submission = self._submit_pipeline(batch)
+                else:
+                    inputs, steps, verification = self._prepare_inputs(batch)
+                    submission = self._submit_round(batch, inputs, steps, verification)
                 self.submissions.complete(submission.event)
                 return submission
         except Exception:
@@ -221,6 +271,150 @@ class SpeculativeRunner:
                 (self.compute_stream or torch.cuda.current_stream(self.device)).synchronize()
             self.submissions.drain()
             raise
+
+    def release(self, request):
+        """Discard only this request generation after its submission has completed."""
+        state = self.pipeline_states.get(request.request_id)
+        if state is not None and state.request is request:
+            self.submissions.drain()
+            del self.pipeline_states[request.request_id]
+
+    def snapshot_pipeline(self, request, device):
+        state = self.pipeline_states.get(request.request_id)
+        if state is None or state.request is not request:
+            return None
+        if state.pending:
+            raise RuntimeError("cannot suspend an uncollected pipeline submission")
+        self.submissions.drain()
+        return state.to(device)
+
+    def restore_pipeline(self, request, state):
+        if state is not None:
+            if state.request is not request or request.request_id in self.pipeline_states:
+                raise RuntimeError("pipeline snapshot belongs to a different request generation")
+            self.pipeline_states[request.request_id] = state.to(self.device)
+
+    def _submit_pipeline(self, batch):
+        # Scheduler still owns admission, capacity reservation and committed output.
+        # Retained tokens are private execution state, bounded by the reserved span.
+        states, tokens, ids = [], [], []
+        for span in batch.requests:
+            request = span.request
+            if request.sampling_params.temperature != 0:
+                raise ValueError("pipeline speculation requires greedy sampling")
+            state = self.pipeline_states.get(request.request_id)
+            if state is None or state.request is not request or state.position != request.position:
+                state = PipelineState(
+                    request,
+                    request.position,
+                    [PipelineToken(request.position, request.input_token_id)],
+                )
+                self.pipeline_states[request.request_id] = state
+            if state.pending:
+                raise RuntimeError("collect the previous pipeline submission before resubmission")
+            state.pending = True
+            # A smaller scheduler budget may drop speculative descendants safely.
+            state.tokens = [
+                t for t in state.tokens if t.position < span.token_start + span.token_count
+            ]
+            states.append(state)
+            tokens.extend(state.tokens)
+            ids.extend([request.request_id] * len(state.tokens))
+        for buffer in self.input_buffers.values():
+            buffer.reset()
+        new = [t for t in tokens if t.hidden is None]
+        input_view = self.input_buffers[torch.int64].append([t.token for t in new])
+        layouts = self.metadata.build(
+            ids,
+            [[t.depth + offset for t in tokens] for offset in range(self.config.draft_loops)],
+            [t.position for t in tokens],
+            packed=False,
+        )
+        layouts = stage_metadata(
+            layouts, lambda values, dtype: self.input_buffers[dtype].append(values)
+        )
+        uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
+        if new:
+            inputs = uploaded[input_view.dtype].as_strided(
+                input_view.shape, input_view.stride(), input_view.storage_offset()
+            )
+            hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=inputs)).hidden
+            for token, row in zip(new, hidden):
+                token.hidden = row
+        hidden = self._recurrent(
+            torch.stack([t.hidden for t in tokens]),
+            tuple(self.metadata.bind(kv, uploaded) for kv in layouts),
+        )
+        endpoints = []
+        for i, (token, row) in enumerate(zip(tokens, hidden)):
+            token.hidden = row
+            token.depth += self.config.draft_loops
+            if token.depth in (self.config.draft_loops, self.config.target_loops):
+                endpoints.append(i)
+        # Synchronous execution reads decisions in collect(), before the next step.
+        choices = (
+            self._coda(hidden[endpoints]).argmax(-1)
+            if endpoints
+            else hidden.new_empty(0, dtype=torch.long)
+        )
+        decisions = choices
+        event = None
+        if self.device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+        self.stats.rounds += len(states)
+        return SpeculativeSubmission(
+            self,
+            batch,
+            None,
+            [],
+            [],
+            event,
+            pipeline=PipelineStep(states, tokens, endpoints, decisions),
+        )
+
+    def _collect_pipeline(self, submission):
+        step = submission.pipeline
+        predictions = {
+            id(step.tokens[i]): value for i, value in zip(step.endpoints, step.decisions.tolist())
+        }
+        results = []
+        for span, state in zip(submission.batch.requests, step.states):
+            if self.pipeline_states.get(span.request.request_id) is not state:
+                results.append(SpeculativeResult([], 0))
+                continue
+            state.pending = False
+            following, final = [], None
+            limit = (
+                len(state.request.prompt_token_ids) + state.request.sampling_params.max_tokens - 1
+            )
+            for token in state.tokens:
+                if token.depth == self.config.target_loops:
+                    final = token
+                else:
+                    following.append(token)
+                    if token.depth == self.config.draft_loops:
+                        token.candidate = predictions[id(token)]
+                        self.stats.drafted_tokens += 1
+                        if token.position + 1 < min(limit, span.token_start + span.token_count):
+                            following.append(PipelineToken(token.position + 1, token.candidate))
+            emitted, accepted = [], 0
+            if final is not None:
+                prediction = predictions[id(final)]
+                emitted = [prediction]
+                accepted = int(final.candidate == prediction)
+                state.position += 1
+                self.stats.verified_rows += 1
+                if not accepted:
+                    following = []
+                if not following and state.position < limit:
+                    following = [PipelineToken(state.position, prediction)]
+            state.tokens = sorted(following, key=lambda t: t.position)
+            frontier = max(
+                [state.position] + [t.position + 1 for t in state.tokens if t.hidden is not None]
+            )
+            results.append(SpeculativeResult(emitted, accepted, kv_frontier=frontier))
+        return results
 
     def _submit_round(self, batch, inputs, steps, verification):
         scheduled_requests = batch.requests

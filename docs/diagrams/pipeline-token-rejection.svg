@@ -1,0 +1,280 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3300" height="2222" viewBox="0 0 3300 2222" role="img" aria-labelledby="title desc"><title id="title">Rejection comparison on aligned recurrent steps</title><desc id="desc">Both panels start at x0 and use the same recurrent-step columns. Block verification occupies three steps in one forward. Drop and restart are shown for both paths.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10" fill="#346bb0"/></marker></defs>
+<rect x="0" y="0" width="3300" height="2222" rx="0" fill="white" stroke="white" stroke-width="1.5"/>
+<text x="45" y="53" font-family="DejaVu Sans,Arial,sans-serif" font-size="36" fill="#172f49" font-weight="700" text-anchor="start">Rejection · aligned recurrent-step timeline</text>
+<text x="45" y="91" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" fill="#172f49" font-weight="400" text-anchor="start">Same start, same mismatch: accept x1, reject x2, produce corrected x2′. Target = 4 loops; draft = 1 loop; block K = 4.</text>
+<text x="45" y="125" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">S1–S8 align RECURRENT loop executions, not measured time. P / C and GPU-ready results are shown; their durations are not represented.</text>
+<text x="45" y="158" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">P = PRELUDE · C = CODA. Processing xi predicts the NEXT token. Red means computed and then discarded; prime denotes the corrected branch.</text>
+<rect x="35" y="190" width="3230" height="884" rx="8" fill="#f7faff" stroke="#c9d8eb" stroke-width="1.5"/>
+<rect x="35" y="190" width="3230" height="53" rx="8" fill="#264f85" stroke="#264f85" stroke-width="1.5"/>
+<text x="60" y="226" font-family="DejaVu Sans,Arial,sans-serif" font-size="27" fill="white" font-weight="700" text-anchor="start">Before · block speculation</text>
+<text x="60" y="276" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">S1–S5: shallow steps. S6–S8: one verification forward through R2–R4. DROP after S8; restart at S9.</text>
+<rect x="310.0" y="305" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="489.25" y="334" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S1</text>
+<path d="M670.5 329L676.5 329" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="677.5" y="305" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="856.75" y="334" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S2</text>
+<path d="M1038.0 329L1044.0 329" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="1045.0" y="305" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="1224.25" y="334" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S3</text>
+<path d="M1405.5 329L1411.5 329" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="1412.5" y="305" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="1591.75" y="334" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S4</text>
+<path d="M1773.0 329L1779.0 329" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="1780.0" y="305" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="1959.25" y="334" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S5</text>
+<path d="M2140.5 329L2146.5 329" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="2147.5" y="305" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="2326.75" y="334" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S6</text>
+<path d="M2508.0 329L2514.0 329" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="2515.0" y="305" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="2694.25" y="334" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S7</text>
+<path d="M2875.5 329L2881.5 329" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="2882.5" y="305" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="none"/>
+<text x="3061.75" y="334" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S8</text>
+<text x="58" y="379" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" fill="#172f49" font-weight="700" text-anchor="start">1 · PRELUDE</text>
+<text x="58" y="406" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#172f49" font-weight="400" text-anchor="start">new token IDs → hidden</text>
+<text x="58" y="434" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" fill="#172f49" font-weight="700" text-anchor="start">2 · RECURRENT</text>
+<rect x="318.0" y="353" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="489.25" y="376" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x0)</text>
+<rect x="685.5" y="353" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="856.75" y="376" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x1)</text>
+<rect x="1053.0" y="353" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="1224.25" y="376" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x2)</text>
+<rect x="1420.5" y="353" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="1591.75" y="376" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x3)</text>
+<rect x="1788.0" y="353" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="1959.25" y="376" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x4)</text>
+<text x="2326.75" y="389" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" fill="#172f49" font-weight="400" text-anchor="middle">—</text>
+<text x="2694.25" y="389" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" fill="#172f49" font-weight="400" text-anchor="middle">—</text>
+<text x="3061.75" y="389" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" fill="#172f49" font-weight="400" text-anchor="middle">—</text>
+<text x="75" y="472" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x0 (known)</text>
+<rect x="318.0" y="447" width="342.5" height="30" rx="6" fill="#fff3db" stroke="#d28b13" stroke-width="1.5"/>
+<text x="489.25" y="469" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x0 · R1</text>
+<rect x="2155.5" y="447" width="342.5" height="30" rx="6" fill="#fff3db" stroke="#d28b13" stroke-width="1.5"/>
+<text x="2326.75" y="469" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x0 · R2</text>
+<rect x="2523.0" y="447" width="342.5" height="30" rx="6" fill="#fff3db" stroke="#d28b13" stroke-width="1.5"/>
+<text x="2694.25" y="469" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x0 · R3</text>
+<rect x="2890.5" y="447" width="342.5" height="30" rx="6" fill="#fff3db" stroke="#d28b13" stroke-width="1.5"/>
+<text x="3061.75" y="469" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x0 · R4</text>
+<text x="75" y="510" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x1</text>
+<rect x="685.5" y="485" width="342.5" height="30" rx="6" fill="#eee7fb" stroke="#9460d3" stroke-width="1.5"/>
+<text x="856.75" y="507" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x1 · R1</text>
+<rect x="2155.5" y="485" width="342.5" height="30" rx="6" fill="#eee7fb" stroke="#9460d3" stroke-width="1.5"/>
+<text x="2326.75" y="507" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x1 · R2</text>
+<rect x="2523.0" y="485" width="342.5" height="30" rx="6" fill="#eee7fb" stroke="#9460d3" stroke-width="1.5"/>
+<text x="2694.25" y="507" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x1 · R3</text>
+<rect x="2890.5" y="485" width="342.5" height="30" rx="6" fill="#eee7fb" stroke="#9460d3" stroke-width="1.5"/>
+<text x="3061.75" y="507" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x1 · R4</text>
+<text x="75" y="548" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x2 (old)</text>
+<rect x="1053.0" y="523" width="342.5" height="30" rx="6" fill="#ddf4f1" stroke="#279c99" stroke-width="1.5"/>
+<text x="1224.25" y="545" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2 · R1</text>
+<rect x="2155.5" y="523" width="342.5" height="30" rx="6" fill="#ddf4f1" stroke="#279c99" stroke-width="1.5"/>
+<text x="2326.75" y="545" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2 · R2</text>
+<rect x="2523.0" y="523" width="342.5" height="30" rx="6" fill="#ddf4f1" stroke="#279c99" stroke-width="1.5"/>
+<text x="2694.25" y="545" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2 · R3</text>
+<rect x="2890.5" y="523" width="342.5" height="30" rx="6" fill="#ddf4f1" stroke="#279c99" stroke-width="1.5"/>
+<text x="3061.75" y="545" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2 · R4</text>
+<text x="75" y="586" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x3 (old)</text>
+<rect x="1420.5" y="561" width="342.5" height="30" rx="6" fill="#e8eef6" stroke="#7d90ab" stroke-width="1.5"/>
+<text x="1591.75" y="583" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x3 · R1</text>
+<rect x="2155.5" y="561" width="342.5" height="30" rx="6" fill="#e8eef6" stroke="#7d90ab" stroke-width="1.5"/>
+<text x="2326.75" y="583" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x3 · R2</text>
+<rect x="2523.0" y="561" width="342.5" height="30" rx="6" fill="#e8eef6" stroke="#7d90ab" stroke-width="1.5"/>
+<text x="2694.25" y="583" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x3 · R3</text>
+<rect x="2890.5" y="561" width="342.5" height="30" rx="6" fill="#e8eef6" stroke="#7d90ab" stroke-width="1.5"/>
+<text x="3061.75" y="583" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x3 · R4</text>
+<text x="75" y="624" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x4 (old)</text>
+<rect x="1788.0" y="599" width="342.5" height="30" rx="6" fill="#fce5eb" stroke="#c86682" stroke-width="1.5"/>
+<text x="1959.25" y="621" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x4 · R1</text>
+<rect x="2155.5" y="599" width="342.5" height="30" rx="6" fill="#fce5eb" stroke="#c86682" stroke-width="1.5"/>
+<text x="2326.75" y="621" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x4 · R2</text>
+<rect x="2523.0" y="599" width="342.5" height="30" rx="6" fill="#fce5eb" stroke="#c86682" stroke-width="1.5"/>
+<text x="2694.25" y="621" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x4 · R3</text>
+<rect x="2890.5" y="599" width="342.5" height="30" rx="6" fill="#fce5eb" stroke="#c86682" stroke-width="1.5"/>
+<text x="3061.75" y="621" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x4 · R4</text>
+<text x="75" y="662" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x2′ (corrected)</text>
+<text x="75" y="700" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x3′</text>
+<text x="75" y="738" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x4′</text>
+<text x="75" y="776" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x5′</text>
+<text x="58" y="829" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="start">3 · CODA + argmax</text>
+<text x="58" y="855" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#172f49" font-weight="400" text-anchor="start">used results → next IDs</text>
+<rect x="318.0" y="804" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="489.25" y="828" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x0:R1 → x1</text>
+<rect x="685.5" y="804" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="856.75" y="828" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x1:R1 → x2</text>
+<rect x="1053.0" y="804" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="1224.25" y="828" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x2:R1 → x3</text>
+<rect x="1420.5" y="804" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="1591.75" y="828" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x3:R1 → x4</text>
+<text x="1959.25" y="846" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" fill="#172f49" font-weight="400" text-anchor="middle">—</text>
+<text x="2326.75" y="846" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" fill="#172f49" font-weight="400" text-anchor="middle">—</text>
+<text x="2694.25" y="846" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" fill="#172f49" font-weight="400" text-anchor="middle">—</text>
+<rect x="2890.5" y="804" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="3061.75" y="828" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">C(x0–x4:R4)</text>
+<text x="3061.75" y="851" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x2′ ≠ draft x2</text>
+<text x="3061.75" y="874" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">REJECT x2</text>
+<text x="58" y="930" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="start">4 · GPU result ready</text>
+<text x="58" y="956" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#172f49" font-weight="400" text-anchor="start">CPU delivery is async</text>
+<text x="3061.75" y="928" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">Ready x1, x2′</text>
+<text x="60" y="1043" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="start">At S8 discard old x2–x4 and their invalid predictions. The next block would restart from x2′ after the displayed S8 boundary.</text>
+<rect x="2890.5" y="523" width="342.5" height="30" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="3061.75" y="545" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="700" text-anchor="middle">x2 · R4 · drop</text>
+<rect x="2890.5" y="561" width="342.5" height="30" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="3061.75" y="583" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="700" text-anchor="middle">x3 · R4 · drop</text>
+<rect x="2890.5" y="599" width="342.5" height="30" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="3061.75" y="621" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="700" text-anchor="middle">x4 · R4 · drop</text>
+<rect x="2890.5" y="804" width="342.5" height="92" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="3061.75" y="828" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="400" text-anchor="middle">x1:R4 → x2′</text>
+<text x="3061.75" y="851" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="400" text-anchor="middle">x2′ ≠ draft x2</text>
+<text x="3061.75" y="874" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="400" text-anchor="middle">REJECT x2</text>
+<rect x="2887.5" y="947" width="347.5" height="46" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="3061.75" y="966" font-family="DejaVu Sans,Arial,sans-serif" font-size="14" fill="#b32d40" font-weight="400" text-anchor="middle">DROP x2–x4</text>
+<text x="3061.75" y="989" font-family="DejaVu Sans,Arial,sans-serif" font-size="14" fill="#b32d40" font-weight="400" text-anchor="middle">+ invalid outputs</text>
+<path d="M3235.0 969L3258.0 969" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="35" y="1204" width="3230" height="884" rx="8" fill="#f7faff" stroke="#c9d8eb" stroke-width="1.5"/>
+<rect x="35" y="1204" width="3230" height="53" rx="8" fill="#264f85" stroke="#264f85" stroke-width="1.5"/>
+<text x="60" y="1240" font-family="DejaVu Sans,Arial,sans-serif" font-size="27" fill="white" font-weight="700" text-anchor="start">After · pipeline speculation</text>
+<text x="60" y="1290" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">S1–S3: fill. S4: produce x1. S5: correct x2 and DROP. S6: restart from x2′. S6–S8: refill the corrected branch.</text>
+<rect x="310.0" y="1319" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="489.25" y="1348" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S1</text>
+<path d="M670.5 1343L676.5 1343" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="677.5" y="1319" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="856.75" y="1348" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S2</text>
+<path d="M1038.0 1343L1044.0 1343" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="1045.0" y="1319" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="1224.25" y="1348" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S3</text>
+<path d="M1405.5 1343L1411.5 1343" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="1412.5" y="1319" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="1591.75" y="1348" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S4</text>
+<path d="M1773.0 1343L1779.0 1343" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="1780.0" y="1319" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="none"/>
+<text x="1959.25" y="1348" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S5</text>
+<path d="M2140.5 1343L2146.5 1343" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="2147.5" y="1319" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="2326.75" y="1348" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S6</text>
+<path d="M2508.0 1343L2514.0 1343" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="2515.0" y="1319" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="2694.25" y="1348" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S7</text>
+<path d="M2875.5 1343L2881.5 1343" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="2882.5" y="1319" width="358.5" height="704" rx="8" fill="#f0f5fc" stroke="#d4dfef" stroke-width="1.5"/>
+<text x="3061.75" y="1348" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="middle">S8</text>
+<text x="58" y="1393" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" fill="#172f49" font-weight="700" text-anchor="start">1 · PRELUDE</text>
+<text x="58" y="1420" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#172f49" font-weight="400" text-anchor="start">new token IDs → hidden</text>
+<text x="58" y="1448" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" fill="#172f49" font-weight="700" text-anchor="start">2 · RECURRENT</text>
+<rect x="318.0" y="1367" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="489.25" y="1390" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x0)</text>
+<rect x="685.5" y="1367" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="856.75" y="1390" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x1)</text>
+<rect x="1053.0" y="1367" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="1224.25" y="1390" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x2)</text>
+<rect x="1420.5" y="1367" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="1591.75" y="1390" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x3)</text>
+<rect x="1788.0" y="1367" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="1959.25" y="1390" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x4)</text>
+<rect x="2155.5" y="1367" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="2326.75" y="1390" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x2′)</text>
+<rect x="2523.0" y="1367" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="2694.25" y="1390" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x3′)</text>
+<rect x="2890.5" y="1367" width="342.5" height="57" rx="6" fill="#e4efff" stroke="#8ba9cf" stroke-width="1.5"/>
+<text x="3061.75" y="1390" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">P(x4′)</text>
+<text x="75" y="1486" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x0 (known)</text>
+<rect x="318.0" y="1461" width="342.5" height="30" rx="6" fill="#fff3db" stroke="#d28b13" stroke-width="1.5"/>
+<text x="489.25" y="1483" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x0 · R1</text>
+<rect x="685.5" y="1461" width="342.5" height="30" rx="6" fill="#fff3db" stroke="#d28b13" stroke-width="1.5"/>
+<text x="856.75" y="1483" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x0 · R2</text>
+<rect x="1053.0" y="1461" width="342.5" height="30" rx="6" fill="#fff3db" stroke="#d28b13" stroke-width="1.5"/>
+<text x="1224.25" y="1483" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x0 · R3</text>
+<rect x="1420.5" y="1461" width="342.5" height="30" rx="6" fill="#fff3db" stroke="#d28b13" stroke-width="1.5"/>
+<text x="1591.75" y="1483" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x0 · R4</text>
+<text x="75" y="1524" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x1</text>
+<rect x="685.5" y="1499" width="342.5" height="30" rx="6" fill="#eee7fb" stroke="#9460d3" stroke-width="1.5"/>
+<text x="856.75" y="1521" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x1 · R1</text>
+<rect x="1053.0" y="1499" width="342.5" height="30" rx="6" fill="#eee7fb" stroke="#9460d3" stroke-width="1.5"/>
+<text x="1224.25" y="1521" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x1 · R2</text>
+<rect x="1420.5" y="1499" width="342.5" height="30" rx="6" fill="#eee7fb" stroke="#9460d3" stroke-width="1.5"/>
+<text x="1591.75" y="1521" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x1 · R3</text>
+<rect x="1788.0" y="1499" width="342.5" height="30" rx="6" fill="#eee7fb" stroke="#9460d3" stroke-width="1.5"/>
+<text x="1959.25" y="1521" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x1 · R4</text>
+<text x="75" y="1562" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x2 (old)</text>
+<rect x="1053.0" y="1537" width="342.5" height="30" rx="6" fill="#ddf4f1" stroke="#279c99" stroke-width="1.5"/>
+<text x="1224.25" y="1559" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2 · R1</text>
+<rect x="1420.5" y="1537" width="342.5" height="30" rx="6" fill="#ddf4f1" stroke="#279c99" stroke-width="1.5"/>
+<text x="1591.75" y="1559" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2 · R2</text>
+<rect x="1788.0" y="1537" width="342.5" height="30" rx="6" fill="#ddf4f1" stroke="#279c99" stroke-width="1.5"/>
+<text x="1959.25" y="1559" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2 · R3</text>
+<text x="75" y="1600" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x3 (old)</text>
+<rect x="1420.5" y="1575" width="342.5" height="30" rx="6" fill="#e8eef6" stroke="#7d90ab" stroke-width="1.5"/>
+<text x="1591.75" y="1597" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x3 · R1</text>
+<rect x="1788.0" y="1575" width="342.5" height="30" rx="6" fill="#e8eef6" stroke="#7d90ab" stroke-width="1.5"/>
+<text x="1959.25" y="1597" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x3 · R2</text>
+<text x="75" y="1638" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x4 (old)</text>
+<rect x="1788.0" y="1613" width="342.5" height="30" rx="6" fill="#fce5eb" stroke="#c86682" stroke-width="1.5"/>
+<text x="1959.25" y="1635" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x4 · R1</text>
+<text x="75" y="1676" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x2′ (corrected)</text>
+<rect x="2155.5" y="1651" width="342.5" height="30" rx="6" fill="#e7f1db" stroke="#6e9841" stroke-width="1.5"/>
+<text x="2326.75" y="1673" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2′ · R1</text>
+<rect x="2523.0" y="1651" width="342.5" height="30" rx="6" fill="#e7f1db" stroke="#6e9841" stroke-width="1.5"/>
+<text x="2694.25" y="1673" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2′ · R2</text>
+<rect x="2890.5" y="1651" width="342.5" height="30" rx="6" fill="#e7f1db" stroke="#6e9841" stroke-width="1.5"/>
+<text x="3061.75" y="1673" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x2′ · R3</text>
+<text x="75" y="1714" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x3′</text>
+<rect x="2523.0" y="1689" width="342.5" height="30" rx="6" fill="#e1edff" stroke="#548aca" stroke-width="1.5"/>
+<text x="2694.25" y="1711" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x3′ · R1</text>
+<rect x="2890.5" y="1689" width="342.5" height="30" rx="6" fill="#e1edff" stroke="#548aca" stroke-width="1.5"/>
+<text x="3061.75" y="1711" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x3′ · R2</text>
+<text x="75" y="1752" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x4′</text>
+<rect x="2890.5" y="1727" width="342.5" height="30" rx="6" fill="#f8e9d8" stroke="#b77c40" stroke-width="1.5"/>
+<text x="3061.75" y="1749" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="middle">x4′ · R1</text>
+<text x="75" y="1790" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">x5′</text>
+<text x="58" y="1843" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="start">3 · CODA + argmax</text>
+<text x="58" y="1869" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#172f49" font-weight="400" text-anchor="start">used results → next IDs</text>
+<rect x="318.0" y="1818" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="489.25" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x0:R1 → x1</text>
+<rect x="685.5" y="1818" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="856.75" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x1:R1 → x2</text>
+<rect x="1053.0" y="1818" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="1224.25" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x2:R1 → x3</text>
+<rect x="1420.5" y="1818" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="1591.75" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x0:R4 → x1</text>
+<text x="1591.75" y="1865" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x3:R1 → x4</text>
+<rect x="1788.0" y="1818" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="1959.25" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x1:R4 → x2</text>
+<text x="1959.25" y="1865" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x4:R1 → x5</text>
+<rect x="2155.5" y="1818" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="2326.75" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x2′:R1 → x3′</text>
+<rect x="2523.0" y="1818" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="2694.25" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x3′:R1 → x4′</text>
+<rect x="2890.5" y="1818" width="342.5" height="92" rx="6" fill="#e8f4ef" stroke="#7da58f" stroke-width="1.5"/>
+<text x="3061.75" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#172f49" font-weight="400" text-anchor="middle">x4′:R1 → x5′</text>
+<text x="58" y="1944" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="700" text-anchor="start">4 · GPU result ready</text>
+<text x="58" y="1970" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#172f49" font-weight="400" text-anchor="start">CPU delivery is async</text>
+<text x="489.25" y="1942" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">No final token</text>
+<text x="856.75" y="1942" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">No final token</text>
+<text x="1224.25" y="1942" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">No final token</text>
+<text x="1591.75" y="1942" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">Ready x1</text>
+<text x="1959.25" y="1942" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">Ready x2′</text>
+<text x="2326.75" y="1942" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">No final token</text>
+<text x="2694.25" y="1942" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">No final token</text>
+<text x="3061.75" y="1942" font-family="DejaVu Sans,Arial,sans-serif" font-size="17" fill="#237b60" font-weight="400" text-anchor="middle">No final token</text>
+<text x="60" y="2057" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" fill="#172f49" font-weight="400" text-anchor="start">Both panels end at S8. Pipeline S6–S8 refill from x2′; no further target result is ready within this window.</text>
+<rect x="1788.0" y="1537" width="342.5" height="30" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="1959.25" y="1559" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="700" text-anchor="middle">x2 · R3 · drop</text>
+<rect x="1788.0" y="1575" width="342.5" height="30" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="1959.25" y="1597" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="700" text-anchor="middle">x3 · R2 · drop</text>
+<rect x="1788.0" y="1613" width="342.5" height="30" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="1959.25" y="1635" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="700" text-anchor="middle">x4 · R1 · drop</text>
+<rect x="1788.0" y="1818" width="342.5" height="92" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="1959.25" y="1842" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="400" text-anchor="middle">x1:R4 → x2′</text>
+<text x="1959.25" y="1865" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="400" text-anchor="middle">x2′ ≠ draft x2</text>
+<text x="1959.25" y="1888" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" fill="#b32d40" font-weight="400" text-anchor="middle">REJECT x2</text>
+<rect x="1785.0" y="1961" width="347.5" height="46" rx="6" fill="#fde7e9" stroke="#c34050" stroke-width="2"/>
+<text x="1959.25" y="1980" font-family="DejaVu Sans,Arial,sans-serif" font-size="14" fill="#b32d40" font-weight="400" text-anchor="middle">DROP x2–x4</text>
+<text x="1959.25" y="2003" font-family="DejaVu Sans,Arial,sans-serif" font-size="14" fill="#b32d40" font-weight="400" text-anchor="middle">+ invalid outputs</text>
+<path d="M2132.5 1983L2155.5 1983" stroke="#346bb0" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="2879.5" y="300" width="364.5" height="709" rx="8" fill="none" stroke="#be4057" stroke-width="3"/>
+<rect x="1777.0" y="1314" width="364.5" height="709" rx="8" fill="none" stroke="#be4057" stroke-width="3"/>
+<path d="M3061.75 1009L1959.25 1314" fill="none" stroke="#be4057" stroke-width="3" marker-end="url(#arrow)"/>
+<text x="45" y="2123" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">Column alignment explains the execution sequence only. More or fewer steps alone do not establish a measured latency or throughput gain.</text>
+<text x="45" y="2155" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">Only valid tokens and used P/C results are shown; inactive/padding rows and unused computations are omitted.</text>
+<text x="45" y="2187" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" fill="#172f49" font-weight="400" text-anchor="start">Async: copy-stream D2H and CPU collect occur later; GPU progress does not wait for CPU delivery.</text>
+</svg>
