@@ -11,10 +11,10 @@ from tests.helpers import (
     tiny_ouro_config,
 )
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig, SpeculativeConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import RequestPhase
 from vllm_rlt.serving.worker import EngineWorker
 from vllm_rlt.worker.async_speculative import (
     AsyncSpeculativeRunner,
@@ -92,7 +92,9 @@ def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True
     )
     tickets = []
     for round_id, (rows, frontier) in enumerate([(3, first_frontier), (2, 6)]):
-        scheduled_request = ScheduledRequest(request, token_start=1 + round_id, token_count=rows)
+        scheduled_request = ScheduledRequest(
+            request, WorkKey.SPECULATIVE, token_start=1 + round_id, token_count=rows
+        )
         host = torch.tensor(
             list(range(10 + 3 * round_id, 10 + 3 * round_id + rows)) + [rows - 1, frontier]
         )
@@ -106,7 +108,7 @@ def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True
         )
         tickets.append(
             SpeculativeRoundTicket(
-                SchedulerOutput(RequestPhase.SPECULATIVE, [scheduled_request]),
+                SchedulerOutput([scheduled_request]),
                 buffer,
                 (state,),
                 (round_id,),
@@ -375,7 +377,7 @@ def test_ticket_result_format_does_not_depend_on_statistics(mode, with_stats):
 
     request = Request("r", [1], SamplingParams(max_tokens=8))
     batch = SchedulerOutput(
-        RequestPhase.SPECULATIVE, [ScheduledRequest(request, token_start=1, token_count=2)]
+        [ScheduledRequest(request, WorkKey.SPECULATIVE, token_start=1, token_count=2)]
     )
     values = [11, 0, 1, 2, 1, 1] if mode == "pipeline" else [11, 12, 0, 2]
     buffer = SimpleNamespace(

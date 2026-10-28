@@ -5,10 +5,11 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import ExecutionBatch, Operation, StateSpan, WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.scheduler import ScheduledRequest, Scheduler, SchedulerOutput
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import ExecutionBatch, Operation, Request, RequestPhase, StateSpan
+from vllm_rlt.request import Request, RequestStatus
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime, build_execution_batch
 
 
@@ -21,20 +22,20 @@ def test_mixed_decode_batch_yields_after_one_loop_without_queued_decode(monkeypa
     scheduled = [
         ScheduledRequest(
             Request("decode", [1, 2], SamplingParams()),
+            WorkKey.DECODE_RECURRENT,
             token_start=2,
             depth=1,
-            phase=RequestPhase.RECURRENT,
         ),
         ScheduledRequest(
             Request("prompt", [3, 4], SamplingParams()),
+            WorkKey.PROMPT_RECURRENT,
             token_start=0,
             token_count=2,
             depth=0,
             chunk_start=0,
-            phase=RequestPhase.PREFILLING_RECURRENT,
         ),
     ]
-    monkeypatch.setattr(scheduler, "has_ready", lambda phase: False)
+    monkeypatch.setattr(scheduler, "has_ready_work", lambda work: False)
     monkeypatch.setattr(scheduler, "_max_contiguous_prefill_loops", lambda item: 4)
 
     assert scheduler._planned_loop_count(scheduled) == 1
@@ -126,8 +127,8 @@ def test_scheduled_recurrence_does_not_follow_mutated_request_progress():
     request = Request("r", [1, 2, 3], SamplingParams())
     request.loops_done = 2
     scheduler = Scheduler(SchedulerConfig(), None)
-    scheduled_request = scheduler._make_scheduled_request(request, RequestPhase.RECURRENT, 1)
-    batch = SchedulerOutput(RequestPhase.RECURRENT, [scheduled_request])
+    scheduled_request = scheduler._make_scheduled_work(request, WorkKey.DECODE_RECURRENT, 1)
+    batch = SchedulerOutput([scheduled_request])
     request.loops_done = 3
     request.generated_token_ids.append(4)
     assert build_execution_batch(batch, 4).addresses() == (["r"], [2], [2])
@@ -206,7 +207,10 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
             )
             for _ in range(40):
                 engine.step()
-                if engine.scheduler.requests["short"].phase == RequestPhase.RECURRENT:
+                if (
+                    engine.scheduler.pending_work(engine.scheduler.requests["short"])
+                    == WorkKey.DECODE_RECURRENT
+                ):
                     break
             else:
                 pytest.fail("decode request did not reach recurrent work")
@@ -224,13 +228,20 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
             )
         outputs = {}
         mixed = []
+        recurrent_mixed = []
         calls = []
+        prelude = engine.model.prelude
         recurrent = engine.model.recurrent_prepared
+
+        def record_prelude(token_ids):
+            calls.append(len(token_ids))
+            return prelude(token_ids)
 
         def record(hidden, kv, cache, **kwargs):
             calls.append(len(hidden))
             return recurrent(hidden, kv, cache, **kwargs)
 
+        engine.model.prelude = record_prelude
         engine.model.recurrent_prepared = record
         for _ in range(300):
             calls.clear()
@@ -239,27 +250,24 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
                     outputs[output.request_id] = (output.token_ids, output.exit_depths)
             batch = engine.last_schedule
             if batch is not None and batch.is_mixed:
-                phases = {batch.phase_for(i) for i in batch.requests}
-                if len(phases) == 2:
-                    recurrent_mix = phases == {
-                        RequestPhase.RECURRENT,
-                        RequestPhase.PREFILLING_RECURRENT,
-                    }
-                    # Recurrent storage kinds share one model invocation. Prelude
-                    # mixes use the same operation but do not call recurrent_core.
-                    if recurrent_mix and not graphs:
+                works = {item.work for item in batch.requests}
+                if len(works) == 2:
+                    if works == {WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT}:
+                        recurrent_mixed.append(batch)
+                    elif works == {WorkKey.DECODE_PRELUDE, WorkKey.PROMPT_PRELUDE}:
+                        assert batch.loop_count == 0
+                    else:
+                        pytest.fail(f"unexpected mixed work batch: {works}")
+                    if not graphs:
                         assert calls == [batch.num_tokens]
-                    elif not recurrent_mix:
-                        assert phases == {
-                            RequestPhase.PRELUDE,
-                            RequestPhase.PREFILLING_PRELUDE,
-                        }
                     assert batch.num_tokens <= 5
                     mixed.append(batch)
             if not engine.has_unfinished_requests():
                 break
         else:
             pytest.fail("mixed scheduling stalled")
+        if mode == "mixed":
+            assert recurrent_mixed
         assert engine.cache_manager.num_used_blocks == 0
         return outputs, mixed
 
@@ -270,6 +278,81 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
     actual, mixed = run("mixed", wavefront=True)
     assert original_batches and mixed
     assert actual == wavefront_refill == original_mixed == separated == expected
+
+
+@pytest.mark.parametrize(
+    "device,graphs",
+    [
+        ("cpu", False),
+        pytest.param("cuda", False, marks=pytest.mark.gpu),
+        pytest.param("cuda", True, marks=pytest.mark.gpu),
+    ],
+)
+def test_mixed_async_prelude_batches_decode_and_prompt_rows(device, graphs):
+    from tests.helpers import LocalLLM as LLM
+    from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig
+    from vllm_rlt.engine.llm_engine import LLMEngine
+
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    torch.manual_seed(123)
+    e = LLMEngine(
+        OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=dtype),
+        attention_backend="triton" if device == "cuda" else "torch",
+        cache_config=CacheConfig(128, 2),
+        scheduler_config=SchedulerConfig(
+            mode="mixed",
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            wavefront_chunked_prefill=True,
+        ),
+        execution_config=ExecutionConfig(
+            async_scheduling=True,
+            cuda_graphs=graphs,
+            cuda_graph_max_batch_size=4,
+        ),
+        exit_config=ExitConfig(mode="ouro_delayed"),
+    )
+    outputs = {}
+    decode_params = SamplingParams(max_tokens=2, min_loops=2, max_loops=2, ignore_eos=True)
+    prompt_params = SamplingParams(max_tokens=1, ignore_eos=True)
+    try:
+        e.add_request("decode", [2, 3], decode_params)
+        decode = e.scheduler.requests["decode"]
+        for _ in range(100):
+            e.step()
+            if e.scheduler.pending_work(decode) is WorkKey.DECODE_PRELUDE:
+                break
+        else:
+            pytest.fail("decode request did not reach its next PRELUDE")
+
+        e.add_request("prompt", [4, 5, 6, 7], prompt_params)
+        e.scheduler._admit()
+        e.step()
+        assert e.last_schedule.works == frozenset((WorkKey.DECODE_PRELUDE, WorkKey.PROMPT_PRELUDE))
+        assert e.last_schedule.loop_count == 0
+
+        for _ in range(100):
+            for output in e.step():
+                if output.finished:
+                    outputs[output.request_id] = output
+            if len(outputs) == 2:
+                break
+        assert set(outputs) == {"decode", "prompt"}
+        assert e.cache_manager.num_used_blocks == 0
+        torch.manual_seed(123)
+        reference = LLM(
+            OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=dtype),
+            attention_backend="triton" if device == "cuda" else "torch",
+        ).generate([[2, 3], [4, 5, 6, 7]], [decode_params, prompt_params])
+        assert [outputs[rid].token_ids for rid in ("decode", "prompt")] == [
+            result.token_ids for result in reference
+        ]
+        assert [outputs[rid].exit_depths for rid in ("decode", "prompt")] == [
+            result.exit_depths for result in reference
+        ]
+    finally:
+        e.close()
 
 
 def mixed_ready_engine():
@@ -286,16 +369,24 @@ def mixed_ready_engine():
     engine.add_request("short", [1], SamplingParams(max_tokens=6, ignore_eos=True))
     for _ in range(40):
         engine.step()
-        if engine.scheduler.requests["short"].phase == RequestPhase.RECURRENT:
+        if (
+            engine.scheduler.pending_work(engine.scheduler.requests["short"])
+            == WorkKey.DECODE_RECURRENT
+        ):
             break
     else:
         pytest.fail("decode request did not reach recurrent work")
     engine.add_request("long", list(range(2, 11)), SamplingParams(max_tokens=6, ignore_eos=True))
     for _ in range(100):
         batch = engine.scheduler.schedule()
-        if batch.is_mixed and len({batch.phase_for(i) for i in batch.requests}) == 2:
+        works = batch.works if batch is not None else frozenset()
+        if {
+            WorkKey.DECODE_RECURRENT,
+            WorkKey.PROMPT_RECURRENT,
+        } <= works:
             return engine, batch
-        engine._update(batch, engine.executor.submit(batch).collect())
+        if batch is not None:
+            engine._update(batch, engine.executor.submit(batch).collect())
     pytest.fail("no mixed batch became ready")
 
 
@@ -334,14 +425,14 @@ def test_late_mixed_result_cannot_advance_a_reused_request_id():
     old = next(
         scheduled_request.request
         for scheduled_request in batch.requests
-        if batch.phase_for(scheduled_request) == RequestPhase.RECURRENT
+        if scheduled_request.work == WorkKey.DECODE_RECURRENT
     )
     engine.abort_request(old.request_id)
     engine.add_request(old.request_id, [8, 9], SamplingParams(max_tokens=2))
     replacement = engine.scheduler.requests[old.request_id]
     engine._update(batch, result)
     assert replacement is not old
-    assert replacement.phase == RequestPhase.WAITING
+    assert replacement.status == RequestStatus.WAITING
     assert replacement.loops_done == 0
     assert replacement.generated_token_ids == []
     other = next(
@@ -355,12 +446,12 @@ def test_late_mixed_result_cannot_advance_a_reused_request_id():
 def test_mixed_selection_protects_requests_selected_from_another_queue(monkeypatch):
     engine, batch = mixed_ready_engine()
     for scheduled_request in batch.requests:
-        engine.scheduler.enqueue(scheduled_request.request, batch.phase_for(scheduled_request))
+        engine.scheduler.enqueue_work(scheduled_request.request, scheduled_request.work)
     selected = next(
-        i.request.request_id for i in batch.requests if batch.phase_for(i) == RequestPhase.RECURRENT
+        i.request.request_id for i in batch.requests if i.work == WorkKey.DECODE_RECURRENT
     )
     blocked = next(
-        i.request.request_id for i in batch.requests if batch.phase_for(i) != RequestPhase.RECURRENT
+        i.request.request_id for i in batch.requests if i.work != WorkKey.DECODE_RECURRENT
     )
     exclusions = []
     monkeypatch.setattr(
@@ -375,7 +466,7 @@ def test_mixed_selection_protects_requests_selected_from_another_queue(monkeypat
     actual = engine.scheduler.schedule()
     assert [i.request.request_id for i in actual.requests] == [selected]
     assert exclusions == [frozenset({selected})]
-    assert list(engine.scheduler.queues[RequestPhase.PREFILLING_RECURRENT]) == [blocked]
+    assert list(engine.scheduler.work_queues[WorkKey.PROMPT_RECURRENT]) == [blocked]
 
 
 def test_runtime_closes_metadata_iterator_when_loop_execution_fails():
@@ -511,16 +602,16 @@ def test_invalid_loop_range_fails_before_writing_kv():
     torch.testing.assert_close(cache.key_cache, before)
 
 
-def test_mixed_attempt_with_one_selected_phase_is_not_a_mixed_batch():
-    from dataclasses import replace
-
+def test_mixed_recurrent_work_keeps_priority_over_coda():
     engine, batch = mixed_ready_engine()
-    for span in batch.requests:
-        engine.scheduler.enqueue(span.request, span.phase)
-    engine.scheduler.config = replace(engine.scheduler.config, max_num_batched_tokens=1)
+    for item in batch.requests:
+        engine.scheduler.enqueue_work(item.request, item.work)
+    engine.add_request("other", [5, 6], SamplingParams(max_tokens=2, ignore_eos=True))
+    engine.scheduler._admit()
+    coda = engine.scheduler.requests["other"]
+    engine.scheduler.remove_pending_work(coda)
+    engine.scheduler.enqueue_work(coda, WorkKey.DECODE_CODA)
     selected = engine.scheduler.schedule()
     assert selected is not None
-    assert {span.phase for span in selected.requests} == {RequestPhase.RECURRENT}
-    assert selected.phase == RequestPhase.RECURRENT
-    assert not selected.is_mixed
+    assert selected.works == frozenset((WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT))
     engine.close()

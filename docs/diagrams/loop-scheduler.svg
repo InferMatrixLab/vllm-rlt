@@ -14,7 +14,7 @@
 <text x="90" y="290" class="small white" text-anchor="start">Select operation · token range · recurrent depth</text>
 <text x="1255" y="260" class="body white" text-anchor="end">6 token rows  /  3 requests</text>
 <text x="1255" y="290" class="small white" text-anchor="end">Mixed policy · split prefill</text>
-<text x="90" y="345" class="small blue bold" text-anchor="start">01  CHOOSE READY PHASES</text>
+<text x="90" y="345" class="small blue bold" text-anchor="start">01  CHOOSE READY WORK</text>
 
 <text x="1085" y="345" class="small blue bold" text-anchor="middle">02  BUILD THE BATCH</text>
 <rect x="90" y="372" width="38" height="38" rx="10" fill="#fff2da" stroke="#c9932c" stroke-width="1.6" />
@@ -73,8 +73,8 @@
 <path d="M860 328V445 M860 545V650" stroke="#b8cce6" stroke-width="1.5" stroke-dasharray="5 5"/>
 <text x="90" y="681" class="small blue" text-anchor="start">Policy selects ready prompt + decode recurrent queues.</text>
 <text x="1085" y="681" class="tiny blue" text-anchor="middle">Ranges · depths · KV / token budget</text>
-<text x="90" y="740" class="tiny muted" text-anchor="start">policy.schedule() → compatible phases</text>
-<text x="920" y="740" class="tiny muted" text-anchor="start">take_phases() → SchedulerOutput</text>
+<text x="90" y="740" class="tiny muted" text-anchor="start">policy.schedule() → compatible WorkKeys</text>
+<text x="920" y="740" class="tiny muted" text-anchor="start">take_works() → SchedulerOutput</text>
 <rect x="1400" y="392" width="340" height="235" rx="18" fill="#fff" stroke="#ccd9e8" stroke-width="1.6" />
 <text x="1425" y="434" class="h" text-anchor="start">03  Execute batch</text>
 <text x="1425" y="467" class="small muted" text-anchor="start">Executor → runner → runtime</text>
@@ -86,7 +86,7 @@
 <rect x="380" y="805" width="1360" height="190" rx="18" fill="#f8fafc" stroke="#d0dce9" stroke-width="1.6" />
 <text x="410" y="848" class="h" text-anchor="start">04  Apply progress &amp; requeue</text>
 <text x="1705" y="848" class="small muted bold" text-anchor="end">StageEngine → Scheduler queues</text>
-<text x="410" y="879" class="small muted" text-anchor="start">StageEngine updates each request and calls Scheduler.enqueue() for its next phase.</text>
+<text x="410" y="879" class="small muted" text-anchor="start">StageEngine updates each request and queues its next WorkKey.</text>
 <rect x="410" y="909" width="350" height="56" rx="12" fill="#fff2da" stroke="#c9932c" stroke-width="1.6" />
 <text x="430" y="945" class="body bold" text-anchor="start">A   Next: loop 3</text>
 <rect x="790" y="909" width="490" height="56" rx="12" fill="#eee7fd" stroke="#9871ce" stroke-width="1.6" />

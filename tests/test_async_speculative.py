@@ -15,9 +15,10 @@ from vllm_rlt import (
     SchedulerConfig,
     SpeculativeConfig,
 )
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.request import Request, RequestPhase
+from vllm_rlt.request import Request
 
 tiny = tiny_ouro_model
 bootstrap = bootstrap_speculation
@@ -79,12 +80,12 @@ def test_scheduler_uses_upper_bound_and_releases_rejected_budget():
     scheduler = Scheduler(SchedulerConfig(), None, SpeculativeConfig(3))
     r = Request("r", [2, 3], SamplingParams(max_tokens=8), generated_token_ids=[4])
     r.num_output_placeholders = 4
-    scheduled_request = scheduler._make_scheduled_request(r, RequestPhase.SPECULATIVE, 16)
+    scheduled_request = scheduler._make_scheduled_work(r, WorkKey.SPECULATIVE, 16)
     assert (scheduled_request.token_start, scheduled_request.token_count) == (6, 3)
     # One committed token instead of the four reserved: recover three slots.
     r.num_output_placeholders = 0
     r.generated_token_ids.append(5)
-    scheduled_request = scheduler._make_scheduled_request(r, RequestPhase.SPECULATIVE, 16)
+    scheduled_request = scheduler._make_scheduled_work(r, WorkKey.SPECULATIVE, 16)
     assert (scheduled_request.token_start, scheduled_request.token_count) == (3, 4)
 
 
@@ -353,10 +354,9 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     runner.buffers = [buffer]
     requests = [Request(rid, [2], SamplingParams()) for rid in ("short", "long")]
     batch = SchedulerOutput(
-        RequestPhase.SPECULATIVE,
         [
-            ScheduledRequest(requests[0], 1, 2),
-            ScheduledRequest(requests[1], 7, 2),
+            ScheduledRequest(requests[0], WorkKey.SPECULATIVE, 1, 2),
+            ScheduledRequest(requests[1], WorkKey.SPECULATIVE, 7, 2),
         ],
     )
     _, _, host, device = runner._prepare_round(batch)
@@ -376,7 +376,7 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     # Simulate retirement, then shrink both dimensions using the same storage.
     buffer.leased = False
     before = buffer.host_tables.clone()
-    smaller = SchedulerOutput(RequestPhase.SPECULATIVE, [ScheduledRequest(requests[0], 0, 1)])
+    smaller = SchedulerOutput([ScheduledRequest(requests[0], WorkKey.SPECULATIVE, 0, 1)])
     _, _, host, device = runner._prepare_round(smaller)
     assert host.shape == device.shape == (1, 4, 1)
     assert host.is_contiguous() and device.is_contiguous()

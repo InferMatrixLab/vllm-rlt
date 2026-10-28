@@ -1,10 +1,10 @@
-"""Request-phase selection and fairness state for loop-level scheduling."""
+"""Work selection and fairness state for loop-level scheduling."""
 
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 from vllm_rlt.config import SchedulerConfig, SpeculativeConfig
-from vllm_rlt.request import RequestPhase
+from vllm_rlt.core.execution import WorkKey
 
 if TYPE_CHECKING:
     from vllm_rlt.core.scheduler import Scheduler, SchedulerOutput
@@ -16,9 +16,14 @@ class NoRefillPhase(Enum):
     CODA = auto()
 
 
+PROMPT_WORKS = frozenset((WorkKey.PROMPT_ATOMIC, WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT))
+DECODE_PROGRESS_WORKS = frozenset((WorkKey.DECODE_RECURRENT, WorkKey.SPECULATIVE))
+PRELUDE_WORKS = (WorkKey.DECODE_PRELUDE, WorkKey.PROMPT_PRELUDE)
+RECURRENT_WORKS = (WorkKey.DECODE_RECURRENT, WorkKey.PROMPT_RECURRENT)
+
+
 class SchedulingPolicy:
-    # Prompt phases supported by this policy also count against the decode bound.
-    PREFILL_PHASES = (RequestPhase.PREFILL,)
+    PREFILL_WORKS = (WorkKey.PROMPT_ATOMIC,)
 
     def __init__(self, config: SchedulerConfig):
         self.config = config
@@ -28,12 +33,24 @@ class SchedulingPolicy:
     def decode_due(self) -> bool:
         return self.prefill_batches_since_recurrent >= self.config.max_prefill_batches_before_decode
 
-    def record_batch(self, phase: RequestPhase) -> None:
-        """Count nonempty scheduled batches, not attempts or GPU completions."""
-        if phase in self.PREFILL_PHASES:
-            self.prefill_batches_since_recurrent += 1
-        elif phase in (RequestPhase.RECURRENT, RequestPhase.SPECULATIVE):
+    def work_group(self, work: WorkKey) -> tuple[WorkKey, ...]:
+        return (work,)
+
+    def has_ready_exact_work(self, scheduler, work: WorkKey) -> bool:
+        return scheduler.has_ready_work(work)
+
+    def has_ready_work(self, scheduler, work: WorkKey) -> bool:
+        return scheduler.has_ready_works(*self.work_group(work))
+
+    def take_work(self, scheduler, work: WorkKey):
+        return scheduler.take_works(self.work_group(work))
+
+    def record_batch(self, works) -> None:
+        works = frozenset(works)
+        if works & DECODE_PROGRESS_WORKS:
             self.prefill_batches_since_recurrent = 0
+        elif works & PROMPT_WORKS:
+            self.prefill_batches_since_recurrent += 1
 
 
 class PromptOnlyPolicy(SchedulingPolicy):
@@ -41,16 +58,16 @@ class PromptOnlyPolicy(SchedulingPolicy):
 
     def __init__(self, config, *, staged_prefill):
         super().__init__(config)
-        self.PREFILL_PHASES = (
-            (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+        self.PREFILL_WORKS = (
+            (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
             if staged_prefill
-            else (RequestPhase.PREFILL,)
+            else (WorkKey.PROMPT_ATOMIC,)
         )
 
     def schedule(self, scheduler, *, prefer_recurrent=False):
         scheduler._admit()
-        for phase in self.PREFILL_PHASES:
-            batch = scheduler.take_phases((phase,))
+        for work in self.PREFILL_WORKS:
+            batch = self.take_work(scheduler, work)
             if batch is not None:
                 return batch
         return None
@@ -60,32 +77,32 @@ class RefillPolicy(SchedulingPolicy):
     def schedule(
         self, scheduler: "Scheduler", *, prefer_recurrent: bool = False
     ) -> "SchedulerOutput | None":
-        # Give independent core work an overlap opportunity before refilling.
-        if prefer_recurrent and scheduler.has_ready(RequestPhase.RECURRENT):
-            return scheduler._take(RequestPhase.RECURRENT)
-        if scheduler.has_ready(RequestPhase.PRELUDE):
-            return scheduler._take(RequestPhase.PRELUDE)
-        if scheduler.has_ready(RequestPhase.CODA) and (
-            len(scheduler.queues[RequestPhase.CODA]) >= self.config.min_coda_batch_size
-            or not scheduler.has_ready(RequestPhase.RECURRENT)
+        if prefer_recurrent and self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT):
+            return self.take_work(scheduler, WorkKey.DECODE_RECURRENT)
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_PRELUDE):
+            return self.take_work(scheduler, WorkKey.DECODE_PRELUDE)
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_CODA) and (
+            len(scheduler.work_queues[WorkKey.DECODE_CODA]) >= self.config.min_coda_batch_size
+            or not self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT)
         ):
-            return scheduler._take(RequestPhase.CODA)
-        if self.decode_due and scheduler.has_ready(RequestPhase.RECURRENT):
-            return scheduler._take(RequestPhase.RECURRENT)
+            return self.take_work(scheduler, WorkKey.DECODE_CODA)
+        if self.decode_due and self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT):
+            return self.take_work(scheduler, WorkKey.DECODE_RECURRENT)
+
         scheduler._admit()
-        for phase in self.PREFILL_PHASES:
-            if scheduler.has_ready(phase):
-                return scheduler._take(phase)
-        # Admission can restore a snapshot directly to a boundary phase.
-        if scheduler.has_ready(RequestPhase.PRELUDE):
-            return scheduler._take(RequestPhase.PRELUDE)
-        if scheduler.has_ready(RequestPhase.CODA) and (
-            len(scheduler.queues[RequestPhase.CODA]) >= self.config.min_coda_batch_size
-            or not scheduler.has_ready(RequestPhase.RECURRENT)
+        for work in self.PREFILL_WORKS:
+            if self.has_ready_work(scheduler, work):
+                return self.take_work(scheduler, work)
+        # Admission can restore a request directly to a boundary work queue.
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_PRELUDE):
+            return self.take_work(scheduler, WorkKey.DECODE_PRELUDE)
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_CODA) and (
+            len(scheduler.work_queues[WorkKey.DECODE_CODA]) >= self.config.min_coda_batch_size
+            or not self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT)
         ):
-            return scheduler._take(RequestPhase.CODA)
-        if scheduler.has_ready(RequestPhase.RECURRENT):
-            return scheduler._take(RequestPhase.RECURRENT)
+            return self.take_work(scheduler, WorkKey.DECODE_CODA)
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT):
+            return self.take_work(scheduler, WorkKey.DECODE_RECURRENT)
         return None
 
 
@@ -98,30 +115,29 @@ class NoRefillPolicy(SchedulingPolicy):
         self, scheduler: "Scheduler", *, prefer_recurrent: bool = False
     ) -> "SchedulerOutput | None":
         if self.phase == NoRefillPhase.CORE:
-            if scheduler.has_ready(RequestPhase.RECURRENT):
-                return scheduler._take(RequestPhase.RECURRENT)
+            if self.has_ready_work(scheduler, WorkKey.DECODE_RECURRENT):
+                return self.take_work(scheduler, WorkKey.DECODE_RECURRENT)
             self.phase = NoRefillPhase.CODA
         if self.phase == NoRefillPhase.CODA:
-            if scheduler.has_ready(RequestPhase.CODA):
-                return scheduler._take(RequestPhase.CODA)
+            if self.has_ready_work(scheduler, WorkKey.DECODE_CODA):
+                return self.take_work(scheduler, WorkKey.DECODE_CODA)
             self.phase = NoRefillPhase.FILL
-        # Bound prefill runs so continuous arrivals cannot starve decode.
         if self.decode_due:
-            if scheduler.has_ready(RequestPhase.PRELUDE):
-                return scheduler._take(RequestPhase.PRELUDE)
-            if scheduler.has_ready(RequestPhase.RECURRENT):
+            if self.has_ready_work(scheduler, WorkKey.DECODE_PRELUDE):
+                return self.take_work(scheduler, WorkKey.DECODE_PRELUDE)
+            if self.has_ready_work(scheduler, WorkKey.DECODE_RECURRENT):
                 self.phase = NoRefillPhase.CORE
-                return scheduler._take(RequestPhase.RECURRENT)
+                return self.take_work(scheduler, WorkKey.DECODE_RECURRENT)
         scheduler._admit()
-        if scheduler.has_ready(RequestPhase.PREFILL):
-            return scheduler._take(RequestPhase.PREFILL)
-        if scheduler.has_ready(RequestPhase.CODA):  # First output after full-depth prompt prefill.
-            return scheduler._take(RequestPhase.CODA)
-        if scheduler.has_ready(RequestPhase.PRELUDE):
-            return scheduler._take(RequestPhase.PRELUDE)
-        if scheduler.has_ready(RequestPhase.RECURRENT):
+        if self.has_ready_work(scheduler, WorkKey.PROMPT_ATOMIC):
+            return self.take_work(scheduler, WorkKey.PROMPT_ATOMIC)
+        if self.has_ready_work(scheduler, WorkKey.DECODE_CODA):
+            return self.take_work(scheduler, WorkKey.DECODE_CODA)
+        if self.has_ready_work(scheduler, WorkKey.DECODE_PRELUDE):
+            return self.take_work(scheduler, WorkKey.DECODE_PRELUDE)
+        if self.has_ready_work(scheduler, WorkKey.DECODE_RECURRENT):
             self.phase = NoRefillPhase.CORE
-            return scheduler._take(RequestPhase.RECURRENT)
+            return self.take_work(scheduler, WorkKey.DECODE_RECURRENT)
         return None
 
 
@@ -130,55 +146,52 @@ class SpeculativePolicy(SchedulingPolicy):
 
     def __init__(self, config):
         super().__init__(config)
-        self.PREFILL_PHASES = (
-            (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+        self.PREFILL_WORKS = (
+            (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
             if requires_staged_prefill(config, produces_tokens=True)
-            else (RequestPhase.PREFILL,)
+            else (WorkKey.PROMPT_ATOMIC,)
         )
 
     def schedule(self, scheduler, *, prefer_recurrent=False):
-        if scheduler.has_ready(RequestPhase.CODA):
-            return scheduler._take(RequestPhase.CODA)
-        if self.decode_due and scheduler.has_ready(RequestPhase.SPECULATIVE):
-            return scheduler._take(RequestPhase.SPECULATIVE)
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_CODA):
+            return self.take_work(scheduler, WorkKey.DECODE_CODA)
+        if self.decode_due and self.has_ready_exact_work(scheduler, WorkKey.SPECULATIVE):
+            return self.take_work(scheduler, WorkKey.SPECULATIVE)
         scheduler._admit()
-        # Admission can import a complete prompt directly into CODA.
-        if scheduler.has_ready(RequestPhase.CODA):
-            return scheduler._take(RequestPhase.CODA)
-        for phase in self.PREFILL_PHASES:
-            if scheduler.has_ready(phase):
-                return scheduler._take(phase)
-        if scheduler.has_ready(RequestPhase.SPECULATIVE):
-            return scheduler._take(RequestPhase.SPECULATIVE)
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_CODA):
+            return self.take_work(scheduler, WorkKey.DECODE_CODA)
+        for work in self.PREFILL_WORKS:
+            if self.has_ready_work(scheduler, work):
+                return self.take_work(scheduler, work)
+        if self.has_ready_exact_work(scheduler, WorkKey.SPECULATIVE):
+            return self.take_work(scheduler, WorkKey.SPECULATIVE)
         return None
 
 
 class SplitPrefillPolicy(RefillPolicy):
     """Refill ordering for staged prompt work and recurrent depth boundaries."""
 
-    PREFILL_PHASES = (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+    PREFILL_WORKS = (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
 
 
 class MixedPolicy(SplitPrefillPolicy):
-    """Choose compatible prompt/generation work; execution is policy-agnostic."""
+    """Combine compatible prompt and decode work while sharing refill ordering."""
+
+    def work_group(self, work: WorkKey) -> tuple[WorkKey, ...]:
+        if work in PRELUDE_WORKS:
+            return PRELUDE_WORKS
+        if work in RECURRENT_WORKS:
+            return RECURRENT_WORKS
+        return (work,)
 
     def schedule(self, scheduler, *, prefer_recurrent=False):
-        if scheduler.has_ready(RequestPhase.RECURRENT) and scheduler.has_ready(
-            RequestPhase.PREFILLING_RECURRENT
+        if self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT) and (
+            self.has_ready_exact_work(scheduler, WorkKey.PROMPT_RECURRENT)
         ):
-            return scheduler.take_phases(
-                (RequestPhase.RECURRENT, RequestPhase.PREFILLING_RECURRENT)
-            )
-        if prefer_recurrent and scheduler.has_ready(RequestPhase.RECURRENT):
-            return scheduler._take(RequestPhase.RECURRENT)
-        if (
-            scheduler.wavefront_chunked_prefill
-            and scheduler.has_ready(RequestPhase.PRELUDE)
-            and scheduler.has_ready(RequestPhase.PREFILLING_PRELUDE)
-        ):
-            return scheduler.take_phases((RequestPhase.PRELUDE, RequestPhase.PREFILLING_PRELUDE))
-        batch = super().schedule(scheduler, prefer_recurrent=prefer_recurrent)
-        return batch
+            return scheduler.take_works(RECURRENT_WORKS)
+        if prefer_recurrent and self.has_ready_exact_work(scheduler, WorkKey.DECODE_RECURRENT):
+            return scheduler.take_works((WorkKey.DECODE_RECURRENT,))
+        return super().schedule(scheduler, prefer_recurrent=prefer_recurrent)
 
 
 def create_scheduling_policy(

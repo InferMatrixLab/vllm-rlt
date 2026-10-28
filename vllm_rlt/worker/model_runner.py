@@ -8,8 +8,9 @@ from typing import NamedTuple
 import torch
 
 from vllm_rlt.config import ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt.core.execution import ExecutionBatch, Operation
 from vllm_rlt.core.scheduler import SchedulerOutput
-from vllm_rlt.request import ExecutionBatch, Operation, Request
+from vllm_rlt.request import Request
 from vllm_rlt.worker.buffers import (
     PackedMetadataBuffer,
     Workspace,
@@ -1180,7 +1181,7 @@ class ModelRunner:
         execution needs only ExecutionBatch; neither path waits for readback here
         unless bounded buffers must be recycled.
         """
-        split_prefill = batch.has_chunks
+        has_split_prefill_work = batch.has_split_prefill_work
         # A fused prelude + loops stays resident on core; chunking does not
         # change the stream of an otherwise standalone prelude or coda.
         stream = self.core_stream if batch.loop_count else self.boundary_stream
@@ -1188,7 +1189,7 @@ class ModelRunner:
         routing_finish_attempted = False
         slot = None
         try:
-            if self.submissions.begin() and split_prefill:
+            if self.submissions.begin() and has_split_prefill_work:
                 self.split_prefill_submission_waits += 1
             prepared = self.prepare_on_cpu(batch)
             source_stream = (
@@ -1254,7 +1255,7 @@ class ModelRunner:
                     for span in batch.spans:
                         self.events[span.request.request_id] = compute_done
                     self.submissions.complete(compute_done)
-            if split_prefill:
+            if has_split_prefill_work:
                 self.split_prefill_submissions += 1
             return Submission(
                 scheduled_batch,

@@ -1,6 +1,6 @@
 """Request state, immutable execution descriptions and public request outputs."""
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 
 import torch
@@ -8,24 +8,12 @@ import torch
 from vllm_rlt.sampling_params import SamplingParams
 
 
-class RequestPhase(str, Enum):
+class RequestStatus(str, Enum):
     WAITING = "waiting"
     RECEIVING = "receiving"
     TRANSFERRING = "transferring"
-    PREFILL = "prefill"
-    PREFILLING_PRELUDE = "prefilling_prelude"
-    PREFILLING_RECURRENT = "prefilling_recurrent"
-    PRELUDE = "prelude"
-    RECURRENT = "recurrent"
-    SPECULATIVE = "speculative"
-    CODA = "coda"
+    ACTIVE = "active"
     FINISHED = "finished"
-
-
-class Operation(Enum):
-    PRELUDE = "prelude"
-    RECURRENT = "recurrent"
-    CODA = "coda"
 
 
 class FinishReason(str, Enum):
@@ -39,7 +27,7 @@ class Request:
     request_id: str
     prompt_token_ids: list[int]
     sampling_params: SamplingParams
-    phase: RequestPhase = RequestPhase.WAITING
+    status: RequestStatus = RequestStatus.WAITING
     generated_token_ids: list[int] = field(default_factory=list)
     exit_depths: list[int] = field(default_factory=list)
     # Scheduling advances before coda's CPU output delivery.
@@ -108,94 +96,7 @@ class Request:
         return self.generated_token_ids[-1]
 
 
-@dataclass(frozen=True)
-class StateSpan:
-    """Immutable execution range borrowing the original Request for state ownership."""
-
-    request: Request
-    token_start: int
-    token_count: int
-    # Zero-based starting recurrent depth, not the request's completed-loop count.
-    # Scheduled PRELUDE starts at 0; CODA executes no recurrent loop and uses 0
-    # for boundary-layer KV addressing when required. CODA consumes the final
-    # recurrent hidden state; its actual exit depth remains in request.loops_done.
-    depth: int
-    # None lets the runner derive token_start - chunk_start. Otherwise this is a
-    # row offset into the request's prefill hidden-state buffer, including its ring slot.
-    chunk_start: int | None = None
-    retain_chunk: bool = False
-    retain_last: bool = True
-    emit_gate: bool = False
-    # For chunk PRELUDE, None reads the immutable request prompt range directly.
-    # Explicit tokens override that source (also used by direct execution callers).
-    input_tokens: tuple[int, ...] | None = None
-    # Row offset in the request's prefill hidden-state buffer. None lets the runner
-    # derive token_start - chunk_start.
-    prefill_hidden_row_offset: int | None = None
-
-
-@dataclass(frozen=True)
-class ExecutionBatch:
-    """Selected request ranges bound to one model operation and loop boundary."""
-
-    operation: Operation
-    spans: tuple[StateSpan, ...]
-    # Number of recurrent operations following PRELUDE, or starting at RECURRENT.
-    # PRELUDE + N loops retains activations locally until the submission boundary.
-    loop_count: int = 0
-
-    def __post_init__(self):
-        if self.loop_count < 0:
-            raise ValueError("loop_count must be nonnegative")
-        if self.operation == Operation.RECURRENT and self.loop_count == 0:
-            object.__setattr__(self, "loop_count", 1)
-        if self.operation == Operation.CODA and self.loop_count:
-            raise ValueError("CODA cannot include recurrent work")
-        for span in self.spans:
-            if span.token_start < 0 or span.token_count <= 0 or span.depth < 0:
-                raise ValueError("state spans require nonnegative addresses and positive rows")
-
-    def at_loop(self, offset: int):
-        """Bind a loop view without changing request progress or storage ownership."""
-        if not 0 <= offset < self.loop_count:
-            raise ValueError("loop offset outside execution range")
-        return replace(
-            self,
-            operation=Operation.RECURRENT,
-            loop_count=1,
-            spans=tuple(replace(span, depth=span.depth + offset) for span in self.spans),
-        )
-
-    def validate_depths(self, total_depths: int):
-        if any(span.depth + self.loop_count > total_depths for span in self.spans):
-            raise ValueError("execution range exceeds model loop depth")
-
-    @property
-    def num_rows(self):
-        return sum(span.token_count for span in self.spans)
-
-    @property
-    def has_chunks(self):
-        return any(span.chunk_start is not None for span in self.spans)
-
-    @property
-    def all_chunks(self):
-        return bool(self.spans) and all(span.chunk_start is not None for span in self.spans)
-
-    @property
-    def emit_gate(self):
-        return any(span.emit_gate for span in self.spans)
-
-    def addresses(self):
-        ids, depths, positions = [], [], []
-        for span in self.spans:
-            ids.extend([span.request.request_id] * span.token_count)
-            depths.extend([span.depth] * span.token_count)
-            positions.extend(range(span.token_start, span.token_start + span.token_count))
-        return ids, depths, positions
-
-
-@dataclass(frozen=True)
+@dataclass
 class RequestOutput:
     request_id: str
     prompt_token_ids: list[int]
@@ -212,7 +113,7 @@ class RequestOutput:
             prompt_token_ids=list(request.prompt_token_ids),
             token_ids=list(request.generated_token_ids),
             exit_depths=list(request.exit_depths),
-            finished=request.phase == RequestPhase.FINISHED,
+            finished=request.status == RequestStatus.FINISHED,
             finish_reason=request.finish_reason.value
             if request.finish_reason is not None
             else None,

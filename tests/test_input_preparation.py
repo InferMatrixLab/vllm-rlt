@@ -5,10 +5,11 @@ import torch
 
 from tests.helpers import make_prefill_engine, tiny_ouro_config, tiny_ouro_model
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import ExecutionBatch, Operation, StateSpan
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import ExecutionBatch, Operation, Request, StateSpan
+from vllm_rlt.request import Request
 from vllm_rlt.worker.buffers import PackedMetadataBuffer, Workspace, stage_metadata
 from vllm_rlt.worker.metadata import KVMetadata
 
@@ -189,7 +190,8 @@ def test_model_execution_consumes_selected_and_staged_graphs(monkeypatch):
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 @pytest.mark.parametrize("phase", ["prepare_on_cpu", "prepare_on_gpu", "_execute"])
 def test_loop_input_failure_releases_ownership_before_pool_wrap(monkeypatch, device, phase):
-    from vllm_rlt.request import ExecutionBatch, Operation, Request, StateSpan
+    from vllm_rlt.core.execution import ExecutionBatch, Operation, StateSpan
+    from vllm_rlt.request import Request
 
     model = OuroForCausalLM(tiny_ouro_config()).to(device)
     engine = LLMEngine(
@@ -336,7 +338,7 @@ def test_packed_metadata_supports_query_lengths_and_per_request_depths(use_uva, 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 @pytest.mark.parametrize("operation", [Operation.PRELUDE, Operation.RECURRENT])
 def test_cpu_preparation_defers_transfers_and_hidden_gather(monkeypatch, device, operation):
-    from vllm_rlt.request import ExecutionBatch, StateSpan
+    from vllm_rlt.core.execution import ExecutionBatch, StateSpan
     from vllm_rlt.worker.tensors import TensorTransfer, UvaBuffer
 
     e = LLMEngine(
@@ -382,7 +384,7 @@ def test_cpu_preparation_defers_transfers_and_hidden_gather(monkeypatch, device,
 
 
 def test_cpu_preparation_failure_returns_acquired_buffer(monkeypatch):
-    from vllm_rlt.request import ExecutionBatch, StateSpan
+    from vllm_rlt.core.execution import ExecutionBatch, StateSpan
 
     e = make_prefill_engine()
     runner = e.model_runner
@@ -410,7 +412,7 @@ def test_cpu_preparation_failure_returns_acquired_buffer(monkeypatch):
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 def test_prelude_gpu_preparation_uses_cpu_snapshot_and_preserves_new_token_reference(device):
-    from vllm_rlt.request import ExecutionBatch, StateSpan
+    from vllm_rlt.core.execution import ExecutionBatch, StateSpan
 
     e = LLMEngine(
         tiny_ouro_model().to(device),
@@ -449,7 +451,7 @@ def test_prelude_gpu_preparation_uses_cpu_snapshot_and_preserves_new_token_refer
 def test_prelude_workspace_owned_once_across_gpu_prepare_and_forward(
     monkeypatch, device, fail_preparation
 ):
-    from vllm_rlt.request import ExecutionBatch, StateSpan
+    from vllm_rlt.core.execution import ExecutionBatch, StateSpan
 
     e = LLMEngine(
         tiny_ouro_model().to(device),

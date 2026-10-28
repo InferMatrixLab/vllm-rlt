@@ -16,20 +16,20 @@
 <path d="M910 327H1010" fill="none" stroke="#356bab" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
 <text x="956" y="310" font-size="19" fill="#356bab" font-weight="400" text-anchor="middle">fits</text>
 <rect x="1010" y="304" width="320" height="46" rx="10" fill="#edf3fc" stroke="#cfdaea" stroke-width="2"/>
-<text x="1170.0" y="334" font-size="21" fill="#203951" font-weight="700" text-anchor="middle">Admit / restore phase</text>
+<text x="1170.0" y="334" font-size="21" fill="#203951" font-weight="700" text-anchor="middle">Admit / restore work</text>
 <path d="M805 374V422H640" fill="none" stroke="#9676ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
 <text x="824" y="407" font-size="19" fill="#9676ac" font-weight="400" text-anchor="start">safe victim</text>
 <rect x="395" y="399" width="245" height="46" rx="10" fill="#f1e9f8" stroke="#cfdaea" stroke-width="2"/>
 <text x="517.5" y="429" font-size="21" fill="#203951" font-weight="700" text-anchor="middle">Preempt → snapshot</text>
 <path d="M410 399V350" fill="none" stroke="#9676ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<text x="677" y="453" font-size="20" fill="#73869c" font-weight="400" text-anchor="start">Victim returns to WAITING; restores its saved phase.</text>
+<text x="677" y="453" font-size="20" fill="#73869c" font-weight="400" text-anchor="start">Victim returns to WAITING; restores its saved WorkKey.</text>
 <path d="M700 327V365H620V350" fill="none" stroke="#8fa3bd" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
 <text x="672" y="391" font-size="18" fill="#73869c" font-weight="400" text-anchor="middle">no fit → wait</text>
 <text x="395" y="503" font-size="22" fill="#526c88" font-weight="400" text-anchor="start">Priority / fairness  ·  free KV  ·  reserved growth  ·  protected users</text>
 <rect x="360" y="595" width="1010" height="330" rx="18" fill="#ffffff" stroke="#cfdaea" stroke-width="2"/>
 <circle cx="402" cy="638" r="24" fill="#356bab"/>
 <text x="402" y="646" font-size="25" fill="white" font-weight="700" text-anchor="middle">B</text>
-<text x="442" y="647" font-size="30" fill="#203951" font-weight="700" text-anchor="start">Ready queues — next phase per request</text>
+<text x="442" y="647" font-size="30" fill="#203951" font-weight="700" text-anchor="start">Work queues — one pending WorkKey per request</text>
 <text x="1338" y="644" font-size="18" fill="#73869c" font-weight="700" text-anchor="end">SCHEDULER</text>
 <text x="395" y="697" font-size="22" fill="#203951" font-weight="700" text-anchor="start">Atomic prompt</text>
 <rect x="620" y="668" width="690" height="46" rx="10" fill="#fff2dc" stroke="#cfdaea" stroke-width="2"/>
@@ -123,7 +123,7 @@
 <text x="962.5" y="2129" font-size="21" fill="#203951" font-weight="700" text-anchor="middle">Next token</text>
 <rect x="1085" y="2099" width="245" height="46" rx="10" fill="#edf3fc" stroke="#cfdaea" stroke-width="2"/>
 <text x="1207.5" y="2129" font-size="21" fill="#203951" font-weight="700" text-anchor="middle">CODA</text>
-<text x="395" y="2194" font-size="22" fill="#73869c" font-weight="400" text-anchor="start">Update Request → enqueue(next phase), or stop scheduling when finished.</text>
+<text x="395" y="2194" font-size="22" fill="#73869c" font-weight="400" text-anchor="start">Update Request → enqueue the next WorkKey, or finish.</text>
 <path d="M865 545V595" fill="none" stroke="#356bab" stroke-width="5" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
 <path d="M865 925V975" fill="none" stroke="#356bab" stroke-width="5" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
 <path d="M865 1415V1470" fill="none" stroke="#356bab" stroke-width="5" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
@@ -132,7 +132,7 @@
 <path d="M865 2225V2320" fill="none" stroke="#356bab" stroke-width="5" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
 <text x="886" y="2291" font-size="20" fill="#73869c" font-weight="400" text-anchor="start">finished</text>
 <path d="M360 2122H110V638H360" fill="none" stroke="#356bab" stroke-width="5" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<text transform="translate(83 1580) rotate(-90)" font-size="24" fill="#356bab" font-weight="700">CONTINUE · enqueue the next phase</text>
+<text transform="translate(83 1580) rotate(-90)" font-size="24" fill="#356bab" font-weight="700">CONTINUE · enqueue the next WorkKey</text>
 <path d="M360 1120H270V422H395" fill="none" stroke="#9676ac" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
 <text transform="translate(250 1030) rotate(-90)" font-size="20" fill="#9676ac">KV growth blocked → safe victim / otherwise defer</text>
 <rect x="1460" y="215" width="290" height="240" rx="18" fill="#fff8ee" stroke="#dfc79c" stroke-width="2"/>

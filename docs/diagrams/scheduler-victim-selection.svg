@@ -134,7 +134,7 @@
 <rect x="942" y="1653" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
 <rect x="984" y="1653" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
 <rect x="1026" y="1653" width="32" height="32" rx="7" fill="#e8dcf2" stroke="#9570ac" stroke-width="2"/>
-<text x="1110" y="1677" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="400" text-anchor="start">KV + h / token + phase</text>
+<text x="1110" y="1677" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#9570ac" font-weight="400" text-anchor="start">KV + hidden / token + WorkKey</text>
 <path d="M1360 1644H1440" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
 <rect x="1460" y="1620" width="505" height="48" rx="17" fill="#f4edf9" stroke="#d0dceb" stroke-width="2"/>
 <text x="1712.5" y="1652" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">Free GPU resources; retain RNG</text>
@@ -155,7 +155,7 @@
 <path d="M710 2030H880V2220H730" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
 <text x="780" y="2010" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#b9656b" font-weight="400" text-anchor="start">no</text>
 <rect x="290" y="2195" width="440" height="48" rx="17" fill="#fff5f3" stroke="#d0dceb" stroke-width="2"/>
-<text x="510.0" y="2227" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#b9656b" font-weight="700" text-anchor="middle">Requeue in original phase</text>
+<text x="510.0" y="2227" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#b9656b" font-weight="700" text-anchor="middle">Keep WAITING position</text>
 <text x="290" y="2275" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#728399" font-weight="400" text-anchor="start">Other requests can still be selected.</text>
 <path d="M110 2310H950" fill="none" stroke="#728399" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
 <text x="110" y="2355" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#356bab" font-weight="700" text-anchor="start">B · Slot freed → shared admission</text>
@@ -171,7 +171,7 @@
 <path d="M340 2590H145V2700H250" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
 <text x="180" y="2570" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#43856f" font-weight="400" text-anchor="start">yes</text>
 <rect x="250" y="2675" width="300" height="48" rx="17" fill="#edf7f1" stroke="#d0dceb" stroke-width="2"/>
-<text x="400.0" y="2707" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#43856f" font-weight="700" text-anchor="middle">Queue next phase</text>
+<text x="400.0" y="2707" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#43856f" font-weight="700" text-anchor="middle">Enqueue saved WorkKey</text>
 <path d="M720 2590H910V2780H600" fill="none" stroke="#b9656b" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
 <text x="805" y="2570" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#b9656b" font-weight="400" text-anchor="start">no</text>
 <rect x="250" y="2755" width="350" height="48" rx="17" fill="#fff5f3" stroke="#d0dceb" stroke-width="2"/>
@@ -215,7 +215,7 @@
 <text x="1205" y="2445" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#728399" font-weight="400" text-anchor="start">CPU → new GPU allocation → synchronize</text>
 <path d="M1560 2475V2520" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
 <rect x="1180" y="2520" width="750" height="48" rx="17" fill="#f0e6f8" stroke="#d0dceb" stroke-width="2"/>
-<text x="1555.0" y="2552" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">Delete snapshot → enqueue saved phase</text>
+<text x="1555.0" y="2552" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">Delete snapshot → enqueue saved WorkKey</text>
 <path d="M1560 2568V2605" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
 <path d="M1560 2587H1298V2605" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
 <path d="M1560 2587H1808V2605" fill="none" stroke="#9570ac" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#a)"/>
@@ -225,7 +225,7 @@
 <text x="1552.5" y="2637" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">RECURRENT</text>
 <rect x="1690" y="2605" width="235" height="48" rx="17" fill="#f4edf9" stroke="#d0dceb" stroke-width="2"/>
 <text x="1807.5" y="2637" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#9570ac" font-weight="700" text-anchor="middle">CODA</text>
-<text x="1180" y="2681" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#9570ac" font-weight="400" text-anchor="start">One saved phase; queue labels above are examples.</text>
+<text x="1180" y="2681" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#9570ac" font-weight="400" text-anchor="start">One saved WorkKey; queue labels above are examples.</text>
 <text x="1180" y="2715" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">Split-prefill rewind resumes at chunk PRELUDE.</text>
 <text x="1180" y="2748" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">Failed restore defers without nested KV preemption.</text>
 <text x="1180" y="2782" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#728399" font-weight="400" text-anchor="start">Shared admission: bounded scan; FCFS / priority.</text>
