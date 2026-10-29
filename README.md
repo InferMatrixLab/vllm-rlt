@@ -88,7 +88,8 @@ for supported combinations and limitations.
   scheduling, multiple CUDA streams, reusable buffers, and CUDA Graph capture
   of decode recurrent cores. Asynchronous self-speculation also supports compatible
   paged FlashAttention backends and recurrent/coda CUDA Graphs; see the
-  [execution scope and constraints](docs/async-speculative.md#cuda-graph-scope-and-ownership).
+  [sync vs async timeline](docs/async-speculative.md#timeline-synchronous-versus-asynchronous-speculation)
+  and [execution scope and constraints](docs/async-speculative.md#cuda-graph-scope-and-ownership).
 - **Offline and online inference.** A Python API, a command-line interface,
   and an OpenAI-compatible completions endpoint with streaming, greedy decoding,
   and seeded top-k/top-p sampling.

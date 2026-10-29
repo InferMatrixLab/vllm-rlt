@@ -620,7 +620,7 @@ def test_speculative_cuda_graph_matches_eager_with_ragged_replay(max_graph_rows,
     if max_graph_rows == 2:
         assert runner.graphs.fallbacks > 0
     else:
-        assert any(rows > 2 for rows, _, _, _ in runner.graphs.entries)
+        assert any(key[0] > 2 for key in runner.graphs.entries)
 
 
 @pytest.mark.parametrize(
@@ -767,12 +767,13 @@ def test_abort_suspended_speculative_request_allows_id_reuse():
 @pytest.mark.parametrize("chunk_size", [1, 3, 8])
 @pytest.mark.parametrize("budget", [2, 7])
 @pytest.mark.parametrize("pipelined", [False, True])
+@pytest.mark.parametrize("wavefront", [False, True])
 def test_split_prefill_and_speculation_share_forward_and_match_atomic(
-    chunk_size, budget, pipelined
+    chunk_size, budget, pipelined, wavefront
 ):
     from vllm_rlt.request import Operation
 
-    def run(atomic):
+    def run(wavefront):
         e = engine(
             model(),
             pipelined=pipelined,
@@ -780,8 +781,9 @@ def test_split_prefill_and_speculation_share_forward_and_match_atomic(
             scheduler_config=SchedulerConfig(
                 max_num_batched_tokens=budget,
                 prefill_chunk_size=chunk_size,
+                wavefront_chunked_prefill=wavefront,
             ),
-            execution_config=ExecutionConfig(atomic_prefill=atomic),
+            execution_config=ExecutionConfig(),
         )
         assert e.speculative_runner.runtime is e.model_runner.runtime
         operations = set()
@@ -802,9 +804,13 @@ def test_split_prefill_and_speculation_share_forward_and_match_atomic(
     assert run(False) == run(True)
 
 
-@pytest.mark.parametrize("atomic", [False, True])
-def test_common_submit_entry_preserves_prefill_and_speculative_results(atomic, monkeypatch):
-    e = engine(model(), execution_config=ExecutionConfig(atomic_prefill=atomic))
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_common_submit_entry_preserves_prefill_and_speculative_results(wavefront, monkeypatch):
+    e = engine(
+        model(),
+        scheduler_config=SchedulerConfig(wavefront_chunked_prefill=wavefront),
+        execution_config=ExecutionConfig(),
+    )
     calls = []
     submit = e.executor.submit
 
@@ -924,5 +930,369 @@ def test_speculative_input_slots_survive_three_submits_before_collection(use_uva
         # Only completion of their GPU readers permits the slots to be recycled.
         tickets = [runner.submit(part) for part in batches]
         assert [ticket.collect().speculative for ticket in tickets] == expected
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("draft_loops", [1, 2])
+@pytest.mark.parametrize("budget", [1, 3, 32])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_pipeline_uses_existing_scheduler_with_ragged_requests(draft_loops, budget, device):
+    m = model(seed=42).to(device)
+    prompts = [[1, 2, 3], [4, 12, 18, 22], [5]]
+    params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in [1, 8, 5]]
+    expected = LLM(m, cache_config=CacheConfig(256, 2)).generate(prompts, params)
+    llm = LLM(
+        m,
+        speculative_config=SpeculativeConfig(4, draft_loops=draft_loops, mode="pipeline"),
+        cache_config=CacheConfig(256, 2),
+        scheduler_config=SchedulerConfig(max_num_batched_tokens=budget, prefill_chunk_size=2),
+    )
+    actual = llm.generate(prompts, params)
+    assert [o.token_ids for o in actual] == [o.token_ids for o in expected]
+    assert not llm.engine.speculative_runner.pipeline_states
+    assert llm.engine.cache_manager.num_used_blocks == 0
+
+
+def test_pipeline_cancel_reuse_and_new_arrival():
+    e = LLMEngine(
+        model(seed=42),
+        speculative_config=SpeculativeConfig(4, draft_loops=1, mode="pipeline"),
+        cache_config=CacheConfig(256, 2),
+    )
+    params = SamplingParams(max_tokens=12, ignore_eos=True)
+    e.add_request("a", [1, 2, 3], params)
+    e.add_request("b", [5], params)
+    for _ in range(100):
+        e.step()
+        if "a" in e.speculative_runner.pipeline_states:
+            break
+    else:
+        pytest.fail("pipeline state was not created")
+    old = e.scheduler.requests["a"]
+    e.abort_request("a")
+    assert "a" not in e.speculative_runner.pipeline_states
+    e.add_request("a", [4, 12, 18, 22], params)
+    # A stale cleanup must not remove the replacement generation.
+    for _ in range(100):
+        e.step()
+        if "a" in e.speculative_runner.pipeline_states:
+            break
+    replacement = e.speculative_runner.pipeline_states["a"]
+    e.speculative_runner.release(old)
+    assert e.speculative_runner.pipeline_states["a"] is replacement
+    e.add_request("c", [9, 3], SamplingParams(max_tokens=3, ignore_eos=True))
+    out = drain(e)
+    assert {"a", "b", "c"} <= set(out)
+    assert not e.speculative_runner.pipeline_states
+    assert e.cache_manager.num_used_blocks == 0
+
+
+def test_pipeline_failure_cleans_state_and_can_reuse_ids(monkeypatch):
+    e = LLMEngine(model(seed=42), speculative_config=SpeculativeConfig(4, mode="pipeline"))
+    e.add_request("a", [1, 2, 3], SamplingParams(max_tokens=8, ignore_eos=True))
+    runner = e.speculative_runner
+    original = runner._recurrent
+
+    def fail(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("injected pipeline failure")
+
+    monkeypatch.setattr(runner, "_recurrent", fail)
+    with pytest.raises(RuntimeError, match="injected pipeline failure"):
+        drain(e)
+    assert not runner.pipeline_states
+    assert e.cache_manager.num_used_blocks == 0
+    monkeypatch.setattr(runner, "_recurrent", original)
+    e.add_request("a", [5], SamplingParams(max_tokens=3, ignore_eos=True))
+    assert len(drain(e)["a"].token_ids) == 3
+
+
+def test_pipeline_eos_uses_scheduler_stop_and_cleanup():
+    m = model(seed=42)
+    prompt = [1, 2, 3]
+    reference = LLM(m).generate([prompt], SamplingParams(max_tokens=6, ignore_eos=True))[0]
+    from dataclasses import replace
+
+    m.config = replace(m.config, eos_token_id=reference.token_ids[2])
+    llm = LLM(m, speculative_config=SpeculativeConfig(4, draft_loops=1, mode="pipeline"))
+    result = llm.generate([prompt], SamplingParams(max_tokens=12))[0]
+    assert result.token_ids[-1] == m.config.eos_token_id
+    assert len(result.token_ids) <= 3
+    assert not llm.engine.speculative_runner.pipeline_states
+    assert llm.engine.cache_manager.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_pipeline_preemption_restores_hidden_and_candidates(offload):
+    _pipeline_preemption_case("cpu", False, False, offload)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("graphs", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "flash_attn_4"])
+def test_pipeline_graph_async_preemption_combination(graphs, async_scheduling, offload, backend):
+    _pipeline_preemption_case("cuda", graphs, async_scheduling, offload, backend)
+
+
+def _pipeline_preemption_case(device, graphs, async_scheduling, offload, backend=None):
+    backend = backend or ("triton" if device == "cuda" else "torch")
+    if backend == "flash_attn_4":
+        torch.manual_seed(42)
+        m = OuroForCausalLM(tiny_ouro_config(hidden_size=256, head_dim=64)).to(
+            device, torch.bfloat16
+        )
+    else:
+        m = model(seed=42).to(device)
+    cache_config = CacheConfig(256, 16 if backend == "flash_attn_4" else 2)
+    prompt = [1, 2, 3]
+    params = SamplingParams(max_tokens=12, ignore_eos=True, priority=10)
+    expected = (
+        LLM(
+            m,
+            cache_config=cache_config,
+            attention_backend=backend,
+        )
+        .generate([prompt], params)[0]
+        .token_ids
+    )
+    e = LLMEngine(
+        m,
+        attention_backend=backend,
+        speculative_config=SpeculativeConfig(4, draft_loops=1, mode="pipeline"),
+        cache_config=cache_config,
+        scheduler_config=SchedulerConfig(max_num_seqs=1, enable_preemption=True, policy="priority"),
+        execution_config=ExecutionConfig(async_scheduling=async_scheduling, cuda_graphs=graphs),
+    )
+    e.add_request("low", prompt, params)
+    for _ in range(200):
+        e.step()
+        runner = e.speculative_runner
+        if async_scheduling:
+            state = runner.states.get("low")
+            if state is not None:
+                break
+        else:
+            state = runner.pipeline_states.get("low")
+            if state and any(t.depth > 0 for t in state.tokens):
+                break
+    else:
+        pytest.fail("did not submit a pipeline cycle")
+    low = e.scheduler.requests["low"]
+    e.add_request("high", [5], SamplingParams(max_tokens=3, ignore_eos=True, priority=0))
+    for _ in range(200):
+        e.step()
+        if "low" in e.preemption.snapshots:
+            break
+    else:
+        pytest.fail("priority arrival did not suspend the pipeline")
+    saved = e.preemption.snapshots["low"]["pipeline"]
+    assert saved is not None
+    assert any(t.hidden is not None for t in saved.tokens)
+    if async_scheduling:
+        assert "low" not in e.speculative_runner.states
+    else:
+        assert "low" not in e.speculative_runner.pipeline_states
+    if offload:
+        e.preemption.suspend(low, offload_kv=True)
+        assert e.preemption.snapshots["low"]["kv"] is not None
+        saved = e.preemption.snapshots["low"]["pipeline"]
+        assert all(t.hidden is None or t.hidden.device.type == "cpu" for t in saved.tokens)
+    outputs = drain(e)
+    assert outputs["low"].token_ids == expected
+    assert e.preemption.resumptions >= 1
+    assert not e.preemption.snapshots
+    assert not e.speculative_runner.pipeline_states
+    assert e.cache_manager.num_used_blocks == 0
+    if graphs:
+        assert e.speculative_runner.graphs.replays > 0
+        assert e.speculative_runner.coda_graphs.replays > 0
+    e.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("graphs", [False, True])
+def test_pipeline_async_cancel_pending_ticket_and_reuse(graphs):
+    device = "cuda"
+    e = LLMEngine(
+        model(seed=42).to(device),
+        cache_config=CacheConfig(256, 2),
+        attention_backend="triton" if device == "cuda" else "torch",
+        speculative_config=SpeculativeConfig(4, draft_loops=1, mode="pipeline"),
+        execution_config=ExecutionConfig(async_scheduling=True, cuda_graphs=graphs),
+        scheduler_config=SchedulerConfig(enable_preemption=True),
+    )
+    params = SamplingParams(max_tokens=8, ignore_eos=True)
+    e.add_request("a", [1, 2, 3], params)
+    for _ in range(200):
+        e.step()
+        pending = e._pending_speculative
+        if pending:
+            break
+    else:
+        pytest.fail("pipeline never returned an uncollected ticket")
+    old = e.scheduler.requests["a"]
+    assert old.num_speculative_rounds == 1
+    assert not e.scheduler._is_preemption_candidate(
+        old, Request("other", [5], params), priority_only=False, excluded=frozenset()
+    )
+    e.abort_request("a")
+    e.add_request("a", [5], params)
+    # The engine must discard the old generation, even if its ticket has results.
+    outputs = drain(e)
+    assert len(outputs["a"].token_ids) == 8
+    assert not e.speculative_runner.pipeline_states
+    assert e.cache_manager.num_used_blocks == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "flash_attn_4"])
+def test_pipeline_two_loop_graph_replay(async_scheduling, backend):
+    torch.manual_seed(42)
+    m = OuroForCausalLM(tiny_ouro_config(hidden_size=256, head_dim=64)).to("cuda", torch.bfloat16)
+    prompts = [[1, 2, 3], [5]]
+    params = SamplingParams(max_tokens=10, ignore_eos=True)
+    expected = LLM(m, cache_config=CacheConfig(256, 16), attention_backend=backend).generate(
+        prompts, params
+    )
+    llm = LLM(
+        m,
+        cache_config=CacheConfig(256, 16),
+        attention_backend=backend,
+        speculative_config=SpeculativeConfig(4, draft_loops=2, mode="pipeline"),
+        execution_config=ExecutionConfig(async_scheduling=async_scheduling, cuda_graphs=True),
+    )
+    actual = llm.generate(prompts, params)
+    assert [o.token_ids for o in actual] == [o.token_ids for o in expected]
+    assert llm.engine.speculative_runner.graphs.replays > 0
+    assert llm.engine.speculative_runner.coda_graphs.replays > 0
+    assert not llm.engine.speculative_runner.pipeline_states
+    llm.engine.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("draft_loops", [1, 2])
+@pytest.mark.parametrize("budget", [1, 3, 16])
+@pytest.mark.parametrize("graphs", [False, True])
+def test_async_pipeline_ragged_matches_sync_and_submits_ahead(draft_loops, budget, graphs):
+    m = model(seed=42).cuda()
+    prompts = [[1, 2, 3], [5], [4, 12, 18, 22]]
+    params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in [2, 9, 6]]
+    results = []
+    for asynchronous in (False, True):
+        llm = LLM(
+            m,
+            attention_backend="triton",
+            cache_config=CacheConfig(256, 2, incremental_allocation=True),
+            speculative_config=SpeculativeConfig(4, draft_loops=draft_loops, mode="pipeline"),
+            scheduler_config=SchedulerConfig(max_num_batched_tokens=budget, prefill_chunk_size=2),
+            execution_config=ExecutionConfig(async_scheduling=asynchronous, cuda_graphs=graphs),
+        )
+        results.append([o.token_ids for o in llm.generate(prompts, params)])
+        runner = llm.engine.speculative_runner
+        if asynchronous:
+            assert runner.submitted_before_collect > 0
+            assert not runner.states
+            assert all(not b.leased for b in runner.buffers)
+            assert not llm.engine._pending_coda
+        assert llm.engine.cache_manager.num_used_blocks == 0
+        llm.engine.close()
+    assert results[0] == results[1]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("reject", [False, True])
+def test_async_pipeline_uses_gpu_decision_before_collect(reject, monkeypatch):
+    from tests.helpers import bootstrap_speculation
+
+    e = LLMEngine(
+        model(seed=42).cuda(),
+        attention_backend="triton",
+        cache_config=CacheConfig(256, 2),
+        speculative_config=SpeculativeConfig(4, draft_loops=1, mode="pipeline"),
+        execution_config=ExecutionConfig(async_scheduling=True),
+    )
+    try:
+        request = bootstrap_speculation(e)
+        start = request.position
+        runner = e.speculative_runner
+        calls = 0
+
+        def controlled(hidden):
+            nonlocal calls
+            calls += 1
+            logits = torch.full(
+                (len(hidden), runner.model.config.vocab_size), -100.0, device="cuda"
+            )
+            logits[:, 10] = 100.0
+            if reject and calls == 4:
+                logits[0, 10] = -100.0
+                logits[0, 20] = 100.0
+            return logits
+
+        monkeypatch.setattr(runner, "_coda", controlled)
+        e.step()
+        e.step()
+        e._collect_speculative()
+        e._collect_speculative()
+        e.step()
+        e.step()
+        e._collect_speculative()  # Step 3; step 4's acceptance remains uncollected.
+        assert len(request.generated_token_ids) == 1
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("submission read a device decision on the CPU")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.Tensor, "item", forbidden)
+            patch.setattr(torch.Tensor, "tolist", forbidden)
+            e.step()  # Step 5 consumes step 4's decision entirely on GPU.
+        assert len(e._pending_speculative) == 2
+        runner.synchronize()
+        state = runner.states[request.request_id]
+        assert int(state.position) == start + (1 if reject else 2)
+        assert int(state.pipeline.tokens[0]) == (20 if reject else 10)
+        e._collect_speculative()
+        assert request.generated_token_ids[-1] == (20 if reject else 10)
+        assert runner.submitted_before_collect >= 2
+    finally:
+        e.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("graphs", [False, True])
+def test_async_pipeline_partial_failure_drains_and_reuses_request(monkeypatch, graphs):
+    from tests.helpers import bootstrap_speculation
+
+    e = LLMEngine(
+        model(seed=42).cuda(),
+        attention_backend="triton",
+        cache_config=CacheConfig(256, 2),
+        speculative_config=SpeculativeConfig(4, draft_loops=1, mode="pipeline"),
+        execution_config=ExecutionConfig(async_scheduling=True, cuda_graphs=graphs),
+    )
+    try:
+        bootstrap_speculation(e)
+        e.step()
+        runner = e.speculative_runner
+        original = runner._pipeline_step
+
+        def fail(*args):
+            original(*args)
+            raise RuntimeError("injected after pipeline computation")
+
+        monkeypatch.setattr(runner, "_pipeline_step", fail)
+        with pytest.raises(RuntimeError, match="injected after pipeline"):
+            e.step()
+        assert not runner.states
+        assert not e._pending_speculative
+        assert all(not b.leased and not b.keepalive for b in runner.buffers)
+        assert e.cache_manager.num_used_blocks == 0
+        monkeypatch.setattr(runner, "_pipeline_step", original)
+        e.add_request("r", [5], SamplingParams(max_tokens=5, ignore_eos=True))
+        assert len(drain(e)["r"].token_ids) == 5
     finally:
         e.close()

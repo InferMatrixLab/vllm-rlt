@@ -20,7 +20,6 @@ def make_engine(
     preemption=False,
     token_budget=16,
     mode="refill",
-    atomic_prefill=True,
     prefill_chunk_size=16,
 ):
     torch.manual_seed(123)
@@ -39,10 +38,7 @@ def make_engine(
             enable_preemption=preemption,
         ),
         exit_config=ExitConfig("ouro_delayed"),
-        execution_config=ExecutionConfig(
-            async_scheduling=asynchronous,
-            atomic_prefill=atomic_prefill,
-        ),
+        execution_config=ExecutionConfig(async_scheduling=asynchronous),
     )
 
 
@@ -361,14 +357,16 @@ def test_mixed_recurrent_and_split_prefill_progression_through_scheduler(asynchr
     engine = make_engine(
         asynchronous=asynchronous,
         mode="mixed",
-        atomic_prefill=False,
         prefill_chunk_size=2,
         token_budget=4,
     )
     engine.add_request("decode", [2, 3], params)
     for _ in range(10):
         engine.step()
-        if engine.scheduler.requests["decode"].generated_token_ids:
+        if (
+            engine.scheduler.requests["decode"].generated_token_ids
+            and engine.scheduler.requests["decode"].phase is RequestPhase.RECURRENT
+        ):
             break
     engine.add_request("prompt", [4, 5, 6, 7], params)
     saw_mixed_batch = False

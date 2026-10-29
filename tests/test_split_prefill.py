@@ -16,6 +16,7 @@ import torch
 from tests.helpers import make_prefill_engine, tiny_ouro_config, tiny_ouro_model
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.scheduling_policy import (
+    MixedPolicy,
     NoRefillPolicy,
     RefillPolicy,
     SchedulingPolicy,
@@ -112,12 +113,16 @@ def test_recurrent_prepare_uses_absolute_token_start_for_kv_rows():
         e.close()
 
 
-def test_final_depth_prefill_scatter_retains_only_coda_hidden_per_item():
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_final_depth_prefill_scatter_retains_only_coda_hidden_per_item(wavefront):
     from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
 
     e = make_prefill_engine(
         scheduler_config=SchedulerConfig(
-            max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            wavefront_chunked_prefill=wavefront,
         )
     )
     e.add_request("mid", [1, 2], SamplingParams(max_tokens=1))
@@ -125,11 +130,20 @@ def test_final_depth_prefill_scatter_retains_only_coda_hidden_per_item():
     for request_id in ("mid", "final"):
         assert e.cache_manager.allocate(request_id, 2)
     mid, final = (e.scheduler.requests[rid] for rid in ("mid", "final"))
+    offset = 4 if wavefront else 0
     batch = SchedulerOutput(
         RequestPhase.PREFILLING_RECURRENT,
         [
-            ScheduledRequest(mid, 0, 2, depth=1, chunk_start=0),
-            ScheduledRequest(final, 0, 2, depth=3, chunk_start=0, completes_prompt=True),
+            ScheduledRequest(mid, 0, 2, depth=1, chunk_start=0, prefill_hidden_row_offset=offset),
+            ScheduledRequest(
+                final,
+                0,
+                2,
+                depth=3,
+                chunk_start=0,
+                completes_prompt=True,
+                prefill_hidden_row_offset=offset,
+            ),
         ],
     )
     runner = e.model_runner
@@ -139,8 +153,9 @@ def test_final_depth_prefill_scatter_retains_only_coda_hidden_per_item():
             runner.prepare_on_cpu(build_execution_batch(batch, runner.model.config.total_ut_steps))
         )
         mid_slot, final_slot = runner.state_slots["mid"], runner.state_slots["final"]
-        runner.prefill_states[mid_slot, :2].fill_(9)
-        runner.prefill_states[final_slot, :2].fill_(7)
+        target = slice(offset, offset + 2)
+        runner.prefill_states[mid_slot, target].fill_(9)
+        runner.prefill_states[final_slot, target].fill_(7)
         hidden = torch.arange(
             4 * e.model.config.hidden_size, dtype=runner.prefill_states.dtype
         ).view(4, e.model.config.hidden_size)
@@ -149,13 +164,91 @@ def test_final_depth_prefill_scatter_retains_only_coda_hidden_per_item():
         runner._store_split_prefill_outputs(hidden, prepared)
 
         assert prepared.batch_inputs.buffers.segments.cpu[:2].tolist() == [
-            [mid_slot, 0, 2, 0, 1],
-            [final_slot, 0, 2, 2, 0],
+            [mid_slot, offset, 2, 0, 1],
+            [final_slot, offset, 2, 2, 0],
         ]
-        assert torch.equal(runner.prefill_states[mid_slot, :2], hidden[:2])
-        assert torch.equal(runner.prefill_states[final_slot, :2], torch.full_like(hidden[2:], 7))
+        assert torch.equal(runner.prefill_states[mid_slot, target], hidden[:2])
+        assert torch.equal(
+            runner.prefill_states[final_slot, target], torch.full_like(hidden[2:], 7)
+        )
         assert torch.equal(final.hidden_state, hidden[-1])
         assert mid.hidden_state is None
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_wavefront_final_depth_does_not_store_any_chunk_hidden(monkeypatch, mixed):
+    from types import SimpleNamespace
+
+    from vllm_rlt.request import ExecutionBatch, StateSpan
+    from vllm_rlt.worker.model_runner import BatchInputs, PreparedExecution
+
+    e = make_prefill_engine(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            wavefront_chunked_prefill=True,
+        )
+    )
+    runner = e.model_runner
+    e.add_request("r", [1, 2, 3, 4], SamplingParams(max_tokens=1))
+    request = e.scheduler.requests["r"]
+    slot = runner._ensure_request_slot(request)
+    runner.prefill_states.fill_(7)
+    spans = (
+        StateSpan(
+            request,
+            0,
+            2,
+            3,
+            chunk_start=0,
+            retain_chunk=False,
+            prefill_hidden_row_offset=4,
+        ),
+        StateSpan(
+            request,
+            2,
+            2,
+            3,
+            chunk_start=2,
+            retain_chunk=False,
+            retain_last=True,
+            prefill_hidden_row_offset=6,
+        ),
+    )
+    if not mixed:
+        # Direct descriptors need the same output policy as the executor.
+        from dataclasses import replace
+
+        spans = (replace(spans[0], retain_last=False), spans[1])
+    batch = ExecutionBatch(Operation.RECURRENT, spans)
+    buffers = runner.batch_input_buffers[0]
+    buffers.reset()
+    prepared = PreparedExecution(
+        batch, (3, 3), (0, 2), (0, 0), batch_inputs=BatchInputs(buffers, 4, 2, mixed=mixed)
+    )
+    hidden = torch.arange(4 * e.model.config.hidden_size, dtype=runner.prefill_states.dtype).view(
+        4, e.model.config.hidden_size
+    )
+    try:
+        if mixed:
+            runner._mixed_hidden_sources(batch, buffers)
+            assert all(chunk is None for _, _, chunk, _ in buffers.hidden_outputs)
+            runner._scatter_prefill(hidden, prepared)
+            assert torch.equal(request.hidden_state, hidden[-1])
+        else:
+            # Reaching the CUDA branch would import/launch a kernel. A batch
+            # with no retained chunks must return before touching device state.
+            with monkeypatch.context() as patch:
+                patch.setattr(runner, "device", SimpleNamespace(type="cuda"))
+                runner._scatter_prefill(hidden, prepared)
+            runner._store_split_prefill_outputs(hidden, prepared)
+            assert torch.equal(request.hidden_state, hidden[-1])
+        assert torch.equal(
+            runner.prefill_states[slot], torch.full_like(runner.prefill_states[slot], 7)
+        )
     finally:
         e.close()
 
@@ -168,9 +261,9 @@ def test_cuda_prefill_segments_gather_and_scatter_variable_spans():
         OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
         cache_config=CacheConfig(64, 4),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=4
+            mode="mixed", max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=4
         ),
-        execution_config=ExecutionConfig(atomic_prefill=False),
+        execution_config=ExecutionConfig(),
         attention_backend="triton",
     )
     try:
@@ -213,9 +306,9 @@ def test_cuda_final_depth_prefill_scatter_retains_only_coda_hidden_per_item():
         OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
         cache_config=CacheConfig(64, 4),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
+            mode="mixed", max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
         ),
-        execution_config=ExecutionConfig(atomic_prefill=False),
+        execution_config=ExecutionConfig(),
         attention_backend="triton",
     )
     prepared = None
@@ -268,9 +361,9 @@ def test_cuda_prefill_submit_keeps_host_and_device_buffers_until_event(use_uva):
         OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
         cache_config=CacheConfig(64, 4),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=4
+            mode="mixed", max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=4
         ),
-        execution_config=ExecutionConfig(atomic_prefill=False, use_uva=use_uva),
+        execution_config=ExecutionConfig(use_uva=use_uva),
         attention_backend="triton",
     )
 
@@ -366,8 +459,8 @@ def test_submit_transfer_failure_releases_only_prepared_prefill_buffers():
     e = LLMEngine(
         OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
         cache_config=CacheConfig(64, 4),
-        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
-        execution_config=ExecutionConfig(async_scheduling=True, atomic_prefill=False),
+        scheduler_config=SchedulerConfig(mode="mixed", max_num_seqs=1, max_num_batched_tokens=4),
+        execution_config=ExecutionConfig(async_scheduling=True),
         exit_config=ExitConfig("ouro_delayed"),
         attention_backend="triton",
     )
@@ -478,8 +571,8 @@ def test_cuda_submit_readback_failure_releases_batch_input_buffers(monkeypatch):
     e = LLMEngine(
         OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
         cache_config=CacheConfig(64, 4),
-        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
-        execution_config=ExecutionConfig(atomic_prefill=False),
+        scheduler_config=SchedulerConfig(mode="mixed", max_num_seqs=1, max_num_batched_tokens=4),
+        execution_config=ExecutionConfig(),
         attention_backend="triton",
     )
     e.add_request("a", [1, 2, 3, 4], SamplingParams(max_tokens=1))
@@ -543,59 +636,61 @@ def schedule_stage(scheduler, stage):
 
 
 def test_split_prefill_steps_one_depth_per_chunk_and_keeps_the_prompt_ordered():
-    e = make_prefill_engine()
+    e = make_prefill_engine(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=2,
+            prefill_chunk_size=2,
+            wavefront_chunked_prefill=True,
+        )
+    )
     e.add_request("a", [1, 2, 3, 4, 5], SamplingParams(max_tokens=2, ignore_eos=True))
     request = e.scheduler.requests["a"]
-    prompt = request.prompt_token_ids
 
-    # Mirror the pending engine update: each completed stage enqueues the next one.
-    def apply(batch):
-        scheduled_request = batch.requests[0]
-        if batch.phase == RequestPhase.PREFILLING_PRELUDE:
-            request.num_preluded_tokens = (
-                scheduled_request.token_start + scheduled_request.token_count
-            )
-            e.scheduler.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
-            return (scheduled_request.token_start, scheduled_request.token_count, None)
-        depth = advance_chunk(request, scheduled_request)
-        if depth + 1 < TOTAL_DEPTHS:
-            e.scheduler.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
-        elif request.num_prefilled_tokens < len(prompt):
-            e.scheduler.enqueue(request, RequestPhase.PREFILLING_PRELUDE)
-        return (scheduled_request.token_start, scheduled_request.token_count, depth)
-
-    trace = []
+    prelude_positions = []
+    recurrent_visits = {}
     for _ in range(40):
         batch = e.scheduler.schedule()
         if batch is None:
             break
-        assert len(batch.requests) == 1
-        trace.append((batch.phase, *apply(batch)))
-    assert e.scheduler.schedule() is None, "prefill must drain, not schedule forever"
+        assert all(item.request is request for item in batch.requests)
+        for item in batch.requests:
+            if batch.phase == RequestPhase.PREFILLING_PRELUDE:
+                prelude_positions.extend(
+                    range(item.token_start, item.token_start + item.token_count)
+                )
+            else:
+                assert batch.phase == RequestPhase.PREFILLING_RECURRENT
+                assert batch.loop_count == 1
+                for position in range(item.token_start, item.token_start + item.token_count):
+                    key = (position, item.depth)
+                    recurrent_visits[key] = recurrent_visits.get(key, 0) + 1
+        e.scheduler._apply_wavefront_prefill_batch_progress(
+            batch.phase, batch.requests, loop_count=batch.loop_count
+        )
+        if request.phase == RequestPhase.CODA:
+            break
 
-    assert trace == [
-        (RequestPhase.PREFILLING_PRELUDE, 0, 2, None),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 3),
-        (RequestPhase.PREFILLING_PRELUDE, 2, 2, None),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 3),
-        (RequestPhase.PREFILLING_PRELUDE, 4, 1, None),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 3),
-    ]
+    assert sorted(prelude_positions) == list(range(len(request.prompt_token_ids)))
+    assert recurrent_visits == {
+        (position, depth): 1
+        for position in range(len(request.prompt_token_ids))
+        for depth in range(TOTAL_DEPTHS)
+    }
     assert request.num_prefilled_tokens == 5
     assert all(left == right for left, right in request.prefill_depth_ranges)
 
 
 def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
-    e = make_prefill_engine()
+    e = make_prefill_engine(
+        atomic=True,
+        scheduler_config=SchedulerConfig(
+            mode="mixed",
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+        ),
+    )
     e.add_request("a", [1, 2, 3, 4, 5], SamplingParams(max_tokens=2, ignore_eos=True))
     request = e.scheduler.requests["a"]
     trace = []
@@ -606,8 +701,10 @@ def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
             break
         assert len(batch.requests) == 1
         scheduled_request = batch.requests[0]
-        progress = e.scheduler._apply_split_prefill_progress(
-            request, batch.phase, scheduled_request
+        progress = e.scheduler._apply_prefill_progress(
+            scheduled_request,
+            batch.phase,
+            loop_count=batch.loop_count,
         )
         trace.append(
             (
@@ -615,27 +712,16 @@ def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
                 scheduled_request.token_start,
                 scheduled_request.token_count,
                 scheduled_request.depth,
+                batch.loop_count,
             )
         )
         if progress.prompt_complete:
             break
 
     assert trace == [
-        (RequestPhase.PREFILLING_PRELUDE, 0, 2, None),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 0, 2, 3),
-        (RequestPhase.PREFILLING_PRELUDE, 2, 2, None),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 2, 2, 3),
-        (RequestPhase.PREFILLING_PRELUDE, 4, 1, None),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 0),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 1),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 2),
-        (RequestPhase.PREFILLING_RECURRENT, 4, 1, 3),
+        (RequestPhase.PREFILLING_PRELUDE, 0, 2, None, TOTAL_DEPTHS),
+        (RequestPhase.PREFILLING_PRELUDE, 2, 2, None, TOTAL_DEPTHS),
+        (RequestPhase.PREFILLING_PRELUDE, 4, 1, None, TOTAL_DEPTHS),
     ]
     assert request.num_prefilled_tokens == len(request.prompt_token_ids)
     assert request.phase is RequestPhase.CODA
@@ -665,11 +751,185 @@ def test_sync_split_prefill_matches_atomic_tokens_and_exit_depths(chunk_size, to
     assert split.cache_manager.num_used_blocks == 0
 
 
-def test_sync_split_prefill_resumes_after_a_cached_prefix():
+def test_wavefront_prefill_batches_ready_depths_and_reuses_retired_ring_slots():
+    scheduler = SchedulerConfig(
+        max_num_seqs=1,
+        max_num_batched_tokens=8,
+        prefill_chunk_size=2,
+        wavefront_chunked_prefill=True,
+    )
+    e = make_prefill_engine(scheduler_config=scheduler)
+    e.add_request(
+        "wave", list(range(1, 11)), SamplingParams(max_tokens=1, min_loops=1, max_loops=1)
+    )
+    request = e.scheduler.requests["wave"]
+
+    prelude = e.scheduler.schedule()
+    assert prelude.phase is RequestPhase.PREFILLING_PRELUDE
+    assert len(prelude.requests) == TOTAL_DEPTHS
+    assert [(item.chunk_start, item.prefill_hidden_row_offset) for item in prelude.requests] == [
+        (0, 0),
+        (2, 2),
+        (4, 4),
+        (6, 6),
+    ]
+    e._update(prelude, None)
+
+    recurrent_trace = []
+    reused = None
+    for _ in range(20):
+        batch = e.scheduler.schedule()
+        assert batch is not None
+        if batch.phase == RequestPhase.PREFILLING_PRELUDE:
+            reused = batch.requests[0]
+            assert (reused.chunk_start, reused.prefill_hidden_row_offset) == (8, 0)
+        else:
+            recurrent_trace.append([(item.token_start, item.depth) for item in batch.requests])
+        e._update(batch, None)
+        if request.phase is RequestPhase.CODA:
+            break
+
+    assert recurrent_trace[:4] == [
+        [(0, 0)],
+        [(0, 1), (2, 0)],
+        [(0, 2), (2, 1), (4, 0)],
+        [(0, 3), (2, 2), (4, 1), (6, 0)],
+    ]
+    assert reused is not None
+    assert request.num_prefilled_tokens == len(request.prompt_token_ids)
+    assert request.prefill_reclaimable_tokens == len(request.prompt_token_ids)
+    assert request.phase is RequestPhase.CODA
+    e.close()
+
+
+def test_wavefront_prefill_matches_atomic_tokens_and_keeps_full_depth_first_output():
+    wavefront = SchedulerConfig(
+        max_num_seqs=2,
+        max_num_batched_tokens=5,
+        prefill_chunk_size=2,
+        wavefront_chunked_prefill=True,
+    )
+    atomic = SchedulerConfig(
+        max_num_seqs=2,
+        max_num_batched_tokens=5,
+        prefill_chunk_size=2,
+    )
+    prompt = list(range(2, 15))
+    reference = make_prefill_engine(atomic=True, scheduler_config=atomic)
+    actual = make_prefill_engine(scheduler_config=wavefront)
+    expected_output = run_request(reference, prompt)
+    actual_output = run_request(actual, prompt)
+
+    assert actual_output.token_ids == expected_output.token_ids
+    assert actual_output.exit_depths == expected_output.exit_depths
+    assert actual_output.exit_depths[0] == TOTAL_DEPTHS
+    assert actual.scheduler.config.wavefront_chunked_prefill
+    reference.close()
+    actual.close()
+
+
+@pytest.mark.parametrize("budget", [1, 5, 17])
+def test_wavefront_prefill_preserves_hidden_and_all_depth_kv(budget):
+    snapshots = []
+    for wavefront in (False, True):
+        engine = make_prefill_engine(
+            atomic=not wavefront,
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=budget,
+                prefill_chunk_size=3,
+                wavefront_chunked_prefill=wavefront,
+            ),
+        )
+        for rid, prompt in (("long", list(range(1, 15))), ("short", [2, 3, 4, 5, 6])):
+            engine.add_request(rid, prompt, SamplingParams(max_tokens=1))
+        completed = {}
+        for _ in range(300):
+            if len(completed) == 2:
+                break
+            engine.step()
+            for request in engine.scheduler.requests.values():
+                if request.phase == RequestPhase.CODA and request.request_id not in completed:
+                    tensors = [request.hidden_state.clone()]
+                    for depth in range(TOTAL_DEPTHS):
+                        for layer in range(engine.model.config.num_hidden_layers):
+                            tensors.extend(
+                                tensor.clone()
+                                for tensor in engine.cache_manager.read(
+                                    layer, request.request_id, depth
+                                )
+                            )
+                    completed[request.request_id] = tensors
+        else:
+            pytest.fail("wavefront prompt snapshots did not complete")
+        snapshots.append(completed)
+        engine.close()
+
+    assert snapshots[0].keys() == snapshots[1].keys()
+    for rid in snapshots[0]:
+        for expected, actual in zip(snapshots[0][rid], snapshots[1][rid]):
+            torch.testing.assert_close(actual, expected, atol=4e-5, rtol=4e-5)
+
+
+def test_wavefront_mixed_prelude_prioritizes_decode_before_prompt_window():
+    import torch
+
+    scheduler = SchedulerConfig(
+        mode="mixed",
+        max_num_seqs=2,
+        max_num_batched_tokens=6,
+        prefill_chunk_size=2,
+        wavefront_chunked_prefill=True,
+    )
+    e = make_prefill_engine(scheduler_config=scheduler)
+    e.add_request("decode", [1], SamplingParams(max_tokens=2, ignore_eos=True))
+    e.add_request("prompt", [2, 3, 4, 5, 6, 7], SamplingParams(max_tokens=2))
+    e.scheduler._admit()
+    decode = e.scheduler.requests["decode"]
+    e.scheduler.queues[RequestPhase.PREFILLING_PRELUDE].remove("decode")
+    decode.generated_token_ids.append(9)
+    decode.hidden_state = torch.zeros(e.model.config.hidden_size)
+    e.scheduler.enqueue(decode, RequestPhase.PRELUDE)
+
+    batch = e.scheduler.schedule()
+    assert batch.is_mixed
+    assert batch.num_tokens == 6
+    assert batch.phase_for(batch.requests[0]) is RequestPhase.PRELUDE
+    prompt_items = [
+        item for item in batch.requests if item.phase is RequestPhase.PREFILLING_PRELUDE
+    ]
+    assert [item.chunk_start for item in prompt_items] == [0, 2, 4]
+    assert sum(item.token_count for item in prompt_items) == 5
+    e.close()
+
+
+def test_wavefront_prefill_rejects_shared_kv():
+    scheduler = SchedulerConfig(wavefront_chunked_prefill=True)
+    with pytest.raises(ValueError, match="staged prefill requires last_exited"):
+        make_prefill_engine(
+            atomic=True,
+            cache_config=CacheConfig(64, 2, "shared"),
+            scheduler_config=scheduler,
+        )
+
+
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_sync_split_prefill_resumes_after_a_cached_prefix(wavefront):
     prompt = [1, 2, 3, 4, 5]
     cache = CacheConfig(64, 2, enable_prefix_caching=True)
-    scheduler = SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=3, prefill_chunk_size=2)
-    atomic = make_prefill_engine(atomic=True, cache_config=cache, scheduler_config=scheduler)
+    scheduler = SchedulerConfig(
+        max_num_seqs=2,
+        max_num_batched_tokens=3,
+        prefill_chunk_size=2,
+        wavefront_chunked_prefill=wavefront,
+    )
+    atomic = make_prefill_engine(
+        atomic=True,
+        cache_config=cache,
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2, max_num_batched_tokens=3, prefill_chunk_size=2
+        ),
+    )
     split = make_prefill_engine(cache_config=cache, scheduler_config=scheduler)
 
     expected = run_request(atomic, prompt)
@@ -684,6 +944,9 @@ def test_sync_split_prefill_resumes_after_a_cached_prefix():
     )
     split.scheduler._admit()
     assert split.scheduler.requests["cached"].num_prefilled_tokens == 4
+    if wavefront:
+        assert split.scheduler.requests["cached"].prefill_window_origin == 4
+        assert split.scheduler.requests["cached"].prefill_reclaimable_tokens == 4
     actual = drain_request(split)
 
     assert actual.token_ids == expected.token_ids
@@ -691,8 +954,16 @@ def test_sync_split_prefill_resumes_after_a_cached_prefix():
     assert split.model_runner.state_slots == {}
 
 
-def test_sync_split_prefill_abort_releases_slot_before_request_id_reuse():
-    split = make_prefill_engine()
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_sync_split_prefill_abort_releases_slot_before_request_id_reuse(wavefront):
+    split = make_prefill_engine(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            wavefront_chunked_prefill=wavefront,
+        )
+    )
     prompt = [1, 2, 3, 4]
     split.add_request("reused", prompt, SamplingParams(max_tokens=2, ignore_eos=True))
 
@@ -713,13 +984,21 @@ def test_sync_split_prefill_abort_releases_slot_before_request_id_reuse():
     assert actual.exit_depths == expected.exit_depths
 
 
-def test_cpu_async_split_prefill_matches_sync_split():
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_cpu_async_split_prefill_matches_sync_split(wavefront):
     prompt = [1, 2, 3, 4, 5]
     trace = ExitConfig("trace", depths_by_request={"run": [TOTAL_DEPTHS, 2, 2]})
-    sync = make_prefill_engine(exit_config=trace)
+    scheduler = SchedulerConfig(
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        prefill_chunk_size=2,
+        wavefront_chunked_prefill=wavefront,
+    )
+    sync = make_prefill_engine(exit_config=trace, scheduler_config=scheduler)
     asynchronous = make_prefill_engine(
         exit_config=trace,
-        execution_config=ExecutionConfig(async_scheduling=True, atomic_prefill=False),
+        scheduler_config=scheduler,
+        execution_config=ExecutionConfig(async_scheduling=True),
     )
 
     expected = run_request(sync, prompt)
@@ -734,8 +1013,14 @@ def test_cpu_async_split_frontier_advances_once_per_submission():
     prompt = [1, 2, 3, 4, 5]
     trace = ExitConfig("trace", depths_by_request={"run": [TOTAL_DEPTHS, 2, 2]})
     e = make_prefill_engine(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=2,
+            prefill_chunk_size=2,
+            wavefront_chunked_prefill=True,
+        ),
         exit_config=trace,
-        execution_config=ExecutionConfig(async_scheduling=True, atomic_prefill=False),
+        execution_config=ExecutionConfig(async_scheduling=True),
     )
     e.add_request("run", prompt, SamplingParams(max_tokens=3, max_loops=2, ignore_eos=True))
     request = e.scheduler.requests["run"]
@@ -751,7 +1036,14 @@ def test_cpu_async_split_frontier_advances_once_per_submission():
                 e.model_runner.events[scheduled_request.request.request_id] = ticket.event
         return ticket
 
-    e.executor.submit = hold_split_ticket
+    held_batches = []
+
+    def record_batch(batch):
+        if batch.phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT):
+            held_batches.append(batch)
+        return hold_split_ticket(batch)
+
+    e.executor.submit = record_batch
     for _ in range(32):
         e.step()
         if request.phase is RequestPhase.CODA:
@@ -760,7 +1052,11 @@ def test_cpu_async_split_frontier_advances_once_per_submission():
     assert request.phase is RequestPhase.CODA
     assert request.num_prefilled_tokens == len(prompt)
     assert all(left == right for left, right in request.prefill_depth_ranges)
-    assert len(held) == 15  # Three chunks, each with prelude plus four depths.
+    assert 0 < len(held) < 15  # Wavefront batches some chunk-depth tasks together.
+    assert all(
+        batch.loop_count == (0 if batch.phase == RequestPhase.PREFILLING_PRELUDE else 1)
+        for batch in held_batches
+    )
     assert e.model_runner.split_prefill_submissions == len(held)
     assert all(not event.complete for event in held)
     for event in held:
@@ -773,7 +1069,7 @@ def test_cpu_async_split_frontier_advances_once_per_submission():
 def test_split_submission_bound_counts_and_waits_for_oldest_event():
     e = make_prefill_engine(
         exit_config=ExitConfig("ouro_delayed"),
-        execution_config=ExecutionConfig(async_scheduling=True, atomic_prefill=False),
+        execution_config=ExecutionConfig(async_scheduling=True),
     )
     e.add_request("wait", [1, 2], SamplingParams(max_tokens=1, ignore_eos=True))
     e.scheduler._admit()
@@ -843,7 +1139,7 @@ def test_split_preemption_rewinds_and_recomputes_the_resident_chunk(completed_de
     assert e.scheduler.preempt(requester)
     assert e.preemption.snapshots["victim"]["phase"] is RequestPhase.PREFILLING_PRELUDE
     assert request.num_preluded_tokens == request.num_prefilled_tokens
-    assert request.prefill_chunk_start == request.num_prefilled_tokens
+    assert request.prefill_reclaimable_tokens == request.num_prefilled_tokens
     assert all(left == request.num_prefilled_tokens for left, _ in request.prefill_depth_ranges)
     assert e.cache_manager.num_used_blocks == 0
 
@@ -857,18 +1153,21 @@ def test_split_preemption_rewinds_and_recomputes_the_resident_chunk(completed_de
     assert e.cache_manager.num_used_blocks == 0
 
 
-def test_priority_admission_preempts_split_prefill_and_matches_reference():
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_priority_admission_preempts_split_prefill_and_matches_reference(wavefront):
     prompt = [1, 2, 3, 4]
     params = SamplingParams(max_tokens=3, max_loops=2, ignore_eos=True, priority=10)
     trace = ExitConfig("trace", depths_by_request={"reference": [4, 2, 2]})
-    scheduler = SchedulerConfig(
+    reference_scheduler = SchedulerConfig(
         max_num_seqs=1,
         max_num_batched_tokens=4,
         prefill_chunk_size=2,
         policy="priority",
     )
     expected = run_request(
-        make_prefill_engine(scheduler_config=scheduler, exit_config=trace), prompt, "reference"
+        make_prefill_engine(scheduler_config=reference_scheduler, exit_config=trace),
+        prompt,
+        "reference",
     )
 
     e = make_prefill_engine(
@@ -878,6 +1177,7 @@ def test_priority_admission_preempts_split_prefill_and_matches_reference():
             prefill_chunk_size=2,
             policy="priority",
             enable_preemption=True,
+            wavefront_chunked_prefill=wavefront,
         ),
         exit_config=ExitConfig("trace", depths_by_request={"low": [4, 2, 2], "high": [4]}),
     )
@@ -912,14 +1212,18 @@ def test_priority_admission_preempts_split_prefill_and_matches_reference():
 @pytest.mark.gpu
 @pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("failure_site", ["prepare_on_gpu", "_execute"])
-def test_cuda_split_failure_drains_writes_before_request_id_reuse(
+def test_cuda_wavefront_failure_drains_writes_before_request_id_reuse(
     monkeypatch, async_scheduling, failure_site
 ):
     e = LLMEngine(
         OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
         cache_config=CacheConfig(64, 4),
-        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
-        execution_config=ExecutionConfig(atomic_prefill=False, async_scheduling=async_scheduling),
+        scheduler_config=SchedulerConfig(
+            wavefront_chunked_prefill=True,
+            max_num_seqs=1,
+            max_num_batched_tokens=4,
+        ),
+        execution_config=ExecutionConfig(async_scheduling=async_scheduling),
         exit_config=ExitConfig("trace", depths_by_request={"reused": [4]}),
         attention_backend="triton",
     )
@@ -962,8 +1266,9 @@ def test_cuda_split_failure_drains_writes_before_request_id_reuse(
 @pytest.mark.gpu
 @pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("multi_stream", [False, True])
-def test_cuda_split_prefill_matches_atomic(async_scheduling, multi_stream):
-    prompt = [1, 2, 3, 4, 5]
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_cuda_split_prefill_matches_atomic(async_scheduling, multi_stream, wavefront):
+    prompt = list(range(1, 10))
     params = SamplingParams(max_tokens=3, max_loops=2, ignore_eos=True)
     execution = dict(
         async_scheduling=async_scheduling,
@@ -976,8 +1281,12 @@ def test_cuda_split_prefill_matches_atomic(async_scheduling, multi_stream):
     atomic = LLMEngine(
         atomic_model,
         cache_config=CacheConfig(128, 2, enable_prefix_caching=True),
-        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
-        execution_config=ExecutionConfig(atomic_prefill=True, **execution),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+        ),
+        execution_config=ExecutionConfig(**execution),
         exit_config=ExitConfig("ouro_delayed"),
         attention_backend="triton",
     )
@@ -994,8 +1303,14 @@ def test_cuda_split_prefill_matches_atomic(async_scheduling, multi_stream):
     split = LLMEngine(
         split_model,
         cache_config=CacheConfig(128, 2, enable_prefix_caching=True),
-        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
-        execution_config=ExecutionConfig(atomic_prefill=False, **execution),
+        scheduler_config=SchedulerConfig(
+            mode="refill" if wavefront else "mixed",
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            wavefront_chunked_prefill=wavefront,
+        ),
+        execution_config=ExecutionConfig(**execution),
         exit_config=ExitConfig("ouro_delayed"),
         attention_backend="triton",
     )
@@ -1025,12 +1340,16 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
         cache = CacheConfig(
             block_size=16, gpu_memory_utilization=0.5, memory_reserve_bytes=32 * 1024**2
         )
-        scheduler = SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2)
+        scheduler = SchedulerConfig(
+            wavefront_chunked_prefill=True,
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+        )
         execution = ExecutionConfig(
             async_scheduling=True,
             cuda_graphs=cuda_graphs,
             cuda_graph_memory_reserve_bytes=graph_reserve,
-            atomic_prefill=False,
         )
         e = LLMEngine(
             model,
@@ -1070,7 +1389,11 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
                 pytest.fail("decode request did not reach its second recurrent step")
             assert split_request.phase is RequestPhase.PREFILLING_RECURRENT
             assert split_request.num_prefilled_tokens == 0
-            assert split_request.num_preluded_tokens == 2
+            # WCPB stages prompt chunks in a prelude wavefront: with
+            # total_ut_steps=4, prefill_chunk_size=2 and a 4-token budget, both
+            # of this prompt's chunks are staged together. num_prefilled_tokens
+            # stays 0 because the final recurrent depth has not completed.
+            assert split_request.num_preluded_tokens == 4
 
             graph_counts = None
             if e.model_runner.graphs is not None:
@@ -1131,8 +1454,13 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
 def test_cuda_async_split_preemption_releases_and_reuses_slot():
     prompt = [1, 2, 3, 4]
     params = SamplingParams(max_tokens=3, max_loops=2, ignore_eos=True, priority=10)
-    scheduler = SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2)
-    execution = ExecutionConfig(atomic_prefill=False)
+    scheduler = SchedulerConfig(
+        wavefront_chunked_prefill=True,
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        prefill_chunk_size=2,
+    )
+    execution = ExecutionConfig()
     torch.manual_seed(432)
     reference_model = OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16)
     reference = LLMEngine(
@@ -1154,13 +1482,15 @@ def test_cuda_async_split_preemption_releases_and_reuses_slot():
         model,
         cache_config=CacheConfig(128, 2),
         scheduler_config=SchedulerConfig(
+            mode="refill",
             max_num_seqs=2,
             max_num_batched_tokens=4,
             prefill_chunk_size=2,
             policy="priority",
             enable_preemption=True,
+            wavefront_chunked_prefill=True,
         ),
-        execution_config=ExecutionConfig(async_scheduling=True, atomic_prefill=False),
+        execution_config=ExecutionConfig(async_scheduling=True),
         exit_config=ExitConfig(
             "trace",
             depths_by_request={
@@ -1227,9 +1557,13 @@ def test_cuda_split_prefill_batches_mixed_depths(attention_backend):
             model,
             cache_config=CacheConfig(128, 16, enable_prefix_caching=True),
             scheduler_config=SchedulerConfig(
-                max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
+                mode="mixed",
+                max_num_seqs=2,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=2,
+                wavefront_chunked_prefill=True,
             ),
-            execution_config=ExecutionConfig(atomic_prefill=False),
+            execution_config=ExecutionConfig(),
             exit_config=ExitConfig("ouro_delayed"),
             attention_backend=attention_backend,
         )
@@ -1258,7 +1592,15 @@ def test_cuda_split_prefill_batches_mixed_depths(attention_backend):
 
 def test_split_prefill_holds_the_next_prelude_until_the_chunk_is_read():
     """One staged chunk per request: its hidden rows are in use until the last depth."""
-    e = make_prefill_engine()
+    e = make_prefill_engine(
+        atomic=True,
+        scheduler_config=SchedulerConfig(
+            mode="mixed",
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+        ),
+    )
     e.add_request("a", [1, 2, 3, 4], SamplingParams(max_tokens=2, ignore_eos=True))
     e.scheduler._admit()
     request = e.scheduler.requests["a"]
@@ -1395,9 +1737,20 @@ def test_prefill_depth_ranges_track_logical_depths():
         ).prefill_depth(5)
 
 
-def test_split_prefill_policy_is_selected_only_by_the_atomic_prefill_flag():
+def test_staged_prefill_policy_is_selected_by_scheduler_requirements():
     assert RefillPolicy is type(make_prefill_engine(atomic=True).scheduler.policy)
-    assert SplitPrefillPolicy is type(make_prefill_engine().scheduler.policy)
+    assert SplitPrefillPolicy is type(
+        make_prefill_engine(
+            atomic=True,
+            scheduler_config=SchedulerConfig(wavefront_chunked_prefill=True),
+        ).scheduler.policy
+    )
+    assert MixedPolicy is type(
+        make_prefill_engine(
+            atomic=True,
+            scheduler_config=SchedulerConfig(mode="mixed"),
+        ).scheduler.policy
+    )
     assert NoRefillPolicy is type(
         make_prefill_engine(
             atomic=True, scheduler_config=SchedulerConfig(mode="no_refill")
@@ -1422,12 +1775,17 @@ def test_scheduling_policies_declare_their_prefill_stages():
         (
             "shared layout",
             {"cache_config": CacheConfig(64, 2, "shared")},
-            "split prefill requires last_exited",
+            "staged prefill requires last_exited",
         ),
         (
-            "no_refill mode",
-            {"scheduler_config": SchedulerConfig(mode="no_refill")},
-            "split prefill currently implements refill",
+            "wavefront no_refill mode",
+            {
+                "atomic": True,
+                "scheduler_config": SchedulerConfig(
+                    mode="no_refill", wavefront_chunked_prefill=True
+                ),
+            },
+            "staged prefill currently implements refill or mixed",
         ),
     ],
 )
@@ -1444,10 +1802,13 @@ def test_chunk_streams_wait_before_hidden_gather(monkeypatch, async_scheduling, 
         OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
         cache_config=CacheConfig(64, 4),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=1, max_num_batched_tokens=4, prefill_chunk_size=4
+            wavefront_chunked_prefill=True,
+            max_num_seqs=1,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=4,
         ),
         execution_config=ExecutionConfig(
-            atomic_prefill=False, async_scheduling=async_scheduling, multi_stream=multi_stream
+            async_scheduling=async_scheduling, multi_stream=multi_stream
         ),
         exit_config=ExitConfig("trace", depths_by_request={"r": [4]}),
         attention_backend="triton",
@@ -1506,9 +1867,9 @@ def test_chunk_prompt_cache_reuse_override_and_request_id_reuse(device, use_uva)
         tiny_ouro_model().to(device),
         cache_config=CacheConfig(64, 2),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
+            mode="mixed", max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
         ),
-        execution_config=ExecutionConfig(atomic_prefill=False, use_uva=use_uva),
+        execution_config=ExecutionConfig(use_uva=use_uva),
         attention_backend="triton" if device == "cuda" else "torch",
     )
     runner = e.model_runner
@@ -1560,9 +1921,7 @@ def test_mixed_hidden_buffers_wait_for_strided_decode_and_chunk_producers(multi_
         scheduler_config=SchedulerConfig(
             mode="mixed", max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
         ),
-        execution_config=ExecutionConfig(
-            atomic_prefill=False, multi_stream=multi_stream, use_uva=use_uva
-        ),
+        execution_config=ExecutionConfig(multi_stream=multi_stream, use_uva=use_uva),
         attention_backend="triton",
     )
     runner = e.model_runner

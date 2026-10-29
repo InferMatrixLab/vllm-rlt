@@ -15,6 +15,7 @@ from vllm_rlt.entrypoints.runtime_args import (
     runtime_configs,
 )
 from vllm_rlt.models import (
+    ModelConfig,
     load_tokenizer,
     resolve_model_config,
     resolve_model_source,
@@ -42,6 +43,7 @@ def load_engine(args):
             raise ValueError("serving requires the Ouro byte-level tokenizer")
     engine = StageClient(
         source,
+        model_config=ModelConfig.from_dict(config),
         revision=revision,
         device=args.device,
         dtype=args.dtype,
@@ -53,6 +55,7 @@ def load_engine(args):
             max_num_batched_tokens=args.max_num_batched_tokens,
             mode=args.mode,
             prefill_chunk_size=getattr(args, "prefill_chunk_size", 128),
+            wavefront_chunked_prefill=getattr(args, "wavefront_chunked_prefill", False),
             max_prefill_batches_before_decode=getattr(args, "max_prefill_batches_before_decode", 1),
             admission_scan_limit=getattr(args, "admission_scan_limit", 64),
             max_admission_bypasses=getattr(args, "max_admission_bypasses", 8),

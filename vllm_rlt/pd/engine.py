@@ -14,7 +14,7 @@ from pathlib import Path
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.engine.stage_config import StageConfig
-from vllm_rlt.models import OuroConfig, resolve_model_config
+from vllm_rlt.models import prepare_model
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
@@ -66,12 +66,16 @@ class PDEngine:
         attention_backend="flash_attn",
         dtype="bfloat16",
         revision=None,
+        model_config=None,
         seed=0,
         speculative_config=None,
     ):
         self.speculative_config = speculative_config
-        if isinstance(model, (str, Path)):
-            model, revision, _ = resolve_model_config(model, revision=revision)
+        model, revision, self.model_config = prepare_model(
+            model, revision=revision, model_config=model_config
+        )
+        if self.model_config.model_type == "huginn_raven":
+            raise ValueError("PD does not support Huginn")
         self.config = pd_config or PDConfig()
         self.exit_config = exit_config or ExitConfig(
             "ouro" if speculative_config else "ouro_delayed"
@@ -113,6 +117,7 @@ class PDEngine:
                     name = f"{epoch}-{role}-{device}"
                     client = StageClient(
                         model,
+                        model_config=self.model_config,
                         device=device,
                         stage_config=StageConfig(stage_id=name, role=role),
                         connector_factory=partial(PDStageConnector.create, config=self.config),
@@ -142,7 +147,6 @@ class PDEngine:
             fingerprints = {p.client.info["fingerprint"] for p in self.peers.values()}
             if len(fingerprints) != 1:
                 raise ValueError("P/D model weights or KV configuration do not match")
-            self.model_config = OuroConfig(**next(iter(self.peers.values())).client.info["model"])
             for peer in self.peers.values():
                 self._send(
                     peer.name,

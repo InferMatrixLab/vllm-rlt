@@ -301,6 +301,7 @@ class OuroForCausalLM(nn.Module):
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
+        config: OuroConfig | None = None,
     ) -> "OuroForCausalLM":
         """Stream strictly checked safetensors into a meta model; never execute Hub code.
 
@@ -316,7 +317,10 @@ class OuroForCausalLM(nn.Module):
 
             source, revision, _ = resolve_model_config(path_or_repo, revision=revision)
             folder = Path(source)
-        config = OuroConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        if config is None:
+            config = OuroConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        elif not isinstance(config, OuroConfig):
+            raise TypeError("config must be an OuroConfig")
         index_path = folder / "model.safetensors.index.json"
         index = json.loads(index_path.read_text())["weight_map"] if index_path.is_file() else None
         if index is None:

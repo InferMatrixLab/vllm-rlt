@@ -22,6 +22,7 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
     spans = []
     operations = set()
     loop_counts = set()
+    planned_loops = scheduled_batch.loop_count
     for scheduled_request in scheduled_batch.requests:
         phase = scheduled_batch.phase_for(scheduled_request)
         request = scheduled_request.request
@@ -49,6 +50,13 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
             if chunk or phase == RequestPhase.PREFILL or scheduled_request.depth is not None
             else request.position
         )
+        execution_loops = (
+            planned_loops
+            if planned_loops is not None
+            else total_depths
+            if phase == RequestPhase.PREFILL
+            else int(operation == Operation.RECURRENT)
+        )
         spans.append(
             StateSpan(
                 request=request,
@@ -56,20 +64,21 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
                 token_count=scheduled_request.token_count,
                 depth=depth,
                 chunk_start=scheduled_request.chunk_start if chunk else None,
-                retain_chunk=chunk and (operation == Operation.PRELUDE or depth + 1 < total_depths),
+                retain_chunk=chunk and depth + execution_loops < total_depths,
                 retain_last=scheduled_request.completes_prompt if chunk else True,
                 emit_gate=phase == RequestPhase.RECURRENT,
                 input_tokens=tuple(
                     request.prompt_token_ids[position : position + scheduled_request.token_count]
                 )
-                if prompt_input and not chunk
+                if prompt_input and (not chunk or execution_loops > 0)
                 else None,
+                prefill_hidden_row_offset=(
+                    scheduled_request.prefill_hidden_row_offset if chunk else None
+                ),
             )
         )
         operations.add(operation)
-        loop_counts.add(
-            total_depths if phase == RequestPhase.PREFILL else int(operation == Operation.RECURRENT)
-        )
+        loop_counts.add(execution_loops)
     if len(operations) != 1 or len(loop_counts) != 1:
         raise ValueError("batch requests must share an operation and execution boundary")
     return ExecutionBatch(operations.pop(), tuple(spans), loop_counts.pop())

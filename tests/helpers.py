@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared small models, workload-specific engine factories and protocol doubles."""
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -91,11 +92,20 @@ def make_cpu_cache(config, *, blocks=64):
 
 def make_prefill_engine(*, atomic=False, **kwargs):
     kwargs.setdefault("cache_config", CacheConfig(64, 2))
-    kwargs.setdefault("execution_config", ExecutionConfig(atomic_prefill=atomic))
-    kwargs.setdefault(
-        "scheduler_config",
-        SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2),
-    )
+    scheduler = kwargs.get("scheduler_config")
+    if scheduler is None:
+        scheduler = SchedulerConfig(
+            mode="refill",
+            wavefront_chunked_prefill=not atomic,
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+        )
+    elif not atomic and not scheduler.wavefront_chunked_prefill:
+        if scheduler.mode == "refill":
+            scheduler = replace(scheduler, wavefront_chunked_prefill=True)
+    kwargs["scheduler_config"] = scheduler
+    kwargs.setdefault("execution_config", ExecutionConfig())
     return StageEngine(tiny_ouro_model(), **kwargs)
 
 
@@ -110,9 +120,9 @@ def make_stage_engine(*, role="prefill_decode", atomic=False, asynchronous=False
             max_num_seqs=3,
             max_num_batched_tokens=4,
             prefill_chunk_size=3,
+            wavefront_chunked_prefill=not atomic and not mixed,
         ),
         execution_config=ExecutionConfig(
-            atomic_prefill=atomic,
             async_scheduling=asynchronous,
             static_buffers=True,
         ),

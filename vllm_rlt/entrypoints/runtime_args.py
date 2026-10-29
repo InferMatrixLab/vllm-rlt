@@ -16,6 +16,7 @@ def add_runtime_args(parser):
         type=int,
         help="Enable fixed-loop self-speculation with K draft tokens",
     )
+    parser.add_argument("--speculative-mode", choices=["block", "pipeline"], default="block")
     parser.add_argument("--draft-loops", type=int, default=2)
     parser.add_argument("--target-loops", type=int, default=4)
     parser.add_argument(
@@ -39,12 +40,6 @@ def add_runtime_args(parser):
         action="store_false",
         help="Copy metadata to the GPU instead of reading mapped host memory",
     )
-    parser.add_argument(
-        "--no-atomic-prefill",
-        dest="atomic_prefill",
-        action="store_false",
-        help="Split prompt prefill into a staged prelude plus one boundary per recurrence depth",
-    )
     parser.add_argument("--kv-layout", choices=["last_exited", "shared"], default="last_exited")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
@@ -61,11 +56,21 @@ def add_runtime_args(parser):
     parser.add_argument(
         "--cuda-graphs",
         action="store_true",
-        help="Capture decode recurrent cores and speculative coda; prefill/sampling stay eager",
+        help="Capture decode/wavefront recurrent cores and speculative coda; sampling stays eager",
     )
-    parser.add_argument("--cuda-graph-max-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--cuda-graph-max-batch-size",
+        type=int,
+        default=None,
+        help="Graph row limit; unset covers async speculative verification rows, else 128",
+    )
     parser.add_argument("--cuda-graph-max-graphs", type=int, default=16)
-    parser.add_argument("--cuda-graph-memory-reserve-bytes", type=int, default=1024**3)
+    parser.add_argument(
+        "--cuda-graph-memory-reserve-bytes",
+        type=int,
+        default=1024**3,
+        help="Automatic KV planning headroom per CUDA Graph pool (plus retained spec logits)",
+    )
     parser.add_argument(
         "--single-stream",
         action="store_true",
@@ -74,6 +79,11 @@ def add_runtime_args(parser):
     parser.add_argument("--static-buffers", action="store_true")
     parser.add_argument("--pad-to-power-of-two", action="store_true")
     parser.add_argument("--prefill-chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--wavefront-chunked-prefill",
+        action="store_true",
+        help="Batch ready prompt chunks across recurrence depths",
+    )
     parser.add_argument("--max-prefill-batches-before-decode", type=int, default=1)
     parser.add_argument("--admission-scan-limit", type=int, default=64)
     parser.add_argument("--max-admission-bypasses", type=int, default=8)
@@ -92,6 +102,7 @@ def runtime_configs(args):
             num_speculative_tokens=args.speculative_tokens,
             draft_loops=args.draft_loops,
             target_loops=args.target_loops,
+            mode=args.speculative_mode,
             loop_level_pipelining=args.loop_level_pipelining,
         )
         if args.speculative_tokens is not None
@@ -117,7 +128,6 @@ def runtime_configs(args):
         execution_config=ExecutionConfig(
             prefill_uva=args.prefill_uva,
             use_uva=args.use_uva,
-            atomic_prefill=args.atomic_prefill,
             cuda_graphs=args.cuda_graphs,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,
             cuda_graph_max_graphs=args.cuda_graph_max_graphs,

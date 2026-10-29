@@ -280,10 +280,11 @@ PyTorch/CUDA versions from step 4, and your Git revision (`git rev-parse HEAD`).
 
 ## Choosing scheduling and deployment separately
 
-The default atomic prefill path and loop-yielding prefill use the same execution
-architecture. On supported models with LAST_EXITED KV, the CLI/server flags
-`--mode mixed --no-atomic-prefill` allow compatible prompt and decode recurrence
-to share a batch. This is a batching choice, not PD disaggregation.
+Prompt chunks normally execute their full recurrence depth in one submission.
+On supported models with LAST_EXITED KV, `--mode mixed` lets the scheduler
+insert a depth boundary when decode work can join a prompt recurrent batch.
+`--wavefront-chunked-prefill` enables per-depth chunk regrouping. These are
+batching choices, not PD disaggregation.
 
 Stage roles are `prefill`, `decode` and `prefill_decode`; `mixed` is a scheduling
 mode, not a stage role. Speculation requires refill scheduling and cannot join

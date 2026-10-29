@@ -49,7 +49,9 @@ def test_loop_waves_cover_each_depth_once_after_its_history(counts, draft_loops,
 def _round(m, pipelined, draft_loops, sampling):
     e = engine(m, k=4, pipelined=pipelined, cache_config=CacheConfig(128, 2))
     runner = e.speculative_runner
-    runner.config = SpeculativeConfig(4, draft_loops, 4, pipelined)
+    runner.config = SpeculativeConfig(
+        4, draft_loops=draft_loops, target_loops=4, loop_level_pipelining=pipelined
+    )
     cache = e.cache_manager
     spans = []
     for i, count in enumerate((5, 3, 1)):
@@ -182,6 +184,8 @@ def test_pipeline_config_and_cli():
     args = parser.parse_args(["--loop-level-pipelining"])
     with pytest.raises(ValueError, match="requires --speculative-tokens"):
         runtime_configs(args)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SpeculativeConfig(3, mode="pipeline", loop_level_pipelining=True)
 
 
 def test_pipeline_partial_execution_failure_releases_kv(monkeypatch):
