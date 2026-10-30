@@ -120,8 +120,10 @@ def main():
     parser.add_argument("--pd-max-receiving-requests", type=int, default=32)
     parser.add_argument("--pd-max-draining-requests", type=int, default=8)
     parser.add_argument("--nixl-backend", default="UCX")
-    parser.add_argument("--pd-transfer-chunk-bytes", type=int, default=64 * 1024**2)
-    parser.add_argument("--pd-max-inflight-bytes", type=int, default=256 * 1024**2)
+    parser.add_argument(
+        "--pd-transfer-chunk-bytes", type=int, default=PDConfig.transfer_chunk_bytes
+    )
+    parser.add_argument("--pd-max-inflight-bytes", type=int, default=PDConfig.max_inflight_bytes)
     parser.add_argument("--pd-max-transfer-descriptors", type=int, default=256)
     parser.add_argument("--pd-startup-timeout", type=float, default=300)
     parser.add_argument("--host", default="127.0.0.1")

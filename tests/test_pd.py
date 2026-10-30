@@ -89,6 +89,32 @@ def test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths():
     parts = list(partition_segments(segments, segments, 333, 3))
     assert sum(n for _, _, n in parts) == len(expected)
     assert all(n <= 333 and len(src) <= 3 and src == dst for src, dst, n in parts)
+    covered = set()
+    for src, _, _ in parts:
+        for address, size, _ in src:
+            covered.update(range(address, address + size))
+    assert covered == expected
+
+
+def test_partition_merges_segments_contiguous_on_both_sides():
+    # Three adjacent 100-byte blocks on both pools collapse into one range; a target
+    # that is not adjacent at the same boundary keeps its own descriptor.
+    source = [(1000, 100, 0), (1100, 100, 0), (1200, 100, 0), (5000, 50, 0)]
+    target = [(7000, 100, 1), (7100, 100, 1), (9000, 100, 1), (9100, 50, 1)]
+    parts = list(partition_segments(source, target, 10**6, 256))
+    assert parts == [
+        (
+            [(1000, 200, 0), (1200, 100, 0), (5000, 50, 0)],
+            [(7000, 200, 1), (9000, 100, 1), (9100, 50, 1)],
+            350,
+        )
+    ]
+    # Byte limits still split a merged range, descriptor limits still bound a chunk.
+    parts = list(partition_segments(source, target, 120, 256))
+    assert [n for _, _, n in parts] == [120, 120, 110]
+    assert sum(len(src) for src, _, _ in parts) == 5
+    with pytest.raises(ValueError):
+        list(partition_segments(source, target[:-1], 10**6, 256))
 
 
 @pytest.mark.parametrize(
@@ -103,6 +129,16 @@ def test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths():
 def test_pd_configuration_validation(options):
     with pytest.raises(ValueError):
         PDConfig(**options)
+
+
+def test_pd_default_budget_keeps_a_whole_long_prompt_in_flight():
+    """Chunks are submitted and acknowledged only between engine steps, so every budget
+    round a request needs adds steps to its commit tail. The default budget holds the
+    KV of a 2048-token Ouro-1.4B prompt (24 layers x 4 depths x K/V x 2048 bf16 values)."""
+    config = PDConfig()
+    ouro_kv_bytes_per_token = 24 * 4 * 2 * 2048 * 2
+    assert config.max_inflight_bytes >= 2048 * ouro_kv_bytes_per_token
+    assert config.max_inflight_bytes % config.transfer_chunk_bytes == 0
 
 
 def test_pd_rejects_huginn_before_spawning(monkeypatch):
@@ -714,3 +750,16 @@ def test_pd_reservations_are_reported_before_worker_acknowledgments():
     assert engine.stats() == dict(requests=1, reserved_blocks=20)
     assert len(messages) == 1 and messages[0][0] == ("decode", "reserve")
     assert not hasattr(engine, "cache_manager") and not hasattr(engine, "scheduler")
+
+
+def test_nixl_backend_params_from_environment(monkeypatch):
+    from vllm_rlt.pd.transport import nixl_backend_params
+
+    monkeypatch.delenv("VLLM_RLT_NIXL_UCX_ERROR_HANDLING", raising=False)
+    assert nixl_backend_params("UCX") == {}
+    monkeypatch.setenv("VLLM_RLT_NIXL_UCX_ERROR_HANDLING", "none")
+    assert nixl_backend_params("UCX") == {"ucx_error_handling_mode": "none"}
+    assert nixl_backend_params("GDS") == {}
+    monkeypatch.setenv("VLLM_RLT_NIXL_UCX_ERROR_HANDLING", "off")
+    with pytest.raises(ValueError, match="none"):
+        nixl_backend_params("UCX")

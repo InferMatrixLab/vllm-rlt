@@ -356,7 +356,8 @@ def test_stage_client_owns_process_and_isolates_cancelled_generations():
     finally:
         client.close()
     assert not client.process.is_alive()
-    assert client.stats() == dict(requests=0, used_blocks=0)
+    stats = client.stats()
+    assert (stats["requests"], stats["used_blocks"]) == (0, 0)
 
 
 def test_stage_client_reports_worker_failure():
@@ -533,7 +534,10 @@ def test_stage_client_controls_can_be_submitted_before_collecting():
                 if reply is not None:
                     replies[control_id] = reply
             time.sleep(0.001)
-        assert all(r["result"] == dict(requests=0, used_blocks=0) for r in replies.values())
+        assert all(
+            r["result"]["requests"] == 0 and r["result"]["used_blocks"] == 0
+            for r in replies.values()
+        )
         assert not client.pending_controls and not client.replies
     finally:
         client.close()

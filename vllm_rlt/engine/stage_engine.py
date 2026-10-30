@@ -383,8 +383,13 @@ class StageEngine:
         return request is not None and request.phase != RequestPhase.FINISHED
 
     def stats(self):
+        cache = self.cache_manager
         return dict(
-            requests=len(self.scheduler.requests), used_blocks=self.cache_manager.num_used_blocks
+            requests=len(self.scheduler.requests),
+            used_blocks=cache.num_used_blocks,
+            num_blocks=cache.num_blocks,
+            prefix_hit_tokens=cache.prefix_hits,
+            prefix_queries=cache.prefix_queries,
         )
 
     def has_unfinished_requests(self) -> bool:

@@ -46,19 +46,46 @@ def kv_segments(info, tables, start, end):
                         )
 
 
-def partition_segments(source, target, byte_limit, descriptor_limit):
-    """Bound both transfer size and descriptor count without an intermediate KV copy."""
+def coalesce_segments(source, target):
+    """Merge consecutive segment pairs that are contiguous on both the source and target.
+
+    Physical blocks handed out in order are adjacent in both pools, so a prompt's
+    per-block descriptors collapse into a few long ranges. Merging never moves a
+    byte: each merged pair covers exactly the bytes of its members, in order.
+    """
     from itertools import zip_longest
 
-    local, remote, size = [], [], 0
+    current = None
     for src, dst in zip_longest(source, target):
         if src is None or dst is None or src[1] != dst[1]:
             raise ValueError("incompatible source/target KV geometry")
+        if (
+            current is not None
+            and current[0] + current[2] == src[0]
+            and current[1] + current[2] == dst[0]
+            and current[3] == src[2]
+            and current[4] == dst[2]
+        ):
+            current[2] += src[1]
+            continue
+        if current is not None:
+            yield tuple(current)
+        current = [src[0], dst[0], src[1], src[2], dst[2]]
+    if current is not None:
+        yield tuple(current)
+
+
+def partition_segments(source, target, byte_limit, descriptor_limit):
+    """Bound both transfer size and descriptor count without an intermediate KV copy."""
+    local, remote, size = [], [], 0
+    for src_address, dst_address, length, src_device, dst_device in coalesce_segments(
+        source, target
+    ):
         offset = 0
-        while offset < src[1]:
-            amount = min(src[1] - offset, byte_limit - size)
-            local.append((src[0] + offset, amount, src[2]))
-            remote.append((dst[0] + offset, amount, dst[2]))
+        while offset < length:
+            amount = min(length - offset, byte_limit - size)
+            local.append((src_address + offset, amount, src_device))
+            remote.append((dst_address + offset, amount, dst_device))
             size += amount
             offset += amount
             if size == byte_limit or len(local) == descriptor_limit:
@@ -68,12 +95,38 @@ def partition_segments(source, target, byte_limit, descriptor_limit):
         yield local, remote, size
 
 
+def nixl_backend_params(backend):
+    """Optional NIXL backend init parameters from the environment.
+
+    VLLM_RLT_NIXL_UCX_ERROR_HANDLING=none|peer sets the UCX plugin's
+    ``ucx_error_handling_mode``. With the default (peer) UCX cannot use shared
+    memory or cuda_ipc lanes, which have no peer failure handler, and emulates
+    intra-node RMA with active messages over TCP (measured 1.3-5 GB/s on a GH200
+    node). ``none`` lets UCX select cuda_ipc for device-memory WRITEs, but a peer
+    failure is then not reported as a transfer error.
+    """
+    import os
+
+    mode = os.environ.get("VLLM_RLT_NIXL_UCX_ERROR_HANDLING")
+    if backend != "UCX" or not mode:
+        return {}
+    if mode not in ("none", "peer"):
+        raise ValueError("VLLM_RLT_NIXL_UCX_ERROR_HANDLING must be 'none' or 'peer'")
+    return {"ucx_error_handling_mode": mode}
+
+
 class NixlConnector:
     def __init__(self, name, cache, hidden, config):
         from nixl._api import nixl_agent, nixl_agent_config
 
         self.config = config
-        self.agent = nixl_agent(name, nixl_agent_config(backends=[config.backend]))
+        params = nixl_backend_params(config.backend)
+        if params:
+            # nixl_agent_config cannot pass backend init parameters; create it explicitly.
+            self.agent = nixl_agent(name, nixl_agent_config(backends=[]))
+            self.agent.create_backend(config.backend, params)
+        else:
+            self.agent = nixl_agent(name, nixl_agent_config(backends=[config.backend]))
         self.storage = (cache.key_cache, cache.value_cache, hidden)
         self.registrations = [self.agent.register_memory(t) for t in self.storage]
         k = cache.key_cache

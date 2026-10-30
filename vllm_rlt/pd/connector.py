@@ -30,6 +30,8 @@ class RequestTransfer:
     transfer_boundary_first: tuple[int, int] | None = None
     transfer_boundary_last: tuple[int, int] | None = None
     transfer_overlaps: int = 0
+    # A chunk of this transfer went on the wire since the last prefill submission.
+    submitted_since_compute: bool = False
     received: set = field(default_factory=set)
     next_sequence: int = 0
     expected: int | None = None
@@ -191,7 +193,12 @@ class PDStageConnector:
             phase == RequestPhase.PREFILLING_RECURRENT
             and self.engine.scheduler.config.wavefront_chunked_prefill
         ):
-            transfer.transfer_overlaps += self.transport.busy(transfer.tid)
+            # Overlap: the transfer ran during this compute step, either still on the
+            # wire now or sent and already drained (coalesced descriptors drain fast).
+            transfer.transfer_overlaps += bool(
+                self.transport.busy(transfer.tid) or transfer.submitted_since_compute
+            )
+        transfer.submitted_since_compute = False
         if not progress.chunk_complete:
             transfer.last_event = event
             return
@@ -388,23 +395,9 @@ class PDStageConnector:
                         ),
                         overlaps=transfer.transfer_overlaps,
                     )
-                # Round robin: at most one bounded transfer per request per tick.
-                if transfer.chunks:
-                    event, seq, local, remote, size = transfer.chunks[0]
-                    if event.query() and self.transport.submit(
-                        transfer.tid, seq, transfer.peer, local, remote, size
-                    ):
-                        transfer.chunks.popleft()
-                if transfer.compute_done and not transfer.chunks and not transfer.committed:
-                    transfer.committed = True
-                    self.notify("commit", tid=transfer.tid, count=transfer.next_sequence)
-                if (
-                    transfer.acknowledged
-                    and transfer.committed
-                    and transfer.request.compute_released
-                    and not self.transport.busy(transfer.tid)
-                ):
-                    self._remove(transfer)
+                # Round robin: one bounded transfer per request per pass; the
+                # in-flight budget is filled with further passes below.
+                self._submit_chunk(transfer)
             elif transfer.cancelled:
                 if transfer.ready or transfer.cancel_confirmed:
                     self._remove(transfer)
@@ -428,3 +421,35 @@ class PDStageConnector:
                         raise RuntimeError("stale import activation")
                     transfer.ready = True
                     self.notify("received", tid=transfer.tid)
+        # Keep the link busy: as long as the in-flight budget admits another chunk,
+        # take one more pass over the outgoing transfers (fairness is preserved by
+        # the pass order). Then commit transfers whose last chunk has gone out.
+        outgoing = [t for t in transfers if t.outgoing and not t.cancelled]
+        while outgoing and any([self._submit_chunk(t) for t in outgoing]):
+            outgoing = [t for t in outgoing if t.chunks]
+        for transfer in transfers:
+            if not transfer.outgoing or transfer.cancelled:
+                continue
+            if transfer.compute_done and not transfer.chunks and not transfer.committed:
+                transfer.committed = True
+                self.notify("commit", tid=transfer.tid, count=transfer.next_sequence)
+            if (
+                transfer.acknowledged
+                and transfer.committed
+                and transfer.request.compute_released
+                and not self.transport.busy(transfer.tid)
+            ):
+                self._remove(transfer)
+
+    def _submit_chunk(self, transfer):
+        """Submit the transfer's next ready chunk; True when one went out."""
+        if not transfer.chunks:
+            return False
+        event, seq, local, remote, size = transfer.chunks[0]
+        if event.query() and self.transport.submit(
+            transfer.tid, seq, transfer.peer, local, remote, size
+        ):
+            transfer.chunks.popleft()
+            transfer.submitted_since_compute = True
+            return True
+        return False

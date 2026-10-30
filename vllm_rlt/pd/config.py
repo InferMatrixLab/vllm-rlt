@@ -7,8 +7,14 @@ class PDConfig:
     prefill_devices: tuple[int, ...] = (0,)
     decode_devices: tuple[int, ...] = (1,)
     max_pending_requests: int = 256
-    transfer_chunk_bytes: int = 64 * 1024**2
-    max_inflight_bytes: int = 256 * 1024**2
+    # KV chunks are submitted, and their completion observed, only between engine
+    # steps, so a request whose KV exceeds the in-flight budget waits extra steps
+    # after its prefill (the commit tail). 2 GiB covers one 2048-token Ouro-1.4B
+    # request (1.6 GB): on a GH200 node the tail fell from ~1 s to 17 ms and 1P1D
+    # throughput rose 1.7x. In-flight bytes are not a buffer: NIXL writes straight
+    # from the registered prefill pool into the decode pool.
+    transfer_chunk_bytes: int = 256 * 1024**2
+    max_inflight_bytes: int = 2 * 1024**3
     max_transfer_descriptors: int = 256
     max_control_messages: int = 32
     startup_timeout: float = 300.0
