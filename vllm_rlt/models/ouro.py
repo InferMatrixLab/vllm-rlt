@@ -11,6 +11,7 @@ request or loop depth; the cache supplies the corresponding causal KV history.
 
 import json
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -20,6 +21,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from vllm_rlt.kernels.dispatch import fused_allowed
 from vllm_rlt.layers import (
     RMSNorm,
     RotaryEmbedding,
@@ -150,6 +152,15 @@ OuroRotaryEmbedding = RotaryEmbedding
 _rotate_half = rotate_half
 
 
+# Opt-in fused SiLU(gate) * up on CUDA (see vllm_rlt.kernels.activation).
+# "exact" (default): fused silu(gate) * up with forced rounding points; bitwise with the
+# eager reference on GH200 over 8.3e8 random elements (bf16/fp16/fp32, three scales).
+# "1"/"approx": compiler-chosen rounding, "0": eager.
+FUSED_ACT = {"1": "approx", "approx": "approx", "exact": "exact"}.get(
+    os.environ.get("VLLM_RLT_FUSED_ACT", "exact")
+)
+
+
 class OuroAttention(nn.Module):
     def __init__(self, config: OuroConfig, layer_idx: int) -> None:
         super().__init__()
@@ -194,7 +205,13 @@ class OuroMLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        gate, up = self.gate_proj(hidden), self.up_proj(hidden)
+        if FUSED_ACT and fused_allowed():
+            from vllm_rlt.kernels.activation import fused_silu_mul, fused_silu_mul_supported
+
+            if fused_silu_mul_supported(gate, up):
+                return self.down_proj(fused_silu_mul(gate, up, exact=FUSED_ACT == "exact"))
+        return self.down_proj(F.silu(gate) * up)
 
 
 class OuroDecoderLayer(nn.Module):
@@ -215,9 +232,9 @@ class OuroDecoderLayer(nn.Module):
         cache: "KVCacheManager",
     ) -> torch.Tensor:
         attention = self.self_attn(self.input_layernorm(hidden), position_embeddings, batch, cache)
-        hidden = hidden + self.input_layernorm_2(attention)
-        return hidden + self.post_attention_layernorm_2(
-            self.mlp(self.post_attention_layernorm(hidden))
+        hidden = self.input_layernorm_2(attention, residual=hidden)
+        return self.post_attention_layernorm_2(
+            self.mlp(self.post_attention_layernorm(hidden)), residual=hidden
         )
 
 

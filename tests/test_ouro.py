@@ -227,3 +227,41 @@ def test_dtype_conversion_preserves_float32_rotary_frequencies(model):
     angles = torch.cat([angles, angles], dim=-1)
     torch.testing.assert_close(cos[:, 0], angles.cos().bfloat16(), atol=0, rtol=0)
     torch.testing.assert_close(sin[:, 0], angles.sin().bfloat16(), atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_silu_mul_tracks_reference(dtype):
+    import torch.nn.functional as F
+
+    from vllm_rlt.kernels.activation import fused_silu_mul, fused_silu_mul_supported
+
+    torch.manual_seed(0)
+    gate = (torch.randn(64, 5632, device="cuda") * 4).to(dtype)
+    up = (torch.randn(64, 5632, device="cuda") * 2).to(dtype)
+    assert fused_silu_mul_supported(gate, up)
+    fused = fused_silu_mul(gate, up)
+    reference = F.silu(gate) * up
+    diff = (fused.float() - reference.float()).abs()
+    ulp = torch.finfo(dtype).eps * reference.float().abs().clamp_min(torch.finfo(dtype).tiny)
+    assert (diff <= 1.01 * ulp).all()
+    assert (diff == 0).float().mean().item() > 0.999
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fused_silu_mul_exact_matches_reference(dtype):
+    """Forced rounding points: the only possible difference left is the transcendental."""
+    import torch.nn.functional as F
+
+    from vllm_rlt.kernels.activation import fused_silu_mul
+
+    torch.manual_seed(0)
+    gate = (torch.randn(64, 5632, device="cuda") * 4).to(dtype)
+    up = (torch.randn(64, 5632, device="cuda") * 2).to(dtype)
+    fused = fused_silu_mul(gate, up, exact=True)
+    reference = F.silu(gate) * up
+    mismatches = int((fused != reference).sum())
+    # libdevice exp is the CUDA math library PyTorch links, so this is expected to be
+    # zero; the bound keeps the test informative if a platform's exp differs.
+    assert mismatches <= 2, mismatches

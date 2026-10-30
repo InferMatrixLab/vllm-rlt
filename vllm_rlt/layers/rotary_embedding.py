@@ -1,8 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared rotary position embedding (RoPE) layers across models."""
 
+import os
+
 import torch
 from torch import nn
+
+from vllm_rlt.kernels.dispatch import fused_allowed
+
+# Fused Triton RoPE on CUDA: "exact" (default) is bitwise with the reference (forced
+# rounding points), "1"/"approx" lets the compiler keep products in fp32, "0" is eager.
+FUSED_ROPE = {"1": "approx", "approx": "approx", "exact": "exact"}.get(
+    os.environ.get("VLLM_RLT_FUSED_ROPE", "exact")
+)
 
 
 def rotate_half(value: torch.Tensor) -> torch.Tensor:
@@ -18,6 +28,17 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies Rotary Position Embedding (RoPE) to Query and Key states."""
+    if FUSED_ROPE and fused_allowed():
+        from vllm_rlt.kernels.rope import fused_rope_, fused_rope_supported
+
+        if fused_rope_supported(q, cos) and fused_rope_supported(k, cos):
+            # q and k are fresh projection outputs here, so in-place is safe.
+            exact = FUSED_ROPE == "exact"
+            return fused_rope_(q, cos, sin, exact=exact), fused_rope_(k, cos, sin, exact=exact)
+    return apply_rotary_pos_emb_reference(q, k, cos, sin)
+
+
+def apply_rotary_pos_emb_reference(q, k, cos, sin):
     q_embed = q * cos + rotate_half(q) * sin
     k_embed = k * cos + rotate_half(k) * sin
     return q_embed, k_embed
