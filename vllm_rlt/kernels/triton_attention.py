@@ -2,10 +2,21 @@
 
 Every query row receives its own physical block table. Single-query attention
 splits each row's context into NUM_SPLITS equal parts (split-KV): one program
-per (row, head, split) produces a partial softmax state and a second kernel
-merges the parts. A row's partition depends only on its own length, so its
-result does not depend on the batch it runs in. Without splitting, one long
-row serialized its whole context in one program and set the decode step time.
+per (row, head, split) produces a partial softmax state, and the parts are
+merged in a fixed order. A row's partition and merge order depend only on its
+own length, so its result does not depend on the batch it runs in. Without
+splitting, one long row serialized its whole context in one program and set
+the decode step time.
+
+There are two merge paths, and they produce bitwise-identical results:
+- Eager: the last split of each (row, head) to finish does the merge, in the
+  same launch, with partial-state buffers reused per stream. Small-batch eager
+  decode is bound by host overhead, so a call costs one launch and no
+  allocation, like an unsplit kernel. The merging program also resets its
+  ticket counter, so no memset runs between calls and PyTorch never updates
+  the reused buffers in place (they may be inference tensors, see below).
+- CUDA graph capture: a separate merge kernel. A replay has no launch cost,
+  and the plain split kernel is the faster one on the GPU.
 """
 
 import torch
@@ -24,9 +35,9 @@ def _paged_attention_kernel(
     V,
     TABLES,
     LENGTHS,
-    PART_M,
-    PART_L,
-    PART_O,
+    PARTS,
+    COUNTERS,
+    OUT,
     q_batch_stride: tl.constexpr,
     q_head_stride: tl.constexpr,
     q_dim_stride: tl.constexpr,
@@ -39,6 +50,9 @@ def _paged_attention_kernel(
     v_head_stride: tl.constexpr,
     v_dim_stride: tl.constexpr,
     table_stride: tl.constexpr,
+    out_batch_stride: tl.constexpr,
+    out_head_stride: tl.constexpr,
+    out_dim_stride: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HEAD_GROUPS: tl.constexpr,
     NUM_HEADS: tl.constexpr,
@@ -47,6 +61,7 @@ def _paged_attention_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     SPLITS: tl.constexpr,
+    FUSED: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -103,18 +118,46 @@ def _paged_attention_kernel(
         accumulator = accumulator * correction + tl.sum(weights[:, None] * values, axis=0)
         normalizer = normalizer * correction + tl.sum(weights, axis=0)
         maximum = next_maximum
+    # PARTS holds this launch's maxima, normalizers and accumulators back to back
+    # (one buffer: each kernel argument costs host time on every launch).
     # An empty part stores (-inf, 0, 0), which the merge weights by zero.
+    states = tl.num_programs(0) * NUM_HEADS * SPLITS
     part = (row * NUM_HEADS + head) * SPLITS + split
-    tl.store(PART_M + part, maximum)
-    tl.store(PART_L + part, normalizer)
-    tl.store(PART_O + part * BLOCK_D + dims, accumulator)
+    tl.store(PARTS + part, maximum)
+    tl.store(PARTS + states + part, normalizer)
+    tl.store(PARTS + 2 * states + part * BLOCK_D + dims, accumulator)
+    if FUSED:
+        # Release this part, then let the last finisher merge all parts. acq_rel
+        # makes every earlier part's stores visible to that program; it reads the
+        # parts in index order, so which program merges never changes the result.
+        ticket = tl.atomic_add(COUNTERS + row * NUM_HEADS + head, 1, sem="acq_rel")
+        if ticket == SPLITS - 1:
+            parts = (row * NUM_HEADS + head) * SPLITS + tl.arange(0, SPLITS)
+            maxima = tl.load(PARTS + parts, cache_modifier=".cg")
+            top = tl.max(maxima, axis=0)
+            # All parts empty (length 0) leaves top = -inf; zero weights give a zero row.
+            scale = tl.where(maxima > -float("inf"), tl.exp(maxima - top), 0.0)
+            normalizer_sum = tl.sum(
+                tl.load(PARTS + states + parts, cache_modifier=".cg") * scale, axis=0
+            )
+            partial = tl.load(
+                PARTS + 2 * states + parts[:, None] * BLOCK_D + dims[None, :],
+                cache_modifier=".cg",
+            )
+            merged = tl.sum(partial * scale[:, None], axis=0)
+            tl.store(
+                OUT + row * out_batch_stride + head * out_head_stride + dims * out_dim_stride,
+                merged / tl.maximum(normalizer_sum, 1.0e-30),
+                mask=dims < HEAD_DIM,
+            )
+            # Every program takes a ticket (no early exit), so the counter is back at 0
+            # for the next launch on this stream, which kernel ordering makes visible.
+            tl.store(COUNTERS + row * NUM_HEADS + head, 0)
 
 
 @triton.jit
 def _paged_attention_merge_kernel(
-    PART_M,
-    PART_L,
-    PART_O,
+    PARTS,
     OUT,
     out_batch_stride: tl.constexpr,
     out_head_stride: tl.constexpr,
@@ -126,14 +169,15 @@ def _paged_attention_merge_kernel(
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
+    states = tl.num_programs(0) * NUM_HEADS * SPLITS  # The split kernel's layout.
     parts = (row * NUM_HEADS + head) * SPLITS + tl.arange(0, SPLITS)
     dims = tl.arange(0, BLOCK_D)
-    maxima = tl.load(PART_M + parts)
+    maxima = tl.load(PARTS + parts)
     top = tl.max(maxima, axis=0)
     # All parts empty (length 0) leaves top = -inf; zero weights give a zero row.
     scale = tl.where(maxima > -float("inf"), tl.exp(maxima - top), 0.0)
-    normalizer = tl.sum(tl.load(PART_L + parts) * scale, axis=0)
-    partial = tl.load(PART_O + parts[:, None] * BLOCK_D + dims[None, :])
+    normalizer = tl.sum(tl.load(PARTS + states + parts) * scale, axis=0)
+    partial = tl.load(PARTS + 2 * states + parts[:, None] * BLOCK_D + dims[None, :])
     accumulator = tl.sum(partial * scale[:, None], axis=0)
     tl.store(
         OUT + row * out_batch_stride + head * out_head_stride + dims * out_dim_stride,
@@ -142,29 +186,78 @@ def _paged_attention_merge_kernel(
     )
 
 
+try:
+    # The raw stream handle, read the way Triton's own launcher reads it (with the
+    # same public fallback): no Stream object per call.
+    from torch._C import _cuda_getCurrentRawStream as _current_raw_stream
+except ImportError:
+
+    def _current_raw_stream(index):
+        return torch.cuda.current_stream(index).cuda_stream
+
+
+# Eager partial-state buffers per (device, stream): grow-only, reused by every
+# call on that stream (calls on one stream are ordered, so they never overlap).
+# Only the kernel writes them. The engine decodes under torch.inference_mode, so
+# they can be inference tensors that a PyTorch in-place op outside it rejects.
+# At most _EAGER_STATE_LIMIT streams keep a buffer; a new stream evicts the oldest
+# entry. That is safe while its kernels still run: the caching allocator reuses a
+# freed block only on the stream that allocated it, which is the evicted key's own
+# stream, so the reuse is ordered after them.
+_EAGER_STATE = {}
+_EAGER_STATE_LIMIT = 16
+
+
+def _eager_state(device, rows, heads, block_d):
+    key = (device.index, _current_raw_stream(device.index))
+    state = _EAGER_STATE.get(key)
+    if state is None or state[0] < rows * heads or state[1] != block_d:
+        # Only this miss path does bookkeeping; a hit stays one dict lookup.
+        _EAGER_STATE.pop(key, None)
+        while len(_EAGER_STATE) >= _EAGER_STATE_LIMIT:
+            del _EAGER_STATE[next(iter(_EAGER_STATE))]
+        state = (
+            rows * heads,
+            block_d,
+            torch.empty(
+                rows * heads * NUM_SPLITS * (block_d + 2), device=device, dtype=torch.float32
+            ),
+            torch.zeros(rows * heads, device=device, dtype=torch.int32),
+        )
+        _EAGER_STATE[key] = state
+    return state[2], state[3]
+
+
 def paged_attention(q, key_cache, value_cache, block_tables, context_lengths):
-    """Launch split-KV parts over [row, head, split], then merge per [row, head]."""
+    """Split-KV decode attention over [row, head, split] parts merged in a fixed order."""
     output = torch.empty_like(q)
     if q.shape[0] == 0:
         return output
     rows, heads = q.shape[0], q.shape[1]
     block_d = triton.next_power_of_2(q.shape[-1])
-    part_m = torch.empty((rows, heads, NUM_SPLITS), device=q.device, dtype=torch.float32)
-    part_l = torch.empty_like(part_m)
-    part_o = torch.empty((rows, heads, NUM_SPLITS, block_d), device=q.device, dtype=torch.float32)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if capturing:
+        # Graph-pool buffers: a later eager growth can never free memory a graph reads.
+        parts = torch.empty(
+            rows * heads * NUM_SPLITS * (block_d + 2), device=q.device, dtype=torch.float32
+        )
+        counters = parts  # Unused by the unfused kernel.
+    else:
+        parts, counters = _eager_state(q.device, rows, heads, block_d)
     _paged_attention_kernel[(rows, heads, NUM_SPLITS)](
         q,
         key_cache,
         value_cache,
         block_tables,
         context_lengths,
-        part_m,
-        part_l,
-        part_o,
+        parts,
+        counters,
+        output,
         *q.stride(),
         *key_cache.stride(),
         *value_cache.stride(),
         block_tables.stride(0),
+        *output.stride(),
         HEAD_DIM=q.shape[-1],
         HEAD_GROUPS=heads // key_cache.shape[2],
         NUM_HEADS=heads,
@@ -173,20 +266,22 @@ def paged_attention(q, key_cache, value_cache, block_tables, context_lengths):
         BLOCK_D=block_d,
         BLOCK_T=32,
         SPLITS=NUM_SPLITS,
+        FUSED=not capturing,
         num_warps=4,
     )
-    _paged_attention_merge_kernel[(rows, heads)](
-        part_m,
-        part_l,
-        part_o,
-        output,
-        *output.stride(),
-        HEAD_DIM=q.shape[-1],
-        NUM_HEADS=heads,
-        BLOCK_D=block_d,
-        SPLITS=NUM_SPLITS,
-        num_warps=4,
-    )
+    if capturing:
+        # Both kernels size PARTS from tl.num_programs(0), so the merge grid's
+        # dimension 0 must stay the split grid's: the same `rows`.
+        _paged_attention_merge_kernel[(rows, heads)](
+            parts,
+            output,
+            *output.stride(),
+            HEAD_DIM=q.shape[-1],
+            NUM_HEADS=heads,
+            BLOCK_D=block_d,
+            SPLITS=NUM_SPLITS,
+            num_warps=4,
+        )
     return output
 
 
