@@ -772,8 +772,8 @@ class Scheduler:
             if prompt_phases
             else scheduled_requests[0].phase
         )
-        self.policy.record_batch(recorded)
         loop_count = self._planned_loop_count(scheduled_requests)
+        self.policy.record_batch(recorded, loop_count=loop_count)
         scheduled_requests = [
             replace(
                 item,
@@ -801,7 +801,11 @@ class Scheduler:
         if RequestPhase.PRELUDE in phases:
             return 0
         if self.wavefront_chunked_prefill:
-            return 1 if RequestPhase.PREFILLING_RECURRENT in phases else 0
+            if RequestPhase.PREFILLING_RECURRENT in phases:
+                return 1
+            if phases == {RequestPhase.RECURRENT}:
+                return self._fused_decode_loops(scheduled_requests)
+            return 0
         if RequestPhase.PREFILLING_PRELUDE in phases:
             # In mixed mode, stage just the embeddings when recurrent decode work
             # is ready so the next depth can join that batch. Without a reason to
@@ -816,8 +820,39 @@ class Scheduler:
                 return 1
             return min(self._max_contiguous_prefill_loops(item) for item in scheduled_requests)
         if RequestPhase.RECURRENT in phases:
-            return 1
+            return self._fused_decode_loops(scheduled_requests)
         raise ValueError(f"cannot derive recurrent boundary for phases: {phases}")
+
+    def _fused_decode_loops(self, scheduled_requests):
+        """Loops one decode RECURRENT submission may run without a host decision.
+
+        A row whose exit depth is already known (fixed depth, or a trace) needs no
+        gate readback between loops, so its remaining loops can run back to back
+        in one submission with per-loop KV metadata. Any row that still depends
+        on a hazard score keeps the one-loop boundary for the whole batch. The
+        batch advances every row by the same count, so the minimum remaining
+        depth bounds the fusion; rows with more loops left return to the
+        RECURRENT queue afterwards.
+        """
+        if self.cache_manager.layout != "last_exited":
+            # SHARED overwrites one plane through recurrence; keep its per-loop boundaries.
+            return 1
+        count = None
+        for item in scheduled_requests:
+            request = item.request
+            params = request.sampling_params
+            maximum = params.max_loops or self.total_ut_steps
+            if self.exit_mode == "trace":
+                target = request.exit_trace[request.num_scheduled_outputs]
+            elif params.exit_threshold >= 1.0:
+                target = maximum
+            else:
+                return 1
+            remaining = min(target, maximum) - request.loops_done
+            if remaining < 1:
+                return 1
+            count = remaining if count is None else min(count, remaining)
+        return count or 1
 
     def _batch_loop_count(self, batch):
         if batch.loop_count is not None:
@@ -1310,9 +1345,15 @@ class Scheduler:
                 request.pending_exit_depth = None
                 self.enqueue(request, RequestPhase.RECURRENT)
             elif phase == RequestPhase.RECURRENT:
-                request.loops_done += 1
+                # A zero count is the executor's one-loop default for RECURRENT.
+                request.loops_done += max(1, self._batch_loop_count(batch))
                 if self.exit_mode == "trace":
                     should_exit = self._trace_exit(request)
+                elif result.gate_scores is None:
+                    # Fused fixed-depth loops deliver no hazard scores; the exit
+                    # depth was decided before submission.
+                    maximum = request.sampling_params.max_loops or self.total_ut_steps
+                    should_exit = request.loops_done >= maximum
                 else:
                     score = result.gate_scores[row]
                     if self.exit_mode == "ouro":
@@ -1440,12 +1481,14 @@ class Scheduler:
                 )
                 self.enqueue(request, RequestPhase.SPECULATIVE)
             elif phase == RequestPhase.RECURRENT:
+                loop_count = max(1, self._batch_loop_count(batch))
                 consume_signal = (
-                    request.loops_done > 0
+                    loop_count == 1
+                    and request.loops_done > 0
                     and request.sampling_params.exit_threshold < 1
                     and self.needs_exit_signal(request)
                 )
-                request.loops_done += 1
+                request.loops_done += loop_count
                 should_exit = (
                     self._trace_exit(request)
                     if self.exit_mode == "trace"

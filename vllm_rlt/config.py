@@ -61,6 +61,9 @@ class SchedulerConfig:
     policy: str = "fcfs"
     enable_preemption: bool = False
     wavefront_chunked_prefill: bool = False
+    # A decode submission that fuses L loops leaves L times the prefill-batch share
+    # (max_prefill_batches_before_decode per loop), as L unfused loop steps would.
+    prefill_share_per_loop: bool = True
 
     def __post_init__(self):
         for name in (
@@ -77,6 +80,8 @@ class SchedulerConfig:
             raise ValueError("enable_preemption must be a boolean")
         if type(self.wavefront_chunked_prefill) is not bool:
             raise ValueError("wavefront_chunked_prefill must be a boolean")
+        if type(self.prefill_share_per_loop) is not bool:
+            raise ValueError("prefill_share_per_loop must be a boolean")
         if self.policy not in ("fcfs", "priority"):
             raise ValueError("policy must be fcfs or priority")
         if self.mode not in ("refill", "no_refill", "mixed"):

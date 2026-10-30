@@ -366,6 +366,26 @@ class ModelRunner:
         self.last_effective_size, self.last_submitted_size = count, size
         return size
 
+    def _fused_decode(self, batch):
+        """A decode submission that runs several loops (or prelude + loops) at once."""
+        return (
+            batch.loop_count > 1
+            and not batch.has_chunks
+            or (
+                batch.operation == Operation.PRELUDE
+                and batch.loop_count > 0
+                and all(span.input_tokens is None for span in batch.spans)
+            )
+        )
+
+    def _row_size(self, batch):
+        """Submitted row count: padded for single-loop steps, exact for fused ones.
+
+        Fused loops stage one host KV view per depth from the real rows, so the
+        device view of the first loop and the hidden rows must use the same count.
+        """
+        return batch.num_rows if self._fused_decode(batch) else self._size(batch.num_rows)
+
     def _workspace(self, group):
         if not self.requestspaces:
             return None
@@ -926,7 +946,7 @@ class ModelRunner:
                 requests,
                 depths,
                 positions,
-                self._size(len(requests)),
+                self._row_size(batch),
                 recurrent=batch.operation == Operation.RECURRENT,
             )
             return replace(prepared, kv=kv, routing=routing)
@@ -980,7 +1000,7 @@ class ModelRunner:
                 hidden = self._gather_prefill(prepared)
                 prepared = replace(prepared, batch_inputs=replace(metadata, hidden=hidden))
         elif batch.operation == Operation.PRELUDE and not batch.loop_count:
-            tokens = self._prepare_tokens(prepared, self._size(batch.num_rows))
+            tokens = self._prepare_tokens(prepared, self._row_size(batch))
             prepared = replace(prepared, token_ids=tokens)
         return self._prepare_forward(prepared)
 
@@ -989,7 +1009,7 @@ class ModelRunner:
         if batch.operation == Operation.PRELUDE and batch.loop_count:
             return replace(prepared, forwards=self._prepare_loop_forwards(prepared))
         requests = [span.request for span in batch.spans]
-        size = batch.num_rows if batch.has_chunks else self._size(batch.num_rows)
+        size = batch.num_rows if batch.has_chunks else self._row_size(batch)
         inputs = prepared.forwards[0].forward
         metadata = inputs.metadata
         kv_metadata = inputs.prelude_coda_kv_metadata
@@ -1216,11 +1236,10 @@ class ModelRunner:
                 # Keep graph selection and its captured compute unchanged.
                 if (
                     scheduled_batch is not None
-                    and self.execution_config.async_scheduling
                     and batch.operation == Operation.RECURRENT
                     and not any(
                         span.emit_gate
-                        and self.exit_config.mode in ("ouro_delayed", "random_lookahead")
+                        and self.exit_config.mode != "trace"
                         and span.request.sampling_params.exit_threshold < 1
                         and span.depth + batch.loop_count
                         < (
