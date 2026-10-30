@@ -27,7 +27,15 @@ def add_runtime_args(parser):
     parser.add_argument(
         "--prefill-uva",
         action="store_true",
-        help="Use packed prefill metadata staging (requires packed attention)",
+        default=None,
+        help="Force packed prefill metadata staging (requires packed attention); "
+        "default resolves automatically (on for CUDA with last_exited KV)",
+    )
+    parser.add_argument(
+        "--no-prefill-uva",
+        action="store_false",
+        dest="prefill_uva",
+        help="Keep per-row prefill even when packed attention is available",
     )
     parser.add_argument(
         "--no-uva",

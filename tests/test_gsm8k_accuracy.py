@@ -522,6 +522,7 @@ def test_min_loops_is_validated_against_the_checkpoint_depth():
         ({"model_type": "ouro", "total_ut_steps": 4}, 4),
         ({"model_type": "ouro", "total_ut_steps": 6}, 6),
         ({"model_type": "llama", "total_ut_steps": 4}, None),
+        ({"architectures": ["RavenForCausalLM"], "mean_recurrence": 32}, 32),
         ({"model_type": "ouro"}, None),
         ({"model_type": "ouro", "total_ut_steps": 0}, None),
         ({"model_type": "ouro", "total_ut_steps": 4.0}, None),

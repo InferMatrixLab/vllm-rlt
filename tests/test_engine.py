@@ -415,3 +415,35 @@ def test_finish_reason_preserves_public_string_values(reason):
     output = RequestOutput.from_request(request)
     assert output.finished and type(output.finish_reason) is str
     assert output.finish_reason == reason.value
+
+
+def test_packed_prefill_resolves_automatically_when_unset(monkeypatch):
+    from vllm_rlt.config import ExecutionConfig
+    from vllm_rlt.engine.stage_engine import packed_prefill_eligible
+
+    common = dict(layout="last_exited", boundary_kv=False, staged_prefill=False)
+    # Unset: on for CUDA, fully recurrent, last_exited, ordinary prefill; off otherwise.
+    assert packed_prefill_eligible(None, device_type="cuda", **common)
+    assert not packed_prefill_eligible(None, device_type="cpu", **common)
+    assert not packed_prefill_eligible(None, device_type="cuda", **{**common, "layout": "shared"})
+    # Huginn packs by default (GSM8K-87 paired gate: no regression); =0 keeps per-row prefill.
+    assert packed_prefill_eligible(None, device_type="cuda", **{**common, "boundary_kv": True})
+    monkeypatch.setenv("VLLM_RLT_HUGINN_PACKED_PREFILL", "0")
+    assert not packed_prefill_eligible(None, device_type="cuda", **{**common, "boundary_kv": True})
+    monkeypatch.delenv("VLLM_RLT_HUGINN_PACKED_PREFILL")
+    assert not packed_prefill_eligible(
+        None, device_type="cuda", **{**common, "staged_prefill": True}
+    )
+    # Explicit settings win regardless of eligibility.
+    assert not packed_prefill_eligible(False, device_type="cuda", **common)
+    assert packed_prefill_eligible(True, device_type="cuda", **{**common, "boundary_kv": True})
+    assert ExecutionConfig().prefill_uva is None
+    with pytest.raises(ValueError, match="prefill_uva"):
+        ExecutionConfig(prefill_uva=1)
+    # A CPU engine resolves the unset value to the per-row path and records the decision.
+    engine = LLMEngine(tiny_model())
+    assert engine.execution_config.prefill_uva is False
+    with pytest.raises(ValueError, match="prefill_uva requires CUDA"):
+        LLMEngine(tiny_model(), execution_config=ExecutionConfig(prefill_uva=True))
+    engine = LLMEngine(tiny_model(), execution_config=ExecutionConfig(prefill_uva=False))
+    assert engine.execution_config.prefill_uva is False

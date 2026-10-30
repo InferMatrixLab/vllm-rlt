@@ -38,6 +38,33 @@ class SignalHandle:
     row: int
 
 
+def _huginn_packed_prefill_disabled() -> bool:
+    """Huginn packs prefill like Ouro; VLLM_RLT_HUGINN_PACKED_PREFILL=0 keeps per-row prefill.
+
+    Measured on GH200 (Huginn-0125, 32 depths): 1.2-2.1x throughput and -39..-64%
+    TTFT at 512-2048-token prompts; GSM8K-87 (70 paired questions) 21 vs 20 correct
+    with 47/70 identical token sequences, i.e. no regression.
+    """
+    import os
+
+    return os.environ.get("VLLM_RLT_HUGINN_PACKED_PREFILL", "1") == "0"
+
+
+def packed_prefill_eligible(prefill_uva, *, device_type, layout, boundary_kv, staged_prefill):
+    """Whether an unset ``prefill_uva`` may resolve to packed prefill.
+
+    Explicit settings win. Packed prefill needs CUDA packed attention and
+    last_exited KV; staged prefill (wavefront chunking, mixed mode) keeps the
+    per-row path, which its schedulers were written against. Boundary-KV models
+    (Huginn) pack unless VLLM_RLT_HUGINN_PACKED_PREFILL=0.
+    """
+    if prefill_uva is not None:
+        return bool(prefill_uva)
+    if boundary_kv and _huginn_packed_prefill_disabled():
+        return False
+    return device_type == "cuda" and layout == "last_exited" and not staged_prefill
+
+
 class StageEngine:
     """Single-device loop-level engine with synchronous or pipelined scheduling."""
 
@@ -78,8 +105,12 @@ class StageEngine:
                 raise ValueError(
                     "Huginn does not support staged prefill required by this scheduler"
                 )
-            if self.execution_config.async_scheduling or self.execution_config.prefill_uva:
-                raise ValueError("Huginn requires synchronous scheduling without prefill UVA")
+            if self.execution_config.async_scheduling:
+                raise ValueError("Huginn requires synchronous scheduling")
+            if self.execution_config.prefill_uva is True and _huginn_packed_prefill_disabled():
+                raise ValueError(
+                    "Huginn packed prefill is disabled by VLLM_RLT_HUGINN_PACKED_PREFILL=0"
+                )
             if speculative_config is not None:
                 raise ValueError("Huginn speculative decoding is not yet supported")
         self.speculative_config = speculative_config
@@ -154,21 +185,40 @@ class StageEngine:
             raise ValueError("prefill_uva requires CUDA packed prefill with last_exited KV")
         if staged_prefill and cache_config.layout != "last_exited":
             raise ValueError("staged prefill requires last_exited KV planes")
-        attention = create_backend(
-            attention_backend,
-            parameter.device,
-            parameter.dtype,
-            config.head_dim,
-            cache_config.block_size,
-            required_capabilities=BackendCapabilities(
-                packed_prefill=self.execution_config.prefill_uva,
-                cuda_graphs=self.execution_config.cuda_graphs,
-                async_scheduling=(
-                    parameter.device.type == "cuda" and self.execution_config.async_scheduling
-                ),
-                device_context_lengths=self.async_speculative,
-            ),
+        auto_packed = packed_prefill_eligible(
+            self.execution_config.prefill_uva,
+            device_type=parameter.device.type,
+            layout=cache_config.layout,
+            boundary_kv=getattr(model, "requires_boundary_kv", False),
+            staged_prefill=staged_prefill,
         )
+
+        def backend(packed_prefill):
+            return create_backend(
+                attention_backend,
+                parameter.device,
+                parameter.dtype,
+                config.head_dim,
+                cache_config.block_size,
+                required_capabilities=BackendCapabilities(
+                    packed_prefill=packed_prefill,
+                    cuda_graphs=self.execution_config.cuda_graphs,
+                    async_scheduling=(
+                        parameter.device.type == "cuda" and self.execution_config.async_scheduling
+                    ),
+                    device_context_lengths=self.async_speculative,
+                ),
+            )
+
+        attention = backend(bool(self.execution_config.prefill_uva))
+        if auto_packed:
+            # Keep the backend the user would get anyway; only Triton needs the
+            # explicit opt-in to pack prefill, FlashAttention-4 packs natively.
+            if attention.info["selected_backend"] == "triton":
+                attention = backend(True)
+            auto_packed = bool(attention.capabilities.packed_prefill)
+        if self.execution_config.prefill_uva is None:
+            self.execution_config = replace(self.execution_config, prefill_uva=auto_packed)
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,

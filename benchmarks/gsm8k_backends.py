@@ -28,10 +28,11 @@ class FiniteLogits(LogitsProcessor):
 
 
 def check_depth(config, loops):
-    if config.total_ut_steps != loops:
-        raise ValueError(
-            f"Model has {config.total_ut_steps} loops but the protocol expects {loops}"
-        )
+    depth = getattr(config, "total_ut_steps", None)
+    if depth is None:
+        depth = getattr(config, "mean_recurrence", None)  # Huginn
+    if depth != loops:
+        raise ValueError(f"Model has {depth} loops but the protocol expects {loops}")
 
 
 class ReleaseExitHooks:
