@@ -17,6 +17,7 @@ an environment to receiving the first generated response. The
 | [Runtime execution and configuration](runtime.md) | Batch contracts, preparation, transfers, execution options and compatibility |
 | [Split prefill and WCPB](split-prefill-wavefront.md) | Chunk/depth scheduling, hidden-state ring, KV dependencies and validation limits |
 | [Self-speculation](async-speculative.md) | Cross-round asynchronous block execution, token pipelines, and acceptance/rejection timelines |
+| [Loop-level speculation](loop_speculative.md) | Opt-in mixed-depth execution, KV dependencies, and feasibility measurements |
 | [Asynchronous scheduling](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
 | [FlashAttention](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
 | [Cache and scheduling features](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
