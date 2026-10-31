@@ -69,6 +69,7 @@ class PDEngine:
         model_config=None,
         seed=0,
         speculative_config=None,
+        sparse_decode_attention_config=None,
     ):
         self.speculative_config = speculative_config
         model, revision, self.model_config = prepare_model(
@@ -138,6 +139,11 @@ class PDEngine:
                             else self.exit_config
                         ),
                         speculative_config=speculative_config if role == "decode" else None,
+                        # Reference state is captured and consumed while decoding;
+                        # prefill rows are always dense, so only D owns a store.
+                        sparse_decode_attention_config=(
+                            sparse_decode_attention_config if role == "decode" else None
+                        ),
                         execution_config=execution,
                         attention_backend=attention_backend,
                     )

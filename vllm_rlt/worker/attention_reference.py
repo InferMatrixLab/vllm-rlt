@@ -79,6 +79,7 @@ class AttentionReferenceStore:
         stream=None,
         initial_key_capacity=None,
         implementation="batched",
+        padding_slot=False,
     ):
         if slots < 1 or layers < 1 or heads < 1 or head_dim < 1:
             raise ValueError("reference store dimensions must be positive")
@@ -106,6 +107,10 @@ class AttentionReferenceStore:
         self.stream = stream
         # Which CUDA attention path consumes this store's plans.
         self.implementation = implementation
+        # CUDA graph replays pad a submission to its bucket. Padding rows read
+        # and write this extra slot, which is never bound to a token.
+        self.padding_slot = slots if padding_slot else None
+        slots += bool(padding_slot)
         shape = (slots, layers, heads)
         self.selected = torch.zeros((*shape, initial), dtype=torch.int32, device=device)
         self.counts = torch.zeros(shape, dtype=torch.int32, device=device)
@@ -120,7 +125,7 @@ class AttentionReferenceStore:
         self.position = torch.zeros(slots, dtype=torch.int64, device=device)
         self.incarnation = torch.zeros(slots, dtype=torch.int64, device=device)
         self.accepted = torch.zeros(slots, dtype=torch.int32, device=device)
-        self.free = list(range(slots))
+        self.free = list(range(self.slots))
         self._bindings: dict[int, tuple[str, int, int]] = {}
         self._incarnations: dict[tuple[str, int], int] = {}
         # Retained counts are host-known: the capture decides them before it
@@ -150,7 +155,9 @@ class AttentionReferenceStore:
     @property
     def peak_capacity_bytes(self) -> int:
         """Conservative payload bound including all in-flight growth generations."""
-        index_bytes = self.slots * self.layers * self.heads * self._peak_selected_capacity * 4
+        index_bytes = (
+            self.selected.shape[0] * self.layers * self.heads * self._peak_selected_capacity * 4
+        )
         return self.bytes - self.selected.nbytes + index_bytes
 
     def ensure_key_capacity(self, count: int) -> None:

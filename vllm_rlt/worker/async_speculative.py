@@ -206,7 +206,15 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         self._generations: dict[str, int] = {}
         sizes = speculative_capture_sizes(execution, scheduler, config)
         self.graphs = (
-            DeviceRecurrentGraphs(model, cache, execution, False, capture_sizes=sizes)
+            DeviceRecurrentGraphs(
+                model,
+                cache,
+                execution,
+                False,
+                capture_sizes=sizes,
+                reference_store=reference_store,
+                key_retention=None if sparse_decode is None else sparse_decode.key_retention,
+            )
             if execution.cuda_graphs
             else None
         )

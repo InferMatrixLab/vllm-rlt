@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE, SparseDecodePlan
 from vllm_rlt.config import cuda_graph_rows
 from vllm_rlt.worker.metadata import DeviceKVMetadata
 
@@ -102,8 +103,10 @@ def _capture(hidden, stream, pool, run, *, startup=False):
 class _DeviceCache:
     """Capture only GPU cache operations, never Python allocation/written state."""
 
-    def __init__(self, cache):
+    def __init__(self, cache, workspace=None):
         self.cache = cache
+        # Sparse capture scratch shared by every bucket; replays run in order.
+        self.workspace = workspace
 
     def _write_prepared(self, layer, batch, k, v):
         cache = self.cache
@@ -121,6 +124,21 @@ class _DeviceCache:
 
     def _attend_prepared(self, layer, batch, q):
         cache = self.cache
+        plan = getattr(batch, "reference_plan", None)
+        if plan is not None:
+            from vllm_rlt.kernels.sparse_decode import fused_paged_attention
+
+            return fused_paged_attention(
+                q,
+                cache.key_cache[:, layer],
+                cache.value_cache[:, layer],
+                batch.block_tables,
+                batch.context_lengths,
+                plan,
+                layer=layer,
+                dense_attention=cache.attention,
+                workspace=self.workspace,
+            )
         if batch.cu_seqlens_q is not None:
             return cache.attention.prefill(
                 q,
@@ -219,10 +237,17 @@ class RecurrentGraphs:
         self.last_event = None
         self.captures = self.replays = self.fallbacks = 0
         self.warned_cache_full = False
+        self.proxy = _DeviceCache(cache)
 
     def select(self, hidden, batch):
         count = _query_count(batch)
         packed = batch.cu_seqlens_q is not None
+        plan = getattr(batch, "reference_plan", None)
+        if plan is not None and not plan.dense():
+            # These entries carry no reference plan; replaying one would
+            # silently run dense attention.
+            self.fallbacks += 1
+            return PreparedGraph(batch)
         if len(batch.position_ids) != count:
             batch = replace(
                 batch,
@@ -287,13 +312,12 @@ class RecurrentGraphs:
                 stream.wait_event(self.last_event)
             _copy_graph_inputs(entry, hidden, batch)
             if entry.graph is None:
-                proxy = _DeviceCache(cache)
                 entry.graph, entry.output = _capture(
                     entry.hidden,
                     self.capture_stream,
                     self.pool,
                     lambda: self.model.recurrent_prepared(
-                        entry.hidden, entry.metadata, proxy, compute_gate=self.compute_gate
+                        entry.hidden, entry.metadata, self.proxy, compute_gate=self.compute_gate
                     ),
                 )
                 self.captures += 1
@@ -328,11 +352,83 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
 
     Allocation identity is checked on every call, outside capture. Entries retain
     only tensor metadata, never request allocations or CPU written-position state.
+
+    With a fused sparse reference store, every bucket is captured once per row
+    mode. A sparse entry owns a static plan whose slot ids are refilled before
+    each replay; the live plan's liveness is checked on the host at that point,
+    since replay runs no Python.
     """
 
-    def __init__(self, model, cache, execution, compute_gate, capture_sizes=None):
+    def __init__(
+        self,
+        model,
+        cache,
+        execution,
+        compute_gate,
+        capture_sizes=None,
+        reference_store=None,
+        key_retention=None,
+    ):
         super().__init__(model, cache, execution, compute_gate)
         self.capture_sizes = capture_sizes or graph_capture_sizes(execution)
+        self.reference_store = reference_store
+        self.key_retention = key_retention
+        self.sparse_replays = 0
+        self.modes = (DENSE,)
+        if reference_store is not None:
+            from vllm_rlt.kernels.sparse_decode import capture_workspace
+
+            if reference_store.padding_slot is None:
+                raise ValueError("sparse CUDA graphs need a reference store padding slot")
+            if reference_store.selected.shape[-1] != (reference_store.key_bucket or 1):
+                # A replay must never see a grown index pool at a new address.
+                raise ValueError("sparse CUDA graphs need the reference index pool at full size")
+            self.modes = (DENSE, CAPTURE, CONSUME)
+            config = model.config
+            width = math.ceil(config.max_position_embeddings / cache.block_size)
+            self.proxy = _DeviceCache(
+                cache,
+                capture_workspace(
+                    cache.device,
+                    self.capture_sizes[-1],
+                    config.num_attention_heads,
+                    width * cache.block_size,
+                    config.head_dim,
+                ),
+            )
+
+    @staticmethod
+    def _key(size, mode):
+        # Dense entries keep their bucket-size keys; sparse ones add the mode.
+        return size if mode == DENSE else (size, mode)
+
+    def _entry(self, hidden, batch, size, mode):
+        entry = _graph_entry(
+            hidden,
+            batch,
+            self.cache,
+            self.model.config.max_position_embeddings,
+            count=size,
+            bucketed=True,
+        )
+        entry.mode = mode
+        if mode != DENSE:
+            store = self.reference_store
+            entry.slot_ids = torch.full(
+                (size,), store.padding_slot, device=self.cache.device, dtype=torch.int64
+            )
+            # Host liveness is checked against the live plan before replay,
+            # so the captured plan names no host slots.
+            entry.metadata.reference_plan = SparseDecodePlan(
+                modes=(mode,) * size,
+                slots=(),
+                incarnations=(),
+                key_retention=self.key_retention,
+                key_bucket=store.key_bucket,
+                slot_ids=entry.slot_ids,
+                store=store,
+            )
+        return entry
 
     @torch.inference_mode()
     def prepare(self):
@@ -347,49 +443,69 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
             block_tables=torch.empty((0, 1), device=self.cache.device, dtype=torch.int32),
             cu_seqlens_q=None,
         )
-        proxy = _DeviceCache(self.cache)
-        for size in self.capture_sizes:
-            entry = _graph_entry(
-                hidden,
-                batch,
-                self.cache,
-                self.model.config.max_position_embeddings,
-                count=size,
-                bucketed=True,
-            )
-            _copy_graph_inputs(entry, hidden, batch, count=0)
-            entry.graph, entry.output = _capture(
-                entry.hidden,
-                self.capture_stream,
-                self.pool,
-                lambda: self.model.recurrent_prepared(
-                    entry.hidden, entry.metadata, proxy, compute_gate=self.compute_gate
-                ),
-                startup=True,
-            )
-            self.entries[size] = entry
-            self.captures += 1
+        for mode in self.modes:
+            for size in self.capture_sizes:
+                entry = self._entry(hidden, batch, size, mode)
+                _copy_graph_inputs(entry, hidden, batch, count=0)
+                entry.graph, entry.output = _capture(
+                    entry.hidden,
+                    self.capture_stream,
+                    self.pool,
+                    lambda entry=entry: self.model.recurrent_prepared(
+                        entry.hidden, entry.metadata, self.proxy, compute_gate=self.compute_gate
+                    ),
+                    startup=True,
+                )
+                self.entries[self._key(size, mode)] = entry
+                self.captures += 1
+
+    def _mode(self, batch):
+        plan = getattr(batch, "reference_plan", None)
+        if plan is None or plan.dense():
+            return DENSE
+        modes = set(plan.modes)
+        if self.reference_store is None or plan.store is not self.reference_store:
+            return None
+        if len(modes) != 1 or plan.key_retention != self.key_retention:
+            return None
+        return plan.modes[0]
 
     def select(self, hidden, batch):
         self.cache._require_live_batch(batch)
         count = _query_count(batch)
-        if not count or count > self.capture_sizes[-1]:
+        mode = self._mode(batch)
+        if not count or count > self.capture_sizes[-1] or mode is None:
             self.fallbacks += 1
             return PreparedGraph(batch)
         capacity = _bucket_size(self.capture_sizes, count)
-        entry = self.entries.get(capacity)
+        key = self._key(capacity, mode)
+        entry = self.entries.get(key)
         if entry is None:
-            entry = _graph_entry(
-                hidden,
-                batch,
-                self.cache,
-                self.model.config.max_position_embeddings,
-                count=capacity,
-                bucketed=True,
-            )
+            entry = self._entry(hidden, batch, capacity, mode)
             entry.graph = None
-            self.entries[capacity] = entry
+            self.entries[key] = entry
         return PreparedGraph(batch, entry)
+
+    @torch.inference_mode()
+    def prepare_inputs(self, call, hidden):
+        entry = call.entry
+        if entry is not None and entry.mode != DENSE:
+            plan = call.metadata.reference_plan
+            self.reference_store._require_live(plan)
+            count = _query_count(call.metadata)
+            stream = torch.cuda.current_stream(self.cache.device)
+            if self.last_event is not None:
+                stream.wait_event(self.last_event)
+            entry.slot_ids[count:].fill_(self.reference_store.padding_slot)
+            entry.slot_ids[:count].copy_(plan.slot_ids[:count])
+        super().prepare_inputs(call, hidden)
+
+    @torch.inference_mode()
+    def execute(self, call, hidden):
+        sparse = call.entry is not None and call.entry.mode != DENSE
+        output = super().execute(call, hidden)
+        self.sparse_replays += sparse
+        return output
 
 
 class CodaGraphs:

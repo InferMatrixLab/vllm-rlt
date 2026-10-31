@@ -521,3 +521,113 @@ def test_fused_engine_rounds_abort_and_drain(monkeypatch):
     assert store.outstanding == 0 and len(store.free) == store.slots
     assert engine.cache_manager.num_used_blocks == 0
     engine.close()
+
+
+def test_padding_slot_is_allocated_but_never_bound():
+    store = make_store(slots=3, padding_slot=True)
+    assert store.padding_slot == 3 and store.slots == 3
+    assert store.valid.shape[0] == store.uses.shape[0] == 4
+    lease = store.reserve("r", 0, 3, generation=1)
+    assert store.padding_slot not in lease.slots
+    with pytest.raises(RuntimeError, match="no retired"):
+        store.reserve("s", 1, 1, generation=1)
+    store.release(lease)
+    store.discard()
+    assert sorted(store.free) == [0, 1, 2]
+    assert make_store(slots=3).padding_slot is None
+
+
+def _graph_engine(*, graphs, max_rows=32):
+    from tests.helpers import tiny_ouro_config
+    from vllm_rlt import CacheConfig, ExecutionConfig, SchedulerConfig, SpeculativeConfig
+    from vllm_rlt.engine.stage_engine import StageEngine
+    from vllm_rlt.models import OuroForCausalLM
+
+    torch.manual_seed(123)
+    model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
+    return StageEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(128, 16, incremental_allocation=True),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=3, max_num_batched_tokens=16, prefill_chunk_size=8
+        ),
+        execution_config=ExecutionConfig(
+            async_scheduling=True,
+            static_buffers=True,
+            pad_to_power_of_two=True,
+            cuda_graphs=graphs,
+            cuda_graph_max_batch_size=max_rows,
+        ),
+        speculative_config=SpeculativeConfig(3),
+        sparse_decode_attention_config=SparseDecodeAttentionConfig(
+            enabled=True, key_retention=0.5, implementation="fused"
+        ),
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("max_rows", [32, 2])
+def test_fused_graphs_replay_sparse_and_match_eager(max_rows, monkeypatch):
+    import vllm_rlt.kernels.sparse_decode as fused_module
+
+    # Graph and eager captures must both take the split path, not the serial fallback.
+    monkeypatch.setattr(fused_module, "_capture_kernel", None)
+    results = []
+    for graphs in (False, True):
+        engine = _graph_engine(graphs=graphs, max_rows=max_rows)
+        store = engine.reference_store
+        try:
+            used = 0
+            for i, (prompt_length, output_length) in enumerate([(15, 23), (17, 9), (31, 1)]):
+                engine.add_request(
+                    str(i),
+                    [2 + i, 3, 4] * (prompt_length // 3) + [5] * (prompt_length % 3),
+                    SamplingParams(max_tokens=output_length, ignore_eos=True),
+                )
+            outputs = {}
+            for _ in range(1000):
+                if not engine.has_unfinished_requests():
+                    break
+                for output in engine.step():
+                    outputs[output.request_id] = output
+                used = max(used, int(store.uses[: store.slots].sum()))
+            assert len(outputs) == 3
+            results.append({rid: o.token_ids for rid, o in outputs.items()})
+            # Consumers ran on live slots, not only on the padding slot.
+            assert used > 0
+            assert store.outstanding == 0 and len(store.free) == store.slots
+            assert engine.cache_manager.num_used_blocks == 0
+            graphs_owner = engine.speculative_runner.graphs
+            if graphs:
+                assert graphs_owner.sparse_replays > 0
+                if max_rows == 32:
+                    assert graphs_owner.fallbacks == 0
+                else:
+                    assert graphs_owner.fallbacks > 0
+        finally:
+            engine.close()
+    # The same per-row kernels run eager and replayed.
+    assert results[0] == results[1]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "sparse",
+    [
+        SparseDecodeAttentionConfig(enabled=True, key_retention=0.5),
+        SparseDecodeAttentionConfig(enabled=True, key_retention=1.0, implementation="fused"),
+    ],
+)
+def test_graphs_reject_sparse_paths_that_cannot_be_replayed(sparse):
+    from vllm_rlt import ExecutionConfig, SpeculativeConfig
+    from vllm_rlt.engine.stage_engine import StageEngine
+
+    with pytest.raises(ValueError, match="CUDA graphs requires"):
+        StageEngine(
+            tiny_ouro_model("cuda"),
+            attention_backend="triton",
+            execution_config=ExecutionConfig(async_scheduling=True, cuda_graphs=True),
+            speculative_config=SpeculativeConfig(3),
+            sparse_decode_attention_config=sparse,
+        )

@@ -132,8 +132,18 @@ class StageEngine:
                 raise ValueError("sparse decode attention requires a recurrent Ouro-style model")
             if cache_config.layout != "last_exited":
                 raise ValueError("sparse decode attention requires last_exited KV")
-            if self.execution_config.cuda_graphs:
-                raise ValueError("sparse decode attention does not yet support CUDA graphs")
+            # Graph replays run only the fused kernels, which need no host
+            # work per row; other paths would silently fall back to dense.
+            graphs = self.execution_config.cuda_graphs
+            if graphs and (
+                not self.async_speculative
+                or sparse_decode.implementation != "fused"
+                or sparse_decode.key_retention >= 1.0
+            ):
+                raise ValueError(
+                    "sparse decode attention with CUDA graphs requires async block "
+                    "speculation, the fused implementation and key_retention < 1"
+                )
             if speculative_config is not None and speculative_config.mode != "block":
                 raise ValueError("sparse decode attention currently requires block speculation")
             if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
@@ -174,7 +184,7 @@ class StageEngine:
             # allocated up front, so a budget that cannot fit must fail here
             # with an actionable message instead of OOM-ing mid-batch.
             reference_bytes = (
-                slots
+                (slots + graphs)
                 * config.num_hidden_layers
                 * config.num_attention_heads
                 * (capacity * 4 + 4 + 4 * 2 * config.head_dim + 8)
@@ -194,9 +204,11 @@ class StageEngine:
                 heads=config.num_attention_heads,
                 head_dim=config.head_dim,
                 key_bucket=capacity,
-                initial_key_capacity=min(capacity, 64),
+                # Graphs bake the index pool's address in: allocate it whole.
+                initial_key_capacity=capacity if graphs else min(capacity, 64),
                 device=parameter.device,
                 implementation=sparse_decode.implementation,
+                padding_slot=graphs,
             )
             if parameter.device.type == "cuda":
                 free_bytes, _ = torch.cuda.mem_get_info(parameter.device)
@@ -219,6 +231,27 @@ class StageEngine:
             # Budget the logical maximum and copy overlap, not just the small
             # initial allocation; short prompts must not overcommit long ones.
             scratch += self.reference_store.peak_capacity_bytes
+            if graphs:
+                from vllm_rlt.kernels.sparse_decode import SELECT_PARTS
+                from vllm_rlt.kernels.triton_attention import NUM_SPLITS
+                from vllm_rlt.worker.cuda_graph import speculative_capture_sizes
+
+                # One capture workspace serves every bucket of the graphs.
+                rows = speculative_capture_sizes(
+                    self.execution_config, scheduler_config, speculative_config
+                )[-1]
+                width = math.ceil(config.max_position_embeddings / cache_config.block_size)
+                head_dim = 1 << (config.head_dim - 1).bit_length()
+                scratch += (
+                    4
+                    * rows
+                    * config.num_attention_heads
+                    * (width * cache_config.block_size + NUM_SPLITS * (2 + head_dim))
+                )
+                # Select scratch per row and head: radix histograms, part counts,
+                # offsets and contribution parts, plus state, lse and ticket.
+                parts = SELECT_PARTS * (4 * 256 + 1 + 2 + 1 + head_dim) * 4
+                scratch += rows * config.num_attention_heads * (parts + 5 * 2 * 8 + 8)
         if speculative_config is not None or self.reference_store is not None:
             cache_config = replace(
                 cache_config, memory_reserve_bytes=cache_config.memory_reserve_bytes + scratch

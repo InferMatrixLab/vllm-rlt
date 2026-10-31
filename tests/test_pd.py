@@ -13,6 +13,7 @@ from vllm_rlt import (
     ExitConfig,
     SamplingParams,
     SchedulerConfig,
+    SparseDecodeAttentionConfig,
     SpeculativeConfig,
 )
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
@@ -116,6 +117,47 @@ def test_pd_rejects_huginn_before_spawning(monkeypatch):
     with pytest.raises(ValueError, match="PD does not support Huginn"):
         PDEngine(HuginnConfig())
     clients.assert_not_called()
+
+
+def test_pd_forwards_sparse_decode_only_to_decode_workers(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_rlt.pd.engine import PDEngine
+
+    config = tiny_ouro_config(head_dim=64)
+    sparse = SparseDecodeAttentionConfig(enabled=True, key_retention=0.5)
+
+    def ready_client(model, *, stage_config, **options):
+        return Mock(
+            ready=True,
+            connected=True,
+            stopped=True,
+            info=dict(
+                kind="ready",
+                stage_id=stage_config.stage_id,
+                role=stage_config.role,
+                fingerprint="same-model-and-cache",
+                info={"agent": stage_config.stage_id},
+                num_blocks=64,
+                block_size=16,
+                depths=model.total_ut_steps,
+            ),
+        )
+
+    clients = Mock(side_effect=ready_client)
+    monkeypatch.setattr("vllm_rlt.pd.engine.StageClient", clients)
+    with PDEngine(
+        config,
+        attention_backend="triton",
+        speculative_config=SpeculativeConfig(3),
+        sparse_decode_attention_config=sparse,
+    ):
+        roles = {
+            call.kwargs["stage_config"].role: call.kwargs["sparse_decode_attention_config"]
+            for call in clients.call_args_list
+        }
+    # Prefill rows are always dense: only the decode stage owns reference state.
+    assert roles == {"prefill": None, "decode": sparse}
 
 
 def test_pd_nanbeige_startup_uses_entry_config_for_request_validation(monkeypatch):
@@ -317,6 +359,8 @@ def create_pd(
     speculative=False,
     asynchronous=True,
     prefix_caching=False,
+    sparse=None,
+    decode_batched_tokens=2,
 ):
     pytest.importorskip("nixl")
     from vllm_rlt.pd.engine import PDEngine
@@ -343,11 +387,14 @@ def create_pd(
             prefill_chunk_size=prefill_chunk_size,
             wavefront_chunked_prefill=wavefront_chunked_prefill,
         ),
-        decode_scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=2),
+        decode_scheduler_config=SchedulerConfig(
+            max_num_seqs=2, max_num_batched_tokens=decode_batched_tokens
+        ),
         exit_config=ExitConfig("ouro")
         if speculative
         else ExitConfig("trace", depths_by_request={"t": [4, 2, 3, 1] * 16}),
         speculative_config=SpeculativeConfig(3) if speculative else None,
+        sparse_decode_attention_config=sparse,
         execution_config=ExecutionConfig(
             async_scheduling=asynchronous,
             static_buffers=graph,
@@ -680,6 +727,101 @@ def test_pd_speculative_matches_local_and_retires_cancelled_rounds(
         finally:
             reference.close()
     assert all(metrics["used_blocks"] == 0 for metrics in engine.worker_metrics.values())
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "sparse",
+    [
+        SparseDecodeAttentionConfig(enabled=True, key_retention=1.0),
+        SparseDecodeAttentionConfig(enabled=True, key_retention=0.5),
+        SparseDecodeAttentionConfig(enabled=True, key_retention=0.5, implementation="fused"),
+    ],
+)
+def test_pd_sparse_decode_on_the_decode_stage(sparse):
+    params = SamplingParams(max_tokens=9, ignore_eos=True)
+    prompts = [[1, 2, 3, 4, 5], [2, 3], [4], [5, 6, 7]]
+    with create_pd(speculative=True, asynchronous=True, sparse=sparse) as engine:
+        for index, prompt in enumerate(prompts):
+            engine.add_request(str(index), prompt, params)
+        outputs = drain(engine)
+        assert sorted(outputs) == ["0", "1", "2", "3"]
+        assert all(len(output.token_ids) == 9 for output in outputs.values())
+        if sparse.key_retention == 1.0:
+            # Full retention is the exact control: it must reproduce local dense decoding.
+            torch.manual_seed(123)
+            reference = LLMEngine(
+                OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda:0", torch.bfloat16),
+                cache_config=CacheConfig(128, 4),
+                attention_backend="triton",
+            )
+            try:
+                for index, prompt in enumerate(prompts):
+                    reference.add_request(str(index), prompt, params)
+                assert outputs == drain(reference)
+            finally:
+                reference.close()
+        # A request aborted mid-decode must still release its reference slots.
+        engine.add_request("abort", prompts[0], replace(params, max_tokens=60))
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if any(len(output.token_ids) > 1 for output in engine.step()):
+                break
+        else:
+            pytest.fail("sparse speculative decode did not start")
+        engine.abort_request("abort")
+        drain(engine)
+        assert all(peer.slots == 0 and peer.reserved_blocks == 0 for peer in engine.peers.values())
+    assert all(metrics["used_blocks"] == 0 for metrics in engine.worker_metrics.values())
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("multi", [False, True])
+def test_pd_sparse_decode_replays_graphs_on_the_decode_stage(multi):
+    fused = SparseDecodeAttentionConfig(enabled=True, key_retention=0.5, implementation="fused")
+    params = SamplingParams(max_tokens=9, ignore_eos=True)
+    prompts = [[1, 2, 3, 4, 5], [2, 3], [4], [5, 6, 7]]
+    results = {}
+    for graph, sparse in [(False, None), (True, None), (False, fused), (True, fused)]:
+        # Room for full verification rounds, so consume steps replay graphs too.
+        with create_pd(
+            graph=graph,
+            multi=multi,
+            speculative=True,
+            asynchronous=True,
+            sparse=sparse,
+            decode_batched_tokens=8,
+        ) as engine:
+            for index, prompt in enumerate(prompts):
+                engine.add_request(str(index), prompt, params)
+            outputs = drain(engine)
+            assert sorted(outputs) == ["0", "1", "2", "3"]
+            results[graph, sparse is not None] = outputs
+            engine.add_request("abort", prompts[0], replace(params, max_tokens=60))
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if any(len(output.token_ids) > 1 for output in engine.step()):
+                    break
+            else:
+                pytest.fail("speculative decode did not start")
+            engine.abort_request("abort")
+            drain(engine)
+            assert all(
+                peer.slots == 0 and peer.reserved_blocks == 0 for peer in engine.peers.values()
+            )
+        metrics = engine.worker_metrics
+        assert all(m["used_blocks"] == 0 for m in metrics.values())
+        decode = [m for name, m in metrics.items() if "-decode-" in name]
+        assert len(decode) == (2 if multi else 1)
+        if graph:
+            assert all(m["graph_replays"] > 0 for m in decode)
+        # Every decode worker owns its store and replays its sparse graphs.
+        assert all(
+            (m["sparse_graph_replays"] > 0) == (graph and sparse is not None) for m in decode
+        )
+    assert results[True, False] == results[False, False]
+    # The replayed fused kernels are the eager ones, row for row.
+    assert results[True, True] == results[False, True]
 
 
 def test_pd_reservations_are_reported_before_worker_acknowledgments():
