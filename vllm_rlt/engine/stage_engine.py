@@ -150,10 +150,6 @@ class StageEngine:
                 raise ValueError(
                     "sparse decode attention requires refill scheduling without preemption"
                 )
-            if self.execution_config.async_scheduling and not self.async_speculative:
-                raise ValueError(
-                    "sparse decode attention ordinary decode requires synchronous scheduling"
-                )
             # The index buffer never truncates the algorithm: capacity must
             # hold the worst-case retained count over the supported serving
             # context, which the caller may bound explicitly instead of paying

@@ -9,6 +9,7 @@ from tests.helpers import tiny_ouro_model
 from vllm_rlt import (
     CacheConfig,
     ExecutionConfig,
+    ExitConfig,
     SamplingParams,
     SchedulerConfig,
     SparseDecodeAttentionConfig,
@@ -67,6 +68,99 @@ def test_full_retention_matches_dense_and_reclaims_slots(draft):
     finally:
         sparse.close()
         dense.close()
+
+
+def _ordinary(asynchronous, retention, device="cpu", dtype=torch.float32, **options):
+    return engine(
+        retention=retention,
+        device=device,
+        dtype=dtype,
+        exit_config=ExitConfig("ouro_delayed"),
+        execution_config=ExecutionConfig(
+            async_scheduling=asynchronous, static_buffers=True, pad_to_power_of_two=True
+        ),
+        **options,
+    )
+
+
+def _bounded_pool(e, monkeypatch):
+    """Fail if live references ever exceed one per scheduled request."""
+    store = e.reference_store
+    reserve = store.reserve
+
+    def checked(*args, **kwargs):
+        lease = reserve(*args, **kwargs)
+        assert store.outstanding <= e.scheduler.config.max_num_seqs
+        return lease
+
+    monkeypatch.setattr(store, "reserve", checked)
+
+
+@pytest.mark.parametrize("retention", [0.5, 1.0])
+def test_async_ordinary_decode_matches_synchronous(retention, monkeypatch):
+    sync = _ordinary(False, retention)
+    asynchronous = _ordinary(True, retention)
+    _bounded_pool(asynchronous, monkeypatch)
+    try:
+        # Staggered prompt lengths keep requests at different depths per batch.
+        assert generate(asynchronous, count=4) == generate(sync, count=4)
+    finally:
+        sync.close()
+        asynchronous.close()
+
+
+def test_async_ordinary_decode_reclaims_after_abort_and_reuse(monkeypatch):
+    e = _ordinary(True, 0.5)
+    _bounded_pool(e, monkeypatch)
+    try:
+        e.add_request("a", [2, 3, 4], SamplingParams(max_tokens=12, ignore_eos=True))
+        for _ in range(100):
+            e.step()
+            if e.reference_store.outstanding:
+                break
+        assert e.reference_store.outstanding == 1
+        e.abort_request("a")
+        for _ in range(100):
+            if not e.has_unfinished_requests():
+                break
+            e.step()
+        assert e.reference_store.outstanding == 0
+        # The same id restarts with a fresh incarnation.
+        assert generate(e, count=2)
+    finally:
+        e.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("implementation", ["batched", "fused"])
+def test_cuda_async_ordinary_decode_matches_synchronous(implementation, monkeypatch):
+    sparse = SparseDecodeAttentionConfig(
+        enabled=True, key_retention=0.5, implementation=implementation
+    )
+    options = dict(device="cuda", dtype=torch.bfloat16, sparse_decode_attention_config=sparse)
+    sync = _ordinary(False, 0.5, **options)
+    asynchronous = _ordinary(True, 0.5, **options)
+    _bounded_pool(asynchronous, monkeypatch)
+    store = asynchronous.reference_store
+    host_count = store.host_count
+    published = []
+
+    def checked(slot, layer):
+        # Every consume is sized from a count the host published at capture.
+        count = host_count(slot, layer)
+        assert count is not None
+        # ...and it is the count the capture actually wrote.
+        assert int(store.counts[slot, layer].max()) == count
+        published.append((slot, layer, count))
+        return count
+
+    monkeypatch.setattr(store, "host_count", checked)
+    try:
+        assert generate(asynchronous, count=4) == generate(sync, count=4)
+        assert published
+    finally:
+        sync.close()
+        asynchronous.close()
 
 
 @pytest.mark.parametrize("draft", [None, 1, 2])

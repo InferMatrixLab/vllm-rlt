@@ -321,6 +321,15 @@ class AttentionReferenceStore:
         """
         self._counts_host[(slot, layer)] = count
 
+    def note_counts(self, slot: int, count: int) -> None:
+        """Record one capture row's retained count for every layer on the host.
+
+        The count follows the row's causal length alone, so a caller that
+        knows the length can publish it before any layer runs.
+        """
+        for layer in range(self.layers):
+            self._counts_host[(slot, layer)] = count
+
     def _forget_counts(self, slots) -> None:
         """Drop the host counts of host-known slots, so none sizes a later read."""
         for slot in slots:

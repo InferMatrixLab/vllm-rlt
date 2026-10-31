@@ -7,7 +7,7 @@ from typing import NamedTuple
 
 import torch
 
-from vllm_rlt.attention.sparse import CAPTURE, DENSE, reference_mode
+from vllm_rlt.attention.sparse import CAPTURE, DENSE, reference_mode, retained_count
 from vllm_rlt.config import ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import ExecutionBatch, Operation, Request
@@ -1072,7 +1072,7 @@ class ModelRunner:
         waits for that same event before releasing an unfinished token.
         """
         requests = [span.request for span in batch.spans for _ in range(span.token_count)]
-        owners, modes = [], []
+        owners, modes, captured = [], [], []
         for request, (_, depth, position) in zip(requests, kv.rows):
             mode = reference_mode(depth) if position >= len(request.prompt_token_ids) else DENSE
             state = self.attention_references.get(request.request_id)
@@ -1089,6 +1089,8 @@ class ModelRunner:
                     self.attention_references[request.request_id] = state
             if state is None:
                 mode = DENSE  # No reference loop for this token: stay dense.
+            elif mode == CAPTURE:
+                captured.append((state[2].slots[0], position + 1))
             owners.append(None if mode == DENSE else (state[2], 0))
             modes.append(mode)
         if all(mode == DENSE for mode in modes):
@@ -1100,6 +1102,13 @@ class ModelRunner:
             owners, modes, key_retention=self.sparse_decode.key_retention
         )
         self.reference_store.bind_positions(plan, kv.position_ids)
+        # A capture row's retained count follows its causal length, which the
+        # host knows here. Publishing it lets a later batched consume size its
+        # gather without reading a fused capture's device count back.
+        for slot, length in captured:
+            self.reference_store.note_counts(
+                slot, retained_count(length, self.sparse_decode.key_retention)
+            )
         return replace(kv, reference_plan=plan)
 
     def _load_hidden(self, batch, prepared, workspace, size):
