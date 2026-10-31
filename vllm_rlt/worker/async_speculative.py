@@ -8,7 +8,7 @@ from typing import Literal
 import numpy as np
 import torch
 
-from vllm_rlt.attention.sparse import DENSE, reference_mode
+from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE, REFERENCE_DEPTH, reference_mode
 from vllm_rlt.core.kv_cache_manager import _Allocation
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Operation, Request
@@ -37,6 +37,9 @@ class DevicePipelineState:
     hidden: torch.Tensor
     candidates: torch.Tensor
     active: torch.Tensor
+    # Sparse decode: a permutation of the request's reference slots, moved with
+    # the tokens, so each row keeps the slot its loop-1 capture wrote.
+    slots: torch.Tensor | None = None
 
 
 @dataclass
@@ -54,6 +57,9 @@ class SpeculativeRequestState:
     # Bumped per request instance so reference store bindings reject a reused
     # request ID across generations.
     generation: int = 0
+    # Token pipelines own their reference slots for the request's lifetime: a
+    # row captures in one submission and consumes in the next.
+    reference: object | None = None
 
 
 class SpeculativeRoundBuffer:
@@ -214,6 +220,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 capture_sizes=sizes,
                 reference_store=reference_store,
                 key_retention=None if sparse_decode is None else sparse_decode.key_retention,
+                device_plans=config.mode == "pipeline",
             )
             if execution.cuda_graphs
             else None
@@ -290,6 +297,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 torch.zeros(width, dtype=torch.long, device=self.device),
                 torch.arange(width, device=self.device) == 0,
             )
+            if self.reference_store is not None:
+                state.reference = self.reference_store.reserve(rid, 0, width, generation)
+                state.pipeline.slots = state.reference.slot_ids.clone()
         self.states[rid] = state
         return state
 
@@ -429,6 +439,22 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             owners, [mode] * len(owners), key_retention=self.sparse_decode.key_retention
         )
 
+    def _pipeline_reference_plan(self, states, slots, depth, active):
+        """Device modes of one pipeline step: each row's loop decides its mode."""
+        if slots is None:
+            return None
+        if any(state.reference is None for state in states):
+            raise RuntimeError("pipeline reference slots were discarded with their buffers")
+        capture = active & (depth == REFERENCE_DEPTH)
+        consume = active & (depth > REFERENCE_DEPTH)
+        modes = torch.where(capture, CAPTURE, torch.where(consume, CONSUME, DENSE)).to(torch.int8)
+        return self.reference_store.build_device_plan(
+            [state.reference for state in states],
+            slots,
+            modes,
+            key_retention=self.sparse_decode.key_retention,
+        )
+
     def _draft(self, plan, tables, allocations, leases=None):
         from vllm_rlt.kernels.routing import gather_kernel
 
@@ -556,7 +582,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             # One reference slot per verification row: the round's live tokens.
             # Outstanding rounds keep disjoint slots until their tickets retire.
             leases = None
-            if self.reference_store is not None:
+            if self.reference_store is not None and self.config.mode != "pipeline":
                 leases = tuple(
                     self.reference_store.reserve(
                         scheduled_request.request.request_id,
@@ -637,10 +663,19 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         prelude = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=tokens)).hidden
         hidden = torch.where((depths == 0)[:, None], prelude, retained)
         row_tables = torch.cat([tables[i : i + 1].expand(w, -1, -1) for i, w in enumerate(widths)])
+        slots = None
+        if self.reference_store is not None:
+            slots = torch.cat([state.pipeline.slots[:w] for state, w in zip(states, widths)])
         for offset in range(self.config.draft_loops):
             depth = torch.where(active, depths + offset, 0)
             hidden = self._execute_recurrent_step(
-                hidden, positions, row_tables, depth, allocations, active
+                hidden,
+                positions,
+                row_tables,
+                depth,
+                allocations,
+                active,
+                reference_plan=self._pipeline_reference_plan(states, slots, depth, active),
             )
         choices = self._coda(hidden).argmax(-1)
         start = 0
@@ -665,6 +700,10 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             source = (ids + emitted.long()).clamp_max(len(ids) - 1)
             remaining = valid.long().sum() - emitted.long()
             surviving = (ids < remaining) & ~reject
+            if p.slots is not None:
+                # A permutation, unlike `source`: a freed root slot moves to the
+                # tail, where only inactive rows or newborns can take it.
+                p.slots.copy_(p.slots.gather(0, (ids + emitted.long()) % len(ids)))
             p.tokens.copy_(p.tokens.gather(0, source))
             p.depths.copy_(new_depths.gather(0, source))
             p.hidden.copy_(next_hidden[source])
@@ -738,6 +777,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             return
         if snapshot.request is not request or request.request_id in self.states:
             raise RuntimeError("invalid pipeline restoration generation")
+        if self.reference_store is not None:
+            # Sparse decode excludes preemption; a snapshot carries no references.
+            raise RuntimeError("sparse decode attention cannot restore a pipeline snapshot")
         if snapshot.pending or snapshot.position != request.position:
             raise RuntimeError("pipeline snapshot disagrees with committed request position")
         width = min(
@@ -793,6 +835,10 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             del self.states[request.request_id]
             if state.slot is not None:
                 self.free_slots.append(state.slot)
+            if state.reference is not None:
+                # The last reader completed with the event above.
+                with torch.cuda.stream(self.compute_stream):
+                    self.reference_store.release(state.reference)
 
     def discard_buffers(self):
         """Reset round storage after both streams drain and all tickets retire.
@@ -810,6 +856,10 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             # Both streams have drained and every ticket retired; any leftover
             # binding can only come from a failed submission.
             reference_store.discard()
+            for state in getattr(self, "states", {}).values():
+                # Discard freed every binding; a surviving pipeline must not
+                # release or read these slots again.
+                state.reference = None
 
     def synchronize(self):
         self.compute_stream.synchronize()

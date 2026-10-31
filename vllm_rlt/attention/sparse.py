@@ -101,6 +101,29 @@ class SparseDecodePlan:
         return all(mode == DENSE for mode in self.modes)
 
 
+@dataclass(frozen=True)
+class DeviceSparseDecodePlan:
+    """A reference plan whose row modes and slots are decided on the device.
+
+    Token pipelines advance, shift and restart their rows on the GPU, so the
+    host knows neither a row's depth nor which of its request's slots it owns.
+    ``modes`` and ``slot_ids`` are device tensors with one entry per row;
+    ``leases`` own every slot a row can name and are checked live on the host.
+    Only the fused kernels read such a plan.
+    """
+
+    modes: torch.Tensor
+    slot_ids: torch.Tensor
+    leases: tuple
+    key_retention: float
+    key_bucket: int | None
+    store: object | None = None
+
+    def dense(self) -> bool:
+        """Unknown on the host: the device may route any row to sparse work."""
+        return False
+
+
 def retained_count(length: int, key_retention: float) -> int:
     """How many keys a query with ``length`` legal keys retains.
 
@@ -344,11 +367,27 @@ def sparse_paged_attention(
     """Use bounded row batches on CUDA, retaining the scalar numerical oracle.
 
     A store configured for the ``fused`` implementation routes uniform capture
-    or consume submissions to the fused kernels. Other CUDA submissions keep
+    or consume submissions, and every device plan, to the fused kernels. Other
+    CUDA submissions keep
     the batched path, whose capture rows take the fused paged score pass when a
     dense backend is available; ``batched_paged_attention`` without
     ``fused_scores`` still reproduces the scalar oracle bit for bit.
     """
+    if isinstance(plan, DeviceSparseDecodePlan):
+        from vllm_rlt.kernels import sparse_decode
+
+        if not sparse_decode.supports(plan, q, dense_attention):
+            raise ValueError("a device sparse plan needs the fused CUDA kernels")
+        return sparse_decode.fused_paged_attention(
+            q,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            plan,
+            layer=layer,
+            dense_attention=dense_attention,
+        )
     if not q.is_cuda:
         return reference_paged_attention(
             q,

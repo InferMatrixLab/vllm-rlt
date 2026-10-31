@@ -24,9 +24,13 @@ import torch
 import triton
 import triton.language as tl
 
-from vllm_rlt.attention.sparse import CAPTURE, CONSUME, retained_count
+from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DeviceSparseDecodePlan, retained_count
 from vllm_rlt.kernels.paged_attention import TritonPagedAttention, triton_paged_attention
 from vllm_rlt.kernels.triton_attention import NUM_SPLITS
+
+# Row modes as the kernels read them from a device plan.
+CAPTURE_MODE = tl.constexpr(CAPTURE)
+CONSUME_MODE = tl.constexpr(CONSUME)
 
 
 @triton.jit
@@ -153,6 +157,7 @@ def _capture_split_kernel(
     RETENTION,
     STATE,
     TICKETS,
+    MODES,
     top,
     score_capacity,
     q_batch_stride: tl.constexpr,
@@ -177,12 +182,17 @@ def _capture_split_kernel(
     SPLITS: tl.constexpr,
     HISTOGRAM: tl.constexpr,
     PARTS: tl.constexpr,
+    MIXED: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
     split = tl.program_id(2)
     kv_head = head // HEAD_GROUPS
     length = tl.load(LENGTHS + row)
+    if MIXED:
+        # Per-row modes: consume rows do no dense work, dense rows keep no scores.
+        mode = tl.load(MODES + row)
+        length = tl.where(mode == CONSUME_MODE, 0, length)
     # Equal tile-aligned parts of this row's context; trailing parts may be empty.
     split_tokens = ((length + SPLITS - 1) // SPLITS + BLOCK_T - 1) // BLOCK_T * BLOCK_T
     begin = split * split_tokens
@@ -220,10 +230,13 @@ def _capture_split_kernel(
         scores = tl.sum(keys * query[None, :], axis=1) * SCALE
         scores = tl.where(valid_tokens, scores, -float("inf"))
         # The only addition to the dense kernel: keep the raw scores for selection.
+        keep = valid_tokens
+        if MIXED:
+            keep = keep & (mode == CAPTURE_MODE)
         tl.store(
             SCORES + (row * NUM_HEADS + head).to(tl.int64) * score_capacity + positions,
             scores,
-            mask=valid_tokens,
+            mask=keep,
         )
         if HISTOGRAM:
             # Selection pass 0 of this part: the top eight bits of the order key.
@@ -251,7 +264,7 @@ def _capture_split_kernel(
     tl.store(PART_O + part * BLOCK_D + dims, accumulator)
     if HISTOGRAM:
         rh = row * NUM_HEADS + head
-        _, count = _retained(LENGTHS, row, RETENTION, top)
+        _, count = _capture_count(LENGTHS, row, RETENTION, top, MODES, MIXED)
         if count > 0:
             bins = tl.arange(0, 512)
             tl.store(SEGHIST + (rh * PARTS + split) * 4 * 256 + bins, local, mask=bins < 256)
@@ -411,6 +424,15 @@ def _retained(LENGTHS, row, RETENTION, top):
 
 
 @triton.jit
+def _capture_count(LENGTHS, row, RETENTION, top, MODES, MIXED: tl.constexpr):
+    """``_retained`` for a capture row; a mixed submission's other rows retain nothing."""
+    length, count = _retained(LENGTHS, row, RETENTION, top)
+    if MIXED:
+        count = tl.where(tl.load(MODES + row) == CAPTURE_MODE, count, 0)
+    return length, count
+
+
+@triton.jit
 def _segment(length, SEGMENTS: tl.constexpr, ALIGN: tl.constexpr):
     """This program's part ``[first, last)`` of a row's context."""
     size = tl.cdiv(tl.cdiv(length, SEGMENTS), ALIGN) * ALIGN
@@ -483,6 +505,7 @@ def _select_pass_kernel(
     TICKETS,
     GREATER,
     OFFSETS,
+    MODES,
     layer,
     top,
     score_capacity,
@@ -499,15 +522,23 @@ def _select_pass_kernel(
     PARTS: tl.constexpr,
     ALIGN: tl.constexpr,
     SPLITS: tl.constexpr,
+    MIXED: tl.constexpr,
 ):
     """One radix pass of one part; the first launched pass also merges the split parts."""
     row = tl.program_id(0)
     head = tl.program_id(1)
     segment = tl.program_id(2)
     rh = row * NUM_HEADS + head
-    length, count = _retained(LENGTHS, row, RETENTION, top)
+    length, count = _capture_count(LENGTHS, row, RETENTION, top, MODES, MIXED)
     if MERGE:
-        if segment == 0:
+        merging = segment == 0
+        marking = True
+        if MIXED:
+            # Consume rows get their output from the consume kernels.
+            mode = tl.load(MODES + row)
+            merging = merging & (mode != CONSUME_MODE)
+            marking = mode == CAPTURE_MODE
+        if merging:
             # Identical to triton_attention._paged_attention_merge_kernel.
             parts = rh * SPLITS + tl.arange(0, SPLITS)
             dims = tl.arange(0, BLOCK_D)
@@ -522,7 +553,8 @@ def _select_pass_kernel(
             tl.store(out, dense, mask=dims < HEAD_DIM)
             slot = tl.load(SLOTS + row)
             if head == 0:
-                tl.store(VALID + slot * NUM_LAYERS + layer, 1)
+                if marking:
+                    tl.store(VALID + slot * NUM_LAYERS + layer, 1)
             tl.store(LSE + rh, maximum + tl.log(normalizer))
             if count > 0:
                 state = (slot * NUM_LAYERS + layer) * NUM_HEADS + head
@@ -589,6 +621,7 @@ def _select_write_kernel(
     STATE,
     OFFSETS,
     SELECTED,
+    MODES,
     layer,
     top,
     score_capacity,
@@ -598,13 +631,14 @@ def _select_write_kernel(
     BLOCK_T: tl.constexpr,
     PARTS: tl.constexpr,
     ALIGN: tl.constexpr,
+    MIXED: tl.constexpr,
 ):
     """Write this part's retained positions at its offset, ties up to its quota."""
     row = tl.program_id(0)
     head = tl.program_id(1)
     segment = tl.program_id(2)
     rh = row * NUM_HEADS + head
-    length, count = _retained(LENGTHS, row, RETENTION, top)
+    length, count = _capture_count(LENGTHS, row, RETENTION, top, MODES, MIXED)
     if count > 0:
         low = tl.load(STATE + (rh * 5 + 4) * 2)
         ties_needed = tl.load(STATE + (rh * 5 + 4) * 2 + 1).to(tl.int32)
@@ -646,6 +680,7 @@ def _select_contribution_kernel(
     TICKETS,
     MASS,
     CONTRIBUTION,
+    MODES,
     layer,
     top,
     score_capacity,
@@ -662,6 +697,7 @@ def _select_contribution_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     PARTS: tl.constexpr,
+    MIXED: tl.constexpr,
 ):
     """``(m, C_ref)`` over the retained ranks, in rank chunks summed in a fixed order.
 
@@ -672,7 +708,7 @@ def _select_contribution_kernel(
     head = tl.program_id(1)
     part = tl.program_id(2)
     rh = row * NUM_HEADS + head
-    length, count = _retained(LENGTHS, row, RETENTION, top)
+    length, count = _capture_count(LENGTHS, row, RETENTION, top, MODES, MIXED)
     if count > 0:
         chunk = tl.cdiv(tl.cdiv(count, PARTS), BLOCK_T) * BLOCK_T
         first = part * chunk
@@ -861,6 +897,7 @@ def _consume_split_kernel(
     PART_M,
     PART_L,
     PART_O,
+    MODES,
     layer,
     table_stride,
     retained_capacity,
@@ -881,6 +918,7 @@ def _consume_split_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     SPLITS: tl.constexpr,
+    MIXED: tl.constexpr,
 ):
     """Online-softmax parts of ``C_new`` over one contiguous chunk of retained ranks.
 
@@ -895,7 +933,10 @@ def _consume_split_kernel(
     maximum = -float("inf")
     normalizer = 0.0
     accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    if tl.load(LENGTHS + row) > 0:
+    reads = tl.load(LENGTHS + row) > 0
+    if MIXED:
+        reads = reads & (tl.load(MODES + row) == CONSUME_MODE)
+    if reads:
         slot = tl.load(SLOTS + row)
         kv_head = head // HEAD_GROUPS
         state = (slot * NUM_LAYERS + layer) * NUM_HEADS + head
@@ -957,6 +998,7 @@ def _consume_merge_kernel(
     CONTRIBUTION,
     USES,
     OUT,
+    MODES,
     layer,
     q_row_stride: tl.constexpr,
     q_head_stride: tl.constexpr,
@@ -965,6 +1007,7 @@ def _consume_merge_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     SPLITS: tl.constexpr,
+    MIXED: tl.constexpr,
 ):
     """``O = O_ref - C_ref + m * C_new``, merging the split parts in a fixed order.
 
@@ -974,28 +1017,34 @@ def _consume_merge_kernel(
     head = tl.program_id(1)
     dims = tl.arange(0, BLOCK_D)
     out = OUT + row * q_row_stride + head * q_head_stride + dims
-    slot = tl.load(SLOTS + row)
-    if head == 0:
-        uses = USES + slot * NUM_LAYERS + layer
-        tl.store(uses, tl.load(uses) + 1)
-    if tl.load(LENGTHS + row) == 0:
-        tl.store(out, tl.zeros((BLOCK_D,), dtype=tl.float32), mask=dims < HEAD_DIM)
-    else:
-        state = (slot * NUM_LAYERS + layer) * NUM_HEADS + head
-        parts = (row * NUM_HEADS + head) * SPLITS + tl.arange(0, SPLITS)
-        maxima = tl.load(PART_M + parts)
-        maximum = tl.max(maxima, axis=0)
-        scale = tl.where(maxima > -float("inf"), tl.exp(maxima - maximum), 0.0)
-        normalizer = tl.sum(tl.load(PART_L + parts) * scale, axis=0)
-        partial = tl.load(PART_O + parts[:, None] * BLOCK_D + dims[None, :])
-        accumulator = tl.sum(partial * scale[:, None], axis=0)
-        reference = tl.load(OUTPUT + state * HEAD_DIM + dims, mask=dims < HEAD_DIM, other=0)
-        contribution = tl.load(
-            CONTRIBUTION + state * HEAD_DIM + dims, mask=dims < HEAD_DIM, other=0
-        )
-        # count 0 (no captured reference) divides 0 by 0: NaN, never a silent value.
-        corrected = reference - contribution + tl.load(MASS + state) * (accumulator / normalizer)
-        tl.store(out, corrected, mask=dims < HEAD_DIM)
+    # A mixed submission writes only its consume rows here.
+    consuming = True
+    if MIXED:
+        consuming = tl.load(MODES + row) == CONSUME_MODE
+    if consuming:
+        slot = tl.load(SLOTS + row)
+        if head == 0:
+            uses = USES + slot * NUM_LAYERS + layer
+            tl.store(uses, tl.load(uses) + 1)
+        if tl.load(LENGTHS + row) == 0:
+            tl.store(out, tl.zeros((BLOCK_D,), dtype=tl.float32), mask=dims < HEAD_DIM)
+        else:
+            state = (slot * NUM_LAYERS + layer) * NUM_HEADS + head
+            parts = (row * NUM_HEADS + head) * SPLITS + tl.arange(0, SPLITS)
+            maxima = tl.load(PART_M + parts)
+            maximum = tl.max(maxima, axis=0)
+            scale = tl.where(maxima > -float("inf"), tl.exp(maxima - maximum), 0.0)
+            normalizer = tl.sum(tl.load(PART_L + parts) * scale, axis=0)
+            partial = tl.load(PART_O + parts[:, None] * BLOCK_D + dims[None, :])
+            accumulator = tl.sum(partial * scale[:, None], axis=0)
+            reference = tl.load(OUTPUT + state * HEAD_DIM + dims, mask=dims < HEAD_DIM, other=0)
+            contribution = tl.load(
+                CONTRIBUTION + state * HEAD_DIM + dims, mask=dims < HEAD_DIM, other=0
+            )
+            # count 0 (no captured reference) divides 0 by 0: NaN, never a silent value.
+            mass = tl.load(MASS + state)
+            corrected = reference - contribution + mass * (accumulator / normalizer)
+            tl.store(out, corrected, mask=dims < HEAD_DIM)
 
 
 _RETENTION: dict[tuple[torch.device, float], torch.Tensor] = {}
@@ -1074,6 +1123,14 @@ def _consume_workspace(device, rows, heads, block_d):
 
 def supports(plan, q, dense_attention) -> bool:
     """Whether the fused path covers this submission; otherwise use the batched path."""
+    if isinstance(plan, DeviceSparseDecodePlan):
+        # Dense and capture rows run the split kernel; it needs the dense backend.
+        return (
+            q.is_cuda
+            and q.shape[-1] <= 256
+            and plan.key_retention < 1.0
+            and dense_attention is not None
+        )
     modes = set(plan.modes)
     return (
         q.is_cuda
@@ -1104,7 +1161,12 @@ def fused_paged_attention(
     dense_attention,
     workspace=None,
 ):
-    """Capture or consume one uniform-mode submission without host readbacks.
+    """Capture or consume one submission without host readbacks.
+
+    A host plan has one mode for every row. A device plan
+    (``DeviceSparseDecodePlan``) carries each row's mode on the device: the
+    capture kernels then compute dense and capture rows, the consume kernels
+    consume rows, and each writes only its own rows of the output.
 
     The kernels also write the store's ``valid``/``uses`` marks, so the host
     only checks the plan's liveness instead of launching the bookkeeping.
@@ -1126,7 +1188,10 @@ def fused_paged_attention(
     selected = store.selected
     if not selected.is_contiguous():
         raise ValueError("fused sparse attention derives index offsets from a contiguous pool")
-    if plan.modes[0] == CAPTURE:
+    mixed = isinstance(plan, DeviceSparseDecodePlan)
+    # Uniform plans never read the mode pointer; any device tensor stands in.
+    modes = plan.modes if mixed else context_lengths
+    if mixed or plan.modes[0] == CAPTURE:
         # With the Triton backend, the dense split kernel also keeps the scores
         # (and the first radix histograms), the dense merge runs inside the
         # first selection pass, and selection runs in parallel parts. Other
@@ -1135,6 +1200,8 @@ def fused_paged_attention(
         # callers may also pass the Triton function itself.
         kernel = getattr(dense_attention, "kernel", dense_attention)
         split = isinstance(kernel, TritonPagedAttention) or kernel is triton_paged_attention
+        if mixed and not split:
+            raise ValueError("a device sparse plan needs the Triton dense attention backend")
         if split:
             output = torch.empty_like(q)
         else:
@@ -1183,6 +1250,7 @@ def fused_paged_attention(
                 retention,
                 state,
                 tickets,
+                modes,
                 top,
                 capacity,
                 *q.stride(),
@@ -1199,6 +1267,7 @@ def fused_paged_attention(
                 SPLITS=NUM_SPLITS,
                 HISTOGRAM=folded,
                 PARTS=SELECT_PARTS,
+                MIXED=mixed,
                 num_warps=4,
             )
             first_pass = 1 if folded else 0
@@ -1223,6 +1292,7 @@ def fused_paged_attention(
                     tickets,
                     greater,
                     offsets,
+                    modes,
                     layer,
                     top,
                     capacity,
@@ -1237,6 +1307,7 @@ def fused_paged_attention(
                     PARTS=SELECT_PARTS,
                     ALIGN=_SEGMENT_ALIGN,
                     SPLITS=NUM_SPLITS,
+                    MIXED=mixed,
                     num_warps=_SCAN_WARPS,
                 )
             _launch(
@@ -1249,6 +1320,7 @@ def fused_paged_attention(
                 state,
                 offsets,
                 selected,
+                modes,
                 layer,
                 top,
                 capacity,
@@ -1258,6 +1330,7 @@ def fused_paged_attention(
                 BLOCK_T=_SCAN_BLOCK,
                 PARTS=SELECT_PARTS,
                 ALIGN=_SEGMENT_ALIGN,
+                MIXED=mixed,
                 num_warps=_SCAN_WARPS,
             )
             _launch(
@@ -1276,6 +1349,7 @@ def fused_paged_attention(
                 tickets,
                 store.mass,
                 store.contribution,
+                modes,
                 layer,
                 top,
                 capacity,
@@ -1292,54 +1366,59 @@ def fused_paged_attention(
                 BLOCK_D=block_d,
                 BLOCK_T=_GATHER_BLOCK,
                 PARTS=SELECT_PARTS,
+                MIXED=mixed,
+                num_warps=4,
+            )
+            if not mixed:
+                return output
+        else:
+            # Serial selection after another backend's dense call (uniform plans).
+            _launch(
+                _capture_kernel,
+                (rows, heads),
+                q,
+                key_cache,
+                value_cache,
+                block_tables,
+                context_lengths,
+                _retention(q.device, plan.key_retention),
+                plan.slot_ids,
+                output,
+                scores,
+                selected,
+                store.counts,
+                store.mass,
+                store.output,
+                store.contribution,
+                store.valid,
+                layer,
+                top,
+                capacity,
+                block_tables.stride(0),
+                selected.shape[-1],
+                q.stride(0),
+                q.stride(1),
+                key_cache.stride(0),
+                key_cache.stride(1),
+                key_cache.stride(2),
+                value_cache.stride(0),
+                value_cache.stride(1),
+                value_cache.stride(2),
+                output.stride(0),
+                output.stride(1),
+                NUM_LAYERS=store.layers,
+                NUM_HEADS=heads,
+                HEAD_DIM=dim,
+                HEAD_GROUPS=groups,
+                PAGE_SIZE=page,
+                SCALE=scale,
+                BLOCK_D=block_d,
+                BLOCK_T=64,
                 num_warps=4,
             )
             return output
-        _launch(
-            _capture_kernel,
-            (rows, heads),
-            q,
-            key_cache,
-            value_cache,
-            block_tables,
-            context_lengths,
-            _retention(q.device, plan.key_retention),
-            plan.slot_ids,
-            output,
-            scores,
-            selected,
-            store.counts,
-            store.mass,
-            store.output,
-            store.contribution,
-            store.valid,
-            layer,
-            top,
-            capacity,
-            block_tables.stride(0),
-            selected.shape[-1],
-            q.stride(0),
-            q.stride(1),
-            key_cache.stride(0),
-            key_cache.stride(1),
-            key_cache.stride(2),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            value_cache.stride(2),
-            output.stride(0),
-            output.stride(1),
-            NUM_LAYERS=store.layers,
-            NUM_HEADS=heads,
-            HEAD_DIM=dim,
-            HEAD_GROUPS=groups,
-            PAGE_SIZE=page,
-            SCALE=scale,
-            BLOCK_D=block_d,
-            BLOCK_T=64,
-            num_warps=4,
-        )
-        return output
-    output = torch.empty_like(q)
+    if not mixed:
+        output = torch.empty_like(q)
     if rows:
         if workspace is None:
             workspace = _consume_workspace(q.device, rows, heads, block_d)
@@ -1362,6 +1441,7 @@ def fused_paged_attention(
             part_m,
             part_l,
             part_o,
+            modes,
             layer,
             block_tables.stride(0),
             selected.shape[-1],
@@ -1382,6 +1462,7 @@ def fused_paged_attention(
             BLOCK_D=block_d,
             BLOCK_T=32,
             SPLITS=NUM_SPLITS,
+            MIXED=mixed,
             num_warps=4,
         )
         _launch(
@@ -1397,6 +1478,7 @@ def fused_paged_attention(
             store.contribution,
             store.uses,
             output,
+            modes,
             layer,
             output.stride(0),
             output.stride(1),
@@ -1405,6 +1487,7 @@ def fused_paged_attention(
             HEAD_DIM=dim,
             BLOCK_D=block_d,
             SPLITS=NUM_SPLITS,
+            MIXED=mixed,
             num_warps=4,
         )
     return output

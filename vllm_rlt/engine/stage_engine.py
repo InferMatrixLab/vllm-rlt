@@ -144,8 +144,17 @@ class StageEngine:
                     "sparse decode attention with CUDA graphs requires async block "
                     "speculation, the fused implementation and key_retention < 1"
                 )
-            if speculative_config is not None and speculative_config.mode != "block":
-                raise ValueError("sparse decode attention currently requires block speculation")
+            if self.pipeline_speculative and (
+                not self.async_speculative
+                or sparse_decode.implementation != "fused"
+                or sparse_decode.key_retention >= 1.0
+            ):
+                # Pipeline rows move and restart on the device; only the fused
+                # kernels read their device-decided modes and slots.
+                raise ValueError(
+                    "sparse decode attention with token pipelines requires asynchronous "
+                    "scheduling, the fused implementation and key_retention < 1"
+                )
             if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
                 raise ValueError(
                     "sparse decode attention requires refill scheduling without preemption"

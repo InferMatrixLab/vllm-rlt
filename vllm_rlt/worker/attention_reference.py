@@ -31,7 +31,13 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE, SparseDecodePlan
+from vllm_rlt.attention.sparse import (
+    CAPTURE,
+    CONSUME,
+    DENSE,
+    DeviceSparseDecodePlan,
+    SparseDecodePlan,
+)
 
 __all__ = ["ReferenceLease", "AttentionReferenceStore", "DENSE", "CAPTURE", "CONSUME"]
 
@@ -302,10 +308,36 @@ class AttentionReferenceStore:
             store=self,
         )
 
-    def _require_live(self, plan: SparseDecodePlan) -> None:
+    def build_device_plan(self, leases, slot_ids, modes, *, key_retention: float):
+        """Publish a plan whose rows name their slots and modes on the device.
+
+        Every slot in ``slot_ids`` must belong to one of ``leases``; the host
+        checks those leases live before each use, as for a host plan.
+        """
+        if slot_ids.shape != modes.shape or slot_ids.dim() != 1:
+            raise ValueError("a device reference plan needs one slot and mode per row")
+        plan = DeviceSparseDecodePlan(
+            modes=modes,
+            slot_ids=slot_ids,
+            leases=tuple(leases),
+            key_retention=key_retention,
+            key_bucket=self.key_bucket,
+            store=self,
+        )
+        self._require_live(plan)
+        return plan
+
+    def _require_live(self, plan) -> None:
         """Reject a plan whose slots were recycled or superseded."""
         if plan.store is not self:
             raise RuntimeError("attention reference plan belongs to a different store")
+        if isinstance(plan, DeviceSparseDecodePlan):
+            for lease in plan.leases:
+                for slot, incarnation in zip(lease.slots, lease.incarnations):
+                    binding = self._bindings.get(slot)
+                    if binding != (lease.request_id, lease.generation, incarnation):
+                        raise RuntimeError("stale attention reference plan for a retired token")
+            return
         for slot, incarnation, mode in zip(plan.slots, plan.incarnations, plan.modes):
             if slot == -1 and mode == DENSE:
                 continue

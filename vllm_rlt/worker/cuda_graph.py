@@ -8,7 +8,13 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE, SparseDecodePlan
+from vllm_rlt.attention.sparse import (
+    CAPTURE,
+    CONSUME,
+    DENSE,
+    DeviceSparseDecodePlan,
+    SparseDecodePlan,
+)
 from vllm_rlt.config import cuda_graph_rows
 from vllm_rlt.worker.metadata import DeviceKVMetadata
 
@@ -347,6 +353,10 @@ class RecurrentGraphs:
         return output
 
 
+# Graph key of entries that replay a device plan (token pipelines); not a row mode.
+DEVICE_PLAN = "device"
+
+
 class DeviceRecurrentGraphs(RecurrentGraphs):
     """Core graphs whose actual positions and KV frontier remain on device.
 
@@ -356,7 +366,9 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
     With a fused sparse reference store, every bucket is captured once per row
     mode. A sparse entry owns a static plan whose slot ids are refilled before
     each replay; the live plan's liveness is checked on the host at that point,
-    since replay runs no Python.
+    since replay runs no Python. With ``device_plans`` (token pipelines) the
+    sparse entries instead replay a device plan, whose per-row modes are
+    refilled alongside the slot ids.
     """
 
     def __init__(
@@ -368,6 +380,7 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
         capture_sizes=None,
         reference_store=None,
         key_retention=None,
+        device_plans=False,
     ):
         super().__init__(model, cache, execution, compute_gate)
         self.capture_sizes = capture_sizes or graph_capture_sizes(execution)
@@ -383,7 +396,7 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
             if reference_store.selected.shape[-1] != (reference_store.key_bucket or 1):
                 # A replay must never see a grown index pool at a new address.
                 raise ValueError("sparse CUDA graphs need the reference index pool at full size")
-            self.modes = (DENSE, CAPTURE, CONSUME)
+            self.modes = (DENSE, DEVICE_PLAN) if device_plans else (DENSE, CAPTURE, CONSUME)
             config = model.config
             width = math.ceil(config.max_position_embeddings / cache.block_size)
             self.proxy = _DeviceCache(
@@ -412,7 +425,22 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
             bucketed=True,
         )
         entry.mode = mode
-        if mode != DENSE:
+        if mode == DEVICE_PLAN:
+            store = self.reference_store
+            entry.slot_ids = torch.full(
+                (size,), store.padding_slot, device=self.cache.device, dtype=torch.int64
+            )
+            # Padded rows stay dense on the never-bound padding slot.
+            entry.modes = torch.full((size,), DENSE, device=self.cache.device, dtype=torch.int8)
+            entry.metadata.reference_plan = DeviceSparseDecodePlan(
+                modes=entry.modes,
+                slot_ids=entry.slot_ids,
+                leases=(),
+                key_retention=self.key_retention,
+                key_bucket=store.key_bucket,
+                store=store,
+            )
+        elif mode != DENSE:
             store = self.reference_store
             entry.slot_ids = torch.full(
                 (size,), store.padding_slot, device=self.cache.device, dtype=torch.int64
@@ -463,9 +491,13 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
         plan = getattr(batch, "reference_plan", None)
         if plan is None or plan.dense():
             return DENSE
-        modes = set(plan.modes)
         if self.reference_store is None or plan.store is not self.reference_store:
             return None
+        if isinstance(plan, DeviceSparseDecodePlan):
+            if DEVICE_PLAN not in self.modes or plan.key_retention != self.key_retention:
+                return None
+            return DEVICE_PLAN
+        modes = set(plan.modes)
         if len(modes) != 1 or plan.key_retention != self.key_retention:
             return None
         return plan.modes[0]
@@ -498,6 +530,9 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
                 stream.wait_event(self.last_event)
             entry.slot_ids[count:].fill_(self.reference_store.padding_slot)
             entry.slot_ids[:count].copy_(plan.slot_ids[:count])
+            if entry.mode == DEVICE_PLAN:
+                entry.modes[count:].fill_(DENSE)
+                entry.modes[:count].copy_(plan.modes[:count])
         super().prepare_inputs(call, hidden)
 
     @torch.inference_mode()
