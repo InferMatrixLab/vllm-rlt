@@ -28,6 +28,8 @@ an environment to receiving the first generated response. The
 
 Earlier measurements and known limitations are retained in the
 [historical validation record](runtime-history.md); they do not qualify the current revision.
+Explorations that did not qualify for merge are recorded with their data and
+reproduction steps: [BeNice! KV sharing and AsymLoop on Ouro-1.4B](kv-sharing-asymloop-exploration.md).
 
 ## Support and Runtime Notes
 
