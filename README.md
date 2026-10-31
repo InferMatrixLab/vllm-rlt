@@ -84,6 +84,10 @@ for supported combinations and limitations.
 - **Depth-aware paged KV cache.** LAST-EXITED and SHARED layouts, automatic
   CUDA cache sizing, and optional prefix caching, incremental page allocation,
   priority scheduling, and preemption with CPU state snapshots.
+- **Sparse decode reference integration.** Opt-in cached loop-2 attention
+  correction for ordinary decode and block self-speculation, with shared
+  per-token reference ownership and explicit capability limits; see the
+  [configuration and scope](docs/runtime.md#sparse-decode-attention-reference-path).
 - **Configurable GPU execution.** Triton and FlashAttention backends, asynchronous
   scheduling, multiple CUDA streams, reusable buffers, and CUDA Graph capture
   of decode recurrent cores. Asynchronous self-speculation also supports compatible

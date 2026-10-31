@@ -190,3 +190,35 @@ class SpeculativeConfig:
             raise ValueError("pipeline draft_loops must divide target_loops")
         if self.draft_loops >= self.target_loops:
             raise ValueError("draft_loops must be smaller than target_loops")
+
+
+@dataclass(frozen=True)
+class SparseDecodeAttentionConfig:
+    """Sparse decode attention group (RFC #156, section 7.2).
+
+    ``enabled`` recomputes attention contributions only for the retained keys
+    of the loop-2 reference; ``key_retention`` is the retained key fraction per
+    query and head relative to that query's causal key count, where ``1.0``
+    provides the full-retention control. ``key_bucket`` is only the reference
+    index-buffer capacity, never an algorithm knob: the retained count follows
+    ``key_retention`` alone, and ``None`` sizes the buffer from the model
+    context and the retention fraction.
+    """
+
+    enabled: bool = False
+    key_retention: float = 1.0
+    key_bucket: int | None = None
+    # Supported serving context bound for the reference index buffer. ``None``
+    # falls back to the model context; set it to the real serving bound so the
+    # pool is not sized for a context the deployment never uses.
+    max_context_tokens: int | None = None
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        if not math.isfinite(self.key_retention) or not 0 < self.key_retention <= 1:
+            raise ValueError("key_retention must be in (0, 1]")
+        if self.key_bucket is not None:
+            _positive("key_bucket", self.key_bucket)
+        if self.max_context_tokens is not None:
+            _positive("max_context_tokens", self.max_context_tokens)

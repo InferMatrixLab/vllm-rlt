@@ -5,7 +5,13 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SpeculativeConfig
+from vllm_rlt.config import (
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    SparseDecodeAttentionConfig,
+    SpeculativeConfig,
+)
 from vllm_rlt.profiling import ProfileConfig
 
 
@@ -48,6 +54,22 @@ def add_runtime_args(parser):
     parser.add_argument("--exit-trace", help="JSON file with depths_by_request")
     parser.add_argument("--lookahead-seed", type=int, default=0)
     parser.add_argument("--async-scheduling", action="store_true")
+    parser.add_argument(
+        "--sparse-decode-attention",
+        action="store_true",
+        help="Recompute decode attention only for retained reference-loop keys",
+    )
+    parser.add_argument(
+        "--sparse-decode-key-retention",
+        type=float,
+        default=1.0,
+        help="Retained key fraction per query/head; 1.0 is the full-retention control",
+    )
+    parser.add_argument(
+        "--sparse-decode-max-context",
+        type=int,
+        help="Supported serving context bound for the reference index buffer",
+    )
     parser.add_argument(
         "--cuda-graphs",
         action="store_true",
@@ -129,6 +151,13 @@ def runtime_configs(args):
             static_buffers=args.static_buffers,
             pad_to_power_of_two=args.pad_to_power_of_two,
         ),
+        sparse_decode_attention_config=SparseDecodeAttentionConfig(
+            enabled=args.sparse_decode_attention,
+            key_retention=args.sparse_decode_key_retention,
+            max_context_tokens=args.sparse_decode_max_context,
+        )
+        if args.sparse_decode_attention
+        else None,
     )
 
 

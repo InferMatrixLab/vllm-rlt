@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 import torch
 
+from vllm_rlt.attention.sparse import CAPTURE, DENSE, reference_mode
 from vllm_rlt.config import ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import ExecutionBatch, Operation, Request
@@ -160,9 +161,15 @@ class ModelRunner:
         scheduler_config=None,
         staged_prefill=None,
         rng: RngRegistry | None = None,
+        reference_store=None,
+        sparse_decode=None,
     ):
         self.model = model.eval()
         self.cache_manager = cache_manager
+        self.reference_store = reference_store
+        self.sparse_decode = sparse_decode
+        self.attention_references = {}
+        self.reference_generation = 0
         self.metadata = cache_manager.metadata_builder
         self.runtime = ModelRuntime(self.model, cache_manager)
         parameter = next(model.parameters())
@@ -1016,6 +1023,8 @@ class ModelRunner:
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
         hidden = self._load_hidden(batch, prepared, workspace, size)
         if batch.operation == Operation.CODA:
+            for request in requests:
+                self._release_attention_reference(request.request_id)
             forward = ForwardBatch(
                 Operation.CODA,
                 hidden=hidden[: batch.num_rows] if kv_metadata else hidden,
@@ -1027,6 +1036,8 @@ class ModelRunner:
         kv = prepared.kv
         if kv is not None:
             metadata = (kv,) + metadata
+        if self.reference_store is not None:
+            metadata = tuple(self._reference_metadata(batch, kv) for kv in metadata)
         forward = ForwardBatch(
             Operation.RECURRENT,
             hidden=hidden[: batch.num_rows]
@@ -1039,6 +1050,57 @@ class ModelRunner:
         return replace(
             prepared, kv=metadata[0], forwards=(PreparedForward(self.runtime.prepare(forward)),)
         )
+
+    def _release_attention_reference(self, request_id):
+        state = self.attention_references.pop(request_id, None)
+        if state is not None:
+            # release() creates the index tensor used by the metadata clears.
+            # Allocate it on core too, so its allocator lifetime follows the
+            # clear kernels even when CODA or teardown calls from another stream.
+            with (
+                torch.cuda.stream(self.core_stream)
+                if self.core_stream is not None
+                else nullcontext()
+            ):
+                self.reference_store.release(state[2])
+
+    def _reference_metadata(self, batch, kv):
+        """Borrow token-owned references; prompt and padded rows remain dense.
+
+        Preparation runs on core, after the request's preceding event. CODA
+        retires the reference after its final recurrent read; request teardown
+        waits for that same event before releasing an unfinished token.
+        """
+        requests = [span.request for span in batch.spans for _ in range(span.token_count)]
+        owners, modes = [], []
+        for request, (_, depth, position) in zip(requests, kv.rows):
+            mode = reference_mode(depth) if position >= len(request.prompt_token_ids) else DENSE
+            state = self.attention_references.get(request.request_id)
+            if state is not None and (state[0] is not request or state[1] != position):
+                self._release_attention_reference(request.request_id)
+                state = None
+            if mode == CAPTURE:
+                if state is None:
+                    self.reference_generation += 1
+                    lease = self.reference_store.reserve(
+                        request.request_id, 0, 1, self.reference_generation
+                    )
+                    state = (request, position, lease)
+                    self.attention_references[request.request_id] = state
+            if state is None:
+                mode = DENSE  # No reference loop for this token: stay dense.
+            owners.append(None if mode == DENSE else (state[2], 0))
+            modes.append(mode)
+        if all(mode == DENSE for mode in modes):
+            return kv
+        padding = len(kv.position_ids) - len(owners)
+        owners.extend([None] * padding)
+        modes.extend([DENSE] * padding)
+        plan = self.reference_store.build_plan(
+            owners, modes, key_retention=self.sparse_decode.key_retention
+        )
+        self.reference_store.bind_positions(plan, kv.position_ids)
+        return replace(kv, reference_plan=plan)
 
     def _load_hidden(self, batch, prepared, workspace, size):
         if prepared is not None and prepared.batch_inputs is not None:
@@ -1269,6 +1331,8 @@ class ModelRunner:
             )
         except Exception:
             self._synchronize_submission(stream, prepared)
+            for span in batch.spans:
+                self._release_attention_reference(span.request.request_id)
             # A failed preparation may advance a pool without enqueueing a batch.
             # Retire all prior readers before any pool can wrap after that gap.
             self.submissions.drain()
@@ -1364,6 +1428,7 @@ class ModelRunner:
         event = self.events.pop(request_id, None)
         if event is not None:
             event.synchronize()
+        self._release_attention_reference(request_id)
         self.prompt_token_owners.pop(request_id, None)
         if self.async_state is not None:
             self.async_state.release(request_id)

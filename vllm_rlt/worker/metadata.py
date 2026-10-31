@@ -39,6 +39,7 @@ class KVMetadata:
     writable: bool
     cu_seqlens_q: torch.Tensor | None = None
     max_seqlen_q: int = 1
+    reference_plan: object | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -62,6 +63,10 @@ class DeviceKVMetadata:
     context_lengths: torch.Tensor
     # Inactive pipeline slots must not overwrite any live KV address.
     write_mask: torch.Tensor | None = None
+    # Sparse decode attention plan of this submission: one row mode and
+    # reference slot per row. Host-known; the attention layer borrows it and
+    # the runner-owned store keeps the referenced state alive.
+    reference_plan: object | None = None
     # The device-owned path currently uses independent single-query rows.
     # These layout fields also let recurrent graphs stage the same contract.
     cu_seqlens_q: torch.Tensor | None = None
@@ -100,6 +105,7 @@ class MetadataBuilder:
         block_tables,
         context_lengths,
         write_mask=None,
+        reference_plan=None,
     ) -> DeviceKVMetadata:
         """Borrow stream-ordered metadata without reading device positions on CPU.
 
@@ -115,7 +121,10 @@ class MetadataBuilder:
             block_tables=block_tables,
             context_lengths=context_lengths,
             write_mask=write_mask,
+            reference_plan=reference_plan,
         )
+        if reference_plan is not None and len(reference_plan.modes) != len(position_ids):
+            raise ValueError("reference plan needs one row mode per query row")
         if write_mask is not None and (
             write_mask.shape != position_ids.shape
             or write_mask.dtype != torch.bool

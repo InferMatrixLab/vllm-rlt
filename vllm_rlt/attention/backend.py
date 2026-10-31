@@ -23,6 +23,8 @@ class BackendCapabilities:
     packed_matches_decode: bool = False
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
+    # Shared paged sparse-reference capture/correction dispatch is available.
+    sparse_decode: bool = False
 
 
 @dataclass
@@ -45,9 +47,9 @@ class AttentionBackend:
         return getattr(self.kernel, "generation", None)
 
 
-_TORCH_CAPABILITIES = BackendCapabilities()
+_TORCH_CAPABILITIES = BackendCapabilities(sparse_decode=True)
 _TRITON_CAPABILITIES = BackendCapabilities(
-    cuda_graphs=True, async_scheduling=True, device_context_lengths=True
+    cuda_graphs=True, async_scheduling=True, device_context_lengths=True, sparse_decode=True
 )
 _FLASH_CAPABILITIES = {
     2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
@@ -128,6 +130,7 @@ def create_backend(
                     "cuda_graphs",
                     "async_scheduling",
                     "device_context_lengths",
+                    "sparse_decode",
                 )
                 if getattr(required_capabilities, name)
                 and not getattr(implementation.capabilities, name)

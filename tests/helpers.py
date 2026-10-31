@@ -146,7 +146,7 @@ class RecordingConnector:
 
 
 def make_speculative_engine(
-    model, *, asynchronous=True, k=3, budget=16, prefix=False, multi_stream=True
+    model, *, asynchronous=True, k=3, budget=16, prefix=False, multi_stream=True, sparse=None
 ):
     return StageEngine(
         model,
@@ -157,6 +157,7 @@ def make_speculative_engine(
         ),
         execution_config=ExecutionConfig(async_scheduling=asynchronous, multi_stream=multi_stream),
         speculative_config=SpeculativeConfig(k),
+        sparse_decode_attention_config=sparse,
     )
 
 
