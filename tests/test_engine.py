@@ -9,10 +9,26 @@ from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 
+DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
 
-def tiny_model():
+
+def tiny_model(device="cpu", dtype=torch.float32):
     torch.manual_seed(123)
-    return OuroForCausalLM(tiny_ouro_config())
+    return OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=dtype)
+
+
+def model_dtype(device):
+    return torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
+
+
+def make_engine(device, *, dtype=None, cache_config=None, **kwargs):
+    """Build the production StageEngine on CPU or a scheduler-reserved device."""
+    return LLMEngine(
+        tiny_model(device, dtype or model_dtype(device)),
+        cache_config=cache_config or CacheConfig(64, 2),
+        attention_backend="triton" if torch.device(device).type == "cuda" else "torch",
+        **kwargs,
+    )
 
 
 def drain(engine, limit=1000):
@@ -155,9 +171,10 @@ def test_sampled_generation_is_batch_invariant():
     assert serial.token_ids == batched.token_ids
 
 
-def test_same_id_after_finish_starts_from_a_fresh_generator():
+@pytest.mark.parametrize("device", DEVICES)
+def test_same_id_after_finish_starts_from_a_fresh_generator(device):
     params = SamplingParams(max_tokens=3, temperature=0.8, seed=17, ignore_eos=True)
-    engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+    engine = make_engine(device, cache_config=CacheConfig(64, 2))
     engine.add_request("r", [2, 4], params)
     request = engine.scheduler.requests["r"]
     for _ in range(20):
@@ -181,11 +198,13 @@ def test_same_id_after_finish_starts_from_a_fresh_generator():
     second, _ = drain(engine)
     assert second["r"].token_ids == first["r"].token_ids
     assert second["r"].exit_depths == first["r"].exit_depths
+    engine.close()
 
 
-def test_abort_drops_the_rng_slot_so_id_reuse_starts_over():
+@pytest.mark.parametrize("device", DEVICES)
+def test_abort_drops_the_rng_slot_so_id_reuse_starts_over(device):
     params = SamplingParams(max_tokens=4, temperature=0.8, seed=23, ignore_eos=True)
-    engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+    engine = make_engine(device, cache_config=CacheConfig(64, 2))
     engine.add_request("r", [2, 4], params)
     for _ in range(20):
         if engine.rng.peek("r") is not None:
@@ -204,16 +223,19 @@ def test_abort_drops_the_rng_slot_so_id_reuse_starts_over():
     assert engine.rng.peek("r") is not aborted_generator
     reused, _ = drain(engine)
 
-    fresh = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+    fresh = make_engine(device, cache_config=CacheConfig(64, 2))
     fresh.add_request("r", [2, 4], params)
     expected, _ = drain(fresh)
     # The rebuilt request replays a same-seed run instead of continuing the
     # aborted stream.
     assert reused["r"].token_ids == expected["r"].token_ids
+    engine.close()
+    fresh.close()
 
 
-def test_greedy_requests_never_create_a_generator():
-    engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+@pytest.mark.parametrize("device", DEVICES)
+def test_greedy_requests_never_create_a_generator(device):
+    engine = make_engine(device, cache_config=CacheConfig(64, 2))
     engine.add_request("g", [2, 4], SamplingParams(max_tokens=3, ignore_eos=True))
     for _ in range(1000):
         if not engine.has_unfinished_requests():
@@ -223,12 +245,14 @@ def test_greedy_requests_never_create_a_generator():
     else:
         pytest.fail("engine failed to finish within bounded scheduler steps")
     assert engine.rng.peek("g") is None
+    engine.close()
 
 
-def test_greedy_sampling_never_acquires_a_generator(monkeypatch):
+@pytest.mark.parametrize("device", DEVICES)
+def test_greedy_sampling_never_acquires_a_generator(device, monkeypatch):
     # The registry is the only creator, so the strongest greedy contract is that
     # acquire() is never reached at all, not merely that no slot is left behind.
-    engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+    engine = make_engine(device, cache_config=CacheConfig(64, 2))
 
     def forbidden(*args, **kwargs):
         raise AssertionError("greedy sampling must not acquire a generator")
@@ -238,16 +262,23 @@ def test_greedy_sampling_never_acquires_a_generator(monkeypatch):
     outputs, _ = drain(engine)
     assert outputs["g"].finish_reason == "length"
     assert engine.rng.peek("g") is None
+    engine.close()
 
 
-def test_coda_sampling_is_prepared_before_execution(monkeypatch):
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_coda_sampling_is_prepared_before_execution(device, dtype, monkeypatch):
     from vllm_rlt.request import ExecutionBatch, Operation, StateSpan
 
-    engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+    engine = make_engine(device, dtype=dtype, cache_config=CacheConfig(64, 2))
     runner = engine.model_runner
     params = SamplingParams(temperature=0.7, seed=3)
     request = Request("r", [1], params)
-    request.hidden_state = torch.ones(engine.model.config.hidden_size)
+    # The synthetic hidden row feeds the model's LM head directly, so it must
+    # carry the model parameter device and dtype (BF16 on the CUDA variant). The
+    # CPU BF16 case pins this without a GPU.
+    request.hidden_state = next(engine.model.parameters()).new_ones(engine.model.config.hidden_size)
+    assert request.hidden_state.dtype == next(engine.model.parameters()).dtype
     batch = ExecutionBatch(Operation.CODA, (StateSpan(request, 0, 1, 0),))
     recorded = []
     acquire = engine.rng.acquire
@@ -261,6 +292,7 @@ def test_coda_sampling_is_prepared_before_execution(monkeypatch):
     request.sampling_params = SamplingParams(temperature=1.2, seed=9)
     prepared = runner.prepare_on_gpu(prepared)
     assert recorded == [(params, runner.device)]
+    assert prepared.sampling_generators[0].device.type == runner.device.type
 
     def unexpected(*args, **kwargs):
         pytest.fail("sampling generators must be resolved before execution")
@@ -271,14 +303,71 @@ def test_coda_sampling_is_prepared_before_execution(monkeypatch):
     engine.close()
 
 
-def test_engines_own_independent_rng_registries():
-    first = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
-    second = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+@pytest.mark.parametrize("device", DEVICES)
+def test_engines_own_independent_rng_registries(device):
+    first = make_engine(device, cache_config=CacheConfig(64, 2))
+    second = make_engine(device, cache_config=CacheConfig(64, 2))
     assert first.model_runner.rng is first.rng
     assert second.model_runner.rng is second.rng
     assert first.rng is not second.rng
-    first.model_runner.rng.acquire("r", SamplingParams(temperature=1.0), torch.device("cpu"))
+    first.model_runner.rng.acquire("r", SamplingParams(temperature=1.0), first.model_runner.device)
     assert second.rng.peek("r") is None
+    first.close()
+    second.close()
+
+
+@pytest.mark.gpu
+def test_cuda_coda_sampling_reuses_and_advances_one_device_generator():
+    # The same request must keep drawing from its registry entry across CODA
+    # steps, with a generator owned by the runner's CUDA device.
+    engine = make_engine("cuda", cache_config=CacheConfig(64, 2))
+    params = SamplingParams(
+        max_tokens=6, temperature=0.8, top_k=7, top_p=0.8, seed=42, ignore_eos=True
+    )
+    engine.add_request("r", [2, 4], params)
+    generator = None
+    first_state = None
+    outputs = {}
+    for _ in range(1000):
+        if not engine.has_unfinished_requests():
+            break
+        for output in engine.step():
+            if output.finished:
+                outputs[output.request_id] = output
+        current = engine.rng.peek("r")
+        if current is not None:
+            if generator is None:
+                generator = current
+                assert generator.device.type == "cuda"
+                first_state = generator.get_state().clone()
+            else:
+                assert current is generator
+    else:
+        pytest.fail("CUDA engine failed to finish within bounded scheduler steps")
+    assert generator is not None and first_state is not None
+    torch.cuda.synchronize(engine.model_runner.device)
+    assert not torch.equal(generator.get_state(), first_state)
+    assert len(outputs["r"].token_ids) == params.max_tokens
+    assert engine.rng.peek("r") is None
+    assert engine.cache_manager.num_used_blocks == 0
+    engine.close()
+
+
+@pytest.mark.gpu
+def test_cuda_sampled_generation_replays_with_the_same_seed():
+    params = SamplingParams(
+        max_tokens=4, temperature=0.8, top_k=7, top_p=0.8, seed=5, ignore_eos=True
+    )
+    first = make_engine("cuda", cache_config=CacheConfig(64, 2))
+    second = make_engine("cuda", cache_config=CacheConfig(64, 2))
+    for engine in (first, second):
+        engine.add_request("r", [2, 4], params)
+    left = drain(first)[0]["r"]
+    right = drain(second)[0]["r"]
+    assert left.token_ids == right.token_ids
+    assert left.exit_depths == right.exit_depths
+    first.close()
+    second.close()
 
 
 def test_execution_failure_releases_affected_requests(monkeypatch):

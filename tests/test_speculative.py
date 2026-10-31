@@ -33,6 +33,34 @@ def engine(m, k=3, **kwargs):
     return LLMEngine(m, speculative_config=SpeculativeConfig(k), **kwargs)
 
 
+DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+
+
+def backend_for(device):
+    return "triton" if torch.device(device).type == "cuda" else "torch"
+
+
+def model_on(device, seed=123, dtype=None):
+    device = torch.device(device)
+    dtype = dtype or (torch.bfloat16 if device.type == "cuda" else torch.float32)
+    return model(seed=seed, dtype=dtype).to(device)
+
+
+def engine_on(device, *, seed=123, k=3, **kwargs):
+    kwargs.setdefault("attention_backend", backend_for(device))
+    return engine(model_on(device, seed=seed), k=k, **kwargs)
+
+
+def plain_engine_on(device, *, seed=123, **kwargs):
+    kwargs.setdefault("attention_backend", backend_for(device))
+    return LLMEngine(model_on(device, seed=seed), **kwargs)
+
+
+def synchronize(device):
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize(torch.device(device))
+
+
 def drain(e):
     final = {}
     for _ in range(2000):
@@ -309,28 +337,30 @@ def test_sampling_seeded_replay_and_request_isolation(top_k, top_p):
     assert [run([p])[0].token_ids for p in prompts] == [o.token_ids for o in batched]
 
 
-def test_both_runners_share_the_engine_rng_registry():
-    # The registry belongs to the engine because LLMEngine builds SpeculativeRunner
-    # before ModelRunner and passes neither to the other. If the two runners held
-    # separate registries, preemption and termination would stop covering the
-    # speculative path's RNG.
-    e = engine(model())
+@pytest.mark.parametrize("device", DEVICES)
+def test_both_runners_share_the_engine_rng_registry(device):
+    # The stage-local engine owns the only registry and injects it into both
+    # runners. If each runner kept a private registry, preemption and termination
+    # would stop covering the other path's RNG, and a request could silently
+    # restart its stream when it moves between CODA and speculation.
+    e = engine_on(device)
     assert e.model_runner.rng is e.rng
     assert e.speculative_runner.rng is e.rng
 
-    plain = LLMEngine(model())
+    plain = plain_engine_on(device)
     assert plain.model_runner.rng is plain.rng
     assert plain.speculative_runner is None
-    # The asynchronous configuration holds AsyncSpeculativeRunner instead; its
-    # constructor allocates CUDA streams, so that case is covered by
-    # test_async_speculative.py::test_async_speculative_engine_shares_its_registry.
+    assert e.rng is not plain.rng
+    e.close()
+    plain.close()
 
 
 def test_acquire_generator_uses_the_logits_device(monkeypatch):
     # The speculative helper must hand acquire() the logits row's device, not the
     # model's. A different runner device makes the two sources distinguishable on a
     # CPU-only machine; the spy returns a real CPU generator so the fake device is
-    # never allocated.
+    # never allocated. The real CUDA counterpart is
+    # test_speculative_path_advances_the_registry_generator[cuda].
     e = engine(model())
     runner = e.speculative_runner
     runner.device = torch.device("meta")
@@ -350,11 +380,12 @@ def test_acquire_generator_uses_the_logits_device(monkeypatch):
     assert generator.device == logits.device
 
 
-def test_speculative_greedy_execution_never_acquires_a_generator(monkeypatch):
+@pytest.mark.parametrize("device", DEVICES)
+def test_speculative_greedy_execution_never_acquires_a_generator(device, monkeypatch):
     # The CODA path has the same check in test_engine.py; this one proves the
     # contract on a request that really executes through RequestPhase.SPECULATIVE, so a
     # generator that is created but unused would still be caught.
-    e = engine(model())
+    e = engine_on(device)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("greedy speculative sampling must not acquire a generator")
@@ -371,13 +402,15 @@ def test_speculative_greedy_execution_never_acquires_a_generator(monkeypatch):
         pytest.fail("speculative engine did not drain")
     assert RequestPhase.SPECULATIVE in stages
     assert e.rng.peek("r") is None
+    e.close()
 
 
-def test_speculative_path_advances_the_registry_generator():
+@pytest.mark.parametrize("device", DEVICES)
+def test_speculative_path_advances_the_registry_generator(device):
     # Sharing the registry is not enough: the speculative path must actually draw
     # from the stored generator. Rebuilding or reseeding one per call would keep
     # the slot frozen and silently change every sampled token after the first.
-    e = engine(model())
+    e = engine_on(device)
     params = SamplingParams(
         max_tokens=24, temperature=0.8, top_k=7, top_p=0.8, seed=42, ignore_eos=True
     )
@@ -393,12 +426,15 @@ def test_speculative_path_advances_the_registry_generator():
     assert step_until_speculative()
     generator = e.rng.peek("r")
     assert generator is not None
+    assert generator.device.type == torch.device(device).type
     state = generator.get_state().clone()
 
     assert step_until_speculative()
     assert e.has_unfinished_requests()
     assert e.rng.peek("r") is generator
+    synchronize(device)
     assert not torch.equal(generator.get_state(), state)
+    e.close()
 
 
 @pytest.mark.parametrize(

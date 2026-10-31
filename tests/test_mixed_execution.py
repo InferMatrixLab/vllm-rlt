@@ -272,6 +272,233 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
     assert actual == wavefront_refill == original_mixed == separated == expected
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_random_sampling_tracks_only_committed_tokens_under_mixed_loops(device, asynchronous):
+    # Mixed recurrent batches carry rows at different depths (and prefill rows).
+    # Only a CODA may draw a token, so the sampler must run exactly once per
+    # committed token and the per-request stream must replay identically to the
+    # non-mixed schedule.
+    from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig
+    from vllm_rlt.engine.llm_engine import LLMEngine
+
+    params = SamplingParams(
+        max_tokens=6,
+        max_loops=3,
+        temperature=0.8,
+        top_k=7,
+        top_p=0.9,
+        seed=17,
+        ignore_eos=True,
+    )
+
+    def run(mode):
+        torch.manual_seed(123)
+        engine = LLMEngine(
+            OuroForCausalLM(tiny_ouro_config()).to(device=device, dtype=torch.float32),
+            attention_backend="triton" if device == "cuda" else "torch",
+            cache_config=CacheConfig(128, 2),
+            scheduler_config=SchedulerConfig(
+                mode=mode,
+                max_num_seqs=3,
+                max_num_batched_tokens=5,
+                prefill_chunk_size=4,
+            ),
+            execution_config=ExecutionConfig(
+                async_scheduling=asynchronous,
+                static_buffers=asynchronous,
+                pad_to_power_of_two=asynchronous,
+            ),
+            exit_config=ExitConfig("ouro_delayed" if asynchronous else "ouro"),
+        )
+        samples = []
+        sampler = engine.model_runner.sampler
+        sample = sampler.sample
+
+        def record(logits, sampling, generator):
+            samples.append(generator)
+            return sample(logits, sampling, generator)
+
+        sampler.sample = record
+        prompts = (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10]))
+        outputs = {}
+        mixed = []
+        try:
+            if mode == "mixed":
+                # Upstream mixed scheduling only forms combined batches when a
+                # resident decode row is already recurring while the long prompt
+                # is prefilling, so stage the short request first.
+                engine.add_request(prompts[0][0], prompts[0][1], params)
+                for _ in range(40):
+                    for output in engine.step():
+                        if output.finished:
+                            outputs[output.request_id] = (
+                                output.token_ids,
+                                output.exit_depths,
+                            )
+                    if engine.scheduler.requests["short"].phase == RequestPhase.RECURRENT:
+                        break
+                else:
+                    pytest.fail("decode request did not reach recurrent work")
+                prompts = prompts[1:]
+            for name, prompt in prompts:
+                engine.add_request(name, prompt, params)
+            for _ in range(300):
+                for output in engine.step():
+                    if output.finished:
+                        outputs[output.request_id] = (
+                            output.token_ids,
+                            output.exit_depths,
+                        )
+                batch = engine.last_schedule
+                if batch is not None and batch.is_mixed:
+                    phases = {batch.phase_for(item) for item in batch.requests}
+                    # Only RECURRENT + PREFILLING_RECURRENT proves mixed loop/depth
+                    # execution; a prelude-only mix would not exercise the sampled
+                    # recurrent path this test targets.
+                    if phases == {
+                        RequestPhase.RECURRENT,
+                        RequestPhase.PREFILLING_RECURRENT,
+                    }:
+                        mixed.append(batch)
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail("mixed scheduling stalled")
+        finally:
+            engine.close()
+        committed = sum(len(token_ids) for token_ids, _ in outputs.values())
+        assert len(samples) == committed
+        assert all(generator.device.type == torch.device(device).type for generator in samples)
+        return outputs, mixed
+
+    expected, _ = run("refill")
+    actual, mixed = run("mixed")
+    assert mixed
+    assert actual == expected
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_bf16_mixed_random_sampling_replays_once_per_committed_token(asynchronous):
+    # BF16 is the main inference configuration, and BF16 reduction order can make
+    # cross-schedule token equality unreliable. Acceptance here is the sampling
+    # contract instead: every committed token drew exactly once, every request
+    # kept one CUDA generator, and the same mixed path replays exactly for a fixed
+    # seed. The FP32 test above remains the cross-mode diagnostic.
+    from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig
+    from vllm_rlt.engine.llm_engine import LLMEngine
+
+    params = SamplingParams(
+        max_tokens=6,
+        max_loops=3,
+        temperature=0.8,
+        top_k=7,
+        top_p=0.9,
+        seed=17,
+        ignore_eos=True,
+    )
+
+    def run():
+        torch.manual_seed(123)
+        engine = LLMEngine(
+            OuroForCausalLM(tiny_ouro_config()).to("cuda", torch.bfloat16),
+            attention_backend="triton",
+            cache_config=CacheConfig(128, 2),
+            scheduler_config=SchedulerConfig(
+                mode="mixed",
+                max_num_seqs=3,
+                max_num_batched_tokens=5,
+                prefill_chunk_size=4,
+                # Exercise the mainline wavefront chunked-prefill path in BF16.
+                wavefront_chunked_prefill=True,
+            ),
+            execution_config=ExecutionConfig(
+                async_scheduling=asynchronous,
+                static_buffers=True,
+                pad_to_power_of_two=True,
+            ),
+            exit_config=ExitConfig("ouro_delayed" if asynchronous else "ouro"),
+        )
+        samples, generators = [], {}
+        sampler = engine.model_runner.sampler
+        sample = sampler.sample
+
+        def record(logits, sampling, generator):
+            samples.append(generator)
+            return sample(logits, sampling, generator)
+
+        def track():
+            for rid in engine.scheduler.requests:
+                generator = engine.rng.peek(rid)
+                if generator is not None:
+                    generators.setdefault(rid, generator)
+                    assert generators[rid] is generator
+
+        sampler.sample = record
+        prompts = (("short", [1]), ("long", [2, 3, 4, 5, 6, 7, 8, 9, 10]))
+        outputs, mixed = {}, 0
+        try:
+            engine.add_request(prompts[0][0], prompts[0][1], params)
+            for _ in range(40):
+                for output in engine.step():
+                    if output.finished:
+                        outputs[output.request_id] = (
+                            output.token_ids,
+                            output.exit_depths,
+                        )
+                track()
+                if engine.scheduler.requests["short"].phase == RequestPhase.RECURRENT:
+                    break
+            else:
+                pytest.fail("decode request did not reach recurrent work")
+            engine.add_request(prompts[1][0], prompts[1][1], params)
+            for _ in range(300):
+                for output in engine.step():
+                    if output.finished:
+                        outputs[output.request_id] = (
+                            output.token_ids,
+                            output.exit_depths,
+                        )
+                batch = engine.last_schedule
+                if (
+                    batch is not None
+                    and batch.is_mixed
+                    and {batch.phase_for(item) for item in batch.requests}
+                    == {RequestPhase.RECURRENT, RequestPhase.PREFILLING_RECURRENT}
+                ):
+                    mixed += 1
+                track()
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail("BF16 mixed scheduling stalled")
+        finally:
+            engine.close()
+        committed = 0
+        counts = {id(generator): 0 for generator in generators.values()}
+        for generator in samples:
+            counts[id(generator)] += 1
+        assert set(generators) == set(outputs)
+        for request_id, (token_ids, _) in outputs.items():
+            committed += len(token_ids)
+            # Each request drew exactly once per committed token: a mixed
+            # recurrent/prefill batch must not add or duplicate draws.
+            assert counts[id(generators[request_id])] == len(token_ids)
+        assert len(samples) == committed
+        assert all(generator.device.type == "cuda" for generator in samples)
+        assert not engine.rng.generators
+        return outputs, mixed
+
+    first, first_mixed = run()
+    second, second_mixed = run()
+    # Each replay must actually execute recurrent + prefilling-recurrent batches;
+    # a prelude-only mix would leave the mixed sampling path unverified.
+    assert first_mixed > 0
+    assert second_mixed > 0
+    assert first == second
+
+
 def mixed_ready_engine():
     from tests.helpers import make_prefill_engine
 
