@@ -361,6 +361,7 @@ def create_pd(
     prefix_caching=False,
     sparse=None,
     decode_batched_tokens=2,
+    speculative_mode="block",
 ):
     pytest.importorskip("nixl")
     from vllm_rlt.pd.engine import PDEngine
@@ -393,7 +394,7 @@ def create_pd(
         exit_config=ExitConfig("ouro")
         if speculative
         else ExitConfig("trace", depths_by_request={"t": [4, 2, 3, 1] * 16}),
-        speculative_config=SpeculativeConfig(3) if speculative else None,
+        speculative_config=SpeculativeConfig(3, mode=speculative_mode) if speculative else None,
         sparse_decode_attention_config=sparse,
         execution_config=ExecutionConfig(
             async_scheduling=asynchronous,
@@ -776,8 +777,9 @@ def test_pd_sparse_decode_on_the_decode_stage(sparse):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("mode", ["block", "pipeline"])
 @pytest.mark.parametrize("multi", [False, True])
-def test_pd_sparse_decode_replays_graphs_on_the_decode_stage(multi):
+def test_pd_sparse_decode_replays_graphs_on_the_decode_stage(multi, mode):
     fused = SparseDecodeAttentionConfig(enabled=True, key_retention=0.5, implementation="fused")
     params = SamplingParams(max_tokens=9, ignore_eos=True)
     prompts = [[1, 2, 3, 4, 5], [2, 3], [4], [5, 6, 7]]
@@ -791,6 +793,7 @@ def test_pd_sparse_decode_replays_graphs_on_the_decode_stage(multi):
             asynchronous=True,
             sparse=sparse,
             decode_batched_tokens=8,
+            speculative_mode=mode,
         ) as engine:
             for index, prompt in enumerate(prompts):
                 engine.add_request(str(index), prompt, params)
