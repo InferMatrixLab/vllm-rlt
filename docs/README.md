@@ -1,4 +1,9 @@
-# Documentation
+# Documentation — v0.2.0
+
+This version is a research/evaluation milestone. Start with synchronous
+execution; optional GPU paths and historical measurements have narrower
+qualification scopes than the feature list. See the [changelog and migration
+notes](../CHANGELOG.md) before upgrading from v0.1.0.
 
 New users should follow the [first-run user guide](launching.md), from creating
 an environment to receiving the first generated response. The
@@ -7,6 +12,7 @@ an environment to receiving the first generated response. The
 | Guide | Topics |
 | --- | --- |
 | [Developer Must-Read](developer-guide.md) | Requirement understanding, correctness, performance analysis, refactoring rules, and completion criteria |
+| [Native kernel development](kernels.md) | Optional CUDA extension, operator layout, and SiLU-and-Mul reference contract |
 | [First-run user guide](launching.md) | Environment setup, model download, server startup, first request, CLI, Python API, and troubleshooting |
 | [Unified architecture](unified_execution.md) | Stage process boundaries, component responsibilities, shared resources and loop-level execution |
 | [Model and KV semantics](design.md) | PRELUDE/RECURRENT/CODA, request progress and depth-specific history |
@@ -35,7 +41,7 @@ Supported models are Ouro-1.4B, Nanbeige4.2-3B and Huginn-0125. See the
 [Thinking recipe](recipes/ouro_thinking.md) for model-specific coverage.
 Huginn currently uses synchronous execution, LAST_EXITED KV, and fixed
 recurrent depth; prefix caching, asynchronous execution, and speculative
-decoding are rejected. Its CUDA Graphs capture the recurrent decode core
+decoding are rejected, as are mixed/WCPB staged prefill and PD. Its CUDA Graphs capture the recurrent decode core
 and coda, including the LM head.
 CPU execution provides a Torch reference backend. FlashAttention hardware validation is currently documented
 for FA4 on B300; FA2/FA3 require validation on their target devices. Disaggregated

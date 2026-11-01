@@ -1,8 +1,15 @@
+import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 from vllm_rlt.attention import BackendCapabilities, create_backend
-from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt.config import (
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    SchedulerConfig,
+    resolve_cuda_graph_rows,
+)
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
@@ -18,6 +25,8 @@ from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry
 from vllm_rlt.worker.speculative import SpeculativeRunner
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vllm_rlt.worker.async_speculative import AsyncSpeculativeRunner
@@ -59,7 +68,9 @@ class StageEngine:
             if cache_config.enable_prefix_caching:
                 raise ValueError("Huginn prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
-        self.execution_config = execution_config or ExecutionConfig()
+        self.execution_config = resolve_cuda_graph_rows(
+            execution_config or ExecutionConfig(), scheduler_config, speculative_config
+        )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
@@ -113,6 +124,22 @@ class StageEngine:
             )
         if self.execution_config.cuda_graphs and parameter.device.type != "cuda":
             raise ValueError("CUDA graphs require CUDA with Triton or FlashAttention")
+        if self.execution_config.cuda_graphs and speculative_config is not None:
+            rows = min(
+                scheduler_config.max_num_seqs * (speculative_config.num_speculative_tokens + 1),
+                scheduler_config.max_num_batched_tokens,
+            )
+            if rows > self.execution_config.cuda_graph_max_batch_size:
+                logger.warning(
+                    "CUDA Graph row limit %d cannot cover %d verification rows "
+                    "(max_num_seqs=%d, K=%d); larger batches run eager. "
+                    "Raise cuda_graph_max_batch_size, or leave it unset to cover them, "
+                    "and budget additional graph memory.",
+                    self.execution_config.cuda_graph_max_batch_size,
+                    rows,
+                    scheduler_config.max_num_seqs,
+                    speculative_config.num_speculative_tokens,
+                )
         if self.execution_config.async_scheduling:
             if not self.async_speculative and self.exit_config.mode not in (
                 "ouro_delayed",
@@ -149,6 +176,7 @@ class StageEngine:
             scheduler_config,
             self.execution_config,
             attention.info["selected_backend"],
+            speculative=speculative_config,
             staged_prefill=staged_prefill,
         )
         self.cache_manager = KVCacheManager(

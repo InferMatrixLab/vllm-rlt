@@ -53,9 +53,19 @@ def add_runtime_args(parser):
         action="store_true",
         help="Capture decode/wavefront recurrent cores and speculative coda; sampling stays eager",
     )
-    parser.add_argument("--cuda-graph-max-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--cuda-graph-max-batch-size",
+        type=int,
+        default=None,
+        help="Graph row limit; unset covers async speculative verification rows, else 128",
+    )
     parser.add_argument("--cuda-graph-max-graphs", type=int, default=16)
-    parser.add_argument("--cuda-graph-memory-reserve-bytes", type=int, default=1024**3)
+    parser.add_argument(
+        "--cuda-graph-memory-reserve-bytes",
+        type=int,
+        default=1024**3,
+        help="Automatic KV planning headroom per CUDA Graph pool (plus retained spec logits)",
+    )
     parser.add_argument(
         "--single-stream",
         action="store_true",

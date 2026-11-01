@@ -1118,7 +1118,8 @@ def test_pipeline_two_loop_graph_replay(async_scheduling, backend):
 @pytest.mark.gpu
 @pytest.mark.parametrize("draft_loops", [1, 2])
 @pytest.mark.parametrize("budget", [1, 3, 16])
-def test_async_pipeline_ragged_matches_sync_and_submits_ahead(draft_loops, budget):
+@pytest.mark.parametrize("graphs", [False, True])
+def test_async_pipeline_ragged_matches_sync_and_submits_ahead(draft_loops, budget, graphs):
     m = model(seed=42).cuda()
     prompts = [[1, 2, 3], [5], [4, 12, 18, 22]]
     params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in [2, 9, 6]]
@@ -1130,7 +1131,7 @@ def test_async_pipeline_ragged_matches_sync_and_submits_ahead(draft_loops, budge
             cache_config=CacheConfig(256, 2, incremental_allocation=True),
             speculative_config=SpeculativeConfig(4, draft_loops=draft_loops, mode="pipeline"),
             scheduler_config=SchedulerConfig(max_num_batched_tokens=budget, prefill_chunk_size=2),
-            execution_config=ExecutionConfig(async_scheduling=asynchronous),
+            execution_config=ExecutionConfig(async_scheduling=asynchronous, cuda_graphs=graphs),
         )
         results.append([o.token_ids for o in llm.generate(prompts, params)])
         runner = llm.engine.speculative_runner

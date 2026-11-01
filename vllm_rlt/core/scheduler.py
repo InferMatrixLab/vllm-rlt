@@ -882,63 +882,59 @@ class Scheduler:
 
         added = set()
         blocked = set()
-        if phase == RequestPhase.PREFILLING_PRELUDE:
-            cursors = {request.request_id: request.num_preluded_tokens for request in candidates}
-            for _ in range(len(candidates[0].prefill_depth_ranges)):
-                for request in candidates:
-                    request_id = request.request_id
-                    if token_budget <= 0:
-                        break
-                    if request_id in blocked or request.phase != phase:
-                        continue
-                    start = cursors[request_id]
-                    if start >= len(request.prompt_token_ids):
-                        continue
-                    scheduled_request = self._make_wavefront_task(
-                        request, phase, token_budget, start=start
-                    )
-                    if scheduled_request is None:
-                        continue
-                    frontier = scheduled_request.token_start + scheduled_request.token_count
-                    if not self._ensure_execution_capacity(request, frontier, selected=selected):
-                        blocked.add(request_id)
-                        continue
-                    scheduled_requests.append(replace(scheduled_request, phase=phase))
-                    selected.add(request_id)
-                    added.add(request_id)
-                    cursors[request_id] += scheduled_request.token_count
-                    token_budget -= scheduled_request.token_count
-        else:
-            tasks = []
-            for depth in range(len(candidates[0].prefill_depth_ranges)):
-                for owner_index, request in enumerate(candidates):
-                    request_id = request.request_id
-                    if token_budget <= 0:
-                        break
-                    if request_id in blocked or request.phase != phase:
-                        continue
+        total_depths = len(candidates[0].prefill_depth_ranges)
+
+        def accept_task(request: Request, scheduled_request: ScheduledRequest) -> bool:
+            """Reserve capacity and commit one wavefront task to this batch."""
+            nonlocal token_budget
+            request_id = request.request_id
+            frontier = scheduled_request.token_start + scheduled_request.token_count
+            if not self._ensure_execution_capacity(request, frontier, selected=selected):
+                blocked.add(request_id)
+                return False
+            selected.add(request_id)
+            added.add(request_id)
+            token_budget -= scheduled_request.token_count
+            return True
+
+        tasks = []
+        prelude_cursors = (
+            {request.request_id: request.num_preluded_tokens for request in candidates}
+            if phase == RequestPhase.PREFILLING_PRELUDE
+            else None
+        )
+        for depth in range(total_depths):
+            for owner_index, request in enumerate(candidates):
+                request_id = request.request_id
+                if token_budget <= 0:
+                    break
+                if request_id in blocked or request.phase != phase:
+                    continue
+                if phase == RequestPhase.PREFILLING_PRELUDE:
+                    assert prelude_cursors is not None
+                    start, end = prelude_cursors[request_id], len(request.prompt_token_ids)
+                else:
                     start, end = request.prefill_depth_ranges[depth]
                     end = min(end, request.num_preluded_tokens)
-                    if start >= end:
-                        continue
-                    scheduled_request = self._make_wavefront_task(
-                        request, phase, token_budget, depth=depth, start=start
-                    )
-                    if scheduled_request is None:
-                        continue
-                    frontier = scheduled_request.token_start + scheduled_request.token_count
-                    if not self._ensure_execution_capacity(request, frontier, selected=selected):
-                        blocked.add(request_id)
-                        continue
-                    tasks.append((owner_index, scheduled_request))
-                    selected.add(request_id)
-                    added.add(request_id)
-                    token_budget -= scheduled_request.token_count
-
-            tasks.sort(key=lambda item: (item[0], item[1].token_start))
-            scheduled_requests.extend(
-                replace(scheduled_request, phase=phase) for _, scheduled_request in tasks
-            )
+                if start >= end:
+                    continue
+                scheduled_request = self._make_wavefront_task(
+                    request,
+                    phase,
+                    token_budget,
+                    depth=(None if phase == RequestPhase.PREFILLING_PRELUDE else depth),
+                    start=start,
+                )
+                if scheduled_request is None or not accept_task(request, scheduled_request):
+                    continue
+                if phase == RequestPhase.PREFILLING_PRELUDE:
+                    assert prelude_cursors is not None
+                    prelude_cursors[request_id] += scheduled_request.token_count
+                tasks.append((owner_index, scheduled_request))
+        tasks.sort(key=lambda item: (item[0], item[1].token_start))
+        scheduled_requests.extend(
+            replace(scheduled_request, phase=phase) for _, scheduled_request in tasks
+        )
 
         for request in candidates:
             # Growing another candidate may have suspended this request and put
@@ -963,11 +959,25 @@ class Scheduler:
         exporting = self.exports_request is not None and self.exports_request(request)
         return RequestPhase.TRANSFERRING if exporting else RequestPhase.CODA
 
-    def _apply_split_prefill_progress(
+    def _advance_prefill_depth_frontier(
         self,
         request: Request,
-        phase: RequestPhase,
+        *,
+        depth: int,
+        token_end: int,
+    ) -> bool:
+        """Advance one submitted prompt span through one recurrent depth."""
+        request.prefill_depth_ranges[depth][0] = token_end
+        if depth + 1 < self.total_ut_steps:
+            request.prefill_depth_ranges[depth + 1][1] = token_end
+            return False
+        request.num_prefilled_tokens = token_end
+        return True
+
+    def _apply_split_prefill_progress(
+        self,
         scheduled_request: ScheduledRequest,
+        phase: RequestPhase,
         *,
         loop_count: int | None = None,
         event=None,
@@ -977,6 +987,7 @@ class Scheduler:
         The device work may still be pending. The event orders prefix publication
         and consumers with that work; this transition does not wait for it.
         """
+        request = scheduled_request.request
         total_depths = self.total_ut_steps
         start = scheduled_request.token_start
         end = start + scheduled_request.token_count
@@ -998,19 +1009,19 @@ class Scheduler:
         boundaries = request.prefill_depth_ranges
         if depth + loop_count > total_depths:
             raise ValueError("prefill execution range exceeds model loop depth")
+        final_depth_reached = False
         for offset in range(loop_count):
             current_depth = depth + offset
             if phase == RequestPhase.PREFILLING_RECURRENT and (
                 boundaries[current_depth][0] != start or boundaries[current_depth][1] < end
             ):
                 raise RuntimeError("prefill execution range crosses an incomplete depth frontier")
-            boundaries[current_depth][0] = end
-            if current_depth + 1 < total_depths:
-                boundaries[current_depth + 1][1] = end
-            else:
-                request.num_prefilled_tokens = end
+            final_depth_reached = self._advance_prefill_depth_frontier(
+                request,
+                depth=current_depth,
+                token_end=end,
+            )
 
-        final_depth_reached = depth + loop_count == total_depths
         chunk_complete = final_depth_reached and end == request.num_preluded_tokens
         if not final_depth_reached or not chunk_complete:
             self.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
@@ -1041,22 +1052,24 @@ class Scheduler:
         event=None,
     ) -> PrefillProgress:
         """One prompt frontier update for local and remotely consumed outputs."""
+        if phase != RequestPhase.PREFILL:
+            return self._apply_split_prefill_progress(
+                scheduled_request,
+                phase,
+                loop_count=loop_count,
+                event=event,
+            )
+
         request = scheduled_request.request
-        if phase == RequestPhase.PREFILL:
-            request.num_prefilled_tokens += scheduled_request.token_count
-            final = request.num_prefilled_tokens == len(request.prompt_token_ids)
-            self.cache_manager.publish_prefix(
-                request.request_id, request.prompt_token_ids, request.num_prefilled_tokens, event
-            )
-            if final:
-                request.loops_done = self.total_ut_steps
-            self.enqueue(
-                request, self._prompt_destination(request) if final else RequestPhase.PREFILL
-            )
-            return PrefillProgress(True, final)
-        return self._apply_split_prefill_progress(
-            request, phase, scheduled_request, loop_count=loop_count, event=event
+        request.num_prefilled_tokens += scheduled_request.token_count
+        final = request.num_prefilled_tokens == len(request.prompt_token_ids)
+        self.cache_manager.publish_prefix(
+            request.request_id, request.prompt_token_ids, request.num_prefilled_tokens, event
         )
+        if final:
+            request.loops_done = self.total_ut_steps
+        self.enqueue(request, self._prompt_destination(request) if final else RequestPhase.PREFILL)
+        return PrefillProgress(True, final)
 
     def _apply_wavefront_prefill_batch_progress(
         self,
@@ -1101,15 +1114,15 @@ class Scheduler:
                 depth = item.depth
                 start = item.token_start
                 end = start + item.token_count
-                boundaries = request.prefill_depth_ranges
-                if boundaries[depth][0] != start:
+                if request.prefill_depth_ranges[depth][0] != start:
                     raise RuntimeError("stale wavefront recurrent depth frontier")
-                boundaries[depth][0] = end
-                if depth + 1 < self.total_ut_steps:
-                    boundaries[depth + 1][1] = end
+                if not self._advance_prefill_depth_frontier(
+                    request,
+                    depth=depth,
+                    token_end=end,
+                ):
                     continue
 
-                request.num_prefilled_tokens = end
                 chunk_end = min(
                     len(request.prompt_token_ids),
                     item.chunk_start + self.config.prefill_chunk_size,
@@ -1157,6 +1170,61 @@ class Scheduler:
             ):
                 groups.setdefault((request.request_id, phase), []).append(item)
         return groups
+
+    def _apply_prefill_phase_progress(
+        self,
+        scheduled_request: ScheduledRequest,
+        phase: RequestPhase,
+        wavefront_groups: dict[tuple[str, RequestPhase], list[ScheduledRequest]],
+        update: SchedulerUpdate,
+        *,
+        loop_count: int,
+        request_events: dict[str, object] | None = None,
+        fallback_event: object | None = None,
+    ) -> bool:
+        """Apply prefill progress shared by submission and output updates.
+
+        The caller filters stale or finished requests before calling this
+        helper. Return ``True`` when prefill owns the row, including duplicate
+        rows consumed by wavefront grouping; return ``False`` for phase-specific
+        logic.
+        """
+        request = scheduled_request.request
+        if self.wavefront_chunked_prefill and phase in (
+            RequestPhase.PREFILLING_PRELUDE,
+            RequestPhase.PREFILLING_RECURRENT,
+        ):
+            grouped = wavefront_groups.pop((request.request_id, phase), None)
+            if grouped is not None:
+                event = (
+                    request_events.get(request.request_id)
+                    if request_events is not None
+                    else fallback_event
+                )
+                representative, progress = self._apply_wavefront_prefill_batch_progress(
+                    phase, grouped, loop_count=loop_count, event=event
+                )
+                update.prefill.append((representative, phase, progress))
+            return True
+        if phase in (
+            RequestPhase.PREFILL,
+            RequestPhase.PREFILLING_PRELUDE,
+            RequestPhase.PREFILLING_RECURRENT,
+        ):
+            event = (
+                request_events.get(request.request_id)
+                if request_events is not None
+                else fallback_event
+            )
+            progress = self._apply_prefill_progress(
+                scheduled_request,
+                phase,
+                loop_count=loop_count,
+                event=event,
+            )
+            update.prefill.append((scheduled_request, phase, progress))
+            return True
+        return False
 
     def _should_exit(self, request: Request) -> bool:
         """Evaluate the policy after recording the completed loop's actual hazard."""
@@ -1214,6 +1282,7 @@ class Scheduler:
             result = ModelRunnerOutput()
         update = SchedulerUpdate()
         wavefront_groups = self._wavefront_prefill_groups(batch)
+        loop_count = self._batch_loop_count(batch)
         for row, scheduled_request in enumerate(batch.requests):
             request = scheduled_request.request
             # Ignore results for a request that is no longer registered: it may
@@ -1225,40 +1294,17 @@ class Scheduler:
             ):
                 continue
             phase = batch.phase_for(scheduled_request)
-            if self.wavefront_chunked_prefill and phase in (
-                RequestPhase.PREFILLING_PRELUDE,
-                RequestPhase.PREFILLING_RECURRENT,
+            if self._apply_prefill_phase_progress(
+                scheduled_request,
+                phase,
+                wavefront_groups,
+                update,
+                loop_count=loop_count,
+                request_events=request_events,
+                fallback_event=result.completion,
             ):
-                grouped = wavefront_groups.pop((request.request_id, phase), None)
-                if grouped is not None:
-                    event = (
-                        request_events.get(request.request_id)
-                        if request_events is not None
-                        else result.completion
-                    )
-                    representative, progress = self._apply_wavefront_prefill_batch_progress(
-                        phase, grouped, loop_count=self._batch_loop_count(batch), event=event
-                    )
-                    update.prefill.append((representative, phase, progress))
                 continue
-            if phase in (
-                RequestPhase.PREFILL,
-                RequestPhase.PREFILLING_PRELUDE,
-                RequestPhase.PREFILLING_RECURRENT,
-            ):
-                event = (
-                    request_events.get(request.request_id)
-                    if request_events is not None
-                    else result.completion
-                )
-                progress = self._apply_prefill_progress(
-                    scheduled_request,
-                    phase,
-                    loop_count=self._batch_loop_count(batch),
-                    event=event,
-                )
-                update.prefill.append((scheduled_request, phase, progress))
-            elif phase == RequestPhase.PRELUDE:
+            if phase == RequestPhase.PRELUDE:
                 request.loops_done = 0
                 request.remaining_probability = 1.0
                 request.pending_exit_depth = None
@@ -1356,6 +1402,7 @@ class Scheduler:
         """Advance logical submissions without requiring CPU token/score delivery."""
         update = SchedulerUpdate()
         wavefront_groups = self._wavefront_prefill_groups(batch)
+        loop_count = self._batch_loop_count(batch)
         for row, scheduled_request in enumerate(batch.requests):
             request = scheduled_request.request
             if (
@@ -1364,40 +1411,17 @@ class Scheduler:
             ):
                 continue
             phase = batch.phase_for(scheduled_request)
-            if self.wavefront_chunked_prefill and phase in (
-                RequestPhase.PREFILLING_PRELUDE,
-                RequestPhase.PREFILLING_RECURRENT,
+            if self._apply_prefill_phase_progress(
+                scheduled_request,
+                phase,
+                wavefront_groups,
+                update,
+                loop_count=loop_count,
+                request_events=request_events,
+                fallback_event=completion,
             ):
-                grouped = wavefront_groups.pop((request.request_id, phase), None)
-                if grouped is not None:
-                    event = (
-                        request_events.get(request.request_id)
-                        if request_events is not None
-                        else completion
-                    )
-                    representative, progress = self._apply_wavefront_prefill_batch_progress(
-                        phase, grouped, loop_count=self._batch_loop_count(batch), event=event
-                    )
-                    update.prefill.append((representative, phase, progress))
                 continue
-            if phase in (
-                RequestPhase.PREFILL,
-                RequestPhase.PREFILLING_PRELUDE,
-                RequestPhase.PREFILLING_RECURRENT,
-            ):
-                event = (
-                    request_events.get(request.request_id)
-                    if request_events is not None
-                    else completion
-                )
-                progress = self._apply_prefill_progress(
-                    scheduled_request,
-                    phase,
-                    loop_count=self._batch_loop_count(batch),
-                    event=event,
-                )
-                update.prefill.append((scheduled_request, phase, progress))
-            elif phase == RequestPhase.PRELUDE:
+            if phase == RequestPhase.PRELUDE:
                 request.loops_done = 0
                 request.remaining_probability = 1.0
                 request.pending_exit_depth = None

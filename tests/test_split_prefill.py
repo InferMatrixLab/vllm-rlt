@@ -727,6 +727,61 @@ def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
     assert request.phase is RequestPhase.CODA
 
 
+def test_split_prefill_progress_advances_multiple_recurrent_depths_per_submission():
+    from unittest.mock import Mock
+
+    from vllm_rlt.core.scheduler import ScheduledRequest, Scheduler
+
+    cache_manager = Mock()
+    scheduler = Scheduler(
+        SchedulerConfig(mode="mixed"),
+        cache_manager,
+        total_ut_steps=TOTAL_DEPTHS,
+    )
+    request = Request(
+        "a",
+        [1, 2, 3, 4],
+        SamplingParams(),
+        prefill_depth_ranges=Request.prefill_boundaries(4, TOTAL_DEPTHS),
+    )
+    staged = ScheduledRequest(request, token_start=0, token_count=2, chunk_start=0)
+
+    progress = scheduler._apply_prefill_progress(
+        staged,
+        RequestPhase.PREFILLING_PRELUDE,
+        loop_count=0,
+    )
+
+    assert (progress.chunk_complete, progress.prompt_complete) == (False, False)
+    assert request.prefill_depth_ranges == [[0, 4], [0, 0], [0, 0], [0, 0]]
+    scheduler.queues[RequestPhase.PREFILLING_RECURRENT].clear()
+
+    progress = scheduler._apply_prefill_progress(
+        ScheduledRequest(request, token_start=0, token_count=2, depth=0, chunk_start=0),
+        RequestPhase.PREFILLING_RECURRENT,
+        loop_count=2,
+    )
+
+    assert (progress.chunk_complete, progress.prompt_complete) == (False, False)
+    assert request.prefill_depth_ranges == [[2, 4], [2, 2], [0, 2], [0, 0]]
+    cache_manager.publish_prefix.assert_not_called()
+    scheduler.queues[RequestPhase.PREFILLING_RECURRENT].clear()
+    event = object()
+
+    progress = scheduler._apply_prefill_progress(
+        ScheduledRequest(request, token_start=0, token_count=2, depth=2, chunk_start=0),
+        RequestPhase.PREFILLING_RECURRENT,
+        loop_count=2,
+        event=event,
+    )
+
+    assert (progress.chunk_complete, progress.prompt_complete) == (True, False)
+    assert request.prefill_depth_ranges == [[2, 4], [2, 2], [2, 2], [2, 2]]
+    assert request.prefill_reclaimable_tokens == 2
+    assert request.phase is RequestPhase.PREFILLING_PRELUDE
+    cache_manager.publish_prefix.assert_called_once_with("a", [1, 2, 3, 4], 2, event)
+
+
 @pytest.mark.parametrize(
     ("chunk_size", "token_budget", "prompt"),
     [(1, 3, [1]), (2, 3, [1, 2, 3, 4, 5]), (3, 4, [5, 4, 3, 2, 1, 6, 7])],
