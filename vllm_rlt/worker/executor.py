@@ -201,13 +201,13 @@ class ModelRuntime:
             if hidden is None:
                 raise ValueError("RECURRENT requires hidden state")
             for index, kv in enumerate(batch.metadata):
-                self.cache.prepare_attention(kv)
                 if batch.graphs is not None:
                     call = batch.graph_calls[index]
                     if not call.inputs_ready:
                         batch.graphs.prepare_inputs(call, hidden)
                     hidden, gate = batch.graphs.execute(call, hidden)
                 else:
+                    self.cache.prepare_attention(kv)
                     hidden, gate = self.model.recurrent_prepared(
                         hidden, kv, self.cache, compute_gate=batch.compute_gate
                     )

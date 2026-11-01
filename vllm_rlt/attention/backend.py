@@ -66,7 +66,7 @@ _FLASH_CAPABILITIES = {
         device_context_lengths=True,
     ),
 }
-_FLASHINFER_FA2_CAPABILITIES = BackendCapabilities()
+_FLASHINFER_FA2_CAPABILITIES = BackendCapabilities(cuda_graphs=True, async_scheduling=True)
 _AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")
 
 

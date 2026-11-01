@@ -286,6 +286,9 @@ class RecurrentGraphs:
             if self.last_event is not None:
                 stream.wait_event(self.last_event)
             _copy_graph_inputs(entry, hidden, batch)
+            # Prime stateful kernels from the graph's private metadata, after the
+            # caller's tables land there and before capture/replay consumes them.
+            cache.prepare_attention(entry.metadata)
             if entry.graph is None:
                 proxy = _DeviceCache(cache)
                 entry.graph, entry.output = _capture(
@@ -297,6 +300,8 @@ class RecurrentGraphs:
                     ),
                 )
                 self.captures += 1
+        else:
+            self.cache.prepare_attention(batch)
         call.inputs_ready = True
 
     @torch.inference_mode()
@@ -358,6 +363,7 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
                 bucketed=True,
             )
             _copy_graph_inputs(entry, hidden, batch, count=0)
+            self.cache.prepare_attention(entry.metadata)
             entry.graph, entry.output = _capture(
                 entry.hidden,
                 self.capture_stream,
@@ -463,6 +469,7 @@ class CodaGraphs:
                 stream.wait_event(self.last_event)
             if self.cache is not None:
                 _copy_graph_inputs(entry, hidden, batch)
+                self.cache.prepare_attention(entry.metadata)
             else:
                 entry.hidden[: len(hidden)].copy_(hidden)
                 entry.hidden[len(hidden) :].zero_()
@@ -480,6 +487,8 @@ class CodaGraphs:
                     entry.hidden, self.stream, self.pool, run, startup=startup
                 )
                 self.captures += 1
+        elif self.cache is not None:
+            self.cache.prepare_attention(batch)
         call.inputs_ready = True
 
     @torch.inference_mode()
