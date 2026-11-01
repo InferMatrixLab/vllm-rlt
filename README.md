@@ -92,8 +92,8 @@ in mixed prefill/decode batches.
   CUDA Graphs, and optional asynchronous/speculative paths. An optional native
   CUDA SiLU-and-Mul operator accelerates the Ouro activation path, with a Torch
   fallback; it is not a general model-speedup claim. FlashInfer FA2 paged decode
-  is an explicit opt-in backend for Ada (SM89) GPUs; see
-  [the FA2 guide](docs/flashinfer-fa2.md).
+  is an explicit opt-in backend for Ada (SM89) GPUs with CUDA Graphs and async
+  scheduling; see [the FA2 guide](docs/flashinfer-fa2.md).
 - **Offline and online use:** Python API, CLI, and a streaming
   OpenAI-compatible **completions** endpoint. This is not a chat-completions API.
 

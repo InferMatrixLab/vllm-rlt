@@ -201,26 +201,33 @@ above are explicit project choices rather than an exact paper reproduction.
 ## Attention-backend runs
 
 `benchmarks.gsm8k run` accepts `--attention-backend {torch,triton,flashinfer_fa2}`
-for the native backend; the default stays `triton`. The flag is recorded in the
-summary and does not change the frozen baseline fingerprint.
+for the native backend; the default stays `triton`. `--cuda-graphs` selects the
+native recurrent-core CUDA Graphs for that run. Both flags are recorded in the
+summary and do not change the frozen baseline fingerprint.
 
 On one L20 (SM89, torch 2.13.0, CUDA 13.0, FlashInfer 0.7.2.post1, Triton
 3.7.1), the default GSM8K-87 protocol (HF baseline 59/87) produced:
 
-| backend | correct | accuracy | gate |
+| run | correct | accuracy | gate |
 |---|---:|---:|---|
 | triton | 61/87 | 70.11% | pass (+2.30 pp) |
-| flashinfer_fa2 | 61/87 | 70.11% | pass (+2.30 pp) |
+| flashinfer_fa2 eager | 60/87 | 68.97% | pass (+1.15 pp) |
+| flashinfer_fa2 + CUDA Graphs | 59/87 | 67.82% | pass (+0.00 pp) |
 
-65/87 generated token sequences are identical. Two correct-answer flips cancel:
-question 360 goes incorrect → correct with FA2, and question 426 goes
-correct → incorrect. The first divergences are near ties (logits maxabs
-<= 0.17, top1/top2 margins 0–0.125), consistent with BF16 accumulation order.
-FA2 has one length-limited runaway (question 182 reaches 1024 tokens; Triton
-stops at 40), so its mean generated length is 115.9 vs 103.7 tokens and its
-generation time is 732.6 s vs 637.4 s. A matched 64-token fixed-work run at
-concurrency 1/8/32 gives FA2/Triton time ratios 1.05/0.97/1.03, within noise;
-this backend does not demonstrate an end-to-end speedup on this workload.
+Eager and graph FA2 share 69/87 generated token sequences. Padded graph rows
+and the full-width plan change the tensor-core split schedule, so 18 first
+divergences are BF16 ties (logits maxabs <= 0.17, top1/top2 margins 0–0.125)
+and each one changes the whole continuation. The graphs run has no
+length-limited runaway (mean 106.7 tokens); the eager run reaches 1024 tokens
+on question 182 (mean 117.1), and Triton stops that question at 40.
+
+The `flashinfer_fa2` backend runs FlashInfer's tensor-core, CUDA-Graph-
+compatible decode wrapper; the FA2 guide records why the CUDA-core path is not
+graph-safe on SM89. CUDA Graphs remove most per-token launch overhead on this
+small model: a matched 64-token fixed-work run went from 5.24/5.78/6.22 s
+(eager) to 1.67/1.92/2.32 s (graphs) at concurrency 1/8/32. That is a launch-
+overhead result on one L20, not a production throughput qualification;
+async+graphs is within noise of graphs.
 
 The stored GSM8K-87 baseline fingerprints `torch==2.13.0`; a run on another torch
 version cannot reuse its 59/87 baseline. A 10-question custom subset on torch 2.8
