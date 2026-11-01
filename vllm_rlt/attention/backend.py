@@ -3,12 +3,12 @@
 import importlib
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS, FlashPagedAttention
-from vllm_rlt.kernels.paged_attention import torch_paged_attention, triton_paged_attention
+from vllm_rlt.kernels.paged_attention import TritonPagedAttention, torch_paged_attention
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,9 @@ class BackendCapabilities:
     packed_prefill: bool = False
     cuda_graphs: bool = False
     async_scheduling: bool = False
+    # Packed rows reproduce single-query decode exactly; speculative verification
+    # relies on this to match serial decoding token for token.
+    packed_matches_decode: bool = False
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
 
@@ -50,7 +53,11 @@ _FLASH_CAPABILITIES = {
     2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
     3: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
     4: BackendCapabilities(
-        packed_prefill=True, cuda_graphs=True, async_scheduling=True, device_context_lengths=True
+        packed_prefill=True,
+        cuda_graphs=True,
+        async_scheduling=True,
+        packed_matches_decode=True,
+        device_context_lengths=True,
     ),
 }
 _AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")
@@ -75,7 +82,7 @@ def _create_explicit(backend, device, dtype, head_dim, block_size):
             raise ValueError("the Triton attention backend requires NVIDIA Compute Capability 8.0+")
         # Probe the actual module, including its dependency imports, before selection.
         importlib.import_module("vllm_rlt.kernels.triton_attention")
-        return AttentionBackend(triton_paged_attention, _TRITON_CAPABILITIES, {"backend": backend})
+        return AttentionBackend(TritonPagedAttention(), _TRITON_CAPABILITIES, {"backend": backend})
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))
@@ -107,6 +114,13 @@ def create_backend(
     for candidate in candidates:
         try:
             implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
+            if candidate == "triton" and required_capabilities.packed_prefill:
+                # Packed BF16 prefill has different arithmetic from per-row decode.
+                # Opt in for prefill_uva without changing existing split/mixed or
+                # Huginn boundary attention when that option is disabled.
+                implementation.capabilities = replace(
+                    implementation.capabilities, packed_prefill=True
+                )
             missing = [
                 name
                 for name in (

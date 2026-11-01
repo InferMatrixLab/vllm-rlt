@@ -47,14 +47,16 @@ class Request:
     num_speculative_rounds: int = 0
     input_token_tensor: torch.Tensor | None = field(default=None, repr=False)
     num_prefilled_tokens: int = 0
-    # Split prefill. [num_prefilled_tokens, num_preluded_tokens) is the staged
-    # chunk: its prelude output is resident and it advances one depth per batch.
+    # Split prefill: [num_prefilled_tokens, num_preluded_tokens) has resident
+    # hidden states; wavefront keeps multiple chunks at distinct depths here.
     num_preluded_tokens: int = 0
-    # Start of the resident chunk. It stays fixed while the final depth advances
-    # a partial chunk and is used for runner pool row addressing.
-    prefill_chunk_start: int = 0
     # Split prefill only: per-depth logical prompt frontiers.
     prefill_depth_ranges: list[list[int]] = field(default_factory=list, repr=False)
+    # Wavefront chunk slots are assigned relative to this cached-prefix origin.
+    prefill_window_origin: int = 0
+    # End of the completed prefix and start of the oldest resident chunk. Advance
+    # only after final-depth completion releases that chunk's hidden-state slot.
+    prefill_reclaimable_tokens: int = 0
     # Host-side decode progress; ModelRunner events track pending device work.
     loops_done: int = 0
     pending_exit_depth: int | None = None
@@ -118,8 +120,8 @@ class StateSpan:
     # for boundary-layer KV addressing when required. CODA consumes the final
     # recurrent hidden state; its actual exit depth remains in request.loops_done.
     depth: int
-    # None addresses the request's single resident hidden row. Otherwise the
-    # span addresses [token_start-chunk_start, ...] in its resident chunk.
+    # None lets the runner derive token_start - chunk_start. Otherwise this is a
+    # row offset into the request's prefill hidden-state buffer, including its ring slot.
     chunk_start: int | None = None
     retain_chunk: bool = False
     retain_last: bool = True
@@ -127,6 +129,9 @@ class StateSpan:
     # For chunk PRELUDE, None reads the immutable request prompt range directly.
     # Explicit tokens override that source (also used by direct execution callers).
     input_tokens: tuple[int, ...] | None = None
+    # Row offset in the request's prefill hidden-state buffer. None lets the runner
+    # derive token_start - chunk_start.
+    prefill_hidden_row_offset: int | None = None
 
 
 @dataclass(frozen=True)

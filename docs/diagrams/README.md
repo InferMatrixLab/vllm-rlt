@@ -66,3 +66,23 @@ and available as individual tabs in `index.html`.
 
 Timing and outcomes are illustrative. Preserve safety conditions and distinguish
 request progress, device completion and remote-access lifetime when editing.
+
+## Synchronous versus asynchronous speculation
+
+[async-speculative-timeline.svg](async-speculative-timeline.svg) is the editable
+2700 × 1620 source; `async-speculative-timeline.png` is its 2× raster export.
+It is embedded in [the speculation guide](../async-speculative.md#timeline-synchronous-versus-asynchronous-speculation)
+and available in `index.html`. Both panels follow one request through two rounds
+on the same illustrative time scale, with CPU, `compute_stream` and `copy_stream`
+lanes. Purple blocks match CPU/GPU acceptance; blue Commit blocks show CPU output
+and progress updates. The T guide aligns synchronous Round 1 completion with the
+asynchronous timeline; an arrow marks the earlier asynchronous Round 1 commit.
+The example assumes slightly shorter GPU acceptance, a small first-commit gap,
+and accumulating overlap across rounds. These durations are not measurements.
+CPU wait endpoints align with their result-copy completion. Later submissions and
+buffer reuse are omitted. R0–R3 denote recurrent depths; Round 0 / 1
+denote speculative iterations.
+
+Start/end markers delimit CPU submission through CPU Commit (including async
+ticket retirement); GPU/copy completion events remain separate. The bottom legend
+defines these boundaries and notes the illustrative timing assumptions.

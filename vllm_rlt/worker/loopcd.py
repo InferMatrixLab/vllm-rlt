@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Request
 
@@ -37,7 +38,7 @@ def validate(model, params, execution, cache, scheduler, exit_config, speculativ
     if not execution.loopcd:
         raise ValueError("LoopCD requires ExecutionConfig(loopcd=True) for memory reservation")
     if (
-        not execution.atomic_prefill
+        requires_staged_prefill(scheduler)
         or execution.async_scheduling
         or execution.prefill_uva
         or cache.layout != "last_exited"

@@ -82,8 +82,9 @@ def test_thinking_records_use_the_chat_template_and_eos_only(thinking_records):
 
     tokenizer = SimpleNamespace(
         apply_chat_template=template,
-        encode=lambda text, add_special_tokens=True: ([1] if add_special_tokens else [])
-        + list(map(ord, text)),
+        encode=lambda text, add_special_tokens=True: (
+            ([1] if add_special_tokens else []) + list(map(ord, text))
+        ),
     )
     records, selection = thinking_records(tokenizer)
     assert [row["id"] for row in records] == selection["ids"]

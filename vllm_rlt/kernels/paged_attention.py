@@ -52,3 +52,24 @@ def triton_paged_attention(
     from vllm_rlt.kernels.triton_attention import paged_attention
 
     return paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
+
+
+def triton_paged_prefill(
+    q, key_cache, value_cache, block_tables, context_lengths, cu_seqlens_q, max_seqlen_q
+):
+    """Packed causal prefill with one block table per sequence (see triton_attention)."""
+    from vllm_rlt.kernels.triton_attention import paged_prefill_attention
+
+    return paged_prefill_attention(
+        q, key_cache, value_cache, block_tables, context_lengths, cu_seqlens_q, max_seqlen_q
+    )
+
+
+class TritonPagedAttention:
+    """Triton single-query decode attention plus packed causal prefill."""
+
+    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
+        return triton_paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
+
+    def prefill(self, *args, **kwargs):
+        return triton_paged_prefill(*args, **kwargs)

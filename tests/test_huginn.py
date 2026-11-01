@@ -239,17 +239,34 @@ def test_prefill_populates_history_without_projecting_unused_logits(model, padde
 
 
 @pytest.mark.parametrize(
-    "cache,execution,error",
+    "cache,execution,scheduler,error",
     [
-        (CacheConfig(layout="shared"), ExecutionConfig(), "last_exited"),
-        (CacheConfig(enable_prefix_caching=True), ExecutionConfig(), "prefix caching"),
-        (CacheConfig(), ExecutionConfig(atomic_prefill=False), "atomic prefill"),
-        (CacheConfig(), ExecutionConfig(async_scheduling=True), "synchronous"),
+        (CacheConfig(layout="shared"), ExecutionConfig(), SchedulerConfig(), "last_exited"),
+        (
+            CacheConfig(enable_prefix_caching=True),
+            ExecutionConfig(),
+            SchedulerConfig(),
+            "prefix caching",
+        ),
+        (CacheConfig(), ExecutionConfig(), SchedulerConfig(mode="mixed"), "staged prefill"),
+        (
+            CacheConfig(),
+            ExecutionConfig(async_scheduling=True),
+            SchedulerConfig(),
+            "synchronous",
+        ),
     ],
 )
-def test_unsupported_execution_rejected_before_cache_allocation(model, cache, execution, error):
+def test_unsupported_execution_rejected_before_cache_allocation(
+    model, cache, execution, scheduler, error
+):
     with pytest.raises(ValueError, match=error):
-        LLMEngine(model, cache_config=cache, execution_config=execution)
+        LLMEngine(
+            model,
+            cache_config=cache,
+            execution_config=execution,
+            scheduler_config=scheduler,
+        )
 
 
 @pytest.mark.gpu

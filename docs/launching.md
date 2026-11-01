@@ -5,6 +5,11 @@ response. Commands work in Bash and fish on Linux; use the activation command
 for your shell. Run them in the same terminal unless a step explicitly asks
 you to open another one.
 
+This guide targets **v0.2.0**. Pin the tag below rather than a moving `main`.
+For migration from v0.1.0, read the [changelog](../CHANGELOG.md); Python scripts
+now construct a spawned stage worker and need the guarded example below.
+The release is for research/evaluation, not a production deployment guarantee.
+
 ## 1. Check the machine
 
 Use Linux with Git, curl, [uv](https://docs.astral.sh/uv/getting-started/installation/),
@@ -28,14 +33,25 @@ Keep this environment active for the following steps.
 ## 3. Clone the repository
 
 ```bash
-git clone https://github.com/InferMatrixLab/vllm-rlt.git
+git clone --branch v0.2.0 --depth 1 https://github.com/InferMatrixLab/vllm-rlt.git
 cd vllm-rlt
 ```
 
 ## 4. Install the project
 
+Select your allocated GPU before installation so automatic compilation targets
+the GPU you will use:
+
 ```bash
-uv pip install -e .
+export CUDA_VISIBLE_DEVICES=0
+```
+
+Use your allocated GPU ID in place of `0`. If your job scheduler already sets
+`CUDA_VISIBLE_DEVICES`, keep its value and skip the export.
+
+```bash
+uv pip install "torch>=2.5" setuptools wheel ninja
+uv pip install --no-build-isolation -e .
 python -m vllm_rlt.entrypoints.serve --help
 ```
 
@@ -52,15 +68,35 @@ A100, and H100. There is no CUDA version to select based on the GPU model;
 your NVIDIA driver must support the CUDA runtime supplied with PyTorch.
 FlashAttention and NIXL are optional and are not needed for this guide.
 
-Select your GPU and confirm that PyTorch can use it:
+Confirm that PyTorch can use your GPU:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
 python -c "import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda); assert torch.cuda.is_available(), 'CUDA unavailable'; assert torch.cuda.is_bf16_supported(), 'BF16 required'"
 ```
 
-Use your allocated GPU ID in place of `0`. If your job scheduler already sets
-`CUDA_VISIBLE_DEVICES`, keep its value and skip the export.
+### Automatic native CUDA build
+
+Installation automatically builds Ouro's fused SiLU-and-Mul implementation when
+it finds CUDA-enabled PyTorch, a CUDA toolkit with `nvcc`, and a visible GPU.
+PyTorch finds the toolkit and detects the visible GPUs' target architectures;
+no build switch or architecture setting is required. The NVIDIA driver and
+PyTorch CUDA runtime alone do not provide the compiler; a compatible toolkit
+and C++ compiler must also be installed.
+
+If the requirements are missing, installation reports why the extension was
+skipped and retains the Torch implementation. To add the extension later, install
+the toolkit, keep your allocated GPU visible, and rerun:
+
+```bash
+uv pip install --no-build-isolation -e .
+```
+
+This compiles and installs `vllm_rlt._C` using the environment's existing PyTorch.
+Ouro selects the native kernel automatically for CUDA inputs; no server flag is
+needed. Without the extension, it retains the Torch implementation. After changing
+CUDA or C++ sources, rerun the build command and restart the server or Python
+process. See [native kernel development](kernels.md#build-and-reference-checks)
+for wheel builds, target GPU architectures and GPU validation commands.
 
 ## 5. Download the model and tokenizer
 
@@ -137,10 +173,14 @@ curl --fail-with-body -sS http://127.0.0.1:8000/v1/completions \
     "prompt": "The capital of France is",
     "max_tokens": 32,
     "temperature": 0,
-    "exit_threshold": 0.7,
+    "exit_threshold": 1.0,
     "stream": false
   }'
 ```
+
+The first request uses fixed full depth (`exit_threshold=1.0`) to establish
+the synchronous baseline. Lower thresholds enable adaptive exit and can change
+output quality; the examples below demonstrate that optional behavior.
 
 A successful response contains `choices[0].text`, a `finish_reason`, and `usage`
 with prompt/completion token counts. The exact generated text can vary; checking
@@ -280,10 +320,11 @@ PyTorch/CUDA versions from step 4, and your Git revision (`git rev-parse HEAD`).
 
 ## Choosing scheduling and deployment separately
 
-The default atomic prefill path and loop-yielding prefill use the same execution
-architecture. On supported models with LAST_EXITED KV, the CLI/server flags
-`--mode mixed --no-atomic-prefill` allow compatible prompt and decode recurrence
-to share a batch. This is a batching choice, not PD disaggregation.
+Prompt chunks normally execute their full recurrence depth in one submission.
+On supported models with LAST_EXITED KV, `--mode mixed` lets the scheduler
+insert a depth boundary when decode work can join a prompt recurrent batch.
+`--wavefront-chunked-prefill` enables per-depth chunk regrouping. These are
+batching choices, not PD disaggregation.
 
 Stage roles are `prefill`, `decode` and `prefill_decode`; `mixed` is a scheduling
 mode, not a stage role. Speculation requires refill scheduling and cannot join

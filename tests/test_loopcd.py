@@ -264,10 +264,10 @@ def test_unsupported_admission_rejected_before_request_allocation(case):
         cache_config=CacheConfig(
             num_blocks=256, block_size=2, enable_prefix_caching=case == "prefix"
         ),
-        scheduler_config=SchedulerConfig(enable_preemption=case == "preemption"),
-        execution_config=ExecutionConfig(
-            loopcd=case != "unreserved", atomic_prefill=case != "split"
+        scheduler_config=SchedulerConfig(
+            enable_preemption=case == "preemption", wavefront_chunked_prefill=case == "split"
         ),
+        execution_config=ExecutionConfig(loopcd=case != "unreserved"),
         stage_config=StageConfig(role="prefill" if case == "stage" else "prefill_decode"),
     )
     params = params_for()
@@ -289,8 +289,8 @@ def test_shallow_prefill_capability_checked_before_allocation(feature):
             execution_config=ExecutionConfig(
                 prefill_depth=2,
                 async_scheduling=feature == "async",
-                atomic_prefill=feature != "split",
             ),
+            scheduler_config=SchedulerConfig(wavefront_chunked_prefill=feature == "split"),
             cache_config=CacheConfig(
                 enable_prefix_caching=feature == "prefix",
                 layout="shared" if feature == "shared" else "last_exited",
