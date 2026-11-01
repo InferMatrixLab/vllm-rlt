@@ -1,0 +1,185 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2700" height="1620" viewBox="0 0 2700 1620" role="img" aria-labelledby="title desc">
+<title id="title">Synchronous versus asynchronous speculation: CPU and CUDA streams</title>
+<desc id="desc">Two rounds of the same request on CPU, compute_stream and copy_stream. R0 through R3 are recurrent depths. Synchronous acceptance follows ID readback on CPU. Asynchronous acceptance updates token and position on compute_stream, enabling the next round while copy_stream returns prior results. CPU waits end exactly at their matching readback completion. Times are illustrative.</desc>
+<rect width="2700" height="1620" fill="#f5f8fc"/>
+<defs><marker id="arr-687d93" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M1 1L6 3.5L1 6" fill="none" stroke="#687d93" stroke-width="1.4"/></marker></defs>
+<defs><marker id="arr-2b68a4" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M1 1L6 3.5L1 6" fill="none" stroke="#2b68a4" stroke-width="1.4"/></marker></defs>
+<defs><marker id="arr-237e68" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M1 1L6 3.5L1 6" fill="none" stroke="#237e68" stroke-width="1.4"/></marker></defs>
+<defs><marker id="arr-8058a5" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M1 1L6 3.5L1 6" fill="none" stroke="#8058a5" stroke-width="1.4"/></marker></defs>
+<defs><marker id="arr-a97323" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M1 1L6 3.5L1 6" fill="none" stroke="#a97323" stroke-width="1.4"/></marker></defs>
+<defs><pattern id="wait" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(35)"><rect width="12" height="12" fill="#fff5df"/><path d="M0 0V12" stroke="#eed9ad" stroke-width="3"/></pattern></defs>
+<text x="60" y="60" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#2b68a4" font-weight="700" text-anchor="start">VLLM-RLT  /  SELF-SPECULATION</text>
+<text x="60" y="119" font-family="Arial,Helvetica,sans-serif" font-size="45" fill="#20354d" font-weight="700" text-anchor="start">A small first-round difference. A growing cross-round advantage.</text>
+<text x="60" y="164" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#687d93" font-weight="400" text-anchor="start">Round 0 / 1 = speculative iterations     R0…R3 = recurrent loop depths (example d=2, D=4)</text>
+<rect x="50" y="210" width="2600" height="580" rx="14" fill="#fff" stroke="#dce6ee" stroke-width="1.5"/>
+<text x="80" y="257" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#2b68a4" font-weight="700" text-anchor="start">01   SYNCHRONOUS</text>
+<text x="580" y="257" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#20354d" font-weight="400" text-anchor="start">Each next round waits for CPU acceptance and commit.</text>
+<path d="M400 292H2570" fill="none" stroke="#687d93" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-687d93)"/>
+<text x="2570" y="279" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#687d93" font-weight="400" text-anchor="end">same illustrative time scale →</text>
+<text x="80" y="371" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#20354d" font-weight="700" text-anchor="start">CPU</text>
+<text x="80" y="404" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#687d93" font-weight="400" text-anchor="start">engine / scheduler</text>
+<path d="M400 426H2570" fill="none" stroke="#687d93" stroke-width="1" stroke-linejoin="round"/>
+<text x="80" y="521" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#20354d" font-weight="700" text-anchor="start">compute_stream</text>
+<text x="80" y="554" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#687d93" font-weight="400" text-anchor="start">model + device state</text>
+<path d="M400 576H2570" fill="none" stroke="#687d93" stroke-width="1" stroke-linejoin="round"/>
+<text x="80" y="671" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#20354d" font-weight="700" text-anchor="start">copy_stream</text>
+<text x="80" y="704" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#687d93" font-weight="400" text-anchor="start">result D2H</text>
+<path d="M400 726H2570" fill="none" stroke="#687d93" stroke-width="1" stroke-linejoin="round"/>
+<rect x="50" y="830" width="2600" height="580" rx="14" fill="#fff" stroke="#dce6ee" stroke-width="1.5"/>
+<text x="80" y="877" font-family="Arial,Helvetica,sans-serif" font-size="29" fill="#237e68" font-weight="700" text-anchor="start">02   ASYNCHRONOUS</text>
+<text x="580" y="877" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#20354d" font-weight="400" text-anchor="start">GPU state joins rounds; result copy and CPU commit overlap the next round.</text>
+<path d="M400 912H2570" fill="none" stroke="#687d93" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-687d93)"/>
+<text x="2570" y="899" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#687d93" font-weight="400" text-anchor="end">same illustrative time scale →</text>
+<text x="80" y="991" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#20354d" font-weight="700" text-anchor="start">CPU</text>
+<text x="80" y="1024" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#687d93" font-weight="400" text-anchor="start">engine / scheduler</text>
+<path d="M400 1046H2570" fill="none" stroke="#687d93" stroke-width="1" stroke-linejoin="round"/>
+<text x="80" y="1141" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#20354d" font-weight="700" text-anchor="start">compute_stream</text>
+<text x="80" y="1174" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#687d93" font-weight="400" text-anchor="start">model + device state</text>
+<path d="M400 1196H2570" fill="none" stroke="#687d93" stroke-width="1" stroke-linejoin="round"/>
+<text x="80" y="1291" font-family="Arial,Helvetica,sans-serif" font-size="28" fill="#20354d" font-weight="700" text-anchor="start">copy_stream</text>
+<text x="80" y="1324" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#687d93" font-weight="400" text-anchor="start">result D2H</text>
+<path d="M400 1346H2570" fill="none" stroke="#687d93" stroke-width="1" stroke-linejoin="round"/>
+<path d="M2420 310V1385" fill="none" stroke="#a97323" stroke-width="3" stroke-linejoin="round" stroke-dasharray="6 7"/>
+<text x="2405" y="816" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97323" font-weight="700" text-anchor="end">T · same instant in both panels</text>
+<rect x="380" y="340" width="120" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="440.0" y="387" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#2b68a4" font-weight="700" text-anchor="middle">Submit 0</text>
+<rect x="500" y="340" width="620" height="76" rx="9" fill="url(#wait)" stroke="#a97323" stroke-width="1.5"/>
+<text x="810.0" y="387" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97323" font-weight="700" text-anchor="middle">Collect 0: wait for compute + IDs</text>
+<rect x="1120" y="340" width="140" height="76" rx="9" fill="#eee8f7" stroke="#8058a5" stroke-width="1.5"/>
+<text x="1190.0" y="371" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8058a5" font-weight="700" text-anchor="middle">Accept</text>
+<text x="1190.0" y="399" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#8058a5" font-weight="400" text-anchor="middle">/ update</text>
+<rect x="1260" y="340" width="140" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="1330.0" y="371" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">Commit 0</text>
+<text x="1330.0" y="399" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">outputs / stop</text>
+<text x="760" y="468" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#237e68" font-weight="700" text-anchor="middle">Round 0</text>
+<rect x="500" y="490" width="320" height="76" rx="9" fill="#e5f3ed" stroke="#237e68" stroke-width="1.5"/>
+<text x="660.0" y="521" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Draft</text>
+<text x="660.0" y="549" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="middle">R0 → R1 · repeated</text>
+<rect x="820" y="490" width="200" height="76" rx="9" fill="#cfe8dd" stroke="#237e68" stroke-width="1.5"/>
+<text x="920.0" y="521" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Verify</text>
+<text x="920.0" y="549" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="middle">R2 → R3</text>
+<rect x="1020" y="490" width="100" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="1070.0" y="521" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">IDs</text>
+<text x="1070.0" y="549" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">→ CPU</text>
+<path d="M1120 566V420" fill="none" stroke="#2b68a4" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-2b68a4)" stroke-dasharray="6 7"/>
+<circle cx="1120" cy="566" r="5" fill="#2b68a4"/>
+<rect x="1120" y="490" width="400" height="76" rx="9" fill="url(#wait)" stroke="#a97323" stroke-width="1.5"/>
+<text x="1320.0" y="537" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97323" font-weight="700" text-anchor="middle">GPU waits for CPU</text>
+<path d="M1400 416V455H1520V486" fill="none" stroke="#2b68a4" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arr-2b68a4)"/>
+<rect x="1400" y="340" width="120" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="1460.0" y="387" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#2b68a4" font-weight="700" text-anchor="middle">Submit 1</text>
+<rect x="1520" y="340" width="620" height="76" rx="9" fill="url(#wait)" stroke="#a97323" stroke-width="1.5"/>
+<text x="1830.0" y="387" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97323" font-weight="700" text-anchor="middle">Collect 1: wait for compute + IDs</text>
+<rect x="2140" y="340" width="140" height="76" rx="9" fill="#eee8f7" stroke="#8058a5" stroke-width="1.5"/>
+<text x="2210.0" y="371" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8058a5" font-weight="700" text-anchor="middle">Accept</text>
+<text x="2210.0" y="399" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#8058a5" font-weight="400" text-anchor="middle">/ update</text>
+<rect x="2280" y="340" width="140" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="2350.0" y="371" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">Commit 1</text>
+<text x="2350.0" y="399" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">outputs / stop</text>
+<text x="1780" y="468" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#237e68" font-weight="700" text-anchor="middle">Round 1</text>
+<rect x="1520" y="490" width="320" height="76" rx="9" fill="#e5f3ed" stroke="#237e68" stroke-width="1.5"/>
+<text x="1680.0" y="521" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Draft</text>
+<text x="1680.0" y="549" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="middle">R0 → R1 · repeated</text>
+<rect x="1840" y="490" width="200" height="76" rx="9" fill="#cfe8dd" stroke="#237e68" stroke-width="1.5"/>
+<text x="1940.0" y="521" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Verify</text>
+<text x="1940.0" y="549" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="middle">R2 → R3</text>
+<rect x="2040" y="490" width="100" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="2090.0" y="521" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">IDs</text>
+<text x="2090.0" y="549" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">→ CPU</text>
+<path d="M2140 566V420" fill="none" stroke="#2b68a4" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-2b68a4)" stroke-dasharray="6 7"/>
+<circle cx="2140" cy="566" r="5" fill="#2b68a4"/>
+<rect x="2140" y="490" width="280" height="76" rx="9" fill="url(#wait)" stroke="#a97323" stroke-width="1.5"/>
+<text x="2280.0" y="537" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97323" font-weight="700" text-anchor="middle">GPU waits for CPU</text>
+<circle cx="2420" cy="416" r="5" fill="#a97323"/>
+<path d="M420 678H2550" fill="none" stroke="#687d93" stroke-width="1.5" stroke-linejoin="round" stroke-dasharray="6 7"/>
+<text x="1480" y="669" font-family="Arial,Helvetica,sans-serif" font-size="26" fill="#687d93" font-weight="400" text-anchor="middle">Unused here: synchronous ID readback runs on compute_stream inside collect().</text>
+<text x="80" y="760" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#8058a5" font-weight="700" text-anchor="start">Verify → read IDs → CPU Accept / update → CPU Commit → next Submit → next Draft</text>
+<rect x="380" y="960" width="120" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="440.0" y="991" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#2b68a4" font-weight="700" text-anchor="middle">Submit 0</text>
+<text x="440.0" y="1019" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">buffer 0</text>
+<rect x="500" y="960" width="120" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="560.0" y="991" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#2b68a4" font-weight="700" text-anchor="middle">Submit 1</text>
+<text x="560.0" y="1019" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">buffer 1</text>
+<rect x="620" y="960" width="600" height="76" rx="9" fill="url(#wait)" stroke="#a97323" stroke-width="1.5"/>
+<text x="920.0" y="1007" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#a97323" font-weight="700" text-anchor="middle">Collect 0: wait for copy_done</text>
+<rect x="1220" y="960" width="140" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="1290.0" y="991" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">Commit 0</text>
+<text x="1290.0" y="1019" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">out / retire</text>
+<rect x="1360" y="960" width="480" height="76" rx="9" fill="url(#wait)" stroke="#a97323" stroke-width="1.5"/>
+<text x="1600.0" y="1007" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#a97323" font-weight="700" text-anchor="middle">Collect 1: wait for copy_done</text>
+<rect x="1840" y="960" width="140" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="1910.0" y="991" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">Commit 1</text>
+<text x="1910.0" y="1019" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">out / retire</text>
+<text x="760" y="1088" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#237e68" font-weight="700" text-anchor="middle">Round 0</text>
+<rect x="500" y="1110" width="320" height="76" rx="9" fill="#e5f3ed" stroke="#237e68" stroke-width="1.5"/>
+<text x="660.0" y="1141" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Draft</text>
+<text x="660.0" y="1169" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="middle">R0 → R1 · repeated</text>
+<rect x="820" y="1110" width="200" height="76" rx="9" fill="#cfe8dd" stroke="#237e68" stroke-width="1.5"/>
+<text x="920.0" y="1141" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Verify</text>
+<text x="920.0" y="1169" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="middle">R2 → R3</text>
+<rect x="1020" y="1110" width="100" height="76" rx="9" fill="#eee8f7" stroke="#8058a5" stroke-width="1.5"/>
+<text x="1070.0" y="1141" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8058a5" font-weight="700" text-anchor="middle">Accept</text>
+<text x="1070.0" y="1169" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#8058a5" font-weight="400" text-anchor="middle">/ update</text>
+<rect x="1120" y="1260" width="100" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="1170.0" y="1291" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#2b68a4" font-weight="700" text-anchor="middle">D2H</text>
+<text x="1170.0" y="1319" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">Round 0</text>
+<path d="M1120 1186V1256" fill="none" stroke="#237e68" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arr-237e68)"/>
+<text x="1108" y="1231" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="end">compute_done</text>
+<circle cx="1120" cy="1186" r="5" fill="#237e68"/>
+<path d="M1220 1256V1189" fill="none" stroke="#a97323" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6 7"/>
+<path d="M1220 1105V1040" fill="none" stroke="#a97323" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-a97323)" stroke-dasharray="6 7"/>
+<circle cx="1220" cy="1336" r="5" fill="#a97323"/>
+<text x="1232" y="1372" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#a97323" font-weight="400" text-anchor="start">copy_done · Round 0</text>
+<path d="M1075 1186V1206H1180V1190" fill="none" stroke="#8058a5" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arr-8058a5)"/>
+<text x="1380" y="1088" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#237e68" font-weight="700" text-anchor="middle">Round 1</text>
+<rect x="1120" y="1110" width="320" height="76" rx="9" fill="#e5f3ed" stroke="#237e68" stroke-width="1.5"/>
+<text x="1280.0" y="1141" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Draft</text>
+<text x="1280.0" y="1169" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="middle">R0 → R1 · repeated</text>
+<rect x="1440" y="1110" width="200" height="76" rx="9" fill="#cfe8dd" stroke="#237e68" stroke-width="1.5"/>
+<text x="1540.0" y="1141" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Verify</text>
+<text x="1540.0" y="1169" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="middle">R2 → R3</text>
+<rect x="1640" y="1110" width="100" height="76" rx="9" fill="#eee8f7" stroke="#8058a5" stroke-width="1.5"/>
+<text x="1690.0" y="1141" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#8058a5" font-weight="700" text-anchor="middle">Accept</text>
+<text x="1690.0" y="1169" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#8058a5" font-weight="400" text-anchor="middle">/ update</text>
+<rect x="1740" y="1260" width="100" height="76" rx="9" fill="#e8f1fc" stroke="#2b68a4" stroke-width="1.5"/>
+<text x="1790.0" y="1291" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#2b68a4" font-weight="700" text-anchor="middle">D2H</text>
+<text x="1790.0" y="1319" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#2b68a4" font-weight="400" text-anchor="middle">Round 1</text>
+<path d="M1740 1186V1256" fill="none" stroke="#237e68" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arr-237e68)"/>
+<text x="1728" y="1231" font-family="Arial,Helvetica,sans-serif" font-size="20" fill="#237e68" font-weight="400" text-anchor="end">compute_done</text>
+<circle cx="1740" cy="1186" r="5" fill="#237e68"/>
+<path d="M1840 1256V1189" fill="none" stroke="#a97323" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6 7"/>
+<path d="M1840 1105V1040" fill="none" stroke="#a97323" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr-a97323)" stroke-dasharray="6 7"/>
+<circle cx="1840" cy="1336" r="5" fill="#a97323"/>
+<text x="1852" y="1372" font-family="Arial,Helvetica,sans-serif" font-size="21" fill="#a97323" font-weight="400" text-anchor="start">copy_done · Round 1</text>
+<circle cx="1980" cy="1036" r="5" fill="#237e68"/>
+<path d="M1980 1040V1080H2420V1040" fill="none" stroke="#237e68" stroke-width="2.5" stroke-linejoin="round"/>
+<path d="M2415 1080H1985" fill="none" stroke="#237e68" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr-237e68)"/>
+<text x="2200" y="1062" font-family="Arial,Helvetica,sans-serif" font-size="27" fill="#237e68" font-weight="700" text-anchor="middle">Round 1 ends earlier</text>
+<text x="2200" y="1158" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#20354d" font-weight="700" text-anchor="middle">Round 0: a small gap.</text>
+<text x="2200" y="1230" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#237e68" font-weight="700" text-anchor="middle">Round 1: overlap widens it.</text>
+<path d="M380 332V340" fill="none" stroke="#2b68a4" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="380" cy="340" r="5" fill="#2b68a4"/>
+<text x="392" y="324" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="start">Round 0 start</text>
+<path d="M1400 332V340" fill="none" stroke="#2b68a4" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="1400" cy="340" r="5" fill="#2b68a4"/>
+<text x="1400" y="324" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">Round 0 end / Round 1 start</text>
+<path d="M2420 332V340" fill="none" stroke="#a97323" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="2420" cy="340" r="5" fill="#a97323"/>
+<text x="2408" y="324" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#a97323" font-weight="700" text-anchor="end">Round 1 end · T</text>
+<path d="M380 952V960" fill="none" stroke="#2b68a4" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="380" cy="960" r="5" fill="#2b68a4"/>
+<text x="368" y="944" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="end">Round 0 start</text>
+<path d="M500 952V960" fill="none" stroke="#2b68a4" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="500" cy="960" r="5" fill="#2b68a4"/>
+<text x="512" y="944" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="start">Round 1 start</text>
+<path d="M1360 952V960" fill="none" stroke="#2b68a4" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="1360" cy="960" r="5" fill="#2b68a4"/>
+<text x="1360" y="944" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">Round 0 end</text>
+<path d="M1980 952V960" fill="none" stroke="#2b68a4" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="1980" cy="960" r="5" fill="#2b68a4"/>
+<text x="1980" y="944" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#2b68a4" font-weight="700" text-anchor="middle">Round 1 end</text>
+<text x="80" y="1455" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#20354d" font-weight="400" text-anchor="start">Start = CPU begins submit. End = CPU finishes Commit (async: includes ticket retirement). These markers cover the round’s host-visible lifetime.</text>
+<text x="80" y="1497" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#20354d" font-weight="400" text-anchor="start">compute_done = GPU work finished; copy_done = result D2H finished. Neither alone means Round End. Async round lifetimes overlap; GPU rounds stay ordered.</text>
+<text x="80" y="1539" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#687d93" font-weight="400" text-anchor="start">Round 0 / 1 = speculative iterations; R0…R3 = recurrent depths. Commit records outputs / progress and checks EOS / length; buffer reuse follows retirement.</text>
+<text x="80" y="1581" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#687d93" font-weight="400" text-anchor="start">Illustrative, not measured: slightly shorter GPU acceptance; equal Draft / Verify widths. Greedy · warm · multi_stream=True · bootstrap / cold capture omitted.</text>
+</svg>

@@ -12,6 +12,13 @@ PRELUDE prepares token hidden states. RECURRENT traverses the shared transformer
 core at a selected depth. CODA consumes the final hidden state and produces
 vocabulary logits. Some models also have attention/KV in prelude or coda.
 
+`ModelRunner.submit()` and `SpeculativeRunner.submit()` return execution tickets whose
+`collect()` method yields a typed `ModelRunnerOutput` after readback (`SpeculativeRunner.execute()`
+also returns `ModelRunnerOutput` directly). `Scheduler` applies completed results through
+`update_from_output()` and records asynchronous submissions through
+`update_after_submission()`, while `StageEngine` coordinates submission,
+pending tickets, connector hooks, and retirement.
+
 Prompt tokens run the full recurrent depth. Atomic prefill executes a chunk's
 prelude and recurrence in one submission; split prefill exposes intermediate
 scheduling boundaries. The final prompt hidden state produces the first output

@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Questions
-    url: https://github.com/ThinkFlowLab/vllm-rlt#contributing
+    url: https://github.com/InferMatrixLab/vllm-rlt#contributing
     about: Ask questions and discuss with other vllm-rlt developers in the WeChat developer group (QR code in the Contributing section of the README).

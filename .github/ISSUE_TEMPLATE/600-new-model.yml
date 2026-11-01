@@ -7,9 +7,9 @@ body:
 - type: markdown
   attributes:
     value: >
-      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+).
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/InferMatrixLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+).
 
-      #### vllm-rlt currently supports recurrent language models such as **ByteDance/Ouro-1.4B**. The [design notes](https://github.com/ThinkFlowLab/vllm-rlt/blob/main/docs/design.md) describe the engine architecture and the model contract.
+      #### vllm-rlt currently supports recurrent language models such as **ByteDance/Ouro-1.4B**. The [design notes](https://github.com/InferMatrixLab/vllm-rlt/blob/main/docs/design.md) describe the engine architecture and the model contract.
 - type: textarea
   attributes:
     label: The model to consider.
@@ -41,5 +41,5 @@ body:
   attributes:
     label: Before submitting a new issue...
     options:
-      - label: Make sure you already searched for relevant issues in the [issue tracker](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+), and looked for the answer in the [documentation](https://github.com/ThinkFlowLab/vllm-rlt/tree/main/docs).
+      - label: Make sure you already searched for relevant issues in the [issue tracker](https://github.com/InferMatrixLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+), and looked for the answer in the [documentation](https://github.com/InferMatrixLab/vllm-rlt/tree/main/docs).
         required: true

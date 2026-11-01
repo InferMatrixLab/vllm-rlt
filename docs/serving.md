@@ -42,9 +42,12 @@ remain separate from the stage-local model execution contract.
 
 Mixed scheduling means batching compatible prompt/decode recurrent work within
 one stage. It does not mean a worker role, and PD does not require it. For
-supported models, select it with `--mode mixed --no-atomic-prefill` and
-LAST_EXITED KV. PD can configure speculative decoding on the decode stage, but
-mixed scheduling and speculative rounds are not a supported combination.
+supported models, select it with `--mode mixed` and LAST_EXITED KV; the
+scheduler chooses depth boundaries when decode work can join a recurrent batch.
+Add `--wavefront-chunked-prefill` to batch ready prompt chunks from different
+recurrent depths; PD can enable this on its prefill scheduler.
+Speculative decoding requires refill scheduling and cannot join mixed recurrent
+batches. PD can configure speculation on its decode stage.
 See [runtime configuration](runtime.md#execution-batches-and-mixed-scheduling)
 for constraints and [the architecture](unified_execution.md) for ownership.
 
@@ -189,7 +192,7 @@ concurrency semaphore and ends at the last choice event, excluding client-side
 queueing and the usage/`[DONE]` tail. The historical offline M1 harness instead timestamps
 engine enqueue/steps and excludes HTTP/tokenization; the values are not
 interchangeable. The M1 harness has been removed; see the
-[archived baseline report](https://github.com/hsliuustc0106/vllm-rlt/blob/5bee22950357d93e3f7a3c6c87b8fbed004c9296/docs/benchmarks/m1-20260910.md)
+[archived baseline report](https://github.com/InferMatrixLab/vllm-rlt/blob/5bee22950357d93e3f7a3c6c87b8fbed004c9296/docs/benchmarks/m1-20260910.md)
 for its measurement scope.
 
 ## Validation

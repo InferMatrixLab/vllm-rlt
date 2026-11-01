@@ -280,6 +280,57 @@ def test_triton_fp8_store_matches_quantize_fp8_bitwise():
         assert not code.float()[untouched].any() and bool((scale[untouched] == 1).all())
 
 
+@pytest.mark.gpu
+def test_triton_fp8_store_skips_masked_and_inactive_rows():
+    # The device-masked writes used by speculative verification and bucketed CUDA graphs.
+    from vllm_rlt.kernels.triton_attention import store_fp8
+
+    torch.manual_seed(4)
+    pages, block, kv_heads, head_dim, rows, active = 6, 8, 2, 64, 10, 7
+    shape = (pages, block, kv_heads, head_dim)
+    codes = [torch.zeros(shape, device="cuda", dtype=torch.float8_e4m3fn) for _ in range(2)]
+    scales = [torch.ones(shape[:-1], device="cuda") for _ in range(2)]
+    slots = torch.randperm(pages * block, device="cuda")[:rows]
+    blocks, offsets = slots // block, slots % block
+    k = torch.randn(rows, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(rows, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    mask = torch.tensor([1, 0, 1, 1, 0, 1, 1, 1, 1, 1], device="cuda", dtype=torch.bool)
+    count = torch.tensor(active, device="cuda", dtype=torch.int32)
+    store_fp8(k, v, *codes, *scales, blocks, offsets, FP8_E4M3_MAX, mask=mask, active=count)
+    written = mask.clone()
+    written[active:] = False
+    for x, code, scale in zip((k, v), codes, scales):
+        want_codes, want_scale = quantize_fp8(x)
+        assert torch.equal(code[blocks, offsets][written].float(), want_codes[written].float())
+        assert torch.equal(scale[blocks, offsets][written], want_scale[written])
+        assert not code[blocks, offsets][~written].float().any()
+        assert bool((scale[blocks, offsets][~written] == 1).all())
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_triton_fp8_prefill_matches_dequantized_prefill(dtype):
+    from vllm_rlt.kernels.triton_attention import paged_prefill_attention
+
+    torch.manual_seed(5)
+    pages, block, kv_heads, heads, head_dim = 40, 16, 2, 8, 128
+    codes, scale = quantize_fp8(torch.randn(pages, block, kv_heads, head_dim, device="cuda"))
+    # Block 0 is never mapped: its NaN codes (e4m3fn 0x7F) must not reach any output.
+    codes[0].view(torch.uint8).fill_(0x7F)
+    dense = dequantize_fp8(codes, scale, dtype)
+    tables = torch.randint(1, pages, (3, 12), device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([70, 5, 150], device="cuda", dtype=torch.int32)
+    query_lengths = torch.tensor([70, 3, 64], device="cuda", dtype=torch.int32)
+    cu = torch.zeros(4, device="cuda", dtype=torch.int32)
+    cu[1:] = query_lengths.cumsum(0)
+    q = torch.randn(int(cu[-1]), heads, head_dim, device="cuda", dtype=dtype)
+    args = (tables, lengths, cu, int(query_lengths.max()))
+    got = paged_prefill_attention(q, codes, codes, *args, scale, scale)
+    want = paged_prefill_attention(q, dense, dense, *args)
+    assert torch.isfinite(got.float()).all()
+    torch.testing.assert_close(got.float(), want.float(), rtol=1e-2, atol=1e-2)
+
+
 def run_cuda_engine(model, backend, execution, traces, prompts, kv_cache_dtype="fp8_e4m3"):
     engine = LLMEngine(
         model,

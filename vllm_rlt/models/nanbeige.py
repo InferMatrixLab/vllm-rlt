@@ -273,6 +273,7 @@ class NanbeigeForCausalLM(nn.Module):
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
+        config: NanbeigeConfig | None = None,
     ) -> "NanbeigeForCausalLM":
         """Stream strictly checked safetensors into a meta model; never execute Hub code."""
         from safetensors import safe_open
@@ -285,7 +286,10 @@ class NanbeigeForCausalLM(nn.Module):
 
             source, revision, _ = resolve_model_config(path_or_repo, revision=revision)
             folder = Path(source)
-        config = NanbeigeConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        if config is None:
+            config = NanbeigeConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        elif not isinstance(config, NanbeigeConfig):
+            raise TypeError("config must be a NanbeigeConfig")
         index_path = folder / "model.safetensors.index.json"
         index = json.loads(index_path.read_text())["weight_map"] if index_path.is_file() else None
         if index is None:

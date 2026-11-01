@@ -209,7 +209,7 @@ ordering and lifetime behavior independently of this performance diagnosis.
 ### Evidence and reproduction
 
 Run-specific commands, artifact locations and source/model/tokenizer identities
-are recorded in [PR #66](https://github.com/ThinkFlowLab/vllm-rlt/pull/66).
+are recorded in [PR #66](https://github.com/InferMatrixLab/vllm-rlt/pull/66).
 The measurements above specify the workload, mode order, warmup, timing boundaries
 and comparison controls. The commands in [Validation](async-speculative.md#validation) remain the supported GPU
 regression entry points; the experiment's diagnostic scripts are not supported

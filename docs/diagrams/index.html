@@ -18,6 +18,7 @@
 <button role="tab" id="tab-scheduler-async-detail" aria-controls="scheduler-async-detail" aria-selected="false" data-panel="scheduler-async-detail">05 · Asynchronous execution and safe buffer reuse</button>
 <button role="tab" id="tab-scheduler-stage-handoff-detail" aria-controls="scheduler-stage-handoff-detail" aria-selected="false" data-panel="scheduler-stage-handoff-detail">06 · Request handoff between reusable stages</button>
 <button role="tab" id="tab-stage-components" aria-controls="stage-components" aria-selected="false" data-panel="stage-components">07 · Stage structure</button>
+<button role="tab" id="tab-async-speculative-timeline" aria-controls="async-speculative-timeline" aria-selected="false" data-panel="async-speculative-timeline">08 · Sync vs async speculation</button>
 </nav>
 <div class="legend"><span><i class="dot blue"></i>Engine and scheduling</span><span><i class="dot green"></i>On-device execution</span><span><i class="dot purple"></i>Request and KV state</span><span><i class="dot orange"></i>Cross-stage handoff</span></div>
 <section class="panel card" id="architecture" role="tabpanel" aria-labelledby="tab-architecture" >
@@ -48,6 +49,10 @@
 <div class="bar"><h2>Stage structure</h2><div class="links"><a href="stage-components.svg" target="_blank" rel="noopener">Open SVG</a><a href="stage-components.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
 <div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom Stage structure"></label><output>100%</output><button class="fit">Fit width</button></div>
 <div class="canvas"><img src="stage-components.svg" alt="Stage structure"></div></section>
+<section class="panel card" id="async-speculative-timeline" role="tabpanel" aria-labelledby="tab-async-speculative-timeline" hidden>
+<div class="bar"><div><h2>Synchronous vs asynchronous speculation</h2><p class="desc">The same request and time scale: CPU acceptance between rounds versus device-owned progress with overlapping result delivery.</p></div><div class="links"><a href="async-speculative-timeline.svg" target="_blank" rel="noopener">Open SVG</a><a href="async-speculative-timeline.png" target="_blank" rel="noopener">High-resolution PNG</a></div></div>
+<div class="tools"><label>Zoom <input type="range" min="60" max="200" value="100" step="10" aria-label="Zoom asynchronous speculation"></label><output>100%</output><button class="fit">Fit width</button><a href="../async-speculative.md#timeline-synchronous-versus-asynchronous-speculation">Read the timeline</a></div>
+<div class="canvas"><img src="async-speculative-timeline.svg" alt="Synchronous and asynchronous speculative rounds compared on one time scale, showing GPU gaps, CPU versus GPU acceptance, result copies, and buffer retirement."></div></section>
 <p class="foot">Rendered offline; no network or Mermaid plugin required. For limitations, including arbitrary launch topologies and PD with speculation, see the <a href="../unified_execution.md">architecture guide</a>.</p>
 </main>
 <script>

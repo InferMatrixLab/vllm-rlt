@@ -1,11 +1,19 @@
-from dataclasses import replace
+import logging
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 from vllm_rlt.attention import BackendCapabilities, create_backend
-from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt.config import (
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    SchedulerConfig,
+    resolve_cuda_graph_rows,
+)
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
-from vllm_rlt.core.scheduler import PrefillProgress, Scheduler
+from vllm_rlt.core.scheduler import Scheduler
+from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.engine.connector import StageConnector
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
@@ -14,11 +22,20 @@ from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
 from vllm_rlt.worker.executor import Executor
 from vllm_rlt.worker.model_runner import ModelRunner
+from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry
 from vllm_rlt.worker.speculative import SpeculativeRunner
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from vllm_rlt.worker.async_speculative import AsyncSpeculativeRunner
+
+
+@dataclass(frozen=True)
+class SignalHandle:
+    ticket: object
+    row: int
 
 
 class StageEngine:
@@ -50,15 +67,25 @@ class StageEngine:
             if cache_config.enable_prefix_caching:
                 raise ValueError("Huginn prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
-        self.execution_config = execution_config or ExecutionConfig()
+        self.execution_config = resolve_cuda_graph_rows(
+            execution_config or ExecutionConfig(), scheduler_config, speculative_config
+        )
+        staged_prefill = requires_staged_prefill(
+            scheduler_config, produces_tokens=self.stage_config.produces_tokens
+        )
         if getattr(model, "requires_boundary_kv", False):
-            if not self.execution_config.atomic_prefill:
-                raise ValueError("Huginn requires atomic prefill")
+            if staged_prefill:
+                raise ValueError(
+                    "Huginn does not support staged prefill required by this scheduler"
+                )
             if self.execution_config.async_scheduling or self.execution_config.prefill_uva:
                 raise ValueError("Huginn requires synchronous scheduling without prefill UVA")
             if speculative_config is not None:
                 raise ValueError("Huginn speculative decoding is not yet supported")
         self.speculative_config = speculative_config
+        self.pipeline_speculative = bool(
+            speculative_config and speculative_config.mode == "pipeline"
+        )
         self.async_speculative = bool(speculative_config and self.execution_config.async_scheduling)
         if speculative_config is not None:
             if cache_config.layout != "last_exited":
@@ -69,7 +96,11 @@ class StageEngine:
                 raise ValueError("speculative decoding requires fixed-depth ouro exit mode")
             if self.async_speculative and parameter.device.type != "cuda":
                 raise ValueError("async speculative decoding requires CUDA")
-            if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
+            if scheduler_config.mode != "refill" or (
+                self.async_speculative
+                and not self.pipeline_speculative
+                and scheduler_config.enable_preemption
+            ):
                 raise ValueError(
                     "speculative decoding requires refill scheduling without preemption"
                 )
@@ -92,6 +123,22 @@ class StageEngine:
             )
         if self.execution_config.cuda_graphs and parameter.device.type != "cuda":
             raise ValueError("CUDA graphs require CUDA with Triton or FlashAttention")
+        if self.execution_config.cuda_graphs and speculative_config is not None:
+            rows = min(
+                scheduler_config.max_num_seqs * (speculative_config.num_speculative_tokens + 1),
+                scheduler_config.max_num_batched_tokens,
+            )
+            if rows > self.execution_config.cuda_graph_max_batch_size:
+                logger.warning(
+                    "CUDA Graph row limit %d cannot cover %d verification rows "
+                    "(max_num_seqs=%d, K=%d); larger batches run eager. "
+                    "Raise cuda_graph_max_batch_size, or leave it unset to cover them, "
+                    "and budget additional graph memory.",
+                    self.execution_config.cuda_graph_max_batch_size,
+                    rows,
+                    scheduler_config.max_num_seqs,
+                    speculative_config.num_speculative_tokens,
+                )
         if self.execution_config.async_scheduling:
             if not self.async_speculative and self.exit_config.mode not in (
                 "ouro_delayed",
@@ -105,9 +152,8 @@ class StageEngine:
             parameter.device.type != "cuda" or cache_config.layout != "last_exited"
         ):
             raise ValueError("prefill_uva requires CUDA packed prefill with last_exited KV")
-        if not self.execution_config.atomic_prefill:
-            if cache_config.layout != "last_exited":
-                raise ValueError("split prefill requires last_exited KV planes")
+        if staged_prefill and cache_config.layout != "last_exited":
+            raise ValueError("staged prefill requires last_exited KV planes")
         attention = create_backend(
             attention_backend,
             parameter.device,
@@ -130,6 +176,8 @@ class StageEngine:
             scheduler_config,
             self.execution_config,
             attention.info["selected_backend"],
+            speculative=speculative_config,
+            staged_prefill=staged_prefill,
         )
         self.cache_manager = KVCacheManager(
             num_layers=config.num_hidden_layers,
@@ -153,8 +201,10 @@ class StageEngine:
             scheduler_config,
             self.cache_manager,
             speculative_config,
-            atomic_prefill=self.execution_config.atomic_prefill,
             produces_tokens=self.stage_config.produces_tokens,
+            total_ut_steps=config.total_ut_steps,
+            eos_token_id=config.eos_token_id,
+            exit_mode=self.exit_config.mode,
         )
         self.connector = connector
         # One RNG registry per engine, shared by both runners: the CODA and
@@ -167,6 +217,7 @@ class StageEngine:
             exit_config=self.exit_config,
             execution_config=self.execution_config,
             scheduler_config=scheduler_config,
+            staged_prefill=self.scheduler.staged_prefill,
             rng=self.rng,
         )
         self.speculative_runner = (
@@ -202,7 +253,7 @@ class StageEngine:
         self._exit_traces = {
             key: tuple(values) for key, values in (self.exit_config.depths_by_request or {}).items()
         }
-        # Unconsumed exit scores: request ID -> (submission, row, token position, depth).
+        # Unconsumed exit scores: request ID -> SignalHandle.
         # Delayed policies consume the preceding loop's score after submitting the next.
         self._pending_exit_signals = {}
         self._pending_coda = []
@@ -227,6 +278,10 @@ class StageEngine:
             if connector is not None or not self.stage_config.produces_tokens
             else None
         )
+        self.scheduler.exports_request = self._exports_request if connector is not None else None
+
+    def _exports_request(self, request):
+        return self._connector.exports(request)
 
     def _execution_ready(self, request):
         if not self.stage_config.produces_tokens:
@@ -256,8 +311,12 @@ class StageEngine:
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
-        if self.async_speculative and params.temperature != 0:
-            raise ValueError("async speculative decoding currently requires greedy sampling")
+        if (
+            self.async_speculative
+            or (self.speculative_config and self.speculative_config.mode == "pipeline")
+        ) and params.temperature != 0:
+            mode = "async" if self.async_speculative else "pipeline"
+            raise ValueError(f"{mode} speculative decoding currently requires greedy sampling")
         if request_id in self._retiring_speculative:
             self._retire_speculative(wait=True, request_id=request_id)
         config = self.model.config
@@ -361,6 +420,8 @@ class StageEngine:
             self._finish(request, FinishReason.ABORT)
             return RequestOutput.from_request(request)
         self.preemption.discard_snapshot(request_id)
+        if self.speculative_runner is not None:
+            self.speculative_runner.release(request)
         self.model_runner.release(request_id)
         self._pending_exit_signals.pop(request_id, None)
         return RequestOutput.from_request(self.scheduler.abort(request_id))
@@ -434,39 +495,6 @@ class StageEngine:
                     self.abort_request(scheduled_request.request.request_id)
             raise
 
-    def _update_speculative(self, batch, results):
-        outputs = []
-        for scheduled_request, result in zip(batch.requests, results):
-            request = scheduled_request.request
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-            emitted = 0
-            reason = None
-            for token in result.token_ids:
-                request.generated_token_ids.append(token)
-                request.exit_depths.append(self.speculative_config.target_loops)
-                emitted += 1
-                if token in eos_ids and not params.ignore_eos:
-                    reason = FinishReason.STOP
-                    break
-                if len(request.generated_token_ids) >= params.max_tokens:
-                    reason = FinishReason.LENGTH
-                    break
-            self.speculative_runner.stats.committed_tokens += emitted
-            self.speculative_runner.stats.accepted_tokens += min(result.accepted_count, emitted)
-            if reason is not None:
-                self._finish(request, reason)
-            else:
-                # The last emitted token is correction/bonus, not yet forwarded.
-                self.cache_manager.truncate_suffix(
-                    request.request_id, scheduled_request.token_start + emitted
-                )
-                request.loops_done = 0
-                self.scheduler.enqueue(request, RequestPhase.SPECULATIVE)
-            outputs.append(RequestOutput.from_request(request))
-        return outputs
-
     def _schedule(self, *, prefer_recurrent=False):
         self._connector_blocked.clear()
         return self.scheduler.schedule(prefer_recurrent=prefer_recurrent)
@@ -492,43 +520,23 @@ class StageEngine:
             for r in self.scheduler.requests.values()
         )
 
-    def _prompt_destination(self, request):
-        exporting = self.connector is not None and self.connector.exports(request)
-        return RequestPhase.TRANSFERRING if exporting else RequestPhase.CODA
-
-    def _apply_prefill_progress(self, batch, scheduled_request):
-        """One prompt frontier update for local and remotely consumed outputs."""
+    def _notify_connector_prefill(self, scheduled_request, phase, progress):
         request = scheduled_request.request
-        phase = batch.phase_for(scheduled_request)
-        event = self.model_runner.events.get(request.request_id)
-        if phase == RequestPhase.PREFILL:
-            request.num_prefilled_tokens += scheduled_request.token_count
-            final = request.num_prefilled_tokens == len(request.prompt_token_ids)
-            self.cache_manager.publish_prefix(
-                request.request_id, request.prompt_token_ids, request.num_prefilled_tokens, event
-            )
-            if final:
-                request.loops_done = self.model.config.total_ut_steps
-            self.scheduler.enqueue(
-                request, self._prompt_destination(request) if final else RequestPhase.PREFILL
-            )
-            progress = PrefillProgress(True, final)
-            start = scheduled_request.token_start
-        else:
-            progress = self._apply_split_prefill_progress(
-                request, phase, scheduled_request, event=event
-            )
-            start = scheduled_request.chunk_start
         if self.connector is not None and self.connector.exports(request):
             self.connector.prefill_submitted(
                 request,
                 phase=phase,
-                start=start,
+                start=(
+                    scheduled_request.token_start
+                    if phase == RequestPhase.PREFILL
+                    else progress.transfer_start
+                    if progress.transfer_start is not None
+                    else scheduled_request.chunk_start
+                ),
                 progress=progress,
-                event=event,
+                event=self.model_runner.events.get(request.request_id),
                 stream=self.model_runner.core_stream,
             )
-        return progress
 
     def reserve_transfer(
         self, request_id, prompt_token_ids, sampling_params, *, receiving, trace_id=None
@@ -551,7 +559,8 @@ class StageEngine:
         count = len(prompt_token_ids)
         hit = plan.cached_tokens
         request.num_prefilled_tokens = request.num_preluded_tokens = hit
-        request.prefill_chunk_start = hit
+        request.prefill_window_origin = hit
+        request.prefill_reclaimable_tokens = hit
         request.prefill_depth_ranges[:] = Request.prefill_boundaries(
             count, self.model.config.total_ut_steps, start=hit
         )
@@ -618,6 +627,8 @@ class StageEngine:
         self.cache_manager.mark_imported_prefix(request.request_id, count, start=cached_tokens)
         self.cache_manager.publish_prefix(request.request_id, request.prompt_token_ids, count)
         request.num_prefilled_tokens = request.num_preluded_tokens = count
+        request.prefill_window_origin = count
+        request.prefill_reclaimable_tokens = count
         request.loops_done = self.model.config.total_ut_steps
         request.hidden_state = hidden
         # Keep RECEIVING until the scheduler grants a compute slot. The lease
@@ -625,64 +636,17 @@ class StageEngine:
         self.scheduler.queues[RequestPhase.WAITING].append(request.request_id)
         return True
 
-    def _apply_split_prefill_progress(
-        self, request, phase, scheduled_request, *, event=None
-    ) -> PrefillProgress:
-        """Advance host-side logical progress for a submitted prefill request.
-
-        The device work may still be pending. The event orders prefix publication
-        and consumers with that work; this transition does not wait for it.
-        """
-        total_depths = self.model.config.total_ut_steps
-        start = scheduled_request.token_start
-        end = start + scheduled_request.token_count
-
-        if phase == RequestPhase.PREFILLING_PRELUDE:
-            request.prefill_chunk_start = start
-            request.num_preluded_tokens = end
-            self.scheduler.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
-            return PrefillProgress(False, False)
-
-        # Assertion: stage == RequestPhase.PREFILLING_RECURRENT
-        depth = scheduled_request.depth
-        boundaries = request.prefill_depth_ranges
-        boundaries[depth][0] = end
-        if depth + 1 < total_depths:
-            boundaries[depth + 1][1] = end
-        else:
-            request.num_prefilled_tokens = end
-
-        chunk_complete = end == request.num_preluded_tokens
-        if depth + 1 < total_depths or not chunk_complete:
-            self.scheduler.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
-            return PrefillProgress(False, False)
-
-        self.cache_manager.publish_prefix(
-            request.request_id,
-            request.prompt_token_ids,
-            request.num_prefilled_tokens,
-            event,
-        )
-        request.prefill_chunk_start = end
-        prompt_complete = end == len(request.prompt_token_ids)
-        if prompt_complete:
-            request.loops_done = total_depths
-            next_stage = self._prompt_destination(request)
-        else:
-            next_stage = RequestPhase.PREFILLING_PRELUDE
-        self.scheduler.enqueue(request, next_stage)
-        return PrefillProgress(True, prompt_complete)
-
     def _rewind_split_prefill(self, request):
         """Rewind an in-flight chunk; the caller rebuilds its queue membership."""
-        if self.execution_config.atomic_prefill or request.phase not in (
+        if request.phase not in (
             RequestPhase.PREFILLING_PRELUDE,
             RequestPhase.PREFILLING_RECURRENT,
         ):
             return
         frontier = request.num_prefilled_tokens
         request.num_preluded_tokens = frontier
-        request.prefill_chunk_start = frontier
+        request.prefill_window_origin = frontier
+        request.prefill_reclaimable_tokens = frontier
         request.prefill_depth_ranges[:] = Request.prefill_boundaries(
             len(request.prompt_token_ids),
             self.model.config.total_ut_steps,
@@ -690,75 +654,29 @@ class StageEngine:
         )
         request.phase = RequestPhase.PREFILLING_PRELUDE
 
-    def _update(self, batch, result) -> list[RequestOutput]:
-        if batch.is_speculative:
-            return self._update_speculative(batch, result)
-        outputs = []
-        for index, scheduled_request in enumerate(batch.requests):
-            request = scheduled_request.request
-            # Ignore results for a request that is no longer registered: it may
-            # have been cancelled, or its ID may now belong to a new Request.
-            # Compare object identity so an old result cannot update the new request.
-            if self.scheduler.requests.get(request.request_id) is not request:
-                continue
-            phase = batch.phase_for(scheduled_request)
-            params = request.sampling_params
-            if phase in (
-                RequestPhase.PREFILL,
-                RequestPhase.PREFILLING_PRELUDE,
-                RequestPhase.PREFILLING_RECURRENT,
-            ):
-                self._apply_prefill_progress(batch, scheduled_request)
-            elif phase == RequestPhase.PRELUDE:
-                request.loops_done = 0
-                request.remaining_probability = 1.0
-                request.pending_exit_depth = None
-                self._pending_exit_signals.pop(request.request_id, None)
-                self.scheduler.enqueue(request, RequestPhase.RECURRENT)
-            elif phase == RequestPhase.RECURRENT:
-                request.loops_done += 1
-                if self.exit_config.mode == "trace":
-                    should_exit = self._trace_exit(request)
-                elif self.exit_config.mode == "ouro":
-                    request.remaining_probability *= 1.0 - result[index]
-                    should_exit = self._should_exit(request)
-                else:
-                    should_exit = self._delayed_exit(request, result[index])
-                if should_exit:
-                    self.model_runner.finalize(request)
-                    self.scheduler.enqueue(request, RequestPhase.CODA)
-                else:
-                    self.scheduler.enqueue(request, RequestPhase.RECURRENT)
-            elif phase == RequestPhase.CODA:
-                token_id = result[index]
-                request.generated_token_ids.append(token_id)
-                request.exit_depths.append(request.loops_done)
-                eos = self.model.config.eos_token_id
-                eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-                if token_id in eos_ids and not params.ignore_eos:
-                    self._finish(request, FinishReason.STOP)
-                elif len(request.generated_token_ids) >= params.max_tokens:
-                    self._finish(request, FinishReason.LENGTH)
-                else:
-                    self.scheduler.enqueue(
-                        request,
-                        RequestPhase.SPECULATIVE
-                        if self.speculative_config
-                        else RequestPhase.PRELUDE,
-                    )
-                outputs.append(RequestOutput.from_request(request))
-        return outputs
+    def _apply_update(self, update) -> list[RequestOutput]:
+        for scheduled_request, phase, progress in update.prefill:
+            self._notify_connector_prefill(scheduled_request, phase, progress)
+        if update.exited:
+            self.model_runner.finalize_many(update.exited)
+        if self.speculative_runner is not None:
+            self.speculative_runner.stats.committed_tokens += update.committed_tokens
+            self.speculative_runner.stats.accepted_tokens += update.accepted_tokens
+        for request in update.finished:
+            self._finish(request, request.finish_reason)
+        return [RequestOutput.from_request(request) for request in update.outputs]
 
-    def _should_exit(self, request: Request) -> bool:
-        """Evaluate the policy after recording the completed loop's actual hazard."""
-        params = request.sampling_params
-        max_loops = params.max_loops or self.model.config.total_ut_steps
-        reached_threshold = (
-            params.exit_threshold < 1.0
-            and request.loops_done >= params.min_loops
-            and 1.0 - request.remaining_probability >= params.exit_threshold
+    def _update(
+        self, batch, result: ModelRunnerOutput | None, *, delivered: bool = False
+    ) -> list[RequestOutput]:
+        return self._apply_update(
+            self.scheduler.update_from_output(
+                batch,
+                result,
+                request_events=self.model_runner.events,
+                delivered=delivered,
+            )
         )
-        return request.loops_done >= max_loops or reached_threshold
 
     def _finish(self, request, reason: FinishReason):
         if self.async_speculative:
@@ -771,6 +689,8 @@ class StageEngine:
                     queue.remove(request.request_id)
             self._retiring_speculative[request.request_id] = request
             return
+        if self.speculative_runner is not None:
+            self.speculative_runner.release(request)
         self.model_runner.release(request.request_id)
         self.cache_manager.poll_prefixes()
         self._pending_exit_signals.pop(request.request_id, None)
@@ -795,14 +715,9 @@ class StageEngine:
         runner = cast("AsyncSpeculativeRunner", self.speculative_runner)
         if not ticket.ready():
             runner.readback_waits += 1
-        results, frontiers = ticket.collect()
-        outputs = []
-        for scheduled_request, state, round_id, result, frontier in zip(
-            ticket.batch.requests,
-            ticket.states,
-            ticket.rounds,
-            results,
-            frontiers,
+        result = ticket.collect()
+        for scheduled_request, state, round_id in zip(
+            ticket.batch.requests, ticket.states, ticket.rounds
         ):
             request = scheduled_request.request
             if (
@@ -814,36 +729,7 @@ class StageEngine:
             if state.delivered != round_id:
                 raise RuntimeError("out-of-order speculative round delivery")
             state.delivered += 1
-            request.num_output_placeholders -= scheduled_request.token_count
-            request.num_speculative_rounds -= 1
-            if request.num_output_placeholders < 0 or request.num_speculative_rounds < 0:
-                raise RuntimeError("invalid speculative reservation count")
-            expected = len(request.prompt_token_ids) + len(request.generated_token_ids) - 1
-            if frontier != expected + len(result.token_ids):
-                raise RuntimeError("speculative GPU frontier disagrees with committed prefix")
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-            emitted = 0
-            for token in result.token_ids:
-                request.generated_token_ids.append(token)
-                request.exit_depths.append(self.speculative_config.target_loops)
-                emitted += 1
-                if token in eos_ids and not params.ignore_eos:
-                    self._finish(request, FinishReason.STOP)
-                    break
-                if len(request.generated_token_ids) >= params.max_tokens:
-                    self._finish(request, FinishReason.LENGTH)
-                    break
-            runner.stats.committed_tokens += emitted
-            runner.stats.accepted_tokens += min(result.accepted_count, emitted)
-            # In particular, do NOT truncate KV here: the GPU may already be
-            # writing the following round at a later actual position.
-            if request.phase != RequestPhase.FINISHED:
-                queue = self.scheduler.queues[RequestPhase.SPECULATIVE]
-                if request.request_id not in queue:
-                    self.scheduler.enqueue(request, RequestPhase.SPECULATIVE)
-            outputs.append(RequestOutput.from_request(request))
+        outputs = self._update(ticket.batch, result)
         ticket.retire()
         self._pending_speculative.pop(0)
         self._retire_speculative()
@@ -852,6 +738,15 @@ class StageEngine:
     def _step_async_speculative(self):
         self._retire_speculative()
         outputs = []
+        # Waiting admissions need a quiescent point before the scheduler can
+        # select a victim. Victim selection remains entirely in Scheduler.
+        if (
+            self.pipeline_speculative
+            and self.scheduler.config.enable_preemption
+            and self.scheduler.queues[RequestPhase.WAITING]
+        ):
+            while self._pending_speculative:
+                outputs.extend(self._collect_speculative())
         # Submit ahead before collecting, even when a small round already
         # completed. Two leased buffers provide a hard global queue bound.
         if len(self._pending_speculative) == 2:
@@ -862,11 +757,7 @@ class StageEngine:
             if batch.phase == RequestPhase.SPECULATIVE:
                 ticket = self.executor.submit(batch)
                 self._pending_speculative.append(ticket)
-                for scheduled_request in batch.requests:
-                    request = scheduled_request.request
-                    request.num_output_placeholders += scheduled_request.token_count
-                    request.num_speculative_rounds += 1
-                    self.scheduler.enqueue(request, RequestPhase.SPECULATIVE)
+                self._apply_update(self.scheduler.update_after_submission(batch))
             else:
                 # Bootstrap uses the same submit contract; only actual host
                 # results (the first sampled token) require collection here.
@@ -881,60 +772,8 @@ class StageEngine:
             raise RuntimeError("speculative scheduler made no progress")
         return outputs
 
-    def _trace_exit(self, request):
-        target = request.exit_trace[request.num_scheduled_outputs]
-        return request.loops_done >= target
-
-    def _delayed_exit(self, request, score):
-        params = request.sampling_params
-        maximum = params.max_loops or self.model.config.total_ut_steps
-        if request.loops_done >= maximum or request.pending_exit_depth == request.loops_done:
-            return True
-        target = request.loops_done + 1
-        if self._delayed_signal(request, score, request.loops_done):
-            request.pending_exit_depth = target
-        return False
-
-    def _delayed_signal(self, request, score, signal_depth):
-        """Consume each signal once; Ouro's minimum applies to the trigger round."""
-        params = request.sampling_params
-        if self.exit_config.mode == "ouro_delayed":
-            request.remaining_probability *= 1.0 - score
-            score = 1.0 - request.remaining_probability
-            eligible_depth = signal_depth
-        else:
-            eligible_depth = signal_depth + 1
-        return (
-            params.exit_threshold < 1
-            and eligible_depth >= params.min_loops
-            and score >= params.exit_threshold
-        )
-
     def _deliver_coda(self, ticket):
-        outputs = []
-        result = ticket.collect()
-        for index, scheduled_request in enumerate(ticket.batch.requests):
-            request = scheduled_request.request
-            if self.scheduler.requests.get(request.request_id) is not request:
-                continue
-            if ticket.output_indices[index] != len(request.generated_token_ids):
-                raise RuntimeError("out-of-order coda delivery")
-            if request.num_output_placeholders != 1:
-                raise RuntimeError("invalid pending output count")
-            request.num_output_placeholders -= 1
-            token_id = result[index]
-            request.generated_token_ids.append(token_id)
-            # Current loops_done may already describe the NEXT token.
-            request.exit_depths.append(ticket.depths[index])
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-            if token_id in eos_ids and not params.ignore_eos:
-                self._finish(request, FinishReason.STOP)
-            elif len(request.generated_token_ids) >= params.max_tokens:
-                self._finish(request, FinishReason.LENGTH)
-            outputs.append(RequestOutput.from_request(request))
-        return outputs
+        return self._update(ticket.batch, ticket.collect(), delivered=True)
 
     def _collect_coda(self, wait=False):
         outputs = []
@@ -996,53 +835,38 @@ class StageEngine:
                 runner.boundary_stream is not None
                 and runner.boundary_stream is not runner.core_stream
             )
-            for index, scheduled_request in enumerate(batch.requests):
-                request = scheduled_request.request
-                request.num_output_placeholders += 1
-                if request.num_scheduled_outputs < request.sampling_params.max_tokens:
-                    request.input_token_tensor = ticket.device_values[index]
-                    self.scheduler.enqueue(request, RequestPhase.PRELUDE)
-        elif not any(batch.phase_for(i) == RequestPhase.RECURRENT for i in batch.requests):
-            self._update(batch, None)
-        else:
-            # Submit r FIRST. While the GPU runs r, consume r-1's signal to
-            # determine whether this token may enter r+1. No speculative extra loop.
-            exited = []
-            for index, scheduled_request in enumerate(batch.requests):
-                if batch.phase_for(scheduled_request) != RequestPhase.RECURRENT:
-                    self._update(replace(batch, requests=[scheduled_request]), None)
-                    continue
-                request = scheduled_request.request
+        signals = {}
+        for row, scheduled_request in enumerate(batch.requests):
+            phase = batch.phase_for(scheduled_request)
+            request = scheduled_request.request
+            if phase == RequestPhase.PRELUDE:
+                self._pending_exit_signals.pop(request.request_id, None)
+            elif phase == RequestPhase.RECURRENT:
+                # Submission is already enqueued. Only now may the preceding score
+                # block CPU delivery; max-depth/trace decisions require no readback.
                 previous = self._pending_exit_signals.pop(request.request_id, None)
-                request.loops_done += 1
-                params = request.sampling_params
-                maximum = params.max_loops or self.model.config.total_ut_steps
-                should_exit = (
-                    self._trace_exit(request)
-                    if self.exit_config.mode == "trace"
-                    else request.loops_done >= maximum
+                if previous is None or not self.scheduler.needs_exit_signal(request):
+                    continue
+                old_ticket, old_row = previous.ticket, previous.row
+                if old_ticket.batch.requests[old_row].request is not request:
+                    continue
+                signals[row] = ExitSignal(
+                    request=request,
+                    position=old_ticket.positions[old_row],
+                    depth=old_ticket.depths[old_row] + 1,
+                    score=old_ticket.collect().gate_scores[old_row],
                 )
-                if previous is not None and not should_exit:
-                    old_ticket, old_index, position, signal_depth = previous
-                    if position != request.position or signal_depth != request.loops_done - 1:
-                        raise RuntimeError("stale lookahead signal")
-                    score = old_ticket.collect()[old_index]
-                    should_exit = self._delayed_signal(request, score, signal_depth)
-                if should_exit:
-                    request.pending_exit_depth = request.loops_done
-                    exited.append(request)
-                    self.scheduler.enqueue(request, RequestPhase.CODA)
-                else:
-                    if (
-                        self.exit_config.mode in ("ouro_delayed", "random_lookahead")
-                        and params.exit_threshold < 1
-                    ):
-                        self._pending_exit_signals[request.request_id] = (
-                            ticket,
-                            index,
-                            request.position,
-                            request.loops_done,
-                        )
-                    self.scheduler.enqueue(request, RequestPhase.RECURRENT)
-            self.model_runner.finalize_many(exited)
+        update = self.scheduler.update_after_submission(
+            batch,
+            completion=ticket.event,
+            request_events=self.model_runner.events,
+            signals=signals,
+        )
+        for row in update.next_prelude:
+            batch.requests[row].request.input_token_tensor = ticket.device_values[row]
+        for row in update.retain_signal:
+            self._pending_exit_signals[batch.requests[row].request.request_id] = SignalHandle(
+                ticket, row
+            )
+        outputs.extend(self._apply_update(update))
         return outputs

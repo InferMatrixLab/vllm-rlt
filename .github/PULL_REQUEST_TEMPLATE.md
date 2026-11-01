@@ -35,4 +35,4 @@ actual behavior); state whether it was reproduced locally.
 
 ## Test Result
 
-<!-- BEFORE SUBMITTING: read the contributing guide at https://github.com/ThinkFlowLab/vllm-rlt#contributing and run `pre-commit run --all-files` from the repository root (Ruff lint, Ruff format, and the CPU regression test suite). -->
+<!-- BEFORE SUBMITTING: read the contributing guide at https://github.com/InferMatrixLab/vllm-rlt#contributing and run `pre-commit run --all-files` from the repository root (Ruff lint, Ruff format, and the CPU regression test suite). -->

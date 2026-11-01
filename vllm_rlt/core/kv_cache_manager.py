@@ -726,7 +726,17 @@ class KVCacheManager:
         if isinstance(batch, DeviceKVMetadata):
             self._validate_tensor(k, len(batch.position_ids), "k")
             self._validate_tensor(v, len(batch.position_ids), "v")
-            self._store_layer(layer, batch.write_blocks, batch.write_offsets, k, v)
+            if self.key_scale is not None:
+                self._store_layer(
+                    layer, batch.write_blocks, batch.write_offsets, k, v, mask=batch.write_mask
+                )
+            elif batch.write_mask is not None:
+                from vllm_rlt.kernels.routing import masked_kv_store
+
+                masked_kv_store(self.key_cache[:, layer], self.value_cache[:, layer], k, v, batch)
+            else:
+                self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
+                self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
             return
         if not batch.writable:
             raise ValueError("a read-only prepared KV batch cannot be written")
@@ -739,14 +749,22 @@ class KVCacheManager:
         for allocation, depth, position in batch.rows:
             allocation.written[self._plane(depth)][layer].add(position)
 
-    def _store_layer(self, layer, blocks, offsets, k, v) -> None:
-        """Write one layer's K/V rows, quantizing them for an FP8 pool."""
+    def _store_layer(self, layer, blocks, offsets, k, v, *, mask=None, active=None) -> None:
+        """Write one layer's K/V rows, quantizing them for an FP8 pool.
+
+        FP8 only: ``mask`` (bool [rows]) and ``active`` (int32 row count) skip
+        rows on the device, like the unquantized masked and graph writers.
+        """
         if self.key_scale is None:
+            if mask is not None or active is not None:
+                raise ValueError("row masks are handled by the unquantized device writers")
             self.key_cache[blocks, layer, offsets] = k
             self.value_cache[blocks, layer, offsets] = v
             return
-        if self.backend == "triton":
+        if self.backend == "triton" or mask is not None or active is not None:
             # One fused launch instead of about 20 small kernels per layer write.
+            # Masked writes always take it, as the unquantized masked writers are
+            # Triton too and boolean indexing would read the mask on the host.
             from vllm_rlt.kernels.triton_attention import store_fp8
 
             store_fp8(
@@ -759,6 +777,8 @@ class KVCacheManager:
                 blocks,
                 offsets,
                 FP8_E4M3_MAX,
+                mask=mask,
+                active=active,
             )
             return
         k_codes, k_scale = quantize_fp8(k)
@@ -826,6 +846,7 @@ class KVCacheManager:
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
+                **self._layer_scales(layer),
             )
         return self.attention(
             q,

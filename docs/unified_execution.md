@@ -32,6 +32,20 @@ requests can take different paths through those depths. The runtime needs to
 represent that progress explicitly so that scheduling and resource management
 can make use of it.
 
+## Version and compatibility
+
+This guide describes the v0.2.0 runtime. Its stage/loop architecture does not
+make all optional execution combinations production-qualified. Synchronous
+execution remains the default; async-first describes the internal ownership
+design, not an instruction to enable every optimization.
+
+For applications upgrading from v0.1.0, `LLM.engine` is a process-facing
+`StageClient`; worker-local cache objects are not exposed through it. Use
+the guarded, context-managed [Python API example](launching.md#python-api)
+and the [migration notes](../CHANGELOG.md). The measured performance section
+below preserves historical experiment scope rather than claiming a fresh
+release-tag GPU acceptance run.
+
 ## Design philosophy
 
 **Stage is the deployment and resource boundary; loop is the basic unit of
@@ -122,10 +136,12 @@ Registering a request and completing its generation are separate events.
 
 **Engine and scheduler.** StageEngine calls Scheduler to select work. Scheduler
 owns its local Request registry, phase queues and policy, checks admission/KV
-capacity and returns selected operations, token ranges and depths. It does not
-invoke ModelRunner. StageEngine submits the returned batch, retains tickets,
-handles required results and applies progress, including requeueing and stop or
-retirement decisions. The engine drives this cycle even when the caller is not
+capacity, returns selected operations, token ranges and depths, and applies
+per-request progress, exit and termination decisions through
+`update_from_output()` and `update_after_submission()`. It does not invoke
+ModelRunner. StageEngine submits the returned batch, retains tickets, collects
+required `ModelRunnerOutput` results and coordinates runner/connector side
+effects and retirement. The engine drives this cycle even when the caller is not
 polling outputs.
 
 **Executor and runners.** Engine calls `Executor.submit(batch)`. Executor binds
@@ -134,7 +150,15 @@ routes a speculative selection to the local round controller. StageEngine
 constructs these objects; Executor references them rather than creating another
 model/KV owner. Runners manage preparation, buffers, stream/event dependencies,
 execution and result storage; the ordinary runner also handles sampling after
-CODA. A returned ticket does not imply device completion.
+CODA. A returned ticket does not imply device completion. The
+[sync vs async speculation timeline](async-speculative.md#timeline-synchronous-versus-asynchronous-speculation)
+shows how GPU-owned next-token state lets consecutive rounds overlap result
+readback and CPU commit within this same stage.
+
+**Pipelined speculation (experimental).** `--speculative-mode pipeline` reuses
+the shared speculative runner to advance tokens at different recurrent depths.
+See [pipelined self-speculation](async-speculative.md#pipelined-self-speculation)
+for configuration, state lifetimes, and token-level acceptance/rejection diagrams.
 
 **Shared execution and resources.** ModelRunner constructs ModelRuntime and the
 speculative controller references that same runtime. Both use the worker-loaded
@@ -148,12 +172,26 @@ and optional stream overlap remain execution choices behind this interface.
 | --- | --- |
 | Worker process, channel and host-side ID mappings | StageClient; connected workers are coordinated by the deployment host |
 | Loaded model and local service loop | StageWorker; the engine and runners reference the same loaded model |
-| Request registry, phase queues and selection policy | Scheduler; StageEngine coordinates lifecycle and progress |
+| Request registry, phase queues and selection policy | Scheduler; StageEngine coordinates lifecycle, pending tickets and runner/connector side effects |
 | KV pages, mappings, validity and references/pins | KVCacheManager, shared by local scheduling and execution |
 | RNG registry and pending results | StageEngine; runners use the shared RNG, and tickets retain their result storage |
 | Input buffers, GPU events and readback storage | Runner/controller owners, retained until consumers finish |
 | Preemption snapshots | Engine-owned PreemptionManager, invoked through scheduler callbacks |
 | Transport staging and remote-access lifetime | Connector; local Request/KV changes are coordinated through StageEngine |
+
+**Model configuration.** Deployment entry points construct a shared `ModelConfig`
+from the resolved checkpoint JSON, an existing concrete config, or `module.config`
+before spawning workers. It retains the concrete model config and delegates common
+request limits, including derived properties. StageClient and the PD coordinator
+retain it; spawned workers receive copies. Checkpoint workers load weights using
+the concrete config without reparsing JSON; config-only inputs construct models,
+and module inputs retain their supplied weights. Models and StageEngine continue
+to use the concrete config. Configuration is treated as read-only after initialization.
+Worker `ready` messages report runtime capacity and transport information, not a
+serialized model config. PD still verifies worker-computed weight/KV fingerprints
+before connecting peers; static configuration does not prove runtime compatibility.
+PD validates model-family support before spawning workers and explicitly rejects
+unsupported families.
 
 **Connector and deployment.** Worker calls `connector.progress()` independently
 of engine progress. Connector readiness/backpressure reaches Scheduler through
@@ -374,5 +412,5 @@ and are not mixed into these charts.
 | Which loops can share a batch, and when does a request wait? | [Loop-level scheduler](scheduler.md) |
 | How are inputs prepared, transferred and executed? | [Runtime execution and configuration](runtime.md) |
 | Which KV history does a loop read, and who retains it? | [Model semantics](design.md) and [KV management](kv_cache_walkthrough.md) |
-| How do draft/verify rounds advance asynchronously? | [Asynchronous speculation](async-speculative.md) |
+| How do draft/verify rounds advance asynchronously? | [Sync vs async timeline](async-speculative.md#timeline-synchronous-versus-asynchronous-speculation) |
 | How do I launch and serve a configuration? | [First-run guide](launching.md) and [HTTP serving](serving.md) |
