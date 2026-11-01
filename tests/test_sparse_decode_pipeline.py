@@ -114,6 +114,67 @@ def test_mixed_modes_match_uniform_fused_kernels():
         assert torch.equal(getattr(mixed_store, name), getattr(uniform_store, name)), name
 
 
+@pytest.mark.gpu
+def test_steps_without_capture_skip_selection_kernels(monkeypatch):
+    """A device plan that cannot capture launches four kernels, with identical results."""
+    from vllm_rlt.kernels import sparse_decode
+    from vllm_rlt.kernels.paged_attention import TritonPagedAttention
+
+    rows, heads, kv_heads, dim, block_size, pages = 4, 4, 2, 64, 16, 9
+    dense = TritonPagedAttention()
+    q, keys, values, tables = _paged(
+        rows, heads, kv_heads, dim, pages, block_size, torch.float32, 3
+    )
+    lengths = torch.tensor([40, 129, 7, 90], device="cuda", dtype=torch.int32)
+    modes = torch.tensor([DENSE, CONSUME, DENSE, CONSUME], device="cuda", dtype=torch.int8)
+    results, launches = [], []
+    for may_capture in (True, False):
+        store = make_store(
+            slots=rows,
+            layers=1,
+            heads=heads,
+            head_dim=dim,
+            key_bucket=pages * block_size,
+            device="cuda",
+            implementation="fused",
+        )
+        lease = store.reserve("r", 0, rows, generation=1)
+        consume_rows = [1, 3]
+        capture = store.build_plan(
+            [(lease, row) for row in consume_rows], [CAPTURE] * 2, key_retention=0.25
+        )
+        sparse_decode.fused_paged_attention(
+            q[consume_rows],
+            keys,
+            values,
+            tables[consume_rows],
+            lengths[consume_rows],
+            capture,
+            layer=0,
+            dense_attention=dense,
+        )
+        plan = store.build_device_plan(
+            [lease], lease.slot_ids, modes, key_retention=0.25, may_capture=may_capture
+        )
+        count = []
+        launch = sparse_decode._launch
+        monkeypatch.setattr(
+            sparse_decode,
+            "_launch",
+            lambda kernel, *a, **k: (count.append(kernel), launch(kernel, *a, **k)),
+        )
+        output = sparse_decode.fused_paged_attention(
+            q, keys, values, tables, lengths, plan, layer=0, dense_attention=dense
+        )
+        monkeypatch.setattr(sparse_decode, "_launch", launch)
+        torch.cuda.synchronize()
+        launches.append(len(count))
+        results.append((output, store.uses.clone(), store.counts.clone(), store.valid.clone()))
+    assert launches == [8, 4]
+    for a, b in zip(*results):
+        assert torch.equal(a, b)
+
+
 def _engine(mode, sparse, *, draft_loops=2, graphs=False, retention=0.5):
     from vllm_rlt.engine.stage_engine import StageEngine
     from vllm_rlt.models import OuroForCausalLM

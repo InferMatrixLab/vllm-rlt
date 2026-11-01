@@ -118,6 +118,9 @@ class DeviceSparseDecodePlan:
     key_retention: float
     key_bucket: int | None
     store: object | None = None
+    # False when no row can be in its capture loop (the host knows which loops a
+    # step runs); the fused path then launches no selection kernels.
+    may_capture: bool = True
 
     def dense(self) -> bool:
         """Unknown on the host: the device may route any row to sparse work."""

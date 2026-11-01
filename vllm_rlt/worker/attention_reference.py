@@ -308,7 +308,9 @@ class AttentionReferenceStore:
             store=self,
         )
 
-    def build_device_plan(self, leases, slot_ids, modes, *, key_retention: float):
+    def build_device_plan(
+        self, leases, slot_ids, modes, *, key_retention: float, may_capture: bool = True
+    ):
         """Publish a plan whose rows name their slots and modes on the device.
 
         Every slot in ``slot_ids`` must belong to one of ``leases``; the host
@@ -323,6 +325,7 @@ class AttentionReferenceStore:
             key_retention=key_retention,
             key_bucket=self.key_bucket,
             store=self,
+            may_capture=may_capture,
         )
         self._require_live(plan)
         return plan

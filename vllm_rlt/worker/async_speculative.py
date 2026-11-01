@@ -439,7 +439,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             owners, [mode] * len(owners), key_retention=self.sparse_decode.key_retention
         )
 
-    def _pipeline_reference_plan(self, states, slots, depth, active):
+    def _pipeline_reference_plan(self, states, slots, depth, active, offset):
         """Device modes of one pipeline step: each row's loop decides its mode."""
         if slots is None:
             return None
@@ -448,11 +448,15 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         capture = active & (depth == REFERENCE_DEPTH)
         consume = active & (depth > REFERENCE_DEPTH)
         modes = torch.where(capture, CAPTURE, torch.where(consume, CONSUME, DENSE)).to(torch.int8)
+        # Rows sit at multiples of draft_loops, so whether any row can be in its
+        # capture loop at this offset is known on the host.
+        depths = range(0, self.config.target_loops, self.config.draft_loops)
         return self.reference_store.build_device_plan(
             [state.reference for state in states],
             slots,
             modes,
             key_retention=self.sparse_decode.key_retention,
+            may_capture=REFERENCE_DEPTH - offset in depths,
         )
 
     def _draft(self, plan, tables, allocations, leases=None):
@@ -675,7 +679,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 depth,
                 allocations,
                 active,
-                reference_plan=self._pipeline_reference_plan(states, slots, depth, active),
+                reference_plan=self._pipeline_reference_plan(states, slots, depth, active, offset),
             )
         choices = self._coda(hidden).argmax(-1)
         start = 0

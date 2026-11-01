@@ -353,8 +353,10 @@ class RecurrentGraphs:
         return output
 
 
-# Graph key of entries that replay a device plan (token pipelines); not a row mode.
+# Graph keys of entries that replay a device plan (token pipelines); not row
+# modes. A step in which no row can capture records no selection kernels.
 DEVICE_PLAN = "device"
+DEVICE_PLAN_NO_CAPTURE = "device-no-capture"
 
 
 class DeviceRecurrentGraphs(RecurrentGraphs):
@@ -396,7 +398,11 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
             if reference_store.selected.shape[-1] != (reference_store.key_bucket or 1):
                 # A replay must never see a grown index pool at a new address.
                 raise ValueError("sparse CUDA graphs need the reference index pool at full size")
-            self.modes = (DENSE, DEVICE_PLAN) if device_plans else (DENSE, CAPTURE, CONSUME)
+            self.modes = (
+                (DENSE, DEVICE_PLAN, DEVICE_PLAN_NO_CAPTURE)
+                if device_plans
+                else (DENSE, CAPTURE, CONSUME)
+            )
             config = model.config
             width = math.ceil(config.max_position_embeddings / cache.block_size)
             self.proxy = _DeviceCache(
@@ -425,7 +431,7 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
             bucketed=True,
         )
         entry.mode = mode
-        if mode == DEVICE_PLAN:
+        if mode in (DEVICE_PLAN, DEVICE_PLAN_NO_CAPTURE):
             store = self.reference_store
             entry.slot_ids = torch.full(
                 (size,), store.padding_slot, device=self.cache.device, dtype=torch.int64
@@ -439,6 +445,7 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
                 key_retention=self.key_retention,
                 key_bucket=store.key_bucket,
                 store=store,
+                may_capture=mode == DEVICE_PLAN,
             )
         elif mode != DENSE:
             store = self.reference_store
@@ -496,7 +503,7 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
         if isinstance(plan, DeviceSparseDecodePlan):
             if DEVICE_PLAN not in self.modes or plan.key_retention != self.key_retention:
                 return None
-            return DEVICE_PLAN
+            return DEVICE_PLAN if plan.may_capture else DEVICE_PLAN_NO_CAPTURE
         modes = set(plan.modes)
         if len(modes) != 1 or plan.key_retention != self.key_retention:
             return None
@@ -530,7 +537,7 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
                 stream.wait_event(self.last_event)
             entry.slot_ids[count:].fill_(self.reference_store.padding_slot)
             entry.slot_ids[:count].copy_(plan.slot_ids[:count])
-            if entry.mode == DEVICE_PLAN:
+            if entry.mode in (DEVICE_PLAN, DEVICE_PLAN_NO_CAPTURE):
                 entry.modes[count:].fill_(DENSE)
                 entry.modes[:count].copy_(plan.modes[:count])
         super().prepare_inputs(call, hidden)
