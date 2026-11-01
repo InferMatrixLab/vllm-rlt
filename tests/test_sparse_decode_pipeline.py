@@ -103,9 +103,13 @@ def test_mixed_modes_match_uniform_fused_kernels():
             dense_attention=dense if mode == CAPTURE else None,
         )
     torch.cuda.synchronize()
-    # Dense and capture rows are the dense kernel's output; consume rows the
-    # uniform consume's; every store field matches slot for slot.
-    assert torch.equal(mixed, expected)
+    # Consume rows are the uniform consume's, bit for bit. Dense and capture
+    # rows are the dense kernel's up to fp32 rounding: the mixed-mode variant is
+    # compiled separately, and some architectures (sm_89) round it differently
+    # by an ulp. Every store field matches slot for slot.
+    consume = [row for row, mode in enumerate(modes) if mode == CONSUME]
+    assert torch.equal(mixed[consume], expected[consume])
+    torch.testing.assert_close(mixed, expected, rtol=0, atol=1e-6)
     for name in ("selected", "counts", "mass", "output", "contribution", "valid", "uses"):
         assert torch.equal(getattr(mixed_store, name), getattr(uniform_store, name)), name
 

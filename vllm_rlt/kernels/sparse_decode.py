@@ -140,8 +140,10 @@ def _select_and_publish(
 
 
 # A copy of triton_attention._paged_attention_kernel that also stores the raw
-# scores. Its arithmetic must stay identical to the dense kernel: the capture
-# output is required to equal the dense backend bit for bit (tested).
+# scores. Its arithmetic must stay identical to the dense kernel: a uniform
+# capture's output is required to equal the dense backend bit for bit (tested).
+# The mixed-mode variant (device plans) is compiled separately and matches it to
+# fp32 rounding; some architectures (sm_89) round it differently by an ulp.
 @triton.jit
 def _capture_split_kernel(
     Q,
