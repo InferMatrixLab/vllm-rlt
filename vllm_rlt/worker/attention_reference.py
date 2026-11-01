@@ -237,6 +237,18 @@ class AttentionReferenceStore:
         """Retained keys of ``(slot, layer)``, or ``None`` before a capture."""
         return self._counts_host.get((slot, layer))
 
+    def _row_slots(self, plan: SparseDecodePlan, rows: list[int]) -> torch.Tensor:
+        """Slot ids of ``rows`` without a host-to-device copy of a Python list.
+
+        ``plan.slot_ids[rows]`` costs ~2.4 ms per call because the list becomes
+        a device tensor first; grouped rows are contiguous, so derive the index
+        on the device instead.
+        """
+        if rows[0] + len(rows) == rows[-1] + 1:
+            index = torch.arange(rows[0], rows[0] + len(rows), device=self.device)
+            return plan.slot_ids.index_select(0, index)
+        return plan.slot_ids[rows]
+
     def capture(self, plan: SparseDecodePlan, layer: int) -> None:
         """Mark the captured rows source-ready for the given layer.
 
@@ -251,7 +263,7 @@ class AttentionReferenceStore:
         # Assign a tensor, not the Python scalar ``True``: a scalar store into
         # a bool tensor through advanced indexing costs milliseconds per call
         # (2.6 ms measured at 32 rows), while a tensor store is ~0.13 ms.
-        slots = plan.slot_ids[rows]
+        slots = self._row_slots(plan, rows)
         self.valid[slots, layer] = torch.ones(slots.numel(), dtype=torch.bool, device=self.device)
 
     def consume(self, plan: SparseDecodePlan, layer: int) -> None:
@@ -260,7 +272,7 @@ class AttentionReferenceStore:
         rows = plan.groups().get(CONSUME)
         if not rows:
             return
-        self.uses[plan.slot_ids[rows], layer] += 1
+        self.uses[self._row_slots(plan, rows), layer] += 1
 
     def bind_positions(self, plan: SparseDecodePlan, positions: torch.Tensor) -> None:
         """Record the device-owned absolute positions of the plan's rows."""
@@ -268,7 +280,7 @@ class AttentionReferenceStore:
         if positions.shape != plan.slot_ids.shape:
             raise ValueError("reference positions need one entry per plan row")
         rows = [row for row, slot in enumerate(plan.slots) if slot >= 0]
-        self.position[plan.slot_ids[rows]] = positions[rows].to(torch.int64)
+        self.position[self._row_slots(plan, rows)] = positions[rows].to(torch.int64)
 
     def write_reference(
         self,

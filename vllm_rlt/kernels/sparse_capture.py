@@ -87,6 +87,8 @@ def fused_capture_scores(
     layer: int,
     block_size: int,
     block_n: int = 128,
+    context: int | None = None,
+    ragged: bool | None = None,
 ) -> torch.Tensor:
     """Scores of every row against its causal keys, straight from the cache.
 
@@ -113,7 +115,11 @@ def fused_capture_scores(
         raise ValueError("query heads must be a multiple of KV heads")
     groups = heads // kv_heads
     lengths = context_lengths.to(torch.int64)
-    context = int(lengths.max().item()) if lengths.numel() else 0
+    # ``context`` and ``ragged`` are host-known for a runner submission. Reading
+    # them back with ``.item()`` would sync the stream once per layer, which
+    # RFC #156 section 6.2 forbids, so callers pass them in.
+    if context is None:
+        context = int(lengths.max().item()) if lengths.numel() else 0
     if context == 0:
         return queries.new_zeros((rows, heads, 0), dtype=torch.float32)
 
@@ -138,7 +144,9 @@ def fused_capture_scores(
     )
     # Rows are ragged; the kernel leaves the tail at zero, so mask it to -inf
     # before any softmax sees it.
-    if int(lengths.min().item()) != context:
+    if ragged is None:
+        ragged = lengths.numel() > 0 and int(lengths.min().item()) != context
+    if ragged:
         positions = torch.arange(context, device=queries.device)[None, None, :]
         out = out.masked_fill(positions >= lengths[:, None, None], float("-inf"))
     return out

@@ -34,6 +34,8 @@ from dataclasses import dataclass
 import torch
 
 from vllm_rlt.kernels.sparse_capture import TRITON_AVAILABLE, fused_capture_scores
+from vllm_rlt.kernels.sparse_consume import selected_scores as fused_selected_scores
+from vllm_rlt.kernels.sparse_consume import selected_values as fused_selected_values
 
 # Row modes for one recurrent submission.
 DENSE = 0
@@ -471,6 +473,7 @@ def batched_paged_attention(
             else:
                 row_ids = torch.tensor(rows, dtype=torch.int64, device=q.device)
             slots = plan.slot_ids[row_ids]
+            chunk_slots = [plan.slots[row] for row in rows]
             queries = q[row_ids].float()
             tables = block_tables[row_ids]
             batch_index = torch.arange(len(rows), device=q.device)[:, None, None]
@@ -480,20 +483,53 @@ def batched_paged_attention(
                     output[row_ids] = dense_output[row_ids]
                     consumed = True
                     continue
-                columns = torch.arange(extent, device=q.device)[None, None, :]
-                selected = store.selected[slots[:, None, None], layer, head_index, columns].long()
-                blocks = tables[batch_index, selected // block_size]
-                offsets = selected % block_size
-                keys = key_cache[blocks, offsets, kv_index].float()
-                values = value_cache[blocks, offsets, kv_index].float()
-                scores = _rowwise_product("hd,hkd->hk", queries, keys) * scale
-                probabilities = torch.softmax(scores, dim=-1)
-                new = _rowwise_product("hk,hkd->hd", probabilities, values)
-                corrected = (
-                    store.output[slots, layer]
-                    - store.contribution[slots, layer]
-                    + store.mass[slots, layer].unsqueeze(-1) * new
-                )
+                # Contiguous slots turn these gathers into views, which is the
+                # difference between one index kernel per tensor and none.
+                if chunk_slots[0] + len(chunk_slots) == chunk_slots[-1] + 1:
+                    span = slice(chunk_slots[0], chunk_slots[0] + len(chunk_slots))
+                    selected = store.selected[span, layer, :, :extent].to(torch.int32)
+                    ref_output = store.output[span, layer]
+                    ref_contribution = store.contribution[span, layer]
+                    ref_mass = store.mass[span, layer]
+                else:
+                    columns = torch.arange(extent, device=q.device)[None, None, :]
+                    selected = store.selected[slots[:, None, None], layer, head_index, columns]
+                    ref_output = store.output[slots, layer]
+                    ref_contribution = store.contribution[slots, layer]
+                    ref_mass = store.mass[slots, layer]
+                if fused_scores:
+                    # Walk the retained indices in place: no dense K/V gather
+                    # and no per-row cuBLAS.
+                    scores = (
+                        fused_selected_scores(
+                            q[row_ids],
+                            key_cache,
+                            selected,
+                            tables,
+                            layer=layer,
+                            block_size=block_size,
+                        )
+                        * scale
+                    )
+                    probabilities = torch.softmax(scores, dim=-1)
+                    new = fused_selected_values(
+                        probabilities,
+                        value_cache,
+                        selected,
+                        tables,
+                        layer=layer,
+                        block_size=block_size,
+                    )
+                else:
+                    selected = selected.long()
+                    blocks = tables[batch_index, selected // block_size]
+                    offsets = selected % block_size
+                    keys = key_cache[blocks, offsets, kv_index].float()
+                    values = value_cache[blocks, offsets, kv_index].float()
+                    scores = _rowwise_product("hd,hkd->hk", queries, keys) * scale
+                    probabilities = torch.softmax(scores, dim=-1)
+                    new = _rowwise_product("hk,hkd->hd", probabilities, values)
+                corrected = ref_output - ref_contribution + ref_mass.unsqueeze(-1) * new
                 output[row_ids] = corrected.to(q.dtype)
                 consumed = True
                 continue
@@ -506,7 +542,10 @@ def batched_paged_attention(
             if fused_scores and dense_output is not None:
                 # One pass over the paged cache: no expanded FP32 K row, and
                 # no per-row cuBLAS. The dot product is still FP32; only the
-                # reduction order differs from the oracle.
+                # reduction order differs from the oracle. The context bound is
+                # host-known here, so the kernel never reads it back.
+                chunk_lengths = [lengths[row] for row in rows]
+                chunk_context = max(chunk_lengths)
                 scores = fused_capture_scores(
                     q[row_ids],
                     key_cache,
@@ -514,6 +553,8 @@ def batched_paged_attention(
                     context_lengths[row_ids],
                     layer=layer,
                     block_size=block_size,
+                    context=chunk_context,
+                    ragged=min(chunk_lengths) != chunk_context,
                 )
                 scores = scores * scale
             else:
@@ -547,18 +588,25 @@ def batched_paged_attention(
                     kv_index,
                 ].float()
                 contribution = _rowwise_product("hk,hkd->hd", gathered, selected_values)
-                columns = torch.arange(count, device=q.device)[None, None, :]
-                # Explicit indices write only the live prefix, never gather the
-                # entire capacity-sized selected tensor to obtain a prefix view.
-                store.selected[slots[:, None, None], layer, head_index, columns] = selected.to(
-                    torch.int32
-                )
-                store.counts[slots, layer] = count
+                # Only the live prefix is written, never the whole capacity.
+                if chunk_slots[0] + len(chunk_slots) == chunk_slots[-1] + 1:
+                    span = slice(chunk_slots[0], chunk_slots[0] + len(chunk_slots))
+                    store.selected[span, layer, :, :count] = selected.to(torch.int32)
+                    store.counts[span, layer] = count
+                    store.mass[span, layer] = gathered.sum(dim=-1)
+                    store.output[span, layer] = reference
+                    store.contribution[span, layer] = contribution
+                else:
+                    columns = torch.arange(count, device=q.device)[None, None, :]
+                    store.selected[slots[:, None, None], layer, head_index, columns] = selected.to(
+                        torch.int32
+                    )
+                    store.counts[slots, layer] = count
+                    store.mass[slots, layer] = gathered.sum(dim=-1)
+                    store.output[slots, layer] = reference
+                    store.contribution[slots, layer] = contribution
                 for row in rows:
                     store.note_count(plan.slots[row], layer, count)
-                store.mass[slots, layer] = gathered.sum(dim=-1)
-                store.output[slots, layer] = reference
-                store.contribution[slots, layer] = contribution
                 captured = True
     if captured:
         store.capture(plan, layer)
