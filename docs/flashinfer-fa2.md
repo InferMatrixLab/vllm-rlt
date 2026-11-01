@@ -123,20 +123,22 @@ official run used the pip `cuda-toolkit[nvcc]==13.0.3` tree.
 
 Matched fixed work, real Ouro-1.4B BF16, greedy depth 4, 64 output tokens,
 32-token prompts, one wave of N requests, second run after a warmup that
-captures the graph:
+captures the graph. All five columns come from one session:
 
-| concurrency | Triton eager | FA2 eager | FA2 graphs | FA2 async+graphs |
-|---:|---:|---:|---:|---:|
-| 1 | 4.94 s (13.0 tok/s) | 5.24 s (12.2) | 1.67 s (38.4) | 1.66 s (38.7) |
-| 8 | 5.50 s (93.1) | 5.78 s (88.6) | 1.92 s (267.4) | 1.88 s (272.1) |
-| 32 | 6.12 s (334.5) | 6.22 s (329.4) | 2.32 s (881.7) | 2.23 s (918.8) |
+| concurrency | Triton eager | Triton graphs | FA2 eager | FA2 graphs | FA2 async+graphs |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4.90 s (13.1 tok/s) | 1.51 s (42.3) | 5.22 s (12.3) | 1.67 s (38.4) | 1.65 s (38.8) |
+| 8 | 5.31 s (96.4) | 1.76 s (290.4) | 5.31 s (96.4) | 1.89 s (270.3) | 1.86 s (275.4) |
+| 32 | 5.78 s (354.3) | 2.20 s (930.0) | 5.97 s (343.1) | 2.30 s (889.6) | 2.23 s (917.5) |
 
-Eager FA2 is at parity with Triton; CUDA Graphs remove most per-step launch
-overhead on this small model (roughly 2.6–3.1× over FA2 eager and 3.0–3.4×
-over Triton eager). The official GSM8K-87 runs agree in direction (eager
-784.6 s, graphs 281.5 s, with different generated lengths). Asynchronous
-scheduling adds no measurable gain at these batch sizes. These are single-GPU,
-single-wave diagnostics, not production throughput claims.
+Eager FA2 is at parity with Triton eager. CUDA Graphs remove most per-step
+launch overhead for **both** backends (about 3.2× over Triton eager and 2.8×
+over FA2 eager on this small model); Triton graphs is then 5–13% faster than
+FA2 graphs, so the graph gain is dispatch reduction, not the FA2 kernel.
+The official GSM8K-87 runs agree in direction (eager 784.6 s, graphs 281.5 s,
+with different generated lengths). Asynchronous scheduling adds no measurable
+gain at these batch sizes. These are single-GPU, single-wave diagnostics, not
+production throughput claims.
 
 Kernel-only figures from the earlier CUDA-core adapter (FA2/Triton 0.39–0.98
 across B 1–32 and context 256–8192) are superseded by the tensor-core kernel

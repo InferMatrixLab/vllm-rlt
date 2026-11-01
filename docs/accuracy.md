@@ -224,8 +224,11 @@ on question 182 (mean 117.1), and Triton stops that question at 40.
 The `flashinfer_fa2` backend runs FlashInfer's tensor-core, CUDA-Graph-
 compatible decode wrapper; the FA2 guide records why the CUDA-core path is not
 graph-safe on SM89. CUDA Graphs remove most per-token launch overhead on this
-small model: a matched 64-token fixed-work run went from 5.24/5.78/6.22 s
-(eager) to 1.67/1.92/2.32 s (graphs) at concurrency 1/8/32. That is a launch-
+small model for both attention backends: a matched 64-token fixed-work run at
+concurrency 1/8/32 went from 5.22/5.31/5.97 s (FA2 eager) to 1.67/1.89/2.30 s
+(FA2 graphs), and from 4.90/5.31/5.78 s (Triton eager) to 1.51/1.76/2.20 s
+(Triton graphs). Triton graphs is 5–13% faster than FA2 graphs here, so the
+gain is graph dispatch reduction rather than the FA2 kernel. That is a launch-
 overhead result on one L20, not a production throughput qualification;
 async+graphs is within noise of graphs.
 
