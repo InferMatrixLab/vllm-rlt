@@ -165,7 +165,9 @@ def test_loopcd_coda_graphs_match_eager_through_request_reuse(implementation):
             rounds.append(finished)
         if graphs:
             coda = engine.model_runner.coda_graphs
-            assert coda.captures == 1 and coda.replays > 1 and coda.fallbacks > 0
+            # Power-of-two padding lets the one bucketed coda graph cover every
+            # batch here, so no row count falls back to eager.
+            assert coda.captures == 1 and coda.replays > 1
         results.append(rounds)
     assert results[0] == results[1]
 
@@ -320,6 +322,9 @@ def test_reference_and_two_head_scratch_budgeted_before_auto_kv():
 )
 @torch.inference_mode()
 def test_teacher_forced_continuation_against_dense_oracle(depth, strength, implementation):
+    # CPU-only: this test must not initialize CUDA. A --run-gpu session may
+    # already have initialized it in an earlier test of the same process.
+    cuda_was_initialized = torch.cuda.is_initialized()
     model = model_for()
     engine = LLMEngine(
         model,
@@ -376,4 +381,4 @@ def test_teacher_forced_continuation_against_dense_oracle(depth, strength, imple
         assert not engine.model_runner.loopcd_references
         assert engine.cache_manager.num_used_blocks == 0
     assert seen == [0, 1, 2] * 2 and owners[0] is not owners[1]
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_was_initialized
