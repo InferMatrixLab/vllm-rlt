@@ -292,6 +292,16 @@ class KVCacheManager:
             return self.key_cache[:, layer], self.value_cache[:, layer], tables
         return self._flat_keys, self._flat_values, tables + layer
 
+    def _layer_cache(self, layer: int):
+        """One layer's [block, token, head, dim] K/V views for indexed writes.
+
+        Packed planes address entries in the flattened pool; offsetting the view
+        by ``layer`` makes ``view[blocks]`` equal ``_flat_keys[blocks + layer]``.
+        """
+        if self.plane_packing == 1:
+            return self.key_cache[:, layer], self.value_cache[:, layer]
+        return self._flat_keys[layer:], self._flat_values[layer:]
+
     def _store_layer(self, layer, blocks, offsets, k, v) -> None:
         if self.plane_packing == 1:
             self.key_cache[blocks, layer, offsets] = k
@@ -792,7 +802,13 @@ class KVCacheManager:
         if isinstance(batch, DeviceKVMetadata):
             self._validate_tensor(k, len(batch.position_ids), "k")
             self._validate_tensor(v, len(batch.position_ids), "v")
-            self._store_layer(layer, batch.write_blocks, batch.write_offsets, k, v)
+            if batch.write_mask is not None:
+                from vllm_rlt.kernels.routing import masked_kv_store
+
+                keys, values = self._layer_cache(layer)
+                masked_kv_store(keys, values, k, v, batch)
+            else:
+                self._store_layer(layer, batch.write_blocks, batch.write_offsets, k, v)
             return
         if not batch.writable:
             raise ValueError("a read-only prepared KV batch cannot be written")

@@ -60,6 +60,8 @@ class DeviceKVMetadata:
     write_offsets: torch.Tensor
     block_tables: torch.Tensor
     context_lengths: torch.Tensor
+    # Inactive pipeline slots must not overwrite any live KV address.
+    write_mask: torch.Tensor | None = None
     # The device-owned path currently uses independent single-query rows.
     # These layout fields also let recurrent graphs stage the same contract.
     cu_seqlens_q: torch.Tensor | None = None
@@ -97,6 +99,7 @@ class MetadataBuilder:
         write_offsets,
         block_tables,
         context_lengths,
+        write_mask=None,
     ) -> DeviceKVMetadata:
         """Borrow stream-ordered metadata without reading device positions on CPU.
 
@@ -111,7 +114,14 @@ class MetadataBuilder:
             write_offsets=write_offsets,
             block_tables=block_tables,
             context_lengths=context_lengths,
+            write_mask=write_mask,
         )
+        if write_mask is not None and (
+            write_mask.shape != position_ids.shape
+            or write_mask.dtype != torch.bool
+            or write_mask.device != self.cache.device
+        ):
+            raise ValueError("write_mask must be bool [rows] on the cache device")
         self.cache._require_live_batch(batch)
         rows = len(position_ids)
         for name, tensor, dtype in (

@@ -11,7 +11,7 @@ from vllm_rlt.entrypoints.runtime_args import (
     profile_config_from_args,
     runtime_configs,
 )
-from vllm_rlt.models import load_tokenizer, resolve_model_config, resolve_model_source
+from vllm_rlt.models import ModelConfig, load_tokenizer, resolve_model_config, resolve_model_source
 from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.engine import PDEngine
 
@@ -37,6 +37,7 @@ def load_engine(args):
     cache = options.pop("cache_config")
     engine = PDEngine(
         source,
+        model_config=ModelConfig.from_dict(config),
         revision=revision,
         dtype=args.dtype,
         pd_config=PDConfig(

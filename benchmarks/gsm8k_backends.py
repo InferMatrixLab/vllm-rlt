@@ -1,7 +1,10 @@
 """Single-request BF16 generation with identical token inputs and stop criteria."""
 
+import importlib.util
+from pathlib import Path
+
+import lm_eval
 import torch
-from lm_eval.models.utils import postprocess_generated_text, stop_sequences_criteria
 from transformers import AutoModelForCausalLM, DynamicCache, LogitsProcessor
 
 from benchmarks.gsm8k import is_fixed
@@ -14,6 +17,23 @@ from vllm_rlt import (
 )
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.models import AutoModelForCausalLM as NativeModel
+
+
+def _load_lm_eval_utils():
+    # Importing lm_eval.models in the pinned harness eagerly imports every model
+    # backend, including multimodal classes removed from Transformers 5. Load
+    # its standalone helpers without importing the unrelated model registry;
+    # retain the pinned harness's exact stopping and postprocessing behavior.
+    path = Path(lm_eval.__file__).parent / "models" / "utils.py"
+    spec = importlib.util.spec_from_file_location("_gsm8k_lm_eval_utils", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_lm_eval_utils = _load_lm_eval_utils()
+postprocess_generated_text = _lm_eval_utils.postprocess_generated_text
+stop_sequences_criteria = _lm_eval_utils.stop_sequences_criteria
 
 
 def check_logits(logits):

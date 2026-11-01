@@ -105,6 +105,77 @@ def test_pd_configuration_validation(options):
         PDConfig(**options)
 
 
+def test_pd_rejects_huginn_before_spawning(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_rlt.models import HuginnConfig
+    from vllm_rlt.pd.engine import PDEngine
+
+    clients = Mock()
+    monkeypatch.setattr("vllm_rlt.pd.engine.StageClient", clients)
+    with pytest.raises(ValueError, match="PD does not support Huginn"):
+        PDEngine(HuginnConfig())
+    clients.assert_not_called()
+
+
+def test_pd_nanbeige_startup_uses_entry_config_for_request_validation(monkeypatch):
+    from unittest.mock import Mock
+
+    from tests.helpers import tiny_nanbeige_config
+    from vllm_rlt.pd.engine import PDEngine
+
+    config = tiny_nanbeige_config()
+
+    def ready_client(model, *, stage_config, **options):
+        # Replace only the process boundary. The coordinator still constructs,
+        # connects peers and validates requests without model metadata in ready.
+        assert model is config
+        assert options["model_config"].model_specific_config is config
+        return Mock(
+            ready=True,
+            connected=True,
+            stopped=True,
+            info=dict(
+                kind="ready",
+                stage_id=stage_config.stage_id,
+                role=stage_config.role,
+                fingerprint="same-model-and-cache",
+                info={"agent": stage_config.stage_id},
+                num_blocks=64,
+                block_size=16,
+                depths=model.total_ut_steps,
+            ),
+        )
+
+    clients = Mock(side_effect=ready_client)
+    monkeypatch.setattr("vllm_rlt.pd.engine.StageClient", clients)
+    with PDEngine(config, attention_backend="triton") as engine:
+        assert clients.call_count == 2
+        assert engine.model_config.model_specific_config is config
+        assert all(
+            call.kwargs["model_config"] is engine.model_config for call in clients.call_args_list
+        )
+        # Accept the upper vocabulary/context boundaries at Nanbeige's depth.
+        params = SamplingParams(
+            max_tokens=config.max_position_embeddings, max_loops=config.total_ut_steps
+        )
+        engine.add_request("valid", [config.vocab_size - 1], params)
+        assert engine.has_request("valid")
+        with pytest.raises(ValueError, match="valid model token IDs"):
+            engine.add_request("bad_token", [config.vocab_size], params)
+        with pytest.raises(ValueError, match="loop bounds exceed model depth"):
+            engine.add_request(
+                "bad_depth", [1], SamplingParams(max_loops=config.total_ut_steps + 1)
+            )
+        with pytest.raises(ValueError, match="exceeds context capacity"):
+            engine.add_request(
+                "bad_context", [1], SamplingParams(max_tokens=config.max_position_embeddings + 1)
+            )
+        assert engine.request_ids() == ("valid",)
+    assert engine.closed
+    assert not engine.has_unfinished_requests()
+
+
 def drain(engine):
     outputs = {}
     deadline = time.monotonic() + 90
@@ -413,6 +484,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
 
     engine = object.__new__(LLMEngine)
     engine.async_speculative = False
+    engine.pipeline_speculative = False
     engine.speculative_runner = None
     engine.profiling = Profiler("cpu")
     engine.preemption = PreemptionManager(engine)

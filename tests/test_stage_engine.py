@@ -255,12 +255,14 @@ def test_spawned_mixed_worker_matches_local_without_connector(asynchronous):
     import multiprocessing
 
     from vllm_rlt.engine.worker import worker_main
+    from vllm_rlt.models import ModelConfig
 
     local = make_stage_engine(mixed=True, asynchronous=asynchronous)
     options = dict(
         seed=123,
         dtype="float32",
         revision=None,
+        model_config=ModelConfig(tiny_ouro_config()),
         engine=dict(
             cache_config=CacheConfig(128, 2),
             scheduler_config=SchedulerConfig(
@@ -295,6 +297,7 @@ def test_spawned_mixed_worker_matches_local_without_connector(asynchronous):
         ready = receive()
         assert ready["kind"] == "ready"
         assert ready["role"] == "prefill_decode"
+        assert "model" not in ready and "model_type" not in ready
         assert "info" not in ready  # No registered transport or PD handshake.
         params = SamplingParams(max_tokens=3, ignore_eos=True)
         for request_id, tokens in (("a", [1, 2, 3, 4, 5]), ("b", [2, 3])):
@@ -560,6 +563,9 @@ def test_module_weight_source_preserves_explicit_deployment(
     _, device, weights, settings = launch.call_args.args
     assert device == expected_device
     assert settings["dtype"] == expected_dtype
+    assert not client.ready
+    assert client.model_config.model_specific_config is model.config
+    assert settings["model_config"] is client.model_config
     assert weights is not model
     assert next(weights.parameters()).device.type == "cpu"
     client.closed = True

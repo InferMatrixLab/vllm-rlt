@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
+from vllm_rlt.kernels import silu_and_mul
 from vllm_rlt.layers import (
     RMSNorm,
     RotaryEmbedding,
@@ -194,7 +194,7 @@ class OuroMLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        return self.down_proj(silu_and_mul(self.gate_proj(hidden), self.up_proj(hidden)))
 
 
 class OuroDecoderLayer(nn.Module):
@@ -301,6 +301,7 @@ class OuroForCausalLM(nn.Module):
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
+        config: OuroConfig | None = None,
     ) -> "OuroForCausalLM":
         """Stream strictly checked safetensors into a meta model; never execute Hub code.
 
@@ -316,7 +317,10 @@ class OuroForCausalLM(nn.Module):
 
             source, revision, _ = resolve_model_config(path_or_repo, revision=revision)
             folder = Path(source)
-        config = OuroConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        if config is None:
+            config = OuroConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        elif not isinstance(config, OuroConfig):
+            raise TypeError("config must be an OuroConfig")
         index_path = folder / "model.safetensors.index.json"
         index = json.loads(index_path.read_text())["weight_map"] if index_path.is_file() else None
         if index is None:
