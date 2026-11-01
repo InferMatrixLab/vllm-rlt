@@ -22,6 +22,8 @@ class SpeculativeResult:
     token_ids: list[int]
     accepted_count: int
     log_probs: list = field(default_factory=list)
+    # Exclusive KV extent still needed by retained pipeline tokens.
+    kv_frontier: int | None = None
 
 
 @dataclass(frozen=True, kw_only=True)

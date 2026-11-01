@@ -175,3 +175,51 @@ def finalize_kernel(
         v = tl.load(V + src, x < LAYERS * CHANNELS, 0)
         tl.store(K + dst, k, x < LAYERS * CHANNELS)
         tl.store(V + dst, v, x < LAYERS * CHANNELS)
+
+
+@triton.jit
+def masked_kv_store_kernel(
+    K,
+    V,
+    Keys,
+    Values,
+    Blocks,
+    Offsets,
+    Active,
+    H: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    BLOCK_STRIDE: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    active = tl.load(Active + row)
+    block = tl.load(Blocks + row)
+    offset = tl.load(Offsets + row)
+    address = block * BLOCK_STRIDE + offset * TOKEN_STRIDE + col
+    k = tl.load(K + row * KS + col, col < H, 0)
+    v = tl.load(V + row * VS + col, col < H, 0)
+    tl.store(Keys + address, k, active & (col < H))
+    tl.store(Values + address, v, active & (col < H))
+
+
+def masked_kv_store(keys, values, k, v, metadata):
+    """Write [rows, heads, dim] into one layer's paged KV, skipping inactive rows."""
+    width = k.shape[-2] * k.shape[-1]
+    masked_kv_store_kernel[(len(k), triton.cdiv(width, 256))](
+        k,
+        v,
+        keys,
+        values,
+        metadata.write_blocks,
+        metadata.write_offsets,
+        metadata.write_mask,
+        width,
+        k.stride(0),
+        v.stride(0),
+        keys.stride(0),
+        keys.stride(1),
+        256,
+    )

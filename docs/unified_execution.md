@@ -32,6 +32,20 @@ requests can take different paths through those depths. The runtime needs to
 represent that progress explicitly so that scheduling and resource management
 can make use of it.
 
+## Version and compatibility
+
+This guide describes the v0.2.0 runtime. Its stage/loop architecture does not
+make all optional execution combinations production-qualified. Synchronous
+execution remains the default; async-first describes the internal ownership
+design, not an instruction to enable every optimization.
+
+For applications upgrading from v0.1.0, `LLM.engine` is a process-facing
+`StageClient`; worker-local cache objects are not exposed through it. Use
+the guarded, context-managed [Python API example](launching.md#python-api)
+and the [migration notes](../CHANGELOG.md). The measured performance section
+below preserves historical experiment scope rather than claiming a fresh
+release-tag GPU acceptance run.
+
 ## Design philosophy
 
 **Stage is the deployment and resource boundary; loop is the basic unit of
@@ -140,6 +154,11 @@ CODA. A returned ticket does not imply device completion. The
 [sync vs async speculation timeline](async-speculative.md#timeline-synchronous-versus-asynchronous-speculation)
 shows how GPU-owned next-token state lets consecutive rounds overlap result
 readback and CPU commit within this same stage.
+
+**Pipelined speculation (experimental).** `--speculative-mode pipeline` reuses
+the shared speculative runner to advance tokens at different recurrent depths.
+See [pipelined self-speculation](async-speculative.md#pipelined-self-speculation)
+for configuration, state lifetimes, and token-level acceptance/rejection diagrams.
 
 **Shared execution and resources.** ModelRunner constructs ModelRuntime and the
 speculative controller references that same runtime. Both use the worker-loaded
