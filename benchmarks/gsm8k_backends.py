@@ -109,6 +109,7 @@ class Generator:
         max_length,
         exit_policy,
         attention_backend="triton",
+        cuda_graphs=False,
     ):
         self.backend, self.tokenizer, self.exit = backend, tokenizer, exit_policy
         # Full depth, taken from the protocol (the checkpoint's total_ut_steps).
@@ -151,7 +152,9 @@ class Generator:
                 cache_config=CacheConfig(num_blocks=loops * ((max_length + 15) // 16)),
                 scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=128),
                 exit_config=ExitConfig(exit_policy["mode"]),
-                execution_config=ExecutionConfig(async_scheduling=exit_policy["async_scheduling"]),
+                execution_config=ExecutionConfig(
+                    async_scheduling=exit_policy["async_scheduling"], cuda_graphs=cuda_graphs
+                ),
             )
             # Observe the existing sampling boundary without changing arithmetic.
             self._finite_hook = self.model.lm_head.register_forward_hook(

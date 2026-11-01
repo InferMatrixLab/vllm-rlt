@@ -590,9 +590,13 @@ def run(args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     attention_backend = getattr(args, "attention_backend", "triton")
+    cuda_graphs = getattr(args, "cuda_graphs", False)
+    if cuda_graphs and args.backend != "native":
+        raise ValueError("--cuda-graphs applies to the native backend only")
     metadata = {
         "backend": args.backend,
         "attention_backend": attention_backend,
+        "cuda_graphs": cuda_graphs,
         "protocol_sha256": file_digest(args.protocol),
         "source": source(),
         "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
@@ -618,6 +622,7 @@ def run(args):
         protocol["max_length"],
         exit_policy,
         attention_backend=attention_backend,
+        cuda_graphs=cuda_graphs,
     )
     load_seconds = time.monotonic() - start
     rows = []
@@ -811,6 +816,11 @@ def main():
     )
     p.add_argument("--min-loops", type=int, help="Required when --exit-threshold is below 1")
     p.add_argument("--async-scheduling", action="store_true", help="Native ouro_delayed only")
+    p.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        help="Native recurrent-core CUDA Graphs; recorded, not part of the baseline fingerprint",
+    )
     p = commands.add_parser("compare")
     p.add_argument("--transformers", "--reference", dest="transformers", required=True)
     p.add_argument("--native", "--candidate", dest="native", required=True)
