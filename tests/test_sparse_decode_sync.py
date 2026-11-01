@@ -230,7 +230,10 @@ def test_unqualified_execution_modes_fail_explicitly(setting):
     options = {
         "graphs": dict(execution_config=ExecutionConfig(cuda_graphs=True)),
         "pipeline": dict(speculative_config=SpeculativeConfig(2, mode="pipeline")),
-        "preemption": dict(scheduler_config=SchedulerConfig(enable_preemption=True)),
+        "preemption": dict(
+            speculative_config=SpeculativeConfig(2),
+            scheduler_config=SchedulerConfig(enable_preemption=True),
+        ),
         "shared": dict(cache_config=CacheConfig(512, 2, layout="shared")),
     }[setting]
     with pytest.raises(ValueError, match="sparse decode attention"):

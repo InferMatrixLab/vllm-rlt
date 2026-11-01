@@ -155,9 +155,13 @@ class StageEngine:
                     "sparse decode attention with token pipelines requires asynchronous "
                     "scheduling, the fused implementation and key_retention < 1"
                 )
-            if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
+            if scheduler_config.mode != "refill":
+                raise ValueError("sparse decode attention requires refill scheduling")
+            if scheduler_config.enable_preemption and speculative_config is not None:
+                # Ordinary decode snapshots a suspended token's reference;
+                # speculative rows hold per-round references with no snapshot.
                 raise ValueError(
-                    "sparse decode attention requires refill scheduling without preemption"
+                    "sparse decode attention supports preemption only for ordinary decode"
                 )
             # The index buffer never truncates the algorithm: capacity must
             # hold the worst-case retained count over the supported serving

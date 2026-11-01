@@ -1446,6 +1446,35 @@ class ModelRunner:
         if slot is not None:
             self.free_state_slots.append(slot)
 
+    def snapshot_attention_reference(self, request, device):
+        """Copy the live reference of a token suspended between its loops.
+
+        Call before ``suspend``. A token suspended after its reference loop
+        must consume that same reference when it resumes; restarting it dense
+        would be safe but would change its output.
+        """
+        state = self.attention_references.get(request.request_id)
+        if state is None:
+            return None
+        if state[0] is not request:
+            raise RuntimeError("attention reference belongs to another request generation")
+        event = self.events.get(request.request_id)
+        if event is not None:
+            event.synchronize()
+        return state[1], self.reference_store.snapshot(state[2], device)
+
+    def restore_attention_reference(self, request, saved):
+        if saved is None:
+            return
+        if request.request_id in self.attention_references:
+            raise RuntimeError("cannot restore over a live attention reference")
+        position, snapshot = saved
+        self.reference_generation += 1
+        lease = self.reference_store.restore(
+            snapshot, request.request_id, 0, self.reference_generation
+        )
+        self.attention_references[request.request_id] = (request, position, lease)
+
     def suspend(self, request_id):
         """Free the request's runner resources but keep its sampling RNG.
 

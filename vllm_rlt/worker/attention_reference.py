@@ -27,6 +27,7 @@ changes, including a corrected token that reuses the same position after a
 rejection. A plan built for a superseded incarnation is stale and rejected.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -39,7 +40,14 @@ from vllm_rlt.attention.sparse import (
     SparseDecodePlan,
 )
 
-__all__ = ["ReferenceLease", "AttentionReferenceStore", "DENSE", "CAPTURE", "CONSUME"]
+__all__ = [
+    "ReferenceLease",
+    "ReferenceSnapshot",
+    "AttentionReferenceStore",
+    "DENSE",
+    "CAPTURE",
+    "CONSUME",
+]
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,48 @@ class ReferenceLease:
 
     def __len__(self) -> int:
         return len(self.slots)
+
+
+@dataclass(frozen=True)
+class ReferenceSnapshot:
+    """Owned copy of a lease's slots, for suspension across preemption.
+
+    Every per-slot field a later reader or the retirement path looks at is
+    copied, so a restored slot is indistinguishable from the original one
+    except for its identity (slot, generation and incarnation are new).
+    ``host_counts`` keeps the published retained counts of each row.
+    """
+
+    selected: torch.Tensor
+    counts: torch.Tensor
+    mass: torch.Tensor
+    output: torch.Tensor
+    contribution: torch.Tensor
+    valid: torch.Tensor
+    uses: torch.Tensor
+    position: torch.Tensor
+    accepted: torch.Tensor
+    host_counts: tuple[dict[int, int], ...]
+
+    def __len__(self) -> int:
+        return self.counts.shape[0]
+
+    def to(self, device) -> "ReferenceSnapshot":
+        tensors = {
+            name: getattr(self, name).to(device)
+            for name in (
+                "selected",
+                "counts",
+                "mass",
+                "output",
+                "contribution",
+                "valid",
+                "uses",
+                "position",
+                "accepted",
+            )
+        }
+        return ReferenceSnapshot(**tensors, host_counts=self.host_counts)
 
 
 class AttentionReferenceStore:
@@ -268,6 +318,78 @@ class AttentionReferenceStore:
         self._bindings.clear()
         self._counts_host.clear()
         self.free = list(range(self.slots))
+
+    def _owner(self):
+        if self.stream is None:
+            return nullcontext()
+        return torch.cuda.stream(self.stream)
+
+    def snapshot(self, lease: ReferenceLease, device) -> ReferenceSnapshot:
+        """Copy a live lease's slots into storage the snapshot owns.
+
+        Suspension calls this after the runner drained, before it releases the
+        lease. The copy runs on the owner stream and completes before return,
+        so the released slots can be reused at once.
+        """
+        for slot, incarnation in zip(lease.slots, lease.incarnations):
+            if self._bindings.get(slot) != (lease.request_id, lease.generation, incarnation):
+                raise RuntimeError("cannot snapshot a retired attention reference")
+        with self._owner():
+            ids = lease.slot_ids
+            snapshot = ReferenceSnapshot(
+                selected=self.selected.index_select(0, ids).to(device),
+                counts=self.counts.index_select(0, ids).to(device),
+                mass=self.mass.index_select(0, ids).to(device),
+                output=self.output.index_select(0, ids).to(device),
+                contribution=self.contribution.index_select(0, ids).to(device),
+                valid=self.valid.index_select(0, ids).to(device),
+                uses=self.uses.index_select(0, ids).to(device),
+                position=self.position.index_select(0, ids).to(device),
+                accepted=self.accepted.index_select(0, ids).to(device),
+                host_counts=tuple(
+                    {
+                        layer: self._counts_host[(slot, layer)]
+                        for layer in range(self.layers)
+                        if (slot, layer) in self._counts_host
+                    }
+                    for slot in lease.slots
+                ),
+            )
+        if self.stream is not None:
+            self.stream.synchronize()
+        return snapshot
+
+    def restore(
+        self, snapshot: ReferenceSnapshot, request_id: str, request_index: int, generation: int
+    ) -> ReferenceLease:
+        """Bind fresh slots for a resumed token and copy its snapshot back."""
+        lease = self.reserve(request_id, request_index, len(snapshot), generation)
+        with self._owner():
+            self.ensure_key_capacity(snapshot.selected.shape[-1])
+            ids = lease.slot_ids
+            width = snapshot.selected.shape[-1]
+            # Only the snapshot's prefix is meaningful; a later capture
+            # overwrites what it uses, exactly as for a never-suspended slot.
+            selected = self.selected[ids]
+            selected[..., :width] = snapshot.selected.to(self.device)
+            self.selected.index_copy_(0, ids, selected)
+            for name in (
+                "counts",
+                "mass",
+                "output",
+                "contribution",
+                "valid",
+                "uses",
+                "position",
+                "accepted",
+            ):
+                getattr(self, name).index_copy_(0, ids, getattr(snapshot, name).to(self.device))
+        if self.stream is not None:
+            self.stream.synchronize()
+        for slot, counts in zip(lease.slots, snapshot.host_counts):
+            for layer, count in counts.items():
+                self._counts_host[(slot, layer)] = count
+        return lease
 
     def build_plan(self, owners, modes, *, key_retention: float) -> SparseDecodePlan:
         """Publish the plan of one submission.
