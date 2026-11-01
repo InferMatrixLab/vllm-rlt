@@ -32,6 +32,20 @@ requests can take different paths through those depths. The runtime needs to
 represent that progress explicitly so that scheduling and resource management
 can make use of it.
 
+## Version and compatibility
+
+This guide describes the v0.2.0 runtime. Its stage/loop architecture does not
+make all optional execution combinations production-qualified. Synchronous
+execution remains the default; async-first describes the internal ownership
+design, not an instruction to enable every optimization.
+
+For applications upgrading from v0.1.0, `LLM.engine` is a process-facing
+`StageClient`; worker-local cache objects are not exposed through it. Use
+the guarded, context-managed [Python API example](launching.md#python-api)
+and the [migration notes](../CHANGELOG.md). The measured performance section
+below preserves historical experiment scope rather than claiming a fresh
+release-tag GPU acceptance run.
+
 ## Design philosophy
 
 **Stage is the deployment and resource boundary; loop is the basic unit of

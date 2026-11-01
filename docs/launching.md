@@ -5,6 +5,11 @@ response. Commands work in Bash and fish on Linux; use the activation command
 for your shell. Run them in the same terminal unless a step explicitly asks
 you to open another one.
 
+This guide targets **v0.2.0**. Pin the tag below rather than a moving `main`.
+For migration from v0.1.0, read the [changelog](../CHANGELOG.md); Python scripts
+now construct a spawned stage worker and need the guarded example below.
+The release is for research/evaluation, not a production deployment guarantee.
+
 ## 1. Check the machine
 
 Use Linux with Git, curl, [uv](https://docs.astral.sh/uv/getting-started/installation/),
@@ -28,7 +33,7 @@ Keep this environment active for the following steps.
 ## 3. Clone the repository
 
 ```bash
-git clone https://github.com/InferMatrixLab/vllm-rlt.git
+git clone --branch v0.2.0 --depth 1 https://github.com/InferMatrixLab/vllm-rlt.git
 cd vllm-rlt
 ```
 
@@ -168,10 +173,14 @@ curl --fail-with-body -sS http://127.0.0.1:8000/v1/completions \
     "prompt": "The capital of France is",
     "max_tokens": 32,
     "temperature": 0,
-    "exit_threshold": 0.7,
+    "exit_threshold": 1.0,
     "stream": false
   }'
 ```
+
+The first request uses fixed full depth (`exit_threshold=1.0`) to establish
+the synchronous baseline. Lower thresholds enable adaptive exit and can change
+output quality; the examples below demonstrate that optional behavior.
 
 A successful response contains `choices[0].text`, a `finish_reason`, and `usage`
 with prompt/completion token counts. The exact generated text can vary; checking
