@@ -214,10 +214,13 @@ On one L20 (SM89, torch 2.13.0, CUDA 13.0, FlashInfer 0.7.2.post1, Triton
 
 65/87 generated token sequences are identical. Two correct-answer flips cancel:
 question 360 goes incorrect → correct with FA2, and question 426 goes
-correct → incorrect. FA2 has one length-limited runaway (question 182 reaches
-1024 tokens; Triton stops at 40), so its mean generated length is 115.9 vs
-103.7 tokens and its generation time is 732.6 s vs 637.4 s. This backend does
-not demonstrate an end-to-end speedup on this workload.
+correct → incorrect. The first divergences are near ties (logits maxabs
+<= 0.17, top1/top2 margins 0–0.125), consistent with BF16 accumulation order.
+FA2 has one length-limited runaway (question 182 reaches 1024 tokens; Triton
+stops at 40), so its mean generated length is 115.9 vs 103.7 tokens and its
+generation time is 732.6 s vs 637.4 s. A matched 64-token fixed-work run at
+concurrency 1/8/32 gives FA2/Triton time ratios 1.05/0.97/1.03, within noise;
+this backend does not demonstrate an end-to-end speedup on this workload.
 
 The stored GSM8K-87 baseline fingerprints `torch==2.13.0`; a run on another torch
 version cannot reuse its 59/87 baseline. A 10-question custom subset on torch 2.8

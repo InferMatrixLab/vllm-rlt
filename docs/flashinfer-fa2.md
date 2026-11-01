@@ -76,6 +76,10 @@ official run used the pip `cuda-toolkit[nvcc]==13.0.3` tree.
   - 65/87 generated token sequences are identical.
   - Two correct-answer flips cancel: question 360 changes from incorrect
     (Triton) to correct (FA2); question 426 changes from correct to incorrect.
+  - The flips are BF16 ties: first-divergence logits differ by <= 0.17. q360
+    has margins 0.0 (Triton) vs 0.125 (FA2); q426 is the reverse; q182's first
+    token is tied at 0.0 (FA2) vs 0.125 (Triton), which sends FA2 into the
+    1024-token runaway.
   - FA2 has one length-limited runaway (question 182 reaches 1024 tokens; Triton
     stops at 40), which inflates its generation time and mean length.
 - An earlier 10-question custom subset on torch 2.8 was used as a smoke:
@@ -96,9 +100,20 @@ Kernel-only, Ouro attention shapes, page 16, random KV, single L20:
 FA2 is ~2–3× faster at low concurrency/short context and at parity at high
 concurrency/long context. End-to-end on the official GSM8K-87 run, FA2 took
 732.6 s and Triton 637.4 s, with mean generated lengths 115.9 and 103.7 tokens;
-the 1024-token runaway accounts for much of the gap. The model forward dominates,
-so this backend has **no demonstrated end-to-end speedup** in this workload. Do
-not treat these as production speedup claims.
+the 1024-token runaway accounts for much of the gap.
+
+A matched fixed-work run (64 output tokens, same prompts, two repeats per cell)
+gives:
+
+| concurrency | Triton s | FA2 s | FA2/Triton |
+|---:|---:|---:|---:|
+| 1 | 4.37 | 4.59 | 1.05 |
+| 8 | 6.62 | 6.41 | 0.97 |
+| 32 | 11.44 | 11.79 | 1.03 |
+
+The differences are within run-to-run noise. The model forward dominates, so
+this backend has **no demonstrated end-to-end speedup** in this workload. Do not
+treat these as production speedup claims.
 
 
 ## Follow-ups
