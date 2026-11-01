@@ -51,6 +51,8 @@ Batching](https://arxiv.org/pdf/2608.09444) by Kristian Schwethelm, Daniel
 Rückert, and Georgios Kaissis (2026). It runs independently and does not require
 vLLM to be installed. See [Citation](#citation) for the paper's BibTeX entry.
 
+<a id="highlights"></a>
+
 ## What's new in v0.2.0
 
 1. **One stage runtime, loop-level scheduling.** Prefill and decode share
