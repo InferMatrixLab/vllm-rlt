@@ -589,8 +589,10 @@ def run(args):
         raise RuntimeError("Run with one scheduler-assigned GPU")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
+    attention_backend = getattr(args, "attention_backend", "triton")
     metadata = {
         "backend": args.backend,
+        "attention_backend": attention_backend,
         "protocol_sha256": file_digest(args.protocol),
         "source": source(),
         "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
@@ -609,7 +611,14 @@ def run(args):
     close_id = thinking_close_id(tokenizer) if scorer == SCORER_THINKING else None
     task = make_task(protocol["task_config"])
     start = time.monotonic()
-    generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"], exit_policy)
+    generator = Generator(
+        args.backend,
+        str(model),
+        tokenizer,
+        protocol["max_length"],
+        exit_policy,
+        attention_backend=attention_backend,
+    )
     load_seconds = time.monotonic() - start
     rows = []
     try:
@@ -785,6 +794,12 @@ def main():
     )
     p = commands.add_parser("run")
     p.add_argument("--backend", choices=["transformers", "native"], required=True)
+    p.add_argument(
+        "--attention-backend",
+        choices=["torch", "triton", "flashinfer_fa2"],
+        default="triton",
+        help="Native backend's attention implementation",
+    )
     p.add_argument("--protocol", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--exit-mode", choices=["ouro", "ouro_delayed"], default="ouro")
