@@ -25,13 +25,14 @@ from vllm_rlt import (
     SpeculativeConfig,
 )
 from vllm_rlt.engine.stage_engine import StageEngine
+from vllm_rlt.models import AutoModelForCausalLM
 
 
-def build(model, concurrency, sparse):
+def build(model, concurrency, sparse, blocks=2048):
     return StageEngine(
         model,
         attention_backend="triton",
-        cache_config=CacheConfig(2048, 16, incremental_allocation=True),
+        cache_config=CacheConfig(blocks, 16, incremental_allocation=True),
         scheduler_config=SchedulerConfig(
             max_num_seqs=concurrency,
             max_num_batched_tokens=8 * concurrency,
@@ -43,13 +44,13 @@ def build(model, concurrency, sparse):
     )
 
 
-def run(model, concurrency, sparse, *, prompt, max_tokens, repeats):
+def run(model, concurrency, sparse, *, prompt, max_tokens, repeats, blocks=2048):
     """One configuration: returns median wall time, tokens/s and peak bytes."""
     outputs = None
     walls = []
     peaks = []
     for _ in range(repeats):
-        engine = build(model, concurrency, sparse)
+        engine = build(model, concurrency, sparse, blocks)
         torch.cuda.reset_peak_memory_stats()
         params = [
             SamplingParams(max_tokens=max_tokens, ignore_eos=True) for _ in range(concurrency)
@@ -88,15 +89,24 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--concurrency", default="1,8,32")
     parser.add_argument("--retentions", default="1.0,0.1")
+    parser.add_argument("--model-path", default=None)
+    parser.add_argument("--cache-blocks", type=int, default=2048)
+    parser.add_argument("--sparse-context", type=int, default=64)
     args = parser.parse_args()
 
     device = args.device
-    model = tiny_ouro_model(device)
+    if args.model_path:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path, device=device, dtype=torch.bfloat16
+        )
+    else:
+        model = tiny_ouro_model(device)
     concurrency_levels = [int(value) for value in args.concurrency.split(",")]
     retentions = [float(value) for value in args.retentions.split(",")]
 
+    label = args.model_path or "tiny Ouro"
     print(
-        f"engine e2e — tiny Ouro ({model.config.num_hidden_layers}L, ctx "
+        f"engine e2e — {label} ({model.config.num_hidden_layers}L, ctx "
         f"{model.config.max_position_embeddings}), prompt {args.prompt}, "
         f"max_tokens {args.max_tokens}, median of {args.repeats}"
     )
@@ -110,6 +120,7 @@ def main():
             prompt=args.prompt,
             max_tokens=args.max_tokens,
             repeats=args.repeats,
+            blocks=args.cache_blocks,
         )
         print(
             f"{concurrency:>5}{'dense':>14}{dense['tokens_per_s']:>10.2f}"
@@ -120,11 +131,14 @@ def main():
                 model,
                 concurrency,
                 SparseDecodeAttentionConfig(
-                    enabled=True, key_retention=retention, max_context_tokens=64
+                    enabled=True,
+                    key_retention=retention,
+                    max_context_tokens=args.sparse_context,
                 ),
                 prompt=args.prompt,
                 max_tokens=args.max_tokens,
                 repeats=args.repeats,
+                blocks=args.cache_blocks,
             )
             same = sum(
                 1
