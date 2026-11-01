@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
+from vllm_rlt.kernels import silu_and_mul
 from vllm_rlt.kernels.dispatch import fused_allowed
 from vllm_rlt.layers import (
     RMSNorm,
@@ -211,7 +211,7 @@ class OuroMLP(nn.Module):
 
             if fused_silu_mul_supported(gate, up):
                 return self.down_proj(fused_silu_mul(gate, up, exact=FUSED_ACT == "exact"))
-        return self.down_proj(F.silu(gate) * up)
+        return self.down_proj(silu_and_mul(gate, up))
 
 
 class OuroDecoderLayer(nn.Module):
@@ -318,6 +318,7 @@ class OuroForCausalLM(nn.Module):
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
+        config: OuroConfig | None = None,
     ) -> "OuroForCausalLM":
         """Stream strictly checked safetensors into a meta model; never execute Hub code.
 
@@ -333,7 +334,10 @@ class OuroForCausalLM(nn.Module):
 
             source, revision, _ = resolve_model_config(path_or_repo, revision=revision)
             folder = Path(source)
-        config = OuroConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        if config is None:
+            config = OuroConfig.from_dict(json.loads((folder / "config.json").read_text()))
+        elif not isinstance(config, OuroConfig):
+            raise TypeError("config must be an OuroConfig")
         index_path = folder / "model.safetensors.index.json"
         index = json.loads(index_path.read_text())["weight_map"] if index_path.is_file() else None
         if index is None:

@@ -669,8 +669,13 @@ class KVCacheManager:
         if isinstance(batch, DeviceKVMetadata):
             self._validate_tensor(k, len(batch.position_ids), "k")
             self._validate_tensor(v, len(batch.position_ids), "v")
-            self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
-            self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+            if batch.write_mask is not None:
+                from vllm_rlt.kernels.routing import masked_kv_store
+
+                masked_kv_store(self.key_cache[:, layer], self.value_cache[:, layer], k, v, batch)
+            else:
+                self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
+                self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
             return
         if not batch.writable:
             raise ValueError("a read-only prepared KV batch cannot be written")

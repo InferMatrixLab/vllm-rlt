@@ -79,7 +79,7 @@ def test_graphs_match_eager_with_ragged_rows_page_growth_and_reuse(
                 if max_rows == 2:
                     assert runner.graphs.fallbacks > 0
                 else:
-                    assert any(key[0] > 3 for key in runner.graphs.entries)
+                    assert any(key > 3 for key in runner.graphs.entries)
             results.append(rounds)
         finally:
             engine.close()

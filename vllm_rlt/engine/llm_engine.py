@@ -4,7 +4,6 @@ import copy
 import time
 from collections import deque
 from dataclasses import replace
-from types import SimpleNamespace
 from uuid import uuid4
 
 import torch
@@ -12,6 +11,7 @@ import torch
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.engine.worker import start_stage_worker
+from vllm_rlt.models import prepare_model
 
 LLMEngine = StageEngine
 
@@ -30,6 +30,7 @@ class StageClient:
         device=None,
         dtype=None,
         revision=None,
+        model_config=None,
         seed=0,
         startup_timeout=120,
         shutdown_timeout=30,
@@ -39,6 +40,9 @@ class StageClient:
         wait_for_ready=True,
         **engine_options,
     ):
+        model, revision, self.model_config = prepare_model(
+            model, revision=revision, model_config=model_config
+        )
         # An explicitly supplied model is a weight source, never a second runner.
         # Checkpoint paths load directly inside the worker without a host copy.
         if isinstance(model, torch.nn.Module):
@@ -69,7 +73,13 @@ class StageClient:
             self.stage_config,
             device,
             model,
-            dict(seed=seed, dtype=dtype, revision=revision, engine=engine_options),
+            dict(
+                seed=seed,
+                dtype=dtype,
+                revision=revision,
+                engine=engine_options,
+                model_config=self.model_config,
+            ),
             connector_factory=connector_factory,
             max_control_messages=max_control_messages,
         )
@@ -131,9 +141,6 @@ class StageClient:
             raise error(f"stage worker failed:\n{self.failure}")
         if kind == "ready":
             self.info, self.ready = message, True
-            self.model_config = SimpleNamespace(
-                **message["model"], model_type=message["model_type"]
-            )
         elif kind == "connected":
             self.connected = True
         elif kind == "reply":

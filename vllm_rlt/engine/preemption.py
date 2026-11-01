@@ -37,9 +37,16 @@ class PreemptionManager:
             phase, hidden, token = previous["phase"], previous["hidden"], previous["token"]
 
         device = torch.device("cpu") if offload_kv else cache.device
+        runner = e.speculative_runner
+        pipeline = previous.get("pipeline") if previous is not None else None
+        if previous is None and runner is not None:
+            pipeline = runner.snapshot_pipeline(victim, device)
+        elif pipeline is not None:
+            pipeline = pipeline.to(device)
         # Build a new record before releasing resources. In particular, a failed
         # offload must leave the prior resident state available for resumption.
         snapshot = dict(
+            pipeline=pipeline,
             phase=phase,
             kv=cache.snapshot(victim.request_id) if offload_kv else None,
             hidden=None if hidden is None else hidden.to(device).clone(),
@@ -50,6 +57,8 @@ class PreemptionManager:
             # another stream reuses the released runner slot.
             torch.cuda.current_stream(cache.device).synchronize()
         if previous is None:
+            if runner is not None:
+                runner.release(victim)
             e.model_runner.suspend(victim.request_id)
             victim.hidden_state = victim.input_token_tensor = None
             self.preemptions += 1
@@ -74,6 +83,8 @@ class PreemptionManager:
         request.input_token_tensor = (
             None if state["token"] is None else state["token"].to(cache.device)
         )
+        if self.engine.speculative_runner is not None:
+            self.engine.speculative_runner.restore_pipeline(request, state.get("pipeline"))
         # Resident copies completed before suspension released their runner slot.
         # Restored CPU buffers must be visible to every stream before resumption.
         if kv is not None and cache.device.type == "cuda":

@@ -15,6 +15,7 @@ from vllm_rlt.entrypoints.runtime_args import (
     runtime_configs,
 )
 from vllm_rlt.models import (
+    ModelConfig,
     load_tokenizer,
     resolve_model_config,
     resolve_model_source,
@@ -42,6 +43,7 @@ def load_engine(args):
             raise ValueError("serving requires the Ouro byte-level tokenizer")
     engine = StageClient(
         source,
+        model_config=ModelConfig.from_dict(config),
         revision=revision,
         device=args.device,
         dtype=args.dtype,
