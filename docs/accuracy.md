@@ -204,16 +204,24 @@ above are explicit project choices rather than an exact paper reproduction.
 for the native backend; the default stays `triton`. The flag is recorded in the
 summary and does not change the frozen baseline fingerprint.
 
-On one L20 (SM89, torch 2.8.0, FlashInfer 0.7.2.post1), a custom 10-question
-subset produced **3/10 with Triton and 3/10 with FlashInfer FA2**; 8/10 generated
-token sequences were identical, and the two divergences were on questions both
-backends answered incorrectly. The first divergences were near ties (top1/top2
-margins 0.0–0.0625), consistent with BF16 kernel accumulation order rather than an
-adapter defect. This is a diagnostic subset, not the GSM8K-87 gate.
+On one L20 (SM89, torch 2.13.0, CUDA 13.0, FlashInfer 0.7.2.post1, Triton
+3.7.1), the default GSM8K-87 protocol (HF baseline 59/87) produced:
+
+| backend | correct | accuracy | gate |
+|---|---:|---:|---|
+| triton | 61/87 | 70.11% | pass (+2.30 pp) |
+| flashinfer_fa2 | 61/87 | 70.11% | pass (+2.30 pp) |
+
+65/87 generated token sequences are identical. Two correct-answer flips cancel:
+question 360 goes incorrect → correct with FA2, and question 426 goes
+correct → incorrect. FA2 has one length-limited runaway (question 182 reaches
+1024 tokens; Triton stops at 40), so its mean generated length is 115.9 vs
+103.7 tokens and its generation time is 732.6 s vs 637.4 s. This backend does
+not demonstrate an end-to-end speedup on this workload.
 
 The stored GSM8K-87 baseline fingerprints `torch==2.13.0`; a run on another torch
-version cannot reuse its 59/87 baseline. Run the default protocol on a torch-2.13
-environment before quoting an 87-question score for either backend.
+version cannot reuse its 59/87 baseline. A 10-question custom subset on torch 2.8
+was used only as an early smoke (3/10 with both backends, 8/10 identical).
 
 
 The [full 1,319-question comparison](https://github.com/InferMatrixLab/vllm-rlt/blob/d2f7db20593cccfe666b3c04c3ee50abc8c39af7/docs/benchmarks/gsm8k-bf16-20260912.md) recorded

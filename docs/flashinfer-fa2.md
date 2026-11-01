@@ -59,24 +59,27 @@ or `--attention-backend flashinfer_fa2` on the offline CLI/server.
 - No `prefill` entry point: the default Ouro path never calls it, and
   `packed_prefill` stays false.
 
-## Validation (L20, 2026-11-01)
+## Validation (L20, 2026-11-01/02)
 
-Environment: 1×L20 (sm_89, 46 GB, driver 580.126.20), torch 2.8.0, FlashInfer
-0.7.2.post1, Triton 3.7.1. The L20 pod's CUDA 12.1 needed a local removal of
-FlashInfer's CUDA-12.9-only `--compress-mode=size` flag; use CUDA 12.9 for a
-clean build.
+Environment: 1×L20 (sm_89, 46 GB, driver 580.126.20), **torch 2.13.0**
+(metadata `2.13.0`, CUDA 13.0), FlashInfer 0.7.2.post1, Triton 3.7.1, and the
+protocol's pinned `transformers 4.55.0` / `lm-eval 0.4.9.2` / `datasets 3.6.0`
+/ `tokenizers 0.21.4`. FlashInfer's JIT requires a CUDA >= 12.9 toolkit; the
+official run used the pip `cuda-toolkit[nvcc]==13.0.3` tree.
 
 - Unit tests: `tests/test_flashinfer_fa2_attention.py` covers selection,
   rejection paths, strided/GQA KV, padding tri-state, zero-length rows, batch
   composition, empty batches, and tiny-Ouro token/exit-depth parity against
   Triton for LAST_EXITED and SHARED.
-- Real Ouro-1.4B: a 10-question custom GSM8K subset produced the same correct
-  count (3/10) with Triton and FA2; 8/10 generated token sequences were
-  identical. The first divergences sit on questions both backends answered
-  incorrectly, at near-tied logits (top1/top2 margins 0.0–0.0625).
-- The official GSM8K-87 fingerprint requires torch 2.13.0; the L20 pod ran
-  torch 2.8, so the stored 59/87 baseline was not claimed. Run the official
-  protocol on a torch-2.13 environment before quoting a 87-question score.
+- Official GSM8K-87 (the default protocol with its 59/87 baseline):
+  **Triton 61/87, FlashInfer FA2 61/87**; both pass the +2.30 pp gate.
+  - 65/87 generated token sequences are identical.
+  - Two correct-answer flips cancel: question 360 changes from incorrect
+    (Triton) to correct (FA2); question 426 changes from correct to incorrect.
+  - FA2 has one length-limited runaway (question 182 reaches 1024 tokens; Triton
+    stops at 40), which inflates its generation time and mean length.
+- An earlier 10-question custom subset on torch 2.8 was used as a smoke:
+  3/10 with both backends and 8/10 identical sequences.
 
 ## Performance (diagnostic, not a benchmark)
 
@@ -91,9 +94,12 @@ Kernel-only, Ouro attention shapes, page 16, random KV, single L20:
 | 32 | 8192 | 2.9407 | 2.9881 | 0.98 |
 
 FA2 is ~2–3× faster at low concurrency/short context and at parity at high
-concurrency/long context. End-to-end, the 10-question real-model run took
-84.8 s with Triton and 79.7 s with FA2; the model forward dominates, so the
-attention gain is small. Do not treat these as production speedup claims.
+concurrency/long context. End-to-end on the official GSM8K-87 run, FA2 took
+732.6 s and Triton 637.4 s, with mean generated lengths 115.9 and 103.7 tokens;
+the 1024-token runaway accounts for much of the gap. The model forward dominates,
+so this backend has **no demonstrated end-to-end speedup** in this workload. Do
+not treat these as production speedup claims.
+
 
 ## Follow-ups
 
