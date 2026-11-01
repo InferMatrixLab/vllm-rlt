@@ -508,6 +508,8 @@ class PDEngine:
     def step(self):
         if self.closed:
             raise RuntimeError("PD engine is closed")
+        if self.failure:
+            raise RuntimeError("PD engine is unavailable")
         if self._update_version is not None or self._update_failed:
             raise RuntimeError("Generation is unavailable during a PD weight update")
         try:
@@ -672,7 +674,7 @@ class PDEngine:
 
     def _terminate(self):
         if not self.terminate_workers_on_failure:
-            self.closed = True
+            # Failed is not closed: close() keeps its cooperative drain, stop and join.
             return
         if self._profile_session:
             self._profile_recording = False

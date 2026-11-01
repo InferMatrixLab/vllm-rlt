@@ -211,6 +211,36 @@ def test_cpu_stage_clients_publish_to_all_pd_peers_and_recover_control_errors():
             client.close()
 
 
+def test_failure_without_forced_termination_keeps_cooperative_close():
+    client = StageClient(
+        tiny_ouro_model(), device="cpu", dtype="float32", cache_config=CacheConfig(64, 2)
+    )
+    pd = object.__new__(PDEngine)
+    pd.config = PDConfig()
+    pd.peers = {"0": SimpleNamespace(name="0", role="decode", client=client)}
+    pd.requests, pd.transfers, pd.outputs, pd.worker_metrics = {}, {}, [], {}
+    pd.closed, pd.failure, pd.terminate_workers_on_failure = False, None, False
+    pd._update_version, pd._update_failed, pd._profile_session = None, False, None
+
+    def timeout():
+        raise TimeoutError("PD request/transfer deadline exceeded")
+
+    pd._admit = timeout
+    try:
+        with pytest.raises(TimeoutError):
+            pd.step()
+        # The failed coordinator neither signalled the worker nor counts as shut down.
+        assert not pd.closed and client.process.is_alive() and not client.stopped
+        with pytest.raises(RuntimeError, match="unavailable"):
+            pd.step()
+        pd.close()
+        assert pd.closed and client.stopped
+        assert not client.process.is_alive()
+        pd.close()
+    finally:
+        client.close()
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_mixed_score_admission_and_unspecified_seed_replay(asynchronous):
     model = tiny_ouro_model()
