@@ -633,6 +633,37 @@ def test_sparse_engine_matches_dense_tokens_at_full_retention():
 
 
 @pytest.mark.gpu
+def test_release_from_another_stream_builds_its_index_on_the_owner_stream(monkeypatch):
+    # A speculative ticket retires from the host's current stream while the
+    # store clears on its owner stream. An index built on the current stream is
+    # freed when release returns and can be reused there before the owner
+    # stream reads it, clearing some other slot.
+    owner = torch.cuda.Stream()
+    store = AttentionReferenceStore(
+        slots=8, layers=1, heads=1, head_dim=4, key_bucket=4, device="cuda", stream=owner
+    )
+    lease = store.reserve("r", 0, 2, generation=1)
+    other = next(slot for slot in range(store.slots) if slot not in lease.slots)
+    store.valid.fill_(True)
+    torch.cuda.synchronize()
+    clear, streams = store._clear, []
+
+    def record(indices):
+        streams.append(torch.cuda.current_stream())
+        clear(indices)
+
+    monkeypatch.setattr(store, "_clear", record)
+    with torch.cuda.stream(owner):
+        torch.cuda._sleep(20_000_000)
+    store.release(lease)
+    poison = [torch.full((1,), other, device="cuda", dtype=torch.int64) for _ in range(32)]
+    torch.cuda.synchronize()
+    assert streams == [owner] and len(poison) == 32
+    assert not bool(store.valid[list(lease.slots)].any())
+    assert bool(store.valid[other].all())
+
+
+@pytest.mark.gpu
 def test_accept_and_retire_do_not_allocate_bucket_sized_temporaries():
     # Reviewer-reported OOM: acceptance used to read-modify-write the retained
     # index buffer, materialising a bucket-sized temporary per batch. Retirement

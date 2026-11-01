@@ -241,7 +241,14 @@ class AttentionReferenceStore:
         if cleared:
             self.free.extend(cleared)
             self._forget_counts(cleared)
-            self._clear(self._index(cleared))
+            if self.stream is None:
+                self._clear(self._index(cleared))
+                return
+            # A ticket retires from the host's current stream. An index built
+            # there would be freed, and reusable by that stream, before the
+            # owner stream's index_fill_ reads it; build it on the owner stream.
+            with torch.cuda.stream(self.stream):
+                self._clear(self._index(cleared))
 
     def discard(self) -> None:
         """Free every binding without device work; the caller has drained."""
