@@ -201,6 +201,7 @@ class ModelRuntime:
             if hidden is None:
                 raise ValueError("RECURRENT requires hidden state")
             for index, kv in enumerate(batch.metadata):
+                self.cache.prepare_attention(kv)
                 if batch.graphs is not None:
                     call = batch.graph_calls[index]
                     if not call.inputs_ready:
