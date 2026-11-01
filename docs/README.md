@@ -24,6 +24,7 @@ an environment to receiving the first generated response. The
 | [Self-speculation](async-speculative.md) | Cross-round asynchronous block execution, token pipelines, and acceptance/rejection timelines |
 | [Asynchronous scheduling](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
 | [FlashAttention](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
+| [FlashInfer FA2 (Ada)](flashinfer-fa2.md) | SM89 paged decode, explicit opt-in, validation scope and limitations |
 | [Cache and scheduling features](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
 | [Prefill/decode disaggregation](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
 | [HTTP serving](serving.md) | Completions API, streaming, and service lifecycle |
