@@ -313,7 +313,10 @@ def test_triton_fp8_prefill_matches_dequantized_prefill(dtype):
     from vllm_rlt.kernels.triton_attention import paged_prefill_attention
 
     torch.manual_seed(5)
-    pages, block, kv_heads, heads, head_dim = 40, 16, 2, 8, 128
+    # The FP32 dense reference kernel needs ~112 KB of shared memory at head
+    # dim 128, above the ~99 KB of sm_86/sm_89/sm_120; 64 fits everywhere.
+    head_dim = 128 if dtype is torch.bfloat16 else 64
+    pages, block, kv_heads, heads = 40, 16, 2, 8
     codes, scale = quantize_fp8(torch.randn(pages, block, kv_heads, head_dim, device="cuda"))
     # Block 0 is never mapped: its NaN codes (e4m3fn 0x7F) must not reach any output.
     codes[0].view(torch.uint8).fill_(0x7F)
