@@ -212,10 +212,16 @@ class SparseDecodeAttentionConfig:
     # falls back to the model context; set it to the real serving bound so the
     # pool is not sized for a context the deployment never uses.
     max_context_tokens: int | None = None
+    # ``batched`` keeps the scalar oracle's reduction shapes (bitwise contract);
+    # ``fused`` launches fixed per-layer kernels without host readbacks and
+    # changes consume-row numerics (see vllm_rlt.kernels.sparse_decode).
+    implementation: str = "batched"
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise ValueError("enabled must be a boolean")
+        if self.implementation not in ("batched", "fused"):
+            raise ValueError("implementation must be 'batched' or 'fused'")
         if not math.isfinite(self.key_retention) or not 0 < self.key_retention <= 1:
             raise ValueError("key_retention must be in (0, 1]")
         if self.key_bucket is not None:

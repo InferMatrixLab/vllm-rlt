@@ -194,20 +194,31 @@ class StageEngine:
                 heads=config.num_attention_heads,
                 head_dim=config.head_dim,
                 key_bucket=capacity,
+                initial_key_capacity=min(capacity, 64),
                 device=parameter.device,
+                implementation=sparse_decode.implementation,
             )
+            if parameter.device.type == "cuda":
+                free_bytes, _ = torch.cuda.mem_get_info(parameter.device)
+                growth_bytes = self.reference_store.peak_capacity_bytes - self.reference_store.bytes
+                if growth_bytes > free_bytes:
+                    raise ValueError(
+                        "sparse reference index growth exceeds available device memory"
+                    )
             logger.info(
                 "sparse decode attention: %d reference slots x %d keys x %d layers x %d heads "
-                "= %.2f GiB (context bound %d, retention %.2f)",
+                "<= %.2f GiB growth peak (context bound %d, retention %.2f)",
                 slots,
                 capacity,
                 config.num_hidden_layers,
                 config.num_attention_heads,
-                self.reference_store.bytes / 1024**3,
+                self.reference_store.peak_capacity_bytes / 1024**3,
                 context_bound,
                 sparse_decode.key_retention,
             )
-            scratch += self.reference_store.bytes
+            # Budget the logical maximum and copy overlap, not just the small
+            # initial allocation; short prompts must not overcommit long ones.
+            scratch += self.reference_store.peak_capacity_bytes
         if speculative_config is not None or self.reference_store is not None:
             cache_config = replace(
                 cache_config, memory_reserve_bytes=cache_config.memory_reserve_bytes + scratch
