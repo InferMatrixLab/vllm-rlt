@@ -51,28 +51,33 @@ Batching](https://arxiv.org/pdf/2608.09444) by Kristian Schwethelm, Daniel
 Rückert, and Georgios Kaissis (2026). It runs independently and does not require
 vLLM to be installed. See [Citation](#citation) for the paper's BibTeX entry.
 
-## Highlights
+## What's new in v0.2.0
 
-- **Three native models:** Ouro-1.4B with fixed-depth or learned early-exit
-  decoding, Nanbeige4.2-3B with fixed two-loop inference, and Huginn-0125 with
-  synchronous fixed-depth inference.
-- **Measured serving performance:** on the B300 ShareGPT C8 workload below,
-  single-GPU asynchronous self-speculation reached **628.9 output tokens/s**,
-  versus **370.6 tokens/s** with base optimizations (**+69.7%**). Mean completion
-  latency fell **40.7%**; TTFT and ITL tails increased. These are diagnostic
-  measurements with unresolved output-equivalence differences.
-- **Loop-aware runtime:** continuous batching, depth-aware paged KV, and opt-in
-  prefix caching, CUDA Graphs, self-speculation, and single-host prefill/decode
-  disaggregation.
-- **Ready-to-use interfaces:** Python API, CLI, and streaming OpenAI-compatible
-  completions.
+1. **One stage runtime, loop-level scheduling.** Prefill and decode share
+   execution machinery; stages own resources while loops expose scheduling
+   progress. Split/wavefront chunked prefill and compatible mixed batching are
+   available as optional scheduling paths. [Architecture](docs/unified_execution.md).
+2. **More recurrent model coverage.** Native Huginn and shared Ouro-Thinking
+   integration join Ouro and Nanbeige. Support is checkpoint- and
+   configuration-specific, not a blanket qualification of every combination.
+   [Support matrix](#model-support).
+3. **A broader execution toolkit.** Asynchronous block/token-pipeline
+   self-speculation and CUDA Graphs are complemented by an optional native
+   CUDA SiLU-and-Mul operator for Ouro. These features have distinct support
+   limits; native-kernel measurements are not general model-speedup claims.
+   [Self-speculation](docs/async-speculative.md) · [Native kernels](docs/kernels.md).
 
-**[v0.1.0 is experimental](https://github.com/InferMatrixLab/vllm-rlt/releases/tag/v0.1.0).**
-Start with synchronous execution. Async execution with preemption can produce
-incorrect outputs ([#109](https://github.com/InferMatrixLab/vllm-rlt/pull/109));
-async self-speculation has unresolved worker-failure and cleanup issues
-([#115](https://github.com/InferMatrixLab/vllm-rlt/pull/115)). See the release notes
-for supported combinations and limitations.
+**v0.2.0 is a research and evaluation milestone, not a production-stability
+promise.** Start with default synchronous execution. The async preemption and
+failure-cleanup fixes #109/#115 are now included; the old warnings apply to
+v0.1.0, not automatically to this revision. Optional modes still require
+workload-specific validation. Existing performance campaigns have unresolved
+cross-configuration output-equivalence differences and are diagnostic rather
+than equal-quality speedup claims.
+
+See [changes and migration notes](CHANGELOG.md) and the
+[versioned release notes](https://github.com/InferMatrixLab/vllm-rlt/releases/tag/v0.2.0)
+for artifact and validation scope.
 
 ## Features
 
@@ -171,13 +176,21 @@ Requires **Python 3.10+** and **PyTorch 2.5+**. For GPU inference, use Linux wit
 an NVIDIA GPU and a CUDA-enabled PyTorch installation compatible with your
 hardware.
 
-With your environment activated, use uv from the repository root to install
-the project (text, serving, and Triton
-support are included):
+For the versioned source, activate your environment and run:
 
 ```bash
+git clone --branch v0.2.0 --depth 1 https://github.com/InferMatrixLab/vllm-rlt.git
+cd vllm-rlt
 uv pip install -e .
+vllm-rlt-serve --help
 ```
+
+This installs text, serving and Linux Triton dependencies. A standard isolated
+build produces a Python-only package with the Torch activation fallback.
+To compile the optional native CUDA operator, use compatible CUDA PyTorch,
+`nvcc` and a C++ compiler, then follow the
+[automatic native build guide](docs/launching.md#automatic-native-cuda-build).
+Release wheels do not bundle model weights; no PyPI publication is implied.
 
 For a fresh machine, follow the [step-by-step user guide](docs/launching.md):
 create an environment, download the model, start the server, and send your first
