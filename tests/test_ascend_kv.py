@@ -10,11 +10,24 @@ pytestmark = pytest.mark.npu
 
 
 @pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("backend", ["torch", "ascend_eager"])
 @torch.inference_mode()
-def test_native_scatter_preserves_inputs_other_layers_and_reused_ids(rows):
+def test_native_scatter_preserves_inputs_other_layers_and_reused_ids(rows, backend, monkeypatch):
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
-    cache = KVCacheManager(2, 2, 64, 32, 16, 4, device=device, dtype=torch.bfloat16)
+    import torch_npu
+
+    native = torch_npu.npu_scatter_nd_update_
+    calls = []
+
+    def observed(*args, **kwargs):
+        calls.append(True)
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(torch_npu, "npu_scatter_nd_update_", observed)
+    cache = KVCacheManager(
+        2, 2, 64, 32, 16, 4, device=device, dtype=torch.bfloat16, backend=backend
+    )
     cache.key_cache.zero_()
     cache.value_cache.zero_()
     assert cache.allocate("a", 17)
@@ -49,3 +62,4 @@ def test_native_scatter_preserves_inputs_other_layers_and_reused_ids(rows):
     cache.free("b")
     assert cache.num_used_blocks == 0
     torch.npu.synchronize()
+    assert len(calls) == (6 if backend == "ascend_eager" else 0)
