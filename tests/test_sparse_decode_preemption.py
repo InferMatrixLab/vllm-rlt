@@ -201,7 +201,7 @@ def test_cuda_pipeline_preemption_restores_each_rows_reference(graphs, offload):
         )
 
     prompt = [1, 2, 3]
-    low = SamplingParams(max_tokens=12, ignore_eos=True, priority=10)
+    low = SamplingParams(max_tokens=64, ignore_eos=True, priority=10)
     e = make()
     try:
         e.add_request("low", prompt, low)
@@ -214,33 +214,48 @@ def test_cuda_pipeline_preemption_restores_each_rows_reference(graphs, offload):
         e.add_request("low", prompt, low)
         request = e.scheduler.requests["low"]
         runner = e.speculative_runner
-        for _ in range(200):
-            e.step()
-            state = runner.states.get("low")
-            # Rows reach their consume loops a few submissions after the root.
-            if state is not None and state.submitted >= 4:
-                break
-        else:
-            pytest.fail("did not submit pipeline steps")
-        e.add_request("high", [5], SamplingParams(max_tokens=3, ignore_eos=True, priority=0))
-        for _ in range(200):
-            e.step()
-            if "low" in e.preemption.snapshots:
-                break
-        else:
-            pytest.fail("priority arrival did not suspend the pipeline")
-        saved = e.preemption.snapshots["low"]["pipeline"]
-        assert saved.references is not None
-        references, permutation = saved.references
-        assert sorted(permutation) == list(range(len(references)))
-        # Some live row is past its capture loop, so its reference matters.
-        assert any(t.depth > 1 for t in saved.tokens)
-        assert "low" not in runner.states
-        if offload:
-            e.preemption.suspend(request, offload_kv=True)
+        outputs, deep = {}, 0
+
+        def step():
+            for output in e.step():
+                if output.finished:
+                    outputs[output.request_id] = list(output.token_ids)
+
+        # A random tiny model rejects most drafts, so a pipeline often restarts
+        # from its root. Suspend repeatedly, one more submission later each time
+        # so the suspension point walks through the pipeline's cycle, until one
+        # suspension holds a row past its capture loop.
+        for attempt in range(8):
+            for _ in range(200):
+                step()
+                state = runner.states.get("low")
+                if state is not None and state.submitted >= 2 + attempt:
+                    break
+            else:
+                pytest.fail("the low request did not run pipeline steps")
+            e.add_request(
+                f"high{attempt}", [5], SamplingParams(max_tokens=3, ignore_eos=True, priority=0)
+            )
+            for _ in range(200):
+                step()
+                if "low" in e.preemption.snapshots:
+                    break
+            else:
+                pytest.fail("priority arrival did not suspend the pipeline")
             saved = e.preemption.snapshots["low"]["pipeline"]
-            assert saved.references[0].selected.device.type == "cpu"
-        outputs = _drain(e, {})
+            references, permutation = saved.references
+            assert sorted(permutation) == list(range(len(references)))
+            assert "low" not in runner.states
+            if offload:
+                e.preemption.suspend(request, offload_kv=True)
+                saved = e.preemption.snapshots["low"]["pipeline"]
+                assert saved.references[0].selected.device.type == "cpu"
+            deep += any(t.depth > 1 for t in saved.tokens)
+            if deep:
+                break
+        assert deep, "no suspension held a row past its capture loop"
+        assert "low" not in outputs
+        outputs.update(_drain(e, {}))
         assert outputs["low"] == expected
         assert e.preemption.resumptions >= 1
         assert not e.preemption.snapshots
