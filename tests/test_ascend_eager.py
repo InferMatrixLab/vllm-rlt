@@ -35,11 +35,11 @@ def test_eager_groups_match_independent_causal_queries(kv_heads):
 @torch.inference_mode()
 def test_engine_matches_the_same_manual_prefill_chunks(chunk_size):
     from tests.helpers import tiny_ouro_config
-    from vllm_rlt.models import OuroForCausalLM
     from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
     from vllm_rlt.core.kv_cache_manager import KVCacheManager
     from vllm_rlt.device import resolve_device
     from vllm_rlt.engine.stage_engine import StageEngine
+    from vllm_rlt.models import OuroForCausalLM
 
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
@@ -125,3 +125,30 @@ def test_engine_matches_the_same_manual_prefill_chunks(chunk_size):
     finally:
         handle.remove()
         engine.close()
+
+
+@pytest.mark.parametrize("device_name", ["cpu", pytest.param("npu", marks=pytest.mark.npu)])
+@torch.inference_mode()
+def test_bf16_probability_rounding_is_part_of_the_eager_contract(device_name):
+    from vllm_rlt.device import resolve_device
+    from vllm_rlt.kernels.paged_attention import torch_paged_attention
+
+    device = resolve_device(device_name)
+    if device_name == "npu":
+        torch.npu.set_device(0)
+    keys = torch.zeros(1, 16, 1, 64, dtype=torch.bfloat16, device=device)
+    values = torch.zeros_like(keys)
+    keys[0, 0].fill_(1.03125)
+    keys[0, 1].fill_(1)
+    values[0, 0].fill_(128)
+    values[0, 1].fill_(-128)
+    query = torch.ones(1, 1, 64, dtype=torch.bfloat16, device=device)
+    table = torch.tensor([[0]], dtype=torch.int32, device=device)
+    lengths = torch.tensor([2], dtype=torch.int32, device=device)
+    # QK/sqrt(64) is [8.25,8]. BF16 probabilities are [.5625,.4375],
+    # so their weighted value is exactly16. FP32 probabilities retain
+    # [.5621765,.4378235] and round the final value to15.9375 instead.
+    actual = AscendEagerAttention()(query, keys, values, table, lengths)
+    torch.testing.assert_close(actual, torch.full_like(actual, 16), atol=0, rtol=0)
+    old_contract = torch_paged_attention(query, keys, values, table, lengths)
+    assert not torch.equal(actual, old_contract)
