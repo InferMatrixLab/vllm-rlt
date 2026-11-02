@@ -157,11 +157,16 @@ class StageEngine:
                 )
             if scheduler_config.mode != "refill":
                 raise ValueError("sparse decode attention requires refill scheduling")
-            if scheduler_config.enable_preemption and speculative_config is not None:
-                # Ordinary decode snapshots a suspended token's reference;
-                # speculative rows hold per-round references with no snapshot.
+            if (
+                scheduler_config.enable_preemption
+                and speculative_config is not None
+                and not self.pipeline_speculative
+            ):
+                # Ordinary decode and token pipelines snapshot their live
+                # references; block rounds hold per-round leases with none.
                 raise ValueError(
-                    "sparse decode attention supports preemption only for ordinary decode"
+                    "sparse decode attention supports preemption only for ordinary "
+                    "decode and token pipelines"
                 )
             # The index buffer never truncates the algorithm: capacity must
             # hold the worst-case retained count over the supported serving

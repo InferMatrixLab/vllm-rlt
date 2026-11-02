@@ -120,6 +120,9 @@ class PipelineState:
     position: int
     tokens: list[PipelineToken]
     pending: bool = False
+    # Sparse decode: the request's reference slots and, per pipeline row, the
+    # index of the slot it reads inside that snapshot.
+    references: tuple | None = None
 
     def to(self, device):
         """Own hidden copies for suspension; never borrow graph/runner buffers."""
@@ -131,6 +134,9 @@ class PipelineState:
                 )
                 for token in self.tokens
             ],
+            references=None
+            if self.references is None
+            else (self.references[0].to(device), self.references[1]),
         )
 
 

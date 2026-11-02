@@ -363,8 +363,10 @@ class AttentionReferenceStore:
         self, snapshot: ReferenceSnapshot, request_id: str, request_index: int, generation: int
     ) -> ReferenceLease:
         """Bind fresh slots for a resumed token and copy its snapshot back."""
-        lease = self.reserve(request_id, request_index, len(snapshot), generation)
         with self._owner():
+            # Reserve here too: its slot ids are copied on the current stream,
+            # which must be the stream that indexes with them below.
+            lease = self.reserve(request_id, request_index, len(snapshot), generation)
             self.ensure_key_capacity(snapshot.selected.shape[-1])
             ids = lease.slot_ids
             width = snapshot.selected.shape[-1]

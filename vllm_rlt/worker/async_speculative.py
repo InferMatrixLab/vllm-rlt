@@ -760,6 +760,17 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             (pipeline.tokens, pipeline.depths, pipeline.candidates, pipeline.active.long())
         ).tolist()
         tokens, depths, candidates, active = values
+        references = None
+        if self.reference_store is not None:
+            if state.reference is None:
+                raise RuntimeError("sparse pipeline lost its reference slots")
+            # Restoration puts the k live tokens back in rows 0..k-1; keep the
+            # slot of each row by recording it relative to the lease.
+            if not all(active[: sum(active)]):
+                raise RuntimeError("live pipeline rows must form a prefix")
+            lease_rows = {slot: row for row, slot in enumerate(state.reference.slots)}
+            permutation = tuple(lease_rows[slot] for slot in pipeline.slots.tolist())
+            references = (self.reference_store.snapshot(state.reference, device), permutation)
         return PipelineState(
             request,
             position,
@@ -774,6 +785,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 for i, token in enumerate(tokens)
                 if active[i]
             ],
+            references=references,
         )
 
     def restore_pipeline(self, request, snapshot):
@@ -781,9 +793,8 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             return
         if snapshot.request is not request or request.request_id in self.states:
             raise RuntimeError("invalid pipeline restoration generation")
-        if self.reference_store is not None:
-            # Sparse decode excludes preemption; a snapshot carries no references.
-            raise RuntimeError("sparse decode attention cannot restore a pipeline snapshot")
+        if (self.reference_store is not None) != (snapshot.references is not None):
+            raise RuntimeError("pipeline snapshot and sparse decode configuration disagree")
         if snapshot.pending or snapshot.position != request.position:
             raise RuntimeError("pipeline snapshot disagrees with committed request position")
         width = min(
@@ -817,12 +828,27 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 values[2],
                 torch.arange(width, device=self.device) < len(snapshot.tokens),
             )
+            generation = self._generations.get(request.request_id, 0) + 1
+            self._generations[request.request_id] = generation
+            reference = None
+            if snapshot.references is not None:
+                saved, permutation = snapshot.references
+                if len(saved) != width or sorted(permutation) != list(range(width)):
+                    raise RuntimeError("pipeline reference snapshot does not match the window")
+                # Fresh slots and generation; each row reads the slot it read
+                # before suspension.
+                reference = self.reference_store.restore(saved, request.request_id, 0, generation)
+                pipeline.slots = reference.slot_ids[
+                    torch.tensor(permutation, device=self.device)
+                ].clone()
             self.states[request.request_id] = SpeculativeRequestState(
                 request,
                 self.cache._get_allocation(request.request_id),
                 torch.tensor(request.input_token_id, device=self.device),
                 torch.tensor(snapshot.position, device=self.device),
                 pipeline,
+                generation=generation,
+                reference=reference,
             )
 
     def request_ready(self, request):

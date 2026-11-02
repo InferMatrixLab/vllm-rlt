@@ -174,3 +174,79 @@ def test_cuda_kv_pressure_preemption_matches_unpreempted(implementation, asynchr
     torch.cuda.synchronize()
     assert preemptions > 0
     assert pressured == baseline
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("graphs", [False, True])
+@pytest.mark.parametrize("offload", [False, True])
+def test_cuda_pipeline_preemption_restores_each_rows_reference(graphs, offload):
+    """A token pipeline suspends with rows past their capture loop and resumes them sparse."""
+    from vllm_rlt import ExecutionConfig, SparseDecodeAttentionConfig
+
+    def make():
+        return engine(
+            retention=None,
+            device="cuda",
+            speculative_config=SpeculativeConfig(4, draft_loops=1, mode="pipeline"),
+            scheduler_config=_scheduler(policy="priority"),
+            execution_config=ExecutionConfig(
+                async_scheduling=True,
+                cuda_graphs=graphs,
+                static_buffers=True,
+                pad_to_power_of_two=True,
+            ),
+            sparse_decode_attention_config=SparseDecodeAttentionConfig(
+                enabled=True, key_retention=0.5, implementation="fused"
+            ),
+        )
+
+    prompt = [1, 2, 3]
+    low = SamplingParams(max_tokens=12, ignore_eos=True, priority=10)
+    e = make()
+    try:
+        e.add_request("low", prompt, low)
+        expected = _drain(e, {})["low"]
+    finally:
+        e.close()
+
+    e = make()
+    try:
+        e.add_request("low", prompt, low)
+        request = e.scheduler.requests["low"]
+        runner = e.speculative_runner
+        for _ in range(200):
+            e.step()
+            state = runner.states.get("low")
+            # Rows reach their consume loops a few submissions after the root.
+            if state is not None and state.submitted >= 4:
+                break
+        else:
+            pytest.fail("did not submit pipeline steps")
+        e.add_request("high", [5], SamplingParams(max_tokens=3, ignore_eos=True, priority=0))
+        for _ in range(200):
+            e.step()
+            if "low" in e.preemption.snapshots:
+                break
+        else:
+            pytest.fail("priority arrival did not suspend the pipeline")
+        saved = e.preemption.snapshots["low"]["pipeline"]
+        assert saved.references is not None
+        references, permutation = saved.references
+        assert sorted(permutation) == list(range(len(references)))
+        # Some live row is past its capture loop, so its reference matters.
+        assert any(t.depth > 1 for t in saved.tokens)
+        assert "low" not in runner.states
+        if offload:
+            e.preemption.suspend(request, offload_kv=True)
+            saved = e.preemption.snapshots["low"]["pipeline"]
+            assert saved.references[0].selected.device.type == "cpu"
+        outputs = _drain(e, {})
+        assert outputs["low"] == expected
+        assert e.preemption.resumptions >= 1
+        assert not e.preemption.snapshots
+        assert e.reference_store.outstanding == 0
+        assert e.cache_manager.num_used_blocks == 0
+        if graphs:
+            assert runner.graphs.replays > 0
+    finally:
+        e.close()
