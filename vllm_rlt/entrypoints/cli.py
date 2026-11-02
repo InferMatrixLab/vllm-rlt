@@ -100,6 +100,8 @@ def main():
         parser.error("--toy uses built-in token ID prompts; omit --prompt")
     if not args.toy and not args.prompt:
         parser.error("provide --prompt or use --toy for a CPU smoke test")
+    if args.device.split(":", 1)[0] == "npu" and args.attention_backend != "torch":
+        parser.error("NPU execution requires explicit --attention-backend torch")
     profiling = profile_config_from_args(args)
     if profiling is not None:
         profiling.resolve_activities(args.device)

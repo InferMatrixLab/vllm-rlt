@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
+import torch
+
 from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.config import (
     CacheConfig,
@@ -71,9 +73,11 @@ class StageEngine:
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
         if parameter.device.type == "npu":
+            if attention_backend != "torch":
+                raise ValueError("NPU execution requires explicit attention_backend='torch'")
             if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
                 raise ValueError("NPU currently supports Ouro with four loops")
-            if str(parameter.dtype) != "torch.bfloat16":
+            if parameter.dtype != torch.bfloat16:
                 raise ValueError("NPU Ouro requires BF16 weights")
             if (
                 self.execution_config.async_scheduling
