@@ -160,7 +160,54 @@ def test_silu_and_mul_cuda_vectors_tails_and_storage_offsets(dtype, shape, offse
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_silu_and_mul_cuda_special_values_and_underflow(dtype):
+def test_silu_and_mul_cuda_all_alignment_pairs_match_aligned_path(dtype):
+    # The two inputs can have different offsets. Cover every 16-byte alignment
+    # pair, including vectors adjacent to either view boundary and short inputs.
+    elements = 16 // torch.empty((), dtype=dtype).element_size()
+    counts = [*range(2 * elements + 2), 17 * elements - 1, 17 * elements + 1]
+    integer = torch.int32 if dtype == torch.float32 else torch.int16
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    for count in counts:
+        for gate_offset in range(elements):
+            for up_offset in range(elements):
+                gate = torch.randn(
+                    count + gate_offset, device="cuda", dtype=dtype, generator=generator
+                )[gate_offset:]
+                up = torch.randn(
+                    count + up_offset, device="cuda", dtype=dtype, generator=generator
+                )[up_offset:]
+                expected = silu_and_mul(gate.clone(), up.clone())
+                actual = silu_and_mul(gate, up)
+                assert torch.equal(actual.view(integer), expected.view(integer)), (
+                    dtype,
+                    count,
+                    gate_offset,
+                    up_offset,
+                )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("count", [352 * 1024 - 1, 352 * 1024, 352 * 1024 + 1, 352 * 1024 + 7])
+def test_silu_and_mul_cuda_threshold_and_vector_offsets_match_aligned_path(dtype, count):
+    # Short-offset tests now take the scalar fallback. Exercise all independent
+    # input alignments on both sides of the dispatch threshold and scalar tails.
+    elements = 16 // torch.empty((), dtype=dtype).element_size()
+    integer = torch.int32 if dtype == torch.float32 else torch.int16
+    generator = torch.Generator(device="cuda").manual_seed(43)
+    for go in range(elements):
+        for uo in range(elements):
+            gate = torch.randn(count + go, device="cuda", dtype=dtype, generator=generator)[go:]
+            up = torch.randn(count + uo, device="cuda", dtype=dtype, generator=generator)[uo:]
+            expected = silu_and_mul(gate.clone(), up.clone())
+            actual = silu_and_mul(gate, up)
+            assert torch.equal(actual.view(integer), expected.view(integer)), (dtype, count, go, uo)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offsets", [(0, 0), (1, 3)])
+def test_silu_and_mul_cuda_special_values_and_underflow(dtype, offsets):
     info = torch.finfo(dtype)
     values = [
         float("nan"),
@@ -184,6 +231,13 @@ def test_silu_and_mul_cuda_special_values_and_underflow(dtype):
         indexing="ij",
     )
     gate, up = gate.contiguous(), up.contiguous()
+    if offsets != (0, 0):
+        count = gate.numel()
+        shifted_gate = torch.empty(count + offsets[0], device="cuda", dtype=dtype)[offsets[0] :]
+        shifted_up = torch.empty(count + offsets[1], device="cuda", dtype=dtype)[offsets[1] :]
+        shifted_gate.copy_(gate.flatten())
+        shifted_up.copy_(up.flatten())
+        gate, up = shifted_gate.view(gate.shape), shifted_up.view(up.shape)
     torch.testing.assert_close(
         silu_and_mul(gate, up), silu_and_mul_reference(gate, up), equal_nan=True
     )
@@ -210,11 +264,13 @@ def test_silu_and_mul_cuda_rejects_autograd_but_allows_inference():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype):
+@pytest.mark.parametrize("offsets", [(0, 0), (1, 3)])
+@pytest.mark.parametrize("count", [4097, 352 * 1024 + 1])
+def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype, offsets, count):
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        gate = torch.randn(4097, device="cuda", dtype=dtype)
-        up = torch.randn_like(gate)
+        gate = torch.randn(count + offsets[0], device="cuda", dtype=dtype)[offsets[0] :]
+        up = torch.randn(count + offsets[1], device="cuda", dtype=dtype)[offsets[1] :]
         for _ in range(3):
             silu_and_mul(gate, up)
     stream.synchronize()
@@ -238,9 +294,10 @@ def test_silu_and_mul_cuda_fp32_streaming_grid_boundary(count):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("offset", [0, 1])
-def test_silu_and_mul_cuda_low_precision_storage_patterns(dtype, offset):
-    # Exercise all gate bit patterns with both vector/tail and scalar-only access.
+@pytest.mark.parametrize("offsets", [(0, 0), (1, 0), (1, 3), (7, 5)])
+def test_silu_and_mul_cuda_low_precision_storage_patterns(dtype, offsets):
+    # Exercise all gate bit patterns through aligned and independently shifted
+    # vector loads, including subnormal products at the scalar tail.
     values = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16).view(dtype)
     info = torch.finfo(dtype)
     subnormal = info.tiny / (1024 if dtype == torch.float16 else 128)
@@ -265,10 +322,9 @@ def test_silu_and_mul_cuda_low_precision_storage_patterns(dtype, offset):
         device="cuda",
         dtype=dtype,
     )
-    gate = torch.empty(values.numel() * factors.numel() + 1 + offset, device="cuda", dtype=dtype)[
-        offset:
-    ]
-    up = torch.empty_like(gate)
+    count = values.numel() * factors.numel() + 1
+    gate = torch.empty(count + offsets[0], device="cuda", dtype=dtype)[offsets[0] :]
+    up = torch.empty(count + offsets[1], device="cuda", dtype=dtype)[offsets[1] :]
     gate[:-1].copy_(values.repeat(factors.numel()))
     up[:-1].copy_(factors.repeat_interleave(values.numel()))
     # The aligned path ends with one scalar multiplication yielding a subnormal.

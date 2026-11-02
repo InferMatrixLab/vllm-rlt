@@ -38,10 +38,22 @@ nor copies incompatible inputs.
 when the extension is installed; CPU inputs and installations without the
 extension use the Torch reference. Import it from `vllm_rlt.kernels`. The model
 call site does not check devices or extension availability. The native kernel
-flattens contiguous inputs, using 16-byte
-loads/stores for the aligned vector body and scalar accesses for the remaining
-elements in the same kernel. Contiguous views with misaligned storage offsets
-use scalar accesses. Empty inputs return an empty output without launching.
+flattens contiguous inputs, using 16-byte loads/stores for the aligned vector
+body and scalar accesses for the remaining elements in the same kernel.
+Contiguous views may have independently misaligned storage offsets. Below
+`352 * 1024` total elements, these inputs use a scalar kernel with one work item
+per element. At or above this cutoff, the kernel loads each input's adjacent
+aligned vectors and reassembles
+the required logical vector with register moves and bit shifts. Scalar loads
+handle input prefixes and suffixes where a full aligned read would extend
+outside the view. The output is processed in aligned vectors with a scalar
+tail; a scalar prefix also handles a misaligned output address. No input copy
+or extra kernel launch is needed. Fully aligned inputs retain their direct
+vector load/store path even for small inputs. Empty inputs return an empty output
+without launching. The cutoff is based on B300 measurements across all three
+dtypes, independent input offsets and vector remainders. It applies to total
+element count, independent of tensor rank or model width, and is not a universal
+hardware optimum.
 
 SiLU uses FP32 arithmetic and rounds to the input dtype before multiplying by
 `up`, preserving the reference's intermediate rounding. FP16/BF16 vector paths
@@ -55,10 +67,11 @@ stream.
 
 Blocks have 256 threads. The grid is capped at 4096 blocks, except for FP32
 workloads with at least `16384 * 256` work items: these use up to 16384 blocks.
-Each aligned work item processes four FP32 elements; an unaligned work item
-processes one scalar. The threshold requires enough work to fill the larger
-grid. This keeps small and medium shapes' launch geometry unchanged. Grid sizes,
-16/32-byte transfers and scalar/packed FP32 products were compared on B300;
+Each vector work item processes four FP32 elements or eight FP16/BF16 elements;
+the scalar path for small misaligned inputs processes one element per work item.
+The streaming threshold requires
+enough work to fill the larger grid. Aligned inputs retain their existing launch
+geometry. Grid sizes, 16/32-byte transfers and scalar/packed FP32 products were compared on B300;
 the selected configuration is not a universal hardware optimum.
 
 Ouro's inference MLP calls this registered operator directly. Availability is

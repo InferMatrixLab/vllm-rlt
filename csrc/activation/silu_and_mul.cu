@@ -77,12 +77,67 @@ __device__ __forceinline__ T compute_scalar(T gate, T up) {
   return Math<T>::mul(activated, up);
 }
 
-template <typename T, bool vectorized>
+template <typename T>
+__device__ __forceinline__ Vector<T> load_vector(const T* input, int64_t index,
+                                                int64_t count) {
+  constexpr int elements = 16 / sizeof(T);
+  const int offset_bytes = reinterpret_cast<uintptr_t>(input + index) & 15;
+  Vector<T> result;
+  if (offset_bytes == 0) {
+    *reinterpret_cast<uint4*>(&result) =
+        *reinterpret_cast<const uint4*>(input + index);
+    return result;
+  }
+
+  const int offset = offset_bytes / sizeof(T);
+  const int64_t lower = index - offset;
+  Vector<T> head{}, tail{};
+  // Never read before or after the input view, even if its storage is larger.
+  if (lower >= 0) {
+    *reinterpret_cast<uint4*>(&head) = *reinterpret_cast<const uint4*>(input + lower);
+  } else {
+#pragma unroll
+    for (int j = 0; j < elements; ++j) {
+      if (j >= offset) reinterpret_cast<T*>(&head)[j] = input[lower + j];
+    }
+  }
+  if (lower + 2 * elements <= count) {
+    *reinterpret_cast<uint4*>(&tail) =
+        *reinterpret_cast<const uint4*>(input + lower + elements);
+  } else {
+#pragma unroll
+    for (int j = 0; j < elements; ++j) {
+      if (j < offset) reinterpret_cast<T*>(&tail)[j] = input[lower + elements + j];
+    }
+  }
+
+  // Reassemble the requested logical vector with register moves and bit shifts.
+  uint4 lo = *reinterpret_cast<const uint4*>(&head);
+  uint4 hi = *reinterpret_cast<const uint4*>(&tail);
+  if (offset_bytes & 8) {
+    lo = make_uint4(lo.z, lo.w, hi.x, hi.y);
+    hi = make_uint4(hi.z, hi.w, 0, 0);
+  }
+  if (offset_bytes & 4) {
+    lo = make_uint4(lo.y, lo.z, lo.w, hi.x);
+    hi.x = hi.y;
+  }
+  if constexpr (sizeof(T) == 2) {
+    if (offset_bytes & 2) {
+      lo = make_uint4(__funnelshift_r(lo.x, lo.y, 16), __funnelshift_r(lo.y, lo.z, 16),
+                      __funnelshift_r(lo.z, lo.w, 16), __funnelshift_r(lo.w, hi.x, 16));
+    }
+  }
+  *reinterpret_cast<uint4*>(&result) = lo;
+  return result;
+}
+
+template <typename T, bool aligned>
 __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t count) {
   const int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   int64_t tail_start = 0;
-  if constexpr (vectorized) {
+  if constexpr (aligned) {
     constexpr int elements = 16 / sizeof(T);
     constexpr int pairs = 16 / sizeof(typename Math<T>::Pair);
     const int64_t vectors = count / elements;
@@ -97,9 +152,40 @@ __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t 
       *reinterpret_cast<uint4*>(out + i * elements) = *reinterpret_cast<uint4*>(&result);
     }
     tail_start = vectors * elements;
+  } else {
+    constexpr int elements = 16 / sizeof(T);
+    constexpr int pairs = 16 / sizeof(typename Math<T>::Pair);
+    const int64_t prefix = min(count, static_cast<int64_t>(
+        ((16 - (reinterpret_cast<uintptr_t>(out) & 15)) & 15) / sizeof(T)));
+    for (int64_t i = thread; i < prefix; i += stride) {
+      out[i] = compute_scalar(gate[i], up[i]);
+    }
+    const int64_t vectors = (count - prefix) / elements;
+    for (int64_t i = thread; i < vectors; i += stride) {
+      const int64_t index = prefix + i * elements;
+      Vector<T> g = load_vector(gate, index, count);
+      Vector<T> u = load_vector(up, index, count);
+      Vector<T> result;
+#pragma unroll
+      for (int j = 0; j < pairs; ++j) {
+        result.pairs[j] = Math<T>::compute(g.pairs[j], u.pairs[j]);
+      }
+      *reinterpret_cast<uint4*>(out + index) = *reinterpret_cast<const uint4*>(&result);
+    }
+    tail_start = prefix + vectors * elements;
   }
   // Only valid scalar addresses are touched, including for count < one vector.
   for (int64_t i = tail_start + thread; i < count; i += stride) {
+    out[i] = compute_scalar(gate[i], up[i]);
+  }
+}
+
+template <typename T>
+__global__ void silu_and_mul_scalar_kernel(const T* gate, const T* up, T* out,
+                                         int64_t count) {
+  const int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = thread; i < count; i += stride) {
     out[i] = compute_scalar(gate[i], up[i]);
   }
 }
@@ -114,7 +200,11 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
                             reinterpret_cast<uintptr_t>(u) |
                             reinterpret_cast<uintptr_t>(result)) & 15) == 0;
   const int64_t count = gate.numel();
-  const int64_t work = vectorized ? std::max<int64_t>(count / (16 / sizeof(T)), 1) : count;
+  // B300 measurements including independently shifted inputs and all vector
+  // remainders favor scalar access below this total element count.
+  constexpr int64_t misaligned_vector_threshold = 352 * 1024;
+  const bool scalar = !vectorized && count < misaligned_vector_threshold;
+  const int64_t work = scalar ? count : std::max<int64_t>(count / (16 / sizeof(T)), 1);
   constexpr int threads = 256;
   int max_blocks = 4096;
   if constexpr (std::is_same_v<T, float>) {
@@ -129,6 +219,8 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
   auto stream = c10::cuda::getCurrentCUDAStream(gate.get_device());
   if (vectorized) {
     silu_and_mul_kernel<T, true><<<blocks, threads, 0, stream>>>(g, u, result, count);
+  } else if (scalar) {
+    silu_and_mul_scalar_kernel<T><<<blocks, threads, 0, stream>>>(g, u, result, count);
   } else {
     silu_and_mul_kernel<T, false><<<blocks, threads, 0, stream>>>(g, u, result, count);
   }
