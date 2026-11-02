@@ -53,15 +53,29 @@ the engine's ordinary CUDA Graph and asynchronous-scheduling options.
   schedule (request/tile indices) into plan-time state; on SM89 a plan built for
   full capacity and replayed with a short live context stalls indefinitely once
   the planned table is wide enough (reproduced at 64+ pages, GQA and MHA). The
-  tensor-core path plans against the full table capacity but takes the schedule
-  from the live CSR buffers and masks unused splits, which is the graph
-  contract FlashInfer documents for this wrapper.
-- **Plan cache.** One plan per `(rows, q_heads, kv_heads, table_width)`, created
-  on first use with a synthetic full-capacity table. Each plan owns its CSR
-  buffers and a workspace sized by `workspace_size(...)`; FlashInfer keeps
-  plan-time tables in that workspace, so plans cannot share it. Plans captured
-  by a CUDA Graph are pinned; eager plans are evicted first when the cache
-  (32 entries) is full. Every plan is created outside graph capture.
+  tensor-core path plans against the planned width but takes the schedule from
+  the live CSR buffers.
+- **Split-KV is disabled.** With FlashInfer's default splitting, a row's
+  reduction order depends on the planned width and on batch composition
+  (verified on L20: the same 1,500-token row differs between a 128- and a
+  256-page plan, and alone versus inside a batch of eight). `disable_split_kv`
+  makes the schedule per-row: eager, graph replay, plan width and batch
+  composition are bit-identical. The cost is low-batch long-context throughput
+  (fewer CTAs); measured kernel-only at batch 8 it is unchanged.
+- **Plan cache.** One plan per `(rows, q_heads, kv_heads, width bucket)`, where
+  the width is rounded up to a power of two. A growing eager context therefore
+  crosses at most one plan per bucket (~7 plans over a 1K-token request) instead
+  of one per page boundary. Each plan owns its CSR buffers and a workspace sized
+  by `workspace_size(...)`; `plan()`/`workspace_size()` inputs are pinned host
+  tensors, so creating a plan does not copy device metadata back to the host.
+  Plans captured by a CUDA Graph are pinned; eager plans are evicted first when
+  the cache (32 entries) is full. `plan_creations` reports plan count next to
+  `plan_misses`.
+- **Kernel pinned by assertion.** The wrapper is constructed with
+  `backend="auto"` (the graph wrapper exposes no backend argument); after the
+  first `plan()` the adapter requires `resolved_backend == "fa2"` and records it
+  in `info`, so a patch release that routes to cuDNN fails loudly instead of
+  changing arithmetic.
 - **Per-traversal metadata.** `prepare_attention` / `ModelRuntime.forward` prime
   the backend once per traversal; the graph paths prime the *graph entry's*
   private metadata after copying the caller's tables in. CSR construction
@@ -91,14 +105,15 @@ protocol's pinned `transformers 4.55.0` / `lm-eval 0.4.9.2` / `datasets 3.6.0`
 / `tokenizers 0.21.4`. FlashInfer's JIT requires a CUDA >= 12.9 toolkit; the
 official run used the pip `cuda-toolkit[nvcc]==13.0.3` tree.
 
-- `tests/test_flashinfer_fa2_attention.py` (18 GPU cases): selection and
-  rejection paths; strided/GQA/MHA KV against both Torch and Triton kernels;
+- `tests/test_flashinfer_fa2_attention.py` (22 cases: 16 GPU, 6 CPU): selection
+  and rejection paths; strided/GQA/MHA KV against both Torch and Triton kernels;
   padding tri-state; zero-length rows; batch composition; vectorized CSR
   against a reference construction (including the empty-row last-page length);
-  no host synchronization in `prepare_step`; adapter-level CUDA Graph
-  capture/replay with refreshed metadata; and tiny-Ouro engine runs where
-  eager, graphs, async, and async+graphs produce identical token/exit-depth
-  sequences for LAST_EXITED and SHARED.
+  no host synchronization in `prepare_step`/`__call__` across a width-bucket
+  change; bounded plan creation over a 1K-token eager decode; bitwise
+  width/batch invariance and graph-replay equality at a 128-page plan; and
+  tiny-Ouro runs where eager, graphs, async and async+graphs produce identical
+  token/exit-depth sequences for LAST_EXITED and SHARED.
 - Real Ouro-1.4B BF16, greedy, trace depth 4, three requests: Triton eager,
   FA2 eager, FA2 graphs, and FA2 graphs+async produce **identical token
   sequences**; `plan_misses == 0`, one graph capture, 60 replays.
@@ -107,17 +122,17 @@ official run used the pip `cuda-toolkit[nvcc]==13.0.3` tree.
 | run | correct | accuracy | gate |
 |---|---:|---:|---|
 | Triton eager | 61/87 | 70.11% | pass |
-| FA2 eager (tensor cores) | 60/87 | 68.97% | pass (+1.15 pp) |
+| FA2 eager (tensor cores) | 59/87 | 67.82% | pass (+0.00 pp) |
 | FA2 + CUDA Graphs | 59/87 | 67.82% | pass (+0.00 pp) |
 
-  Eager and graphs share **69/87** token sequences; 18 diverge at a BF16 tie
-  because padded graph rows and the full-width plan change the tensor-core
-  split schedule, and each divergence changes the whole continuation. The
-  graphs run has no length-limited runaway (mean 106.7 tokens); the eager run
-  hits one (question 182, mean 117.1 tokens). Both runs were repeated after
-  removing a host synchronization from CSR construction (a Python scalar was
-  assigned into a CUDA slice) and reproduced **87/87 identical sequences**
-  (eager 793.2 s, graphs 281.6 s).
+  Eager and graphs are **bit-identical: 87/87 token sequences**, with no
+  length-limited runaway (mean 106.7 tokens; eager 717.8 s, graphs 279.6 s).
+  Against Triton, 67/87 sequences are identical; four answers flip (203, 426,
+  819 correct → incorrect; 871 incorrect → correct). The no-split arithmetic
+  reproduces the earlier split-KV *graph* run on all 87 questions; the earlier
+  split-KV eager run differs on 18 questions because its reduction order
+  depended on the narrow eager plan width. Disabling split-KV moved the eager
+  score from 60/87 to 59/87, exactly at the baseline.
 - The earlier CUDA-core variant of this branch scored 61/87 with a different
   BF16 accumulation order; it is superseded by the tensor-core kernel that
   graph execution requires.
@@ -132,17 +147,31 @@ captures the graph. All five columns come from one session:
 
 | concurrency | Triton eager | Triton graphs | FA2 eager | FA2 graphs | FA2 async+graphs |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 5.11 s (12.5 tok/s) | 1.52 s (42.2) | 5.25 s (12.2) | 1.61 s (39.8) | 1.59 s (40.3) |
-| 8 | 5.45 s (94.0) | 1.76 s (291.2) | 5.56 s (92.1) | 1.86 s (275.4) | 1.82 s (281.7) |
-| 32 | 6.26 s (327.2) | 2.21 s (927.9) | 6.15 s (333.3) | 2.25 s (908.9) | 2.17 s (943.1) |
+| 1 | 5.20 s (12.3 tok/s) | 1.52 s (42.2) | 5.49 s (11.7) | 1.59 s (40.2) | 1.58 s (40.6) |
+| 8 | 5.34 s (95.8) | 1.76 s (290.2) | 5.55 s (92.2) | 1.84 s (278.1) | 1.81 s (282.8) |
+| 32 | 6.26 s (327.3) | 2.20 s (930.1) | 6.32 s (324.1) | 2.24 s (915.4) | 2.15 s (952.3) |
 
 Eager FA2 is at parity with Triton eager. CUDA Graphs remove most per-step
-launch overhead for **both** backends (about 2.7–3.4× over eager on this small
-model); Triton graphs is then 2–6% faster than FA2 graphs, so the graph gain is
+launch overhead for **both** backends (2.8–3.5× over eager on this small
+model); Triton graphs is then 2–5% faster than FA2 graphs, so the graph gain is
 dispatch reduction, not the FA2 kernel. Asynchronous scheduling adds 1–4% over
 FA2 graphs at these batch sizes. The official GSM8K-87 runs agree in direction
-(eager 793.2 s, graphs 281.6 s, with different generated lengths). These are
+(eager 717.8 s, graphs 279.6 s, identical generated lengths). These are
 single-GPU, single-wave diagnostics, not production throughput claims.
+
+Disabling split-KV costs attention time only at low batch and long context
+(kernel-only, one L20, page 16, random KV):
+
+| rows | ctx | split-KV ms | no split ms | ratio |
+|---:|---:|---:|---:|---:|
+| 1 | 4096 | 0.023 | 0.049 | 2.13× |
+| 1 | 8192 | 0.028 | 0.092 | 3.35× |
+| 8 | 4096 | 0.375 | 0.372 | 0.99× |
+| 8 | 8192 | 0.741 | 0.739 | 1.00× |
+
+Ouro runs 24 attention layers per depth view, so at batch 1 and 8K context the
+no-split schedule adds roughly 6 ms per generated token; at batch 8 it is
+unchanged. The determinism above is the reason for accepting that cost.
 
 Kernel-only figures from the earlier CUDA-core adapter (FA2/Triton 0.39–0.98
 across B 1–32 and context 256–8192) are superseded by the tensor-core kernel
@@ -154,7 +183,11 @@ used here and are not reproduced.
 - More page sizes/head dimensions, packed prefill, PD and speculative paths.
 - Revisit the CUDA-core decode path if FlashInfer makes its plan schedule
   independent of plan-time lengths; it is bit-closer to the Torch reference.
-- Size plan workspaces per graph-entry width; full-capacity plans allocate the
-  widest table even for short contexts.
+- Write the live CSR directly into the plan buffers at prime time (currently
+  three per-layer copies, about 0.5 MiB per layer at 32 rows and 4096 pages).
+- Revisit split-KV for low-batch long-context workloads if FlashInfer offers a
+  deterministic split schedule; today the deterministic path costs 2.1–3.4×
+  kernel time there.
+- Add a CPU test for the GSM8K `--cuda-graphs` / `--attention-backend` flags.
 - Reconcile with #112 if XQA lands first; this backend keeps a distinct
   `flashinfer_fa2` name and module.

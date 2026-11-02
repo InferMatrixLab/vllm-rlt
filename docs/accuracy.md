@@ -211,27 +211,31 @@ On one L20 (SM89, torch 2.13.0, CUDA 13.0, FlashInfer 0.7.2.post1, Triton
 | run | correct | accuracy | gate |
 |---|---:|---:|---|
 | triton | 61/87 | 70.11% | pass (+2.30 pp) |
-| flashinfer_fa2 eager | 60/87 | 68.97% | pass (+1.15 pp) |
+| flashinfer_fa2 eager | 59/87 | 67.82% | pass (+0.00 pp) |
 | flashinfer_fa2 + CUDA Graphs | 59/87 | 67.82% | pass (+0.00 pp) |
 
-Eager and graph FA2 share 69/87 generated token sequences. Padded graph rows
-and the full-width plan change the tensor-core split schedule, so 18 first
-divergences are BF16 ties (logits maxabs <= 0.17, top1/top2 margins 0–0.125)
-and each one changes the whole continuation. The graphs run has no
-length-limited runaway (mean 106.7 tokens); the eager run reaches 1024 tokens
-on question 182 (mean 117.1), and Triton stops that question at 40.
+Eager and graph FA2 are **bit-identical (87/87 token sequences)**. This backend
+disables FlashInfer's split-KV: with splitting, a row's reduction order depends
+on the planned width and batch composition, which made the earlier eager and
+graph runs differ on 18 questions. Without splits, 67/87 sequences match
+Triton; four answers flip (203, 426, 819 correct → incorrect; 871 incorrect →
+correct). There is no length-limited runaway (mean 106.7 tokens; eager 717.8 s,
+graphs 279.6 s). The no-split arithmetic reproduces the earlier split-KV graph
+run on all 87 questions; the earlier split-KV eager run scored 60/87.
 
 The `flashinfer_fa2` backend runs FlashInfer's tensor-core, CUDA-Graph-
 compatible decode wrapper; the FA2 guide records why the CUDA-core path is not
 graph-safe on SM89. CUDA Graphs remove most per-token launch overhead on this
 small model for both attention backends: a matched 64-token fixed-work run at
-concurrency 1/8/32 went from 5.25/5.56/6.15 s (FA2 eager) to 1.61/1.86/2.25 s
-(FA2 graphs), and from 5.11/5.45/6.26 s (Triton eager) to 1.52/1.76/2.21 s
-(Triton graphs). Triton graphs is 2–6% faster than FA2 graphs here, so the gain
+concurrency 1/8/32 went from 5.49/5.55/6.32 s (FA2 eager) to 1.59/1.84/2.24 s
+(FA2 graphs), and from 5.20/5.34/6.26 s (Triton eager) to 1.52/1.76/2.20 s
+(Triton graphs). Triton graphs is 2–5% faster than FA2 graphs here, so the gain
 is graph dispatch reduction rather than the FA2 kernel; async+graphs is 1–4%
 faster than FA2 graphs. That is a launch-overhead result on one L20, not a
-production throughput qualification. A GPU test keeps `prepare_step` free of
-host synchronization (it runs it under `torch.cuda.set_sync_debug_mode`).
+production throughput qualification. A GPU test keeps `prepare_step` and
+`__call__` free of host synchronization across a plan-width bucket change (it
+runs them under `torch.cuda.set_sync_debug_mode`), and a CPU test bounds eager
+plan creation over a 1K-token decode.
 
 The stored GSM8K-87 baseline fingerprints `torch==2.13.0`; a run on another torch
 version cannot reuse its 59/87 baseline. A 10-question custom subset on torch 2.8
