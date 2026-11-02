@@ -11,6 +11,7 @@ from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.device import resolve_device
 from vllm_rlt.engine.stage_engine import StageEngine
+from vllm_rlt.profiling import ProfileConfig
 
 
 def test_cpu_device_resolution_does_not_import_optional_backend(monkeypatch):
@@ -48,8 +49,19 @@ def test_npu_unsupported_execution_rejected_before_allocation(options):
 def test_npu_does_not_use_cpu_default_memory_budget():
     model = npu_model_stub()
     with pytest.raises(ValueError, match="explicit num_blocks"):
-        plan_cache(model, CacheConfig(), SchedulerConfig(), ExecutionConfig(), "ascend")
+        plan_cache(model, CacheConfig(), SchedulerConfig(), ExecutionConfig(), "torch")
     blocks, info = plan_cache(
-        model, CacheConfig(num_blocks=17), SchedulerConfig(), ExecutionConfig(), "ascend"
+        model, CacheConfig(num_blocks=17), SchedulerConfig(), ExecutionConfig(), "torch"
     )
     assert blocks == 17 and info["source"] == "blocks"
+
+
+@pytest.mark.parametrize("backend", ["auto", "triton", "flash_attn_4"])
+def test_npu_requires_explicit_torch_before_allocation(backend):
+    with pytest.raises(ValueError, match="explicit attention_backend='torch'"):
+        StageEngine(npu_model_stub(), attention_backend=backend)
+
+
+def test_builtin_profiler_does_not_mislabel_npu_as_cpu_only(tmp_path):
+    with pytest.raises(ValueError, match="torch_npu.profiler"):
+        ProfileConfig(str(tmp_path)).resolve_activities("npu:0")
