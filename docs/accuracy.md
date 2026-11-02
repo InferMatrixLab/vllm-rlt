@@ -225,12 +225,13 @@ The `flashinfer_fa2` backend runs FlashInfer's tensor-core, CUDA-Graph-
 compatible decode wrapper; the FA2 guide records why the CUDA-core path is not
 graph-safe on SM89. CUDA Graphs remove most per-token launch overhead on this
 small model for both attention backends: a matched 64-token fixed-work run at
-concurrency 1/8/32 went from 5.22/5.31/5.97 s (FA2 eager) to 1.67/1.89/2.30 s
-(FA2 graphs), and from 4.90/5.31/5.78 s (Triton eager) to 1.51/1.76/2.20 s
-(Triton graphs). Triton graphs is 5–13% faster than FA2 graphs here, so the
-gain is graph dispatch reduction rather than the FA2 kernel. That is a launch-
-overhead result on one L20, not a production throughput qualification;
-async+graphs is within noise of graphs.
+concurrency 1/8/32 went from 5.25/5.56/6.15 s (FA2 eager) to 1.61/1.86/2.25 s
+(FA2 graphs), and from 5.11/5.45/6.26 s (Triton eager) to 1.52/1.76/2.21 s
+(Triton graphs). Triton graphs is 2–6% faster than FA2 graphs here, so the gain
+is graph dispatch reduction rather than the FA2 kernel; async+graphs is 1–4%
+faster than FA2 graphs. That is a launch-overhead result on one L20, not a
+production throughput qualification. A GPU test keeps `prepare_step` free of
+host synchronization (it runs it under `torch.cuda.set_sync_debug_mode`).
 
 The stored GSM8K-87 baseline fingerprints `torch==2.13.0`; a run on another torch
 version cannot reuse its 59/87 baseline. A 10-question custom subset on torch 2.8

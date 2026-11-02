@@ -66,7 +66,8 @@ the engine's ordinary CUDA Graph and asynchronous-scheduling options.
   the backend once per traversal; the graph paths prime the *graph entry's*
   private metadata after copying the caller's tables in. CSR construction
   (`indptr`, compact `indices`, `last_page_len`) is fixed-shape and device-only,
-  so a step with device-owned context lengths does not read back to the host.
+  and a GPU regression test runs it under `torch.cuda.set_sync_debug_mode` so a
+  step with device-owned context lengths cannot regain a host read.
 - **Replay refreshes the plan buffers.** `__call__` copies the staging CSR into
   the plan's buffers; graph capture records those copies, so every replay
   consumes the metadata written by `prepare_step` immediately before it. The
@@ -90,13 +91,14 @@ protocol's pinned `transformers 4.55.0` / `lm-eval 0.4.9.2` / `datasets 3.6.0`
 / `tokenizers 0.21.4`. FlashInfer's JIT requires a CUDA >= 12.9 toolkit; the
 official run used the pip `cuda-toolkit[nvcc]==13.0.3` tree.
 
-- `tests/test_flashinfer_fa2_attention.py` (15 GPU cases): selection and
+- `tests/test_flashinfer_fa2_attention.py` (18 GPU cases): selection and
   rejection paths; strided/GQA/MHA KV against both Torch and Triton kernels;
   padding tri-state; zero-length rows; batch composition; vectorized CSR
-  against a reference construction; adapter-level CUDA Graph capture/replay
-  with refreshed metadata; and tiny-Ouro engine runs where eager, graphs,
-  async, and async+graphs produce identical token/exit-depth sequences for
-  LAST_EXITED and SHARED.
+  against a reference construction (including the empty-row last-page length);
+  no host synchronization in `prepare_step`; adapter-level CUDA Graph
+  capture/replay with refreshed metadata; and tiny-Ouro engine runs where
+  eager, graphs, async, and async+graphs produce identical token/exit-depth
+  sequences for LAST_EXITED and SHARED.
 - Real Ouro-1.4B BF16, greedy, trace depth 4, three requests: Triton eager,
   FA2 eager, FA2 graphs, and FA2 graphs+async produce **identical token
   sequences**; `plan_misses == 0`, one graph capture, 60 replays.
@@ -112,7 +114,10 @@ official run used the pip `cuda-toolkit[nvcc]==13.0.3` tree.
   because padded graph rows and the full-width plan change the tensor-core
   split schedule, and each divergence changes the whole continuation. The
   graphs run has no length-limited runaway (mean 106.7 tokens); the eager run
-  hits one (question 182, mean 117.1 tokens).
+  hits one (question 182, mean 117.1 tokens). Both runs were repeated after
+  removing a host synchronization from CSR construction (a Python scalar was
+  assigned into a CUDA slice) and reproduced **87/87 identical sequences**
+  (eager 793.2 s, graphs 281.6 s).
 - The earlier CUDA-core variant of this branch scored 61/87 with a different
   BF16 accumulation order; it is superseded by the tensor-core kernel that
   graph execution requires.
@@ -127,18 +132,17 @@ captures the graph. All five columns come from one session:
 
 | concurrency | Triton eager | Triton graphs | FA2 eager | FA2 graphs | FA2 async+graphs |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 4.90 s (13.1 tok/s) | 1.51 s (42.3) | 5.22 s (12.3) | 1.67 s (38.4) | 1.65 s (38.8) |
-| 8 | 5.31 s (96.4) | 1.76 s (290.4) | 5.31 s (96.4) | 1.89 s (270.3) | 1.86 s (275.4) |
-| 32 | 5.78 s (354.3) | 2.20 s (930.0) | 5.97 s (343.1) | 2.30 s (889.6) | 2.23 s (917.5) |
+| 1 | 5.11 s (12.5 tok/s) | 1.52 s (42.2) | 5.25 s (12.2) | 1.61 s (39.8) | 1.59 s (40.3) |
+| 8 | 5.45 s (94.0) | 1.76 s (291.2) | 5.56 s (92.1) | 1.86 s (275.4) | 1.82 s (281.7) |
+| 32 | 6.26 s (327.2) | 2.21 s (927.9) | 6.15 s (333.3) | 2.25 s (908.9) | 2.17 s (943.1) |
 
 Eager FA2 is at parity with Triton eager. CUDA Graphs remove most per-step
-launch overhead for **both** backends (about 3.2× over Triton eager and 2.8×
-over FA2 eager on this small model); Triton graphs is then 5–13% faster than
-FA2 graphs, so the graph gain is dispatch reduction, not the FA2 kernel.
-The official GSM8K-87 runs agree in direction (eager 784.6 s, graphs 281.5 s,
-with different generated lengths). Asynchronous scheduling adds no measurable
-gain at these batch sizes. These are single-GPU, single-wave diagnostics, not
-production throughput claims.
+launch overhead for **both** backends (about 2.7–3.4× over eager on this small
+model); Triton graphs is then 2–6% faster than FA2 graphs, so the graph gain is
+dispatch reduction, not the FA2 kernel. Asynchronous scheduling adds 1–4% over
+FA2 graphs at these batch sizes. The official GSM8K-87 runs agree in direction
+(eager 793.2 s, graphs 281.6 s, with different generated lengths). These are
+single-GPU, single-wave diagnostics, not production throughput claims.
 
 Kernel-only figures from the earlier CUDA-core adapter (FA2/Triton 0.39–0.98
 across B 1–32 and context 256–8192) are superseded by the tensor-core kernel
