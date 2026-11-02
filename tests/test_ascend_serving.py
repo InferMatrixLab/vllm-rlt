@@ -15,13 +15,14 @@ import pytest
 pytestmark = pytest.mark.npu
 
 
-def test_checkpoint_http_completions_stream_and_disconnect(tmp_path):
+@pytest.mark.parametrize("backend", ["torch", "ascend_eager"])
+def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend):
     import aiohttp
 
     source = os.environ.get("VLLM_RLT_OURO_CHECKPOINT")
     if not source:
         pytest.skip("set VLLM_RLT_OURO_CHECKPOINT to the pinned local Ouro-1.4B checkpoint")
-    folder = Path(os.environ.get("VLLM_RLT_ASCEND_RESULTS", tmp_path))
+    folder = Path(os.environ.get("VLLM_RLT_ASCEND_RESULTS", tmp_path)) / backend
     folder.mkdir(parents=True, exist_ok=True)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -39,7 +40,7 @@ def test_checkpoint_http_completions_stream_and_disconnect(tmp_path):
         "--dtype",
         "bfloat16",
         "--attention-backend",
-        "torch",
+        backend,
         "--num-blocks",
         "64",
         "--max-num-seqs",

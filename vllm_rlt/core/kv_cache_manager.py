@@ -755,12 +755,8 @@ class KVCacheManager:
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
             )
-        return self.attention(
-            q,
-            self.key_cache[:, layer],
-            self.value_cache[:, layer],
-            batch.block_tables,
-            batch.context_lengths,
+        return self.attention.attend_metadata(
+            q, self.key_cache[:, layer], self.value_cache[:, layer], batch
         )
 
     @torch.no_grad()
