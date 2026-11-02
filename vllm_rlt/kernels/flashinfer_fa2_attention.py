@@ -2,8 +2,16 @@
 
 The adapter builds the CSR metadata FlashInfer's paged kernel wants once per
 traversal (``prepare_step``), then reuses it across every decoder layer through
-``__call__``.  Plans are created once per (rows, heads, table width) at the
-cache's full table capacity, so later steps only refresh device buffers.
+``__call__``.  Plans are keyed by ``(rows, heads, width bucket)``, where the
+width is rounded up to a power of two, so a growing eager context creates at
+most one plan per bucket instead of one per page boundary.
+
+Split-KV is disabled: with it, a row's reduction order depends on the planned
+width and on batch composition, so eager and graph execution (padded rows,
+full-width graph plans) disagree bit for bit.  Without splits the schedule is
+per-row, and eager, graphs and any batch composition produce identical output.
+The cost is low-batch long-context throughput (fewer CTAs); at batch 8 the
+kernel cost is unchanged.
 
 Only FlashInfer's CUDA-Graph-compatible tensor-core FA2 wrapper is used.  The
 CUDA-core decode wrapper bakes its work schedule (request/tile indices) into
@@ -130,6 +138,7 @@ class FlashInferFA2PagedAttention:
         self._csr = {}
         self._primed = {}
         self._plan_misses = 0
+        self._plan_creations = 0
         self.info = dict(
             backend="flashinfer_fa2",
             package="flashinfer-python",
@@ -137,6 +146,7 @@ class FlashInferFA2PagedAttention:
             kernel="fa2",
             tensor_cores=True,
             cuda_graph_wrapper=True,
+            split_kv=False,
             page_size=block_size,
             head_dim=head_dim,
             sm="8.9",
@@ -147,6 +157,10 @@ class FlashInferFA2PagedAttention:
     @property
     def plan_misses(self):
         return self._plan_misses
+
+    @property
+    def plan_creations(self):
+        return self._plan_creations
 
     @property
     def plan_entries(self):
@@ -230,6 +244,10 @@ class FlashInferFA2PagedAttention:
         )
 
     def _wrapper(self, rows, q_heads, kv_heads, width):
+        # Round the table width up to a power of two: a growing eager context
+        # then crosses at most one plan per bucket instead of one per page.
+        width = max(1, width)
+        width = 1 << (width - 1).bit_length()
         key = (rows, q_heads, kv_heads, width)
         plan = self._wrappers.get(key)
         if plan is not None:
@@ -248,11 +266,18 @@ class FlashInferFA2PagedAttention:
         indptr = torch.zeros(rows + 1, dtype=torch.int32, device=device)
         indices = torch.zeros(rows * width, dtype=torch.int32, device=device)
         last_page_len = torch.full((rows,), self.page_size, dtype=torch.int32, device=device)
-        # Plan for the widest table this cache can present; live CSR values are
-        # written before every run and unused splits are masked by the wrapper.
-        capacity_indptr = torch.arange(rows + 1, dtype=torch.int32, device=device) * width
-        capacity_indices = torch.zeros(rows * width, dtype=torch.int32, device=device)
-        capacity_last = torch.full((rows,), self.page_size, dtype=torch.int32, device=device)
+
+        def host(values):
+            tensor = torch.as_tensor(values, dtype=torch.int32)
+            return tensor.pin_memory() if torch.cuda.is_available() else tensor
+
+        # Plan inputs live on the host: plan()/workspace_size() copy indptr and
+        # last_page_len to CPU, and a device source would synchronize each time.
+        capacity_indptr = host([row * width for row in range(rows + 1)])
+        capacity_last = host([self.page_size] * rows)
+        capacity_indices = torch.zeros(rows * width, dtype=torch.int32)
+        if torch.cuda.is_available():
+            capacity_indices = capacity_indices.pin_memory()
         probe = torch.empty(256, dtype=torch.uint8, device=device)
         wrapper = self._wrapper_cls(
             probe, indptr, indices, last_page_len, "NHD", use_tensor_cores=True
@@ -268,6 +293,7 @@ class FlashInferFA2PagedAttention:
             pos_encoding_mode="NONE",
             q_data_type=torch.bfloat16,
             kv_data_type=torch.bfloat16,
+            disable_split_kv=True,
         )
         wrapper.reset_workspace_buffer(
             torch.empty(max(float_bytes, 256), dtype=torch.uint8, device=device),
@@ -284,7 +310,15 @@ class FlashInferFA2PagedAttention:
             pos_encoding_mode="NONE",
             q_data_type=torch.bfloat16,
             kv_data_type=torch.bfloat16,
+            disable_split_kv=True,
         )
+        resolved = wrapper.resolved_backend
+        if resolved != "fa2":
+            raise RuntimeError(
+                f"flashinfer-python {self.info['version']} resolved the tensor-core "
+                f"wrapper to {resolved!r}; flashinfer_fa2 requires the FA2 kernel"
+            )
+        self.info["resolved_backend"] = resolved
         if len(self._wrappers) >= FLASHINFER_FA2_PLAN_CAPACITY:
             # Captured plans are referenced by graph replays and must outlive
             # them; only eager plans are evictable.
@@ -298,6 +332,7 @@ class FlashInferFA2PagedAttention:
             last_page_len,
             pinned=torch.cuda.is_current_stream_capturing(),
         )
+        self._plan_creations += 1
         self._wrappers[key] = plan
         return plan
 
@@ -319,8 +354,9 @@ class FlashInferFA2PagedAttention:
         plan = self._wrapper(rows, q.shape[1], key_cache.shape[2], width)
         # Copied per layer on purpose: under CUDA Graph capture these nodes are
         # recorded and re-read the refreshed staging buffers on every replay.
+        # The plan's buffers cover the bucket width, so live CSR fits its prefix.
         plan.indptr.copy_(csr.indptr)
-        plan.indices.copy_(csr.indices)
+        plan.indices[: csr.indices.numel()].copy_(csr.indices)
         plan.last_page_len.copy_(csr.last_page_len)
         out = torch.empty_like(q)
         plan.wrapper.run(q, (key_cache, value_cache), out=out)
