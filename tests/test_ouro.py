@@ -1,6 +1,9 @@
 """CPU numerical checks against an independent, dense Ouro implementation."""
 
 import json
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import torch
@@ -9,12 +12,81 @@ from safetensors.torch import save_file
 from tests.helpers import make_cpu_cache, tiny_ouro_config
 from tests.reference import dense_reference
 from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models.ouro import OuroMLP
 
 
 @pytest.fixture
 def model():
     torch.manual_seed(71)
     return OuroForCausalLM(tiny_ouro_config())
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("rows", [1, 7, 32])
+def test_cuda_mlp_matches_torch_expression(dtype, rows):
+    torch.manual_seed(72)
+    layer = OuroMLP(tiny_ouro_config(intermediate_size=17)).to(device="cuda", dtype=dtype)
+    layer.requires_grad_(False)
+    hidden = torch.randn(rows, layer.gate_proj.in_features, device="cuda", dtype=dtype)
+    expected = layer.down_proj(
+        torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
+    )
+    torch.testing.assert_close(layer(hidden), expected, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("native_available", [True, False])
+def test_cuda_mlp_selects_native_or_missing_extension_fallback(native_available):
+    # Dispatcher registrations last for the process lifetime. Exercise an absent
+    # extension in a fresh process rather than changing an already loaded backend.
+    script = textwrap.dedent(f"""
+        import importlib
+        import torch
+        original_import = importlib.import_module
+        def import_module(name, *args, **kwargs):
+            if name == 'vllm_rlt._C' and not {native_available}:
+                raise ModuleNotFoundError(name=name)
+            return original_import(name, *args, **kwargs)
+        importlib.import_module = import_module
+        from tests.helpers import tiny_ouro_config
+        from vllm_rlt.models.ouro import OuroMLP
+        assert not torch.cuda.is_initialized()
+        assert torch._C._dispatch_has_kernel_for_dispatch_key(
+            'vllm_rlt::silu_and_mul', 'CUDA') == {native_available}
+        layer = OuroMLP(tiny_ouro_config()).cuda().bfloat16().requires_grad_(False)
+        hidden = torch.randn(3, layer.gate_proj.in_features,
+                             device='cuda', dtype=torch.bfloat16)
+        expected = layer.down_proj(
+            torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden))
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            actual = layer(hidden)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        names = {{event.key for event in prof.key_averages()}}
+        assert 'vllm_rlt::silu_and_mul' in names
+        assert ('aten::silu' in names) == (not {native_available})
+    """)
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, timeout=60)
+
+
+@pytest.mark.gpu
+def test_cuda_mlp_graph_replays_updated_hidden():
+    layer = OuroMLP(tiny_ouro_config(intermediate_size=17)).cuda().bfloat16().requires_grad_(False)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        hidden = torch.randn(3, layer.gate_proj.in_features, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3):
+            layer(hidden)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = layer(hidden)
+    hidden.fill_(0.5)
+    graph.replay()
+    expected = layer.down_proj(
+        torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])

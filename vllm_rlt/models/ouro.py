@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
+from vllm_rlt.kernels import silu_and_mul
 from vllm_rlt.layers import (
     RMSNorm,
     RotaryEmbedding,
@@ -194,7 +194,7 @@ class OuroMLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        return self.down_proj(silu_and_mul(self.gate_proj(hidden), self.up_proj(hidden)))
 
 
 class OuroDecoderLayer(nn.Module):

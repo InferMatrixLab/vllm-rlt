@@ -737,7 +737,6 @@ def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
         assert len(batch.requests) == 1
         scheduled_request = batch.requests[0]
         progress = e.scheduler._apply_split_prefill_progress(
-            request,
             scheduled_request.work,
             scheduled_request,
             loop_count=batch.loop_count,
@@ -761,6 +760,74 @@ def test_engine_split_prefill_transition_advances_the_same_frontier_contract():
     ]
     assert request.num_prefilled_tokens == len(request.prompt_token_ids)
     assert e.scheduler.pending_work(request) is WorkKey.DECODE_CODA
+
+
+def test_split_prefill_progress_advances_multiple_recurrent_depths_per_submission():
+    from unittest.mock import Mock
+
+    from vllm_rlt.core.scheduler import ScheduledRequest, Scheduler
+
+    cache_manager = Mock()
+    scheduler = Scheduler(
+        SchedulerConfig(mode="mixed"),
+        cache_manager,
+        total_ut_steps=TOTAL_DEPTHS,
+    )
+    request = Request(
+        "a",
+        [1, 2, 3, 4],
+        SamplingParams(),
+        prefill_depth_ranges=Request.prefill_boundaries(4, TOTAL_DEPTHS),
+    )
+    scheduler.add_request(request)
+    scheduler.waiting.remove(request.request_id)
+    scheduler.activate_request(request)
+    scheduler.enqueue_work(request, WorkKey.PROMPT_PRELUDE)
+    staged = ScheduledRequest(
+        request, WorkKey.PROMPT_PRELUDE, token_start=0, token_count=2, chunk_start=0
+    )
+
+    scheduler.remove_pending_work(request)
+    progress = scheduler._apply_prefill_progress(
+        staged,
+        WorkKey.PROMPT_PRELUDE,
+        loop_count=0,
+    )
+
+    assert (progress.chunk_complete, progress.prompt_complete) == (False, False)
+    assert request.prefill_depth_ranges == [[0, 4], [0, 0], [0, 0], [0, 0]]
+    assert scheduler.pending_work(request) is WorkKey.PROMPT_RECURRENT
+
+    scheduler.remove_pending_work(request)
+    progress = scheduler._apply_prefill_progress(
+        ScheduledRequest(
+            request, WorkKey.PROMPT_RECURRENT, token_start=0, token_count=2, depth=0, chunk_start=0
+        ),
+        WorkKey.PROMPT_RECURRENT,
+        loop_count=2,
+    )
+
+    assert (progress.chunk_complete, progress.prompt_complete) == (False, False)
+    assert request.prefill_depth_ranges == [[2, 4], [2, 2], [0, 2], [0, 0]]
+    cache_manager.publish_prefix.assert_not_called()
+    assert scheduler.pending_work(request) is WorkKey.PROMPT_RECURRENT
+    event = object()
+
+    scheduler.remove_pending_work(request)
+    progress = scheduler._apply_prefill_progress(
+        ScheduledRequest(
+            request, WorkKey.PROMPT_RECURRENT, token_start=0, token_count=2, depth=2, chunk_start=0
+        ),
+        WorkKey.PROMPT_RECURRENT,
+        loop_count=2,
+        event=event,
+    )
+
+    assert (progress.chunk_complete, progress.prompt_complete) == (True, False)
+    assert request.prefill_depth_ranges == [[2, 4], [2, 2], [2, 2], [2, 2]]
+    assert request.prefill_reclaimable_tokens == 2
+    assert scheduler.pending_work(request) is WorkKey.PROMPT_PRELUDE
+    cache_manager.publish_prefix.assert_called_once_with("a", [1, 2, 3, 4], 2, event)
 
 
 @pytest.mark.parametrize(
