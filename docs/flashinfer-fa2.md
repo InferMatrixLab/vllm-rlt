@@ -82,11 +82,11 @@ the engine's ordinary CUDA Graph and asynchronous-scheduling options.
   (`indptr`, compact `indices`, `last_page_len`) is fixed-shape and device-only,
   and a GPU regression test runs it under `torch.cuda.set_sync_debug_mode` so a
   step with device-owned context lengths cannot regain a host read.
-- **Replay refreshes the plan buffers.** `__call__` copies the staging CSR into
-  the plan's buffers; graph capture records those copies, so every replay
-  consumes the metadata written by `prepare_step` immediately before it. The
-  staging buffers are referenced weakly by their metadata tensors and stay
-  alive as long as a graph entry does.
+- **Replay refreshes the plan buffers.** The first call of a traversal copies the
+  staging CSR into the plan's buffers and later layers skip it; a capture
+  records one copy group, so every replay consumes the metadata written by
+  `prepare_step` immediately before it. The staging buffers are referenced
+  weakly by their metadata tensors and stay alive as long as a graph entry does.
 - **Padding.** Rows with `context_lengths == 0` are masked to exact zeros after
   the kernel call.
 - K/V must have identical strides. The engine's `key_cache[:, layer]` and
@@ -183,11 +183,11 @@ used here and are not reproduced.
 - More page sizes/head dimensions, packed prefill, PD and speculative paths.
 - Revisit the CUDA-core decode path if FlashInfer makes its plan schedule
   independent of plan-time lengths; it is bit-closer to the Torch reference.
-- Write the live CSR directly into the plan buffers at prime time (currently
-  three per-layer copies, about 0.5 MiB per layer at 32 rows and 4096 pages).
+- Write the live CSR directly into the plan buffers at prime time: one copy per
+  traversal remains because the plan key needs head counts that are only known
+  at the first call.
 - Revisit split-KV for low-batch long-context workloads if FlashInfer offers a
   deterministic split schedule; today the deterministic path costs 2.1–3.4×
   kernel time there.
-- Add a CPU test for the GSM8K `--cuda-graphs` / `--attention-backend` flags.
 - Reconcile with #112 if XQA lands first; this backend keeps a distinct
   `flashinfer_fa2` name and module.

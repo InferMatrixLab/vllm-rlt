@@ -68,7 +68,15 @@ class _CSR:
     and the raw pointers recorded by its capture valid.
     """
 
-    __slots__ = ("indptr", "indices", "last_page_len", "block_tables", "context_lengths")
+    __slots__ = (
+        "indptr",
+        "indices",
+        "last_page_len",
+        "block_tables",
+        "context_lengths",
+        "synced",
+        "captured",
+    )
 
     def __init__(self, block_tables, context_lengths):
         rows, width = block_tables.shape
@@ -78,6 +86,10 @@ class _CSR:
         self.last_page_len = torch.empty(rows, dtype=torch.int32, device=device)
         self.block_tables = weakref.ref(block_tables)
         self.context_lengths = weakref.ref(context_lengths)
+        # Plans already refreshed from these sources in the current traversal
+        # (eager) or recorded into a capture, so layers do not copy again.
+        self.synced = set()
+        self.captured = set()
 
     def owns(self, block_tables, context_lengths):
         return self.block_tables() is block_tables and self.context_lengths() is context_lengths
@@ -87,7 +99,8 @@ class _Plan:
     """One planned wrapper with the buffers its captured replays read.
 
     The wrapper keeps the CSR buffers by reference; ``prepare_step`` refreshes
-    the staging copy and ``__call__`` copies it in, so replays see new metadata.
+    the staging copy and the first call of a traversal copies it in, so later
+    layers and replays see the same metadata without per-layer copies.
     """
 
     __slots__ = ("wrapper", "indptr", "indices", "last_page_len", "pinned")
@@ -184,6 +197,7 @@ class FlashInferFA2PagedAttention:
                 continue
             csr = self._csr_entry(block_tables, context_lengths)
             self._write_csr(csr, block_tables, context_lengths)
+            csr.synced.clear()
             self._primed[(id(block_tables), id(context_lengths))] = csr
 
     @staticmethod
@@ -352,12 +366,16 @@ class FlashInferFA2PagedAttention:
             csr = self._csr_entry(block_tables, context_lengths)
             self._write_csr(csr, block_tables, context_lengths)
         plan = self._wrapper(rows, q.shape[1], key_cache.shape[2], width)
-        # Copied per layer on purpose: under CUDA Graph capture these nodes are
-        # recorded and re-read the refreshed staging buffers on every replay.
-        # The plan's buffers cover the bucket width, so live CSR fits its prefix.
-        plan.indptr.copy_(csr.indptr)
-        plan.indices[: csr.indices.numel()].copy_(csr.indices)
-        plan.last_page_len.copy_(csr.last_page_len)
+        # One refresh per traversal (and one recorded group per capture), not
+        # per layer: every layer of a traversal shares the same plan buffers.
+        # Captures record their own copy so replay re-reads the staging buffers.
+        capturing = torch.cuda.is_current_stream_capturing()
+        synced = csr.captured if capturing else csr.synced
+        if plan not in synced:
+            plan.indptr.copy_(csr.indptr)
+            plan.indices[: csr.indices.numel()].copy_(csr.indices)
+            plan.last_page_len.copy_(csr.last_page_len)
+            synced.add(plan)
         out = torch.empty_like(q)
         plan.wrapper.run(q, (key_cache, value_cache), out=out)
         out.mul_((context_lengths > 0).to(out.dtype).unsqueeze(-1).unsqueeze(-1))
