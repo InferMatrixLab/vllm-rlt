@@ -212,7 +212,9 @@ class FlashInferFA2PagedAttention:
         width = block_tables.shape[1]
         page = self.page_size
         pages = (context_lengths.clamp_min(0) + page - 1) // page
-        csr.indptr[0] = 0
+        # A Python scalar assignment to a CUDA slice stages through host memory
+        # and synchronizes; fill_ keeps CSR construction device-only.
+        csr.indptr[0].fill_(0)
         csr.indptr[1:].copy_(torch.cumsum(pages, dim=0))
         valid = self._columns(block_tables.device, width) < pages.unsqueeze(1)
         flat = valid.reshape(-1)
