@@ -23,6 +23,7 @@ from vllm_rlt.attention import (
     create_backend,
     validate_backend_name,
 )
+from vllm_rlt.device import resolve_device
 from vllm_rlt.request import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
@@ -133,7 +134,7 @@ class KVCacheManager:
         ):
             raise ValueError("recurrent_layers must be valid cache layer indices")
         self.storage_depths = max_loops if layout == "last_exited" else 1
-        self.device = torch.device(device)
+        self.device = resolve_device(device)
         self.dtype = dtype
         self.attention = attention or create_backend(
             backend, self.device, dtype, head_dim, block_size
