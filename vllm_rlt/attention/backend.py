@@ -94,7 +94,9 @@ def _create_explicit(backend, device, dtype, head_dim, block_size):
         from vllm_rlt.kernels.flashinfer_fa2_attention import FlashInferFA2PagedAttention
 
         kernel = FlashInferFA2PagedAttention(device, dtype, head_dim, block_size)
-        return AttentionBackend(kernel, _FLASHINFER_FA2_CAPABILITIES, dict(kernel.info))
+        # Share the dict so the resolved kernel recorded after the first plan is
+        # visible through the backend's selection info.
+        return AttentionBackend(kernel, _FLASHINFER_FA2_CAPABILITIES, kernel.info)
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))
