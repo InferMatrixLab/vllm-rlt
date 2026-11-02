@@ -93,6 +93,21 @@ def test_missing_package_never_falls_back(fake_flashinfer, monkeypatch):
         create_backend("flashinfer_fa2", torch.device("cuda"), torch.bfloat16, 128, 16)
 
 
+def test_call_rejects_row_mismatch(fake_flashinfer):
+    kernel = create_backend("flashinfer_fa2", torch.device("cuda"), torch.bfloat16, 128, 16).kernel
+    q = torch.empty(3, 4, 128, dtype=torch.bfloat16)
+    tables = torch.zeros(2, 4, dtype=torch.int32)
+    lengths = torch.zeros(2, dtype=torch.int32)
+    with pytest.raises(ValueError, match="one metadata row per query row"):
+        kernel(q, None, None, tables, lengths)
+
+
+def test_wrapper_rejects_unsupported_head_ratio(fake_flashinfer):
+    kernel = create_backend("flashinfer_fa2", torch.device("cuda"), torch.bfloat16, 128, 16).kernel
+    with pytest.raises(ValueError, match="head ratio"):
+        kernel._wrapper(2, 3, 1, 4)
+
+
 @pytest.mark.gpu
 def test_strided_gqa_padding_and_zero_rows():
     torch.manual_seed(7)
@@ -176,16 +191,40 @@ def test_vectorized_csr_matches_reference():
     torch.manual_seed(11)
     attention = FlashInferFA2PagedAttention(torch.device("cuda"), torch.bfloat16, 128, 16)
     tables = torch.randint(0, 40, (6, 10), device="cuda", dtype=torch.int32)
-    lengths = torch.tensor([1, 15, 16, 17, 129, 145], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([1, 15, 16, 17, 129, 0], device="cuda", dtype=torch.int32)
     attention.prepare_step((SimpleNamespace(block_tables=tables, context_lengths=lengths),))
     csr = attention._csr[(id(tables), id(lengths))]
     pages = ((lengths + 15) // 16).tolist()
     rows = [tables[row, :count].tolist() for row, count in enumerate(pages)]
     assert csr.indptr.tolist() == [0] + torch.cumsum(torch.tensor(pages, device="cuda"), 0).tolist()
     assert csr.indices[: csr.indptr[-1]].tolist() == [page for row in rows for page in row]
+    # Empty rows keep the kernel's required last-page length of one.
     assert csr.last_page_len.tolist() == [
-        int(length) - (count - 1) * 16 for length, count in zip(lengths.tolist(), pages)
+        1 if count == 0 else int(length) - (count - 1) * 16
+        for length, count in zip(lengths.tolist(), pages)
     ]
+
+
+@pytest.mark.gpu
+def test_prepare_step_does_not_synchronize():
+    page, head_dim, rows, width = 16, 128, 2, 64
+    torch.manual_seed(17)
+    keys = torch.randn(32, 3, page, 16, head_dim, device="cuda", dtype=torch.bfloat16)[:, 1]
+    values = torch.randn(32, 3, page, 16, head_dim, device="cuda", dtype=torch.bfloat16)[:, 1]
+    q = torch.randn(rows, 16, head_dim, device="cuda", dtype=torch.bfloat16)
+    tables = torch.randint(0, 32, (rows, width), device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([33, 47], device="cuda", dtype=torch.int32)
+    attention = FlashInferFA2PagedAttention(torch.device("cuda"), torch.bfloat16, head_dim, page)
+    batch = SimpleNamespace(block_tables=tables, context_lengths=lengths)
+    # Warm module load and allocator caches outside the measured region.
+    attention.prepare_step((batch,))
+    attention(q, keys, values, tables, lengths)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        attention.prepare_step((batch,))
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
 
 
 @pytest.mark.gpu
