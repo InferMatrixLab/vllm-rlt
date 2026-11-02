@@ -134,7 +134,7 @@ No PyPI publication is implied.
 
 | Checkpoint | Implementation | Documented validation scope | Guide |
 | --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | Existing runtime and benchmark coverage under their recorded configurations; experimental single-device Ascend 910B3 BF16/fixed-four-loop synchronous Torch path, with paired quality regressions pending correction | [Runtime](docs/runtime.md), [accuracy](docs/accuracy.md), [Ascend recipe](docs/recipes/ouro_ascend.md) |
+| Ouro-1.4B | Native Ouro | Existing runtime and benchmark coverage under their recorded configurations; experimental single-device Ascend 910B3 BF16/fixed-four-loop synchronous path with explicit HF-style attention; selected full-prefill paired regression matches official HF (63/87 each, 87/87 exact sequences) | [Runtime](docs/runtime.md), [accuracy](docs/accuracy.md), [Ascend recipe](docs/recipes/ouro_ascend.md) |
 | Ouro-2.6B | Shared Ouro | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
 | Ouro-1.4B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
 | Ouro-2.6B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
