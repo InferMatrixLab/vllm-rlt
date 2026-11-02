@@ -156,10 +156,12 @@ class Scheduler:
         self.exit_mode = exit_mode
         self.requests: dict[str, Request] = {}
         self.queues: dict[RequestPhase, deque[str]] = {s: deque() for s in RequestPhase}
+        self._blocked_priority_preemptions: dict[str, int] = {}
         # Bound by Engine when preemption is enabled. These callbacks can copy
         # device state; queue transitions remain owned by this scheduler.
         self.suspend_callback = None
         self.resume_callback = None
+        self.resume_blocks_callback = None
         # Optional connector readiness and export predicates. Never mutate queues or blocks.
         self.execution_ready = None
         self.exports_request = None
@@ -206,6 +208,7 @@ class Scheduler:
         request.num_output_placeholders = 0
         request.num_speculative_rounds = 0
         self.requests.pop(request.request_id)
+        self._blocked_priority_preemptions.clear()
 
     def abort(self, request_id: str) -> Request:
         request = self.requests[request_id]
@@ -317,17 +320,97 @@ class Scheduler:
         suspends a selected victim and moves it to WAITING before admitting the
         arrival. The victim retains KV until an allocation actually needs it.
         Admission runs before any batch is selected, so no request is excluded
-        from preemption here.
+        from preemption here. A previous unsuccessful priority preemption is
+        retried only when the available admission budget improves.
         """
         if active_count < self.config.max_num_seqs:
             return active_count
-        if (
-            self.config.policy == "priority"
-            and self.suspend_callback is not None
-            and self.preempt(request, priority_only=True, excluded=frozenset())
+        blocked_budget = self._blocked_priority_preemptions.get(request.request_id)
+        if blocked_budget is not None and self._available_admission_budget() <= blocked_budget:
+            return None
+        if self.config.policy != "priority" or self.suspend_callback is None:
+            return None
+        excluded = set()
+        while victim := self._select_preemption_victim(
+            request, priority_only=True, excluded=frozenset(excluded)
         ):
-            return active_count - 1
+            if self._priority_preemption_can_admit(request, victim, active_count):
+                if self.preempt(request, priority_only=True, excluded=frozenset(excluded)):
+                    return active_count - 1
+                return None
+            excluded.add(victim.request_id)
         return None
+
+    def _priority_preemption_can_admit(
+        self, request: Request, victim: Request, active_count: int
+    ) -> bool:
+        """Reject a slot preemption only if even optimistic KV capacity is too small.
+
+        A victim keeps resident KV initially; admission may subsequently offload
+        it and any eligible waiting allocations. Prefix hits are optimistic, so
+        an uncertain preflight can proceed and the failed-preemption guard still
+        protects against a later allocation failure.
+        """
+        cache = self.cache_manager
+        if request.phase == RequestPhase.RECEIVING or (
+            cache.has_allocation(request.request_id)
+            and cache.has_transfer_lease(request.request_id)
+        ):
+            return True
+        if self.resume_callback is not None and self.resume_blocks_callback is None:
+            return True
+        restore_blocks = (
+            self.resume_blocks_callback(request)
+            if self.resume_blocks_callback is not None
+            else None
+        )
+        if restore_blocks == 0:
+            return True
+        reclaim_ids = [
+            waiting.request_id
+            for waiting in self.requests.values()
+            if waiting.phase == RequestPhase.WAITING
+            and self._is_preemption_candidate(
+                waiting, request, priority_only=False, excluded=frozenset()
+            )
+        ]
+        if cache.has_allocation(victim.request_id):
+            reclaim_ids.append(victim.request_id)
+        available = cache.num_free_blocks + cache.reclaimable_blocks(reclaim_ids)
+        if restore_blocks is not None:
+            return restore_blocks <= available
+        prompt_tokens = len(request.prompt_token_ids)
+        budget_tokens = (
+            prompt_tokens
+            if cache.incremental_allocation
+            else prompt_tokens + request.sampling_params.max_tokens - 1
+        )
+        prefix_blocks, cached_claim = cache.prefix_admission_bounds(
+            request.prompt_token_ids, release_requests=reclaim_ids
+        )
+        remaining_growth = self._reserved_growth_blocks(
+            reserve_outputs=False, excluded=frozenset({victim.request_id})
+        )
+        headroom = cache.watermark_blocks if active_count > 1 else 0
+        return (
+            cache.required_blocks(budget_tokens)
+            - prefix_blocks
+            + cached_claim
+            + remaining_growth
+            + headroom
+            <= available
+        )
+
+    def _available_admission_budget(self) -> int:
+        return self.cache_manager.num_free_blocks - self._reserved_growth_blocks(
+            reserve_outputs=False
+        )
+
+    def _record_failed_priority_preemption(self, request: Request) -> None:
+        """Do not repeatedly roll back active work without more KV capacity."""
+        budget = self._available_admission_budget()
+        previous = self._blocked_priority_preemptions.get(request.request_id, budget)
+        self._blocked_priority_preemptions[request.request_id] = max(budget, previous)
 
     def _try_resume(self, request: Request) -> ResumeResult:
         """Translate the existing restoration callback's three-way result.
@@ -346,7 +429,7 @@ class Scheduler:
         self.enqueue(request, restored)
         return ResumeResult.RESTORED
 
-    def _reserved_growth_blocks(self, *, reserve_outputs: bool) -> int:
+    def _reserved_growth_blocks(self, *, reserve_outputs: bool, excluded=frozenset()) -> int:
         """Budget future growth of existing requests without allocating it.
 
         Example: a request needs 12 blocks eventually but owns 4. Without
@@ -357,6 +440,8 @@ class Scheduler:
         cache = self.cache_manager
         reserved = 0
         for request in self.requests.values():
+            if request.request_id in excluded:
+                continue
             # Imported/reserved requests already own pages before compute admission.
             # Without preemption their future decode growth must remain affordable too.
             has_allocation = cache.has_allocation(request.request_id)
@@ -475,8 +560,8 @@ class Scheduler:
         """Admit waiting requests: order -> slot -> restore/allocate -> defer/enter.
 
         A blocked long request may let a short one pass. Each successful fresh
-        admission increments earlier blocked requests' bypass counts; reaching
-        the limit stops further bypasses so active requests can drain.
+        admission or resumption increments earlier blocked requests' bypass
+        counts; reaching the limit lets active requests drain.
         """
         if not self.queues[RequestPhase.WAITING]:
             return
@@ -499,6 +584,7 @@ class Scheduler:
             available_count = self._ensure_active_slot(request, active_count)
             if available_count is None:
                 break
+            slot_preempted = available_count < active_count
             active_count = available_count
             request_id = waiting.popleft()
             request = self.requests[request_id]
@@ -515,26 +601,30 @@ class Scheduler:
                 self._enter_prefill(request)
             else:
                 resume_result = self._try_resume(request)
-                if resume_result == ResumeResult.RESTORED:
-                    active_count += 1
-                    continue
                 if resume_result == ResumeResult.BLOCKED:
-                    deferred.append(request_id)
-                    continue
-
-                plan = self._plan_admission(request, active_count)
-                admitted = self._commit_admission(request, plan)
-                while not admitted and self.preempt(request, waiting_only=True):
-                    # Recompute prefix claims and growth reservations after
-                    # releasing a resident allocation; the previous plan is stale.
-                    plan = self._plan_admission(request, active_count)
-                    admitted = self._commit_admission(request, plan)
-                if not admitted:
+                    if slot_preempted:
+                        self._record_failed_priority_preemption(request)
                     deferred.append(request_id)
                     if request.admission_bypasses >= self.config.max_admission_bypasses:
                         break
                     continue
+                if resume_result == ResumeResult.NOT_PREEMPTED:
+                    plan = self._plan_admission(request, active_count)
+                    admitted = self._commit_admission(request, plan)
+                    while not admitted and self.preempt(request, waiting_only=True):
+                        # Recompute prefix claims and growth reservations after
+                        # releasing a resident allocation; the previous plan is stale.
+                        plan = self._plan_admission(request, active_count)
+                        admitted = self._commit_admission(request, plan)
+                    if not admitted:
+                        if slot_preempted:
+                            self._record_failed_priority_preemption(request)
+                        deferred.append(request_id)
+                        if request.admission_bypasses >= self.config.max_admission_bypasses:
+                            break
+                        continue
 
+            self._blocked_priority_preemptions.pop(request_id, None)
             active_count += 1
             for blocked_id in deferred:
                 self.requests[blocked_id].admission_bypasses += 1
