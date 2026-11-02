@@ -703,3 +703,15 @@ def test_compare_reports_sequences_without_changing_the_gate(tmp_path):
     assert differences["exit_depths"]["questions_differing_on_identical_context"] == 1
     assert result["answer_disagreements"] == []
     assert result["passes_observed_accuracy_gate"]
+
+
+def test_cuda_graphs_requires_native_before_creating_output(tmp_path):
+    args = SimpleNamespace(
+        backend="transformers",
+        cuda_graphs=True,
+        protocol=str(tmp_path / "protocol.json"),
+        output=str(tmp_path / "out"),
+    )
+    with pytest.raises(ValueError, match="native backend"):
+        gsm8k.run(args)
+    assert not (tmp_path / "out").exists()

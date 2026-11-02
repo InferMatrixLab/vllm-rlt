@@ -559,6 +559,8 @@ def run(args):
     import torch
     from transformers import AutoTokenizer
 
+    if getattr(args, "cuda_graphs", False) and args.backend != "native":
+        raise ValueError("--cuda-graphs applies to the native backend only")
     protocol = json.loads(Path(args.protocol).read_text())
     if (
         "baseline" in protocol
@@ -589,8 +591,6 @@ def run(args):
         raise RuntimeError("Run with one scheduler-assigned GPU")
     attention_backend = getattr(args, "attention_backend", "triton")
     cuda_graphs = getattr(args, "cuda_graphs", False)
-    if cuda_graphs and args.backend != "native":
-        raise ValueError("--cuda-graphs applies to the native backend only")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
