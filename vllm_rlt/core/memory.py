@@ -69,6 +69,8 @@ def plan_cache(
     if cache.kv_cache_memory_bytes is not None:
         blocks = budget_blocks(cache.kv_cache_memory_bytes, per_block)
         return blocks, {"source": "bytes", "bytes_per_block": per_block}
+    if device.type == "npu":
+        raise ValueError("NPU requires explicit num_blocks or kv_cache_memory_bytes")
     if device.type != "cuda":
         return 256, {"source": "cpu_default", "bytes_per_block": per_block}
     torch.cuda.synchronize(device)
