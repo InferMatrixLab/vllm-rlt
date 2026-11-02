@@ -684,7 +684,7 @@ class KVCacheManager:
         self._validate_tensor(v, len(batch.position_ids), "v")
         if not batch.rows:
             return
-        if self.device.type == "npu":
+        if self.device.type == "npu" and self.attention.info.get("backend") == "ascend_eager":
             if not hasattr(self, "_npu_writer"):
                 from vllm_rlt.kernels.ascend_kv import AscendKVWriter
 
