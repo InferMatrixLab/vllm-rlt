@@ -684,8 +684,22 @@ class KVCacheManager:
         self._validate_tensor(v, len(batch.position_ids), "v")
         if not batch.rows:
             return
-        self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
-        self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
+        if self.device.type == "npu":
+            if not hasattr(self, "_npu_writer"):
+                from vllm_rlt.kernels.ascend_kv import AscendKVWriter
+
+                self._npu_writer = AscendKVWriter()
+            self._npu_writer.write(
+                self.key_cache,
+                self.value_cache,
+                layer,
+                batch,
+                k[: len(batch.rows)],
+                v[: len(batch.rows)],
+            )
+        else:
+            self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
+            self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
         for allocation, depth, position in batch.rows:
             allocation.written[self._plane(depth)][layer].add(position)
 
