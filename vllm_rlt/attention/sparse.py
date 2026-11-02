@@ -343,10 +343,11 @@ def sparse_paged_attention(
 ):
     """Use bounded row batches on CUDA, retaining the scalar numerical oracle.
 
-    On CUDA with a dense backend available, the capture rows take the fused
-    paged score pass; the scalar oracle stays the definition of the arithmetic,
-    and ``batched_paged_attention`` without ``fused_scores`` still reproduces it
-    bit for bit.
+    A store configured for the ``fused`` implementation routes uniform capture
+    or consume submissions to the fused kernels. Other CUDA submissions keep
+    the batched path, whose capture rows take the fused paged score pass when a
+    dense backend is available; ``batched_paged_attention`` without
+    ``fused_scores`` still reproduces the scalar oracle bit for bit.
     """
     if not q.is_cuda:
         return reference_paged_attention(
@@ -359,6 +360,20 @@ def sparse_paged_attention(
             layer=layer,
             dense_attention=dense_attention,
         )
+    if getattr(plan.store, "implementation", "batched") == "fused":
+        from vllm_rlt.kernels import sparse_decode
+
+        if sparse_decode.supports(plan, q, dense_attention):
+            return sparse_decode.fused_paged_attention(
+                q,
+                key_cache,
+                value_cache,
+                block_tables,
+                context_lengths,
+                plan,
+                layer=layer,
+                dense_attention=dense_attention,
+            )
     return batched_paged_attention(
         q,
         key_cache,
@@ -435,11 +450,16 @@ def batched_paged_attention(
         # The retained count is host-known from the capture. Reading it back
         # from the device would sync every layer, which RFC #156 section 6.2
         # forbids.
-        for row in consume_rows:
-            count = store.host_count(plan.slots[row], layer)
-            if not count:
-                raise RuntimeError("a consume row has no captured reference")
-            counts[row] = count
+        counts = {row: store.host_count(plan.slots[row], layer) for row in consume_rows}
+        missing = [row for row, count in counts.items() if count is None]
+        if missing:
+            # The fused capture decides its count on the device (graph replays
+            # change lengths without the host), so a mixed submission that
+            # falls back here after it reads those counts back once.
+            slots = plan.slot_ids[missing]
+            counts.update(zip(missing, store.counts[slots, layer].amax(dim=-1).tolist()))
+        if any(count == 0 for count in counts.values()):
+            raise RuntimeError("a consume row has no captured reference")
     grouped = {}
     for row, length in enumerate(lengths):
         if length:
@@ -465,13 +485,21 @@ def batched_paged_attention(
             chunk = max(1, min(32, 64 * 1024 * 1024 // (extent * heads * dim)))
         for start in range(0, len(all_rows), chunk):
             rows = all_rows[start : start + chunk]
-            # Building a device tensor from a Python list costs ~2.4 ms (a
-            # blocking host-to-device copy per call). Grouped rows are almost
-            # always contiguous, so derive them on the device instead.
+            # Contiguous rows come from a device-side arange; otherwise a pinned
+            # source keeps the copy from draining the stream.
             if rows[0] + len(rows) == rows[-1] + 1:
                 row_ids = torch.arange(rows[0], rows[0] + len(rows), device=q.device)
             else:
-                row_ids = torch.tensor(rows, dtype=torch.int64, device=q.device)
+                row_ids = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(
+                    q.device, non_blocking=True
+                )
+            if mode == DENSE and dense_output is not None:
+                output[row_ids] = dense_output[row_ids]
+                continue
+            if mode == CONSUME and dense_output is not None and plan.key_retention == 1.0:
+                output[row_ids] = dense_output[row_ids]
+                consumed = True
+                continue
             slots = plan.slot_ids[row_ids]
             chunk_slots = [plan.slots[row] for row in rows]
             queries = q[row_ids].float()
@@ -536,9 +564,6 @@ def batched_paged_attention(
             positions = torch.arange(extent, device=q.device)
             blocks = tables[:, positions // block_size]
             offsets = positions % block_size
-            if mode == DENSE and dense_output is not None:
-                output[row_ids] = dense_output[row_ids]
-                continue
             if fused_scores and dense_output is not None:
                 # One pass over the paged cache: no expanded FP32 K row, and
                 # no per-row cuBLAS. The dot product is still FP32; only the
@@ -571,21 +596,16 @@ def batched_paged_attention(
             output[row_ids] = reference.to(q.dtype)
             if mode == CAPTURE:
                 count = retained_count(extent, plan.key_retention)
-                capacity = store.selected.shape[-1]
-                if count > capacity:
-                    raise ValueError(
-                        f"reference capacity {capacity} cannot hold {count} retained keys"
-                    )
+                store.ensure_key_capacity(count)
                 order = torch.argsort(probabilities, dim=-1, descending=True, stable=True)
                 selected = order[..., :count].sort(dim=-1).values
                 gathered = probabilities.gather(-1, selected)
-                # Gather the retained values straight from the paged cache: the
-                # expanded fp32 copy would be the same bits (bf16 -> fp32 is
-                # exact) but reading it scatters through a row-length tensor.
+                # Gather only retained V directly from the paged cache. The
+                # FP32 values and reduction geometry are identical to gathering
+                # from the full GQA-expanded tensor, without materializing it.
+                selected_blocks = tables[batch_index, selected // block_size]
                 selected_values = value_cache[
-                    tables[batch_index, selected // block_size],
-                    selected % block_size,
-                    kv_index,
+                    selected_blocks, selected % block_size, kv_index
                 ].float()
                 contribution = _rowwise_product("hk,hkd->hd", gathered, selected_values)
                 # Only the live prefix is written, never the whole capacity.

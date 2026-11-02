@@ -67,11 +67,36 @@ class AttentionReferenceStore:
     round.
     """
 
-    def __init__(self, *, slots, layers, heads, head_dim, key_bucket, device, stream=None):
+    def __init__(
+        self,
+        *,
+        slots,
+        layers,
+        heads,
+        head_dim,
+        key_bucket,
+        device,
+        stream=None,
+        initial_key_capacity=None,
+        implementation="batched",
+    ):
         if slots < 1 or layers < 1 or heads < 1 or head_dim < 1:
             raise ValueError("reference store dimensions must be positive")
         if key_bucket is not None and key_bucket < 1:
             raise ValueError("key_bucket must be positive when set")
+        limit = key_bucket or 1
+        initial = limit if initial_key_capacity is None else initial_key_capacity
+        if not 1 <= initial <= limit:
+            raise ValueError("initial key capacity must be within the reference capacity")
+        # Conservatively include all growth generations: an asynchronous
+        # stream may not have finished copying earlier buffers at the next
+        # growth. The engine budgets this before allocating its KV cache.
+        capacity = initial
+        self._peak_selected_capacity = capacity
+        while capacity < limit:
+            grown = min(limit, capacity * 2)
+            self._peak_selected_capacity += grown
+            capacity = grown
         self.slots = slots
         self.layers = layers
         self.heads = heads
@@ -79,8 +104,10 @@ class AttentionReferenceStore:
         self.key_bucket = key_bucket
         self.device = torch.device(device)
         self.stream = stream
+        # Which CUDA attention path consumes this store's plans.
+        self.implementation = implementation
         shape = (slots, layers, heads)
-        self.selected = torch.zeros((*shape, key_bucket or 1), dtype=torch.int32, device=device)
+        self.selected = torch.zeros((*shape, initial), dtype=torch.int32, device=device)
         self.counts = torch.zeros(shape, dtype=torch.int32, device=device)
         self.mass = torch.zeros(shape, dtype=torch.float32, device=device)
         self.output = torch.zeros((*shape, head_dim), dtype=torch.float32, device=device)
@@ -121,9 +148,52 @@ class AttentionReferenceStore:
         )
 
     @property
+    def peak_capacity_bytes(self) -> int:
+        """Conservative payload bound including all in-flight growth generations."""
+        index_bytes = self.slots * self.layers * self.heads * self._peak_selected_capacity * 4
+        return self.bytes - self.selected.nbytes + index_bytes
+
+    def ensure_key_capacity(self, count: int) -> None:
+        """Grow shared index storage on the attention owner stream.
+
+        Existing plans borrow the store rather than a fixed index pointer.
+        Prior reads/writes and the copy execute on the same owner stream;
+        record_stream protects the old allocation until that copy completes.
+        The logical key bucket and retained count never shrink with allocation.
+        """
+        limit = self.key_bucket or 1
+        if count > limit:
+            raise ValueError(f"reference capacity {limit} cannot hold {count} retained keys")
+        current = self.selected.shape[-1]
+        if count <= current:
+            return
+        if self.device.type == "cuda" and self.stream is not None:
+            if torch.cuda.current_stream(self.device) != self.stream:
+                raise RuntimeError("reference growth must run on the attention owner stream")
+        capacity = current
+        while capacity < count:
+            capacity = min(limit, capacity * 2)
+        old = self.selected
+        grown = torch.zeros((*old.shape[:-1], capacity), dtype=old.dtype, device=old.device)
+        grown[..., :current].copy_(old)
+        if old.device.type == "cuda":
+            old.record_stream(torch.cuda.current_stream(old.device))
+        self.selected = grown
+
+    @property
     def outstanding(self) -> int:
         """Number of slots currently bound to live tokens."""
         return len(self._bindings)
+
+    def _index(self, values) -> torch.Tensor:
+        """Host-known slot or row indices on the device, without a blocking copy.
+
+        A pageable host-to-device copy waits for the stream to drain, which
+        serializes the host with every in-flight round; a pinned source lets
+        the copy queue behind the work already submitted.
+        """
+        host = torch.tensor(values, dtype=torch.int64, pin_memory=self.device.type == "cuda")
+        return host.to(self.device, non_blocking=True)
 
     def reserve(self, request_id: str, request_index: int, rows: int, generation: int):
         """Take one slot per verification row of a request's submission."""
@@ -137,15 +207,17 @@ class AttentionReferenceStore:
             count = self._incarnations.get((request_id, row), 0) + 1
             self._incarnations[(request_id, row)] = count
             self._bindings[slot] = (request_id, generation, count)
-            self.incarnation[slot] = count
             incarnations.append(count)
+        slot_ids = self._index(slots)
+        # Writing host integers element by element would block on each copy.
+        self.incarnation.index_copy_(0, slot_ids, self._index(incarnations))
         return ReferenceLease(
             request_id=request_id,
             generation=generation,
             request_index=request_index,
             slots=slots,
             incarnations=tuple(incarnations),
-            slot_ids=torch.tensor(slots, dtype=torch.int64, device=self.device),
+            slot_ids=slot_ids,
             row_index=torch.arange(rows, dtype=torch.int64, device=self.device),
         )
 
@@ -168,11 +240,20 @@ class AttentionReferenceStore:
                 cleared.append(slot)
         if cleared:
             self.free.extend(cleared)
-            self._clear(torch.tensor(cleared, dtype=torch.int64, device=self.device))
+            self._forget_counts(cleared)
+            if self.stream is None:
+                self._clear(self._index(cleared))
+                return
+            # A ticket retires from the host's current stream. An index built
+            # there would be freed, and reusable by that stream, before the
+            # owner stream's index_fill_ reads it; build it on the owner stream.
+            with torch.cuda.stream(self.stream):
+                self._clear(self._index(cleared))
 
     def discard(self) -> None:
         """Free every binding without device work; the caller has drained."""
         self._bindings.clear()
+        self._counts_host.clear()
         self.free = list(range(self.slots))
 
     def build_plan(self, owners, modes, *, key_retention: float) -> SparseDecodePlan:
@@ -210,7 +291,7 @@ class AttentionReferenceStore:
             incarnations=tuple(incarnations),
             key_retention=key_retention,
             key_bucket=self.key_bucket,
-            slot_ids=torch.tensor(slots, dtype=torch.int64, device=self.device),
+            slot_ids=self._index(slots),
             store=self,
         )
 
@@ -233,6 +314,12 @@ class AttentionReferenceStore:
         """
         self._counts_host[(slot, layer)] = count
 
+    def _forget_counts(self, slots) -> None:
+        """Drop the host counts of host-known slots, so none sizes a later read."""
+        for slot in slots:
+            for layer in range(self.layers):
+                self._counts_host.pop((int(slot), layer), None)
+
     def host_count(self, slot: int, layer: int) -> int | None:
         """Retained keys of ``(slot, layer)``, or ``None`` before a capture."""
         return self._counts_host.get((slot, layer))
@@ -244,10 +331,12 @@ class AttentionReferenceStore:
         a device tensor first; grouped rows are contiguous, so derive the index
         on the device instead.
         """
+        if len(rows) == len(plan.slots):
+            return plan.slot_ids
         if rows[0] + len(rows) == rows[-1] + 1:
             index = torch.arange(rows[0], rows[0] + len(rows), device=self.device)
             return plan.slot_ids.index_select(0, index)
-        return plan.slot_ids[rows]
+        return self._index([plan.slots[row] for row in rows])
 
     def capture(self, plan: SparseDecodePlan, layer: int) -> None:
         """Mark the captured rows source-ready for the given layer.
@@ -261,8 +350,7 @@ class AttentionReferenceStore:
         if not rows:
             return
         # Assign a tensor, not the Python scalar ``True``: a scalar store into
-        # a bool tensor through advanced indexing costs milliseconds per call
-        # (2.6 ms measured at 32 rows), while a tensor store is ~0.13 ms.
+        # a bool tensor through advanced indexing copies it from the host.
         slots = self._row_slots(plan, rows)
         self.valid[slots, layer] = torch.ones(slots.numel(), dtype=torch.bool, device=self.device)
 
@@ -280,7 +368,9 @@ class AttentionReferenceStore:
         if positions.shape != plan.slot_ids.shape:
             raise ValueError("reference positions need one entry per plan row")
         rows = [row for row, slot in enumerate(plan.slots) if slot >= 0]
-        self.position[self._row_slots(plan, rows)] = positions[rows].to(torch.int64)
+        if len(rows) < len(plan.slots):
+            positions = positions[self._index(rows)]
+        self.position[self._row_slots(plan, rows)] = positions.to(torch.int64)
 
     def write_reference(
         self,
@@ -298,9 +388,7 @@ class AttentionReferenceStore:
         self._require_live(plan)
         slot = plan.slots[row]
         count = selected.shape[-1]
-        capacity = self.selected.shape[-1]
-        if count > capacity:
-            raise ValueError(f"reference capacity {capacity} cannot hold {count} retained keys")
+        self.ensure_key_capacity(count)
         self.selected[slot, layer, :, :count] = selected.to(torch.int32)
         self.counts[slot, layer] = counts.to(torch.int32)
         self.note_count(slot, layer, int(count))
@@ -313,6 +401,9 @@ class AttentionReferenceStore:
         self._require_live(plan)
         slot = plan.slots[row]
         count = self.host_count(slot, layer)
+        if count is None:
+            # A fused capture decides its count on the device.
+            count = int(self.counts[slot, layer].max())
         if not count:
             raise RuntimeError("a consume row has no captured reference")
         return (
@@ -351,15 +442,18 @@ class AttentionReferenceStore:
         )
         limit = accepted.to(device=self.device, dtype=rows.dtype).index_select(0, request)
         self.accepted[slot_ids] = limit.to(torch.int32)
-        rejected = slot_ids[rows > limit]
-        if rejected.numel():
-            # Scalar fills touch only the rejected rows and allocate nothing.
-            self.valid[rejected] = False
-            self.counts[rejected] = 0
-            self.mass[rejected] = 0
-            for slot in rejected.tolist():
-                for layer in range(self.counts.shape[1]):
-                    self._counts_host.pop((slot, layer), None)
+        # A boolean-mask gather of the rejected slots would read its size back
+        # to the host. Masked writes over the round's own rows stay on device;
+        # they touch only these rows' per-layer metadata, never the index bucket.
+        keep = rows <= limit
+        self.valid[slot_ids] = self.valid[slot_ids] & keep[:, None]
+        self.counts[slot_ids] = torch.where(keep[:, None, None], self.counts[slot_ids], 0)
+        self.mass[slot_ids] = torch.where(keep[:, None, None], self.mass[slot_ids], 0)
+        # Which rows were rejected is known only on the device, so drop the host
+        # counts of every row of these leases: a later reader then sizes from
+        # the device counts, which are zero for rejected rows, and a stale host
+        # count can never size a gather.
+        self._forget_counts(slot for lease in leases for slot in lease.slots)
 
     def _clear(self, slots: torch.Tensor) -> None:
         """Retire the metadata of the given slots, ordered on the owner stream.
@@ -371,16 +465,18 @@ class AttentionReferenceStore:
         """
 
         def zero():
-            for slot in slots.tolist():
-                for layer in range(self.counts.shape[1]):
-                    self._counts_host.pop((slot, layer), None)
-            self.valid[slots] = False
-            self.uses[slots] = 0
-            self.accepted[slots] = 0
-            self.incarnation[slots] = 0
-            self.position[slots] = 0
-            self.mass[slots] = 0
-            self.counts[slots] = 0
+            # index_fill_ passes the scalar to the kernel; assigning a Python
+            # scalar through an index tensor copies it from the host and blocks.
+            for tensor in (
+                self.valid,
+                self.uses,
+                self.accepted,
+                self.incarnation,
+                self.position,
+                self.mass,
+                self.counts,
+            ):
+                tensor.index_fill_(0, slots, 0)
 
         if self.stream is not None:
             with torch.cuda.stream(self.stream):
@@ -392,13 +488,19 @@ class AttentionReferenceStore:
         """Invalidate the references of the given slots without freeing them."""
         if len(slots) == 0:
             return
-        slots = torch.as_tensor(slots, dtype=torch.int64, device=self.device)
-        for slot in slots.tolist():
-            for layer in range(self.counts.shape[1]):
-                self._counts_host.pop((slot, layer), None)
-        self.valid[slots] = False
-        self.mass[slots] = 0
-        self.output[slots] = 0
-        self.contribution[slots] = 0
-        self.selected[slots] = 0
-        self.counts[slots] = 0
+        if isinstance(slots, torch.Tensor):
+            # Callers hand host lists; a device tensor costs one readback here.
+            self._forget_counts(slots.tolist())
+            slots = slots.to(device=self.device, dtype=torch.int64)
+        else:
+            self._forget_counts(slots)
+            slots = self._index(list(slots))
+        for tensor in (
+            self.valid,
+            self.mass,
+            self.output,
+            self.contribution,
+            self.selected,
+            self.counts,
+        ):
+            tensor.index_fill_(0, slots, 0)

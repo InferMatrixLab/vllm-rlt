@@ -234,6 +234,23 @@ def test_accept_invalidates_rejected_candidates_and_descendants():
         store.read_reference(rejected_plan, layer=0, row=0)
 
 
+def test_accept_drops_host_counts_so_rejected_rows_cannot_size_a_read():
+    store = make_store()
+    lease = store.reserve("r", 0, 3, generation=1)
+    fill_payload(store, lease.slots)
+    for slot in lease.slots:
+        for layer in range(store.layers):
+            store.note_count(slot, layer, 1)
+    store.accept([lease], torch.tensor([1]))
+    assert all(store.host_count(slot, 0) is None for slot in lease.slots)
+    # The kept row still reads its device count; the rejected row cannot be read.
+    kept = store.build_plan([(lease, 1)], [CONSUME], key_retention=0.5)
+    assert store.read_reference(kept, layer=0, row=0)[0].shape[-1] == 1
+    rejected = store.build_plan([(lease, 2)], [CONSUME], key_retention=0.5)
+    with pytest.raises(RuntimeError, match="no captured reference"):
+        store.read_reference(rejected, layer=0, row=0)
+
+
 def test_accept_keeps_root_when_every_candidate_is_rejected():
     store = make_store()
     lease = store.reserve("r", 0, 3, generation=1)
@@ -613,6 +630,37 @@ def test_sparse_engine_matches_dense_tokens_at_full_retention():
     sparse, outstanding = run(SparseDecodeAttentionConfig(enabled=True, key_retention=1.0))
     assert sparse == dense
     assert outstanding == 0
+
+
+@pytest.mark.gpu
+def test_release_from_another_stream_builds_its_index_on_the_owner_stream(monkeypatch):
+    # A speculative ticket retires from the host's current stream while the
+    # store clears on its owner stream. An index built on the current stream is
+    # freed when release returns and can be reused there before the owner
+    # stream reads it, clearing some other slot.
+    owner = torch.cuda.Stream()
+    store = AttentionReferenceStore(
+        slots=8, layers=1, heads=1, head_dim=4, key_bucket=4, device="cuda", stream=owner
+    )
+    lease = store.reserve("r", 0, 2, generation=1)
+    other = next(slot for slot in range(store.slots) if slot not in lease.slots)
+    store.valid.fill_(True)
+    torch.cuda.synchronize()
+    clear, streams = store._clear, []
+
+    def record(indices):
+        streams.append(torch.cuda.current_stream())
+        clear(indices)
+
+    monkeypatch.setattr(store, "_clear", record)
+    with torch.cuda.stream(owner):
+        torch.cuda._sleep(20_000_000)
+    store.release(lease)
+    poison = [torch.full((1,), other, device="cuda", dtype=torch.int64) for _ in range(32)]
+    torch.cuda.synchronize()
+    assert streams == [owner] and len(poison) == 32
+    assert not bool(store.valid[list(lease.slots)].any())
+    assert bool(store.valid[other].all())
 
 
 @pytest.mark.gpu
