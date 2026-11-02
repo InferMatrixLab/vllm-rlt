@@ -587,12 +587,12 @@ def run(args):
         raise ValueError("Checkpoint depth differs from the protocol")
     if not os.environ.get("CUDA_VISIBLE_DEVICES") or torch.cuda.device_count() != 1:
         raise RuntimeError("Run with one scheduler-assigned GPU")
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=False)
     attention_backend = getattr(args, "attention_backend", "triton")
     cuda_graphs = getattr(args, "cuda_graphs", False)
     if cuda_graphs and args.backend != "native":
         raise ValueError("--cuda-graphs applies to the native backend only")
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=False)
     metadata = {
         "backend": args.backend,
         "attention_backend": attention_backend,
