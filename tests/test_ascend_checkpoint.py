@@ -1,7 +1,5 @@
-"""Pinned real-weight NPU checks for explicit Torch attention, not fused CANN."""
+"""Opt-in local-checkpoint KV and lifecycle regressions on Ascend."""
 
-import hashlib
-import json
 import os
 from pathlib import Path
 
@@ -21,27 +19,15 @@ pytestmark = pytest.mark.npu
 def checkpoint():
     source = os.environ.get("VLLM_RLT_OURO_CHECKPOINT")
     if not source:
-        pytest.skip("set VLLM_RLT_OURO_CHECKPOINT to the pinned local Ouro-1.4B checkpoint")
+        pytest.skip("set VLLM_RLT_OURO_CHECKPOINT to a prepared local Ouro checkpoint")
+    if not Path(source).is_dir():
+        pytest.fail("VLLM_RLT_OURO_CHECKPOINT must be a prepared local directory")
     resolve_device("npu")
     torch.npu.set_device(0)
-    checksum = hashlib.sha256()
-    with (Path(source) / "model.safetensors").open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            checksum.update(block)
-    digest = checksum.hexdigest()
-    assert digest == "58872a72616c736595b8b7662079c5b12c5a162ec16eae94f21c348dfa9885af"
     model = OuroForCausalLM.from_pretrained(source, device="npu", dtype=torch.bfloat16)
     assert all(p.dtype == torch.bfloat16 for p in model.parameters())
     yield model, load_tokenizer(source)
     torch.npu.synchronize()
-
-
-def save_record(name, record):
-    folder = os.environ.get("VLLM_RLT_ASCEND_RESULTS")
-    if folder:
-        path = Path(folder)
-        path.mkdir(parents=True, exist_ok=True)
-        (path / name).write_text(json.dumps(record, indent=2))
 
 
 @torch.inference_mode()
@@ -62,54 +48,53 @@ def test_checkpoint_incremental_pages_preserve_hidden_logits_and_kv(checkpoint):
     for key in expected_kv:
         for name, a, b in zip(("key", "value"), actual_kv[key], expected_kv[key], strict=True):
             pairs[f"{key}.{name}"] = (a, b)
-    save_record(
-        "checkpoint-numerics.json",
-        dict(
-            tokens=tokens,
-            states=len(pairs),
-            exact=all(torch.equal(a, b) for a, b in pairs.values()),
-            finite=all(
-                bool(torch.isfinite(a).all() and torch.isfinite(b).all()) for a, b in pairs.values()
-            ),
-        ),
-    )
     for a, b in pairs.values():
         assert_bf16_close(a, b)
         torch.testing.assert_close(a, b, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("backend", ["torch", "ascend_eager"])
 @torch.inference_mode()
-def test_checkpoint_greedy_generation_and_cleanup(checkpoint):
+def test_checkpoint_greedy_replay_and_request_cleanup(checkpoint, backend):
     model, tokenizer = checkpoint
     engine = StageEngine(
         model,
-        attention_backend="torch",
+        attention_backend=backend,
         cache_config=CacheConfig(num_blocks=64),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=32),
     )
     prompts = ["The capital of France is", "One plus one equals"]
-    finished = {}
+    loops = model.config.total_ut_steps
+    params = SamplingParams(
+        max_tokens=4, temperature=0, min_loops=loops, max_loops=loops, ignore_eos=True
+    )
+    expected = None
     try:
-        for index, prompt in enumerate(prompts):
-            engine.add_request(
-                str(index),
-                tokenizer.encode(prompt, add_special_tokens=False),
-                SamplingParams(max_tokens=4, temperature=0, ignore_eos=True),
-            )
-        for _ in range(200):
-            for output in engine.step():
-                if output.finished:
-                    assert output.exit_depths == [4] * 4
-                    assert output.finish_reason == "length"
-                    finished[output.request_id] = dict(
-                        tokens=output.token_ids, text=tokenizer.decode(output.token_ids)
-                    )
-            if not engine.has_unfinished_requests():
-                break
-        assert set(finished) == {"0", "1"}
-        assert finished["0"]["tokens"] == [7042, 30, 198, 198]
-        assert finished["1"]["tokens"] == [827, 30, 198, 198]
-        assert engine.cache_manager.num_used_blocks == 0
-        save_record("checkpoint-generation.json", finished)
+        # Repeat the same packed workload and reuse IDs after all pages are freed.
+        # Expected IDs come from this checkpoint, not a particular weight file.
+        for _ in range(2):
+            finished = {}
+            for index, prompt in enumerate(prompts):
+                engine.add_request(
+                    str(index), tokenizer.encode(prompt, add_special_tokens=False), params
+                )
+            for _ in range(200):
+                for output in engine.step():
+                    if output.finished:
+                        assert len(output.token_ids) == params.max_tokens
+                        assert all(
+                            0 <= token < model.config.vocab_size for token in output.token_ids
+                        )
+                        assert output.exit_depths == [loops] * params.max_tokens
+                        assert output.finish_reason == "length"
+                        finished[output.request_id] = list(output.token_ids)
+                if not engine.has_unfinished_requests():
+                    break
+            assert set(finished) == {str(index) for index in range(len(prompts))}
+            assert engine.cache_manager.num_used_blocks == 0
+            if expected is None:
+                expected = finished
+            else:
+                assert finished == expected
     finally:
         engine.close()
