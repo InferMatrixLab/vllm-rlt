@@ -212,3 +212,9 @@ Its different intermediate rounding is reported separately from the reference
 semantics. The general native path can use a different reduction order than
 PyTorch; use the `rlt_torch_order` measurements when assessing Ouro's actual
 compatibility path.
+
+For one example of the model-level execution change, see the
+[matched B300 Graph timeline](assets/performance/ouro-rmsnorm-graph-b300.png)
+for an Ouro-1.4B BF16 request with 128 input tokens and 2 output tokens. The
+profiler trace illustrates work and launch counts; use separate unprofiled
+measurements for latency and throughput.
