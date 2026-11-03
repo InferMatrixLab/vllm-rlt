@@ -53,8 +53,8 @@ Below the cutoff, misaligned inputs use scalar computation with one work item
 per element. At or above it, the kernel loads each input's adjacent aligned
 vectors and reassembles the required logical vector with register moves and bit
 shifts. Scalar loads handle input prefixes and suffixes where a full aligned
-read would extend outside the view. Aligned and reconstructed inputs share the
-same vector calculation and output loop; output prefix and tail use scalar
+read would extend outside the view. Aligned and misaligned vector paths share the
+same calculation and output loop; output prefix and tail use scalar
 computation. No input copy or extra kernel launch is needed. Fully aligned inputs
 retain their direct vector loads even for small inputs. Empty inputs return an
 empty output without launching. On B300, correctness was tested for all

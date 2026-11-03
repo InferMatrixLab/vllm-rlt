@@ -133,7 +133,7 @@ __device__ __forceinline__ Vector<T> load_vector(const T* input, int64_t index,
   return result;
 }
 
-enum class AccessMode { Aligned, Reconstruct, Scalar };
+enum class AccessMode { Aligned, Misaligned, Scalar };
 
 template <typename T, AccessMode mode>
 __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t count) {
@@ -144,7 +144,7 @@ __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t 
     constexpr int elements = 16 / sizeof(T);
     constexpr int pairs = 16 / sizeof(typename Math<T>::Pair);
     int64_t prefix = 0;
-    if constexpr (mode == AccessMode::Reconstruct) {
+    if constexpr (mode == AccessMode::Misaligned) {
       prefix = min(count, static_cast<int64_t>(
           ((16 - (reinterpret_cast<uintptr_t>(out) & 15)) & 15) / sizeof(T)));
     }
@@ -210,7 +210,7 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
   } else if (scalar) {
     silu_and_mul_kernel<T, AccessMode::Scalar><<<blocks, threads, 0, stream>>>(g, u, result, count);
   } else {
-    silu_and_mul_kernel<T, AccessMode::Reconstruct><<<blocks, threads, 0, stream>>>(g, u, result, count);
+    silu_and_mul_kernel<T, AccessMode::Misaligned><<<blocks, threads, 0, stream>>>(g, u, result, count);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
