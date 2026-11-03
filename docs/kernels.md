@@ -54,8 +54,10 @@ per element. At or above it, the kernel loads each input's adjacent aligned
 vectors and reassembles the required logical vector with register moves and bit
 shifts. Scalar loads handle input prefixes and suffixes where a full aligned
 read would extend outside the view. Aligned and misaligned vector paths share the
-same calculation and output loop; output prefix and tail use scalar
-computation. No input copy or extra kernel launch is needed. Fully aligned inputs
+same calculation and output loop. A 16-byte-aligned output uses 16-byte stores;
+an 8-byte-aligned output uses two 8-byte stores, and an incomplete tail uses
+scalar computation. Output addresses must be aligned to at least 8 bytes. No
+input copy or extra kernel launch is needed. Fully aligned inputs
 retain their direct vector loads even for small inputs. Empty inputs return an
 empty output without launching. On B300, correctness was tested for all
 independent 16-byte input offsets just above the cutoff and for every vector

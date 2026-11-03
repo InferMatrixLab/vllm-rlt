@@ -3,6 +3,7 @@
 
 import json
 import math
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -265,6 +266,72 @@ def test_silu_and_mul_cuda_uses_device_scaled_threshold(dtype, tmp_path):
         f"AccessMode){mode}>" in event["name"]
         for event, mode in zip(kernels, (2, 1, 0), strict=True)
     )
+
+
+@pytest.mark.gpu
+def test_silu_and_mul_cuda_eight_byte_aligned_output(tmp_path):
+    nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        pytest.skip("nvcc is required to build the custom CUDA allocator")
+    source = tmp_path / "shifted_allocator.cu"
+    library = tmp_path / "shifted_allocator.so"
+    source.write_text(
+        textwrap.dedent("""
+        #include <cuda_runtime_api.h>
+        #include <cstddef>
+        extern "C" void* alloc8(ssize_t size, int device, cudaStream_t stream) {
+            (void)device; (void)stream;
+            void* ptr = nullptr;
+            if (cudaMalloc(&ptr, static_cast<size_t>(size) + 16) != cudaSuccess) return nullptr;
+            return static_cast<char*>(ptr) + 8;
+        }
+        extern "C" void free8(void* ptr, size_t size, int device, cudaStream_t stream) {
+            (void)size; (void)device; (void)stream;
+            if (ptr) cudaFree(static_cast<char*>(ptr) - 8);
+        }
+    """)
+    )
+    subprocess.run(
+        [nvcc, "-shared", "-Xcompiler", "-fPIC", "-O2", str(source), "-o", str(library)],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    script = textwrap.dedent(f"""
+        import json
+        import torch
+        from vllm_rlt.kernels import silu_and_mul
+        allocator = torch.cuda.memory.CUDAPluggableAllocator({str(library)!r}, 'alloc8', 'free8')
+        pool = torch.cuda.MemPool(allocator.allocator())
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        modes = []
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                torch.profiler.ProfilerActivity.CUDA]) as prof:
+            for dtype in (torch.bfloat16, torch.float16, torch.float32):
+                elements = 16 // torch.empty((), dtype=dtype).element_size()
+                large = sms * 160 * 256 * elements + 3
+                for count, gate_offset, up_offset in ((4097, 0, 0), (large, 1, 3)):
+                    gate_storage = torch.full((count + gate_offset,), 1, device='cuda', dtype=dtype)
+                    up_storage = torch.full((count + up_offset,), 2, device='cuda', dtype=dtype)
+                    gate, up = gate_storage[gate_offset:], up_storage[up_offset:]
+                    with torch.cuda.use_mem_pool(pool):
+                        out = silu_and_mul(gate, up)
+                    torch.cuda.synchronize()
+                    assert out.data_ptr() % 16 == 8
+                    expected = (torch.nn.functional.silu(gate[:1]) * up[:1]).item()
+                    assert torch.all(out == expected)
+                    modes.append(0 if gate_offset == 0 else 1)
+        trace = {str(tmp_path / "eight-byte-output.json")!r}
+        prof.export_chrome_trace(trace)
+        with open(trace) as f:
+            events = json.load(f)['traceEvents']
+        kernels = sorted((event for event in events if event.get('cat') == 'kernel' and
+                          'silu_and_mul_kernel' in event.get('name', '')), key=lambda e: e['ts'])
+        assert len(kernels) == len(modes), (len(kernels), len(modes))
+        assert all(f'AccessMode){{mode}}>' in event['name']
+                   for event, mode in zip(kernels, modes))
+    """)
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, timeout=120)
 
 
 @pytest.mark.gpu
