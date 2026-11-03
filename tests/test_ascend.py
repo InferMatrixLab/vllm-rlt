@@ -1,4 +1,4 @@
-"""Opt-in synchronous BF16 Ouro checks using explicit Torch attention on 910B3."""
+"""Opt-in synchronous BF16 Ouro checks using explicit Torch attention on Ascend."""
 
 import pytest
 import torch
@@ -18,7 +18,6 @@ pytestmark = pytest.mark.npu
 def npu_device():
     resolve_device("npu")
     torch.npu.set_device(0)
-    assert torch.npu.get_device_name(0) == "Ascend910B3"
     yield torch.device("npu:0")
     torch.npu.synchronize()
     torch.npu.empty_cache()

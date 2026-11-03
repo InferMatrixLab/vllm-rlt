@@ -37,6 +37,11 @@ class AttentionBackend:
         return self.kernel(*args, **kwargs)
 
     def attend_metadata(self, q, keys, values, batch):
+        """Borrow validated host metadata when supported; retain the legacy tensor API.
+
+        Metadata-aware kernels can reuse host planning across layers without
+        reading device tables or lengths back to the host.
+        """
         method = getattr(self.kernel, "attend_metadata", None)
         if method is not None:
             return method(q, keys, values, batch)

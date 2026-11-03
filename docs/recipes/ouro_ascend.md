@@ -1,4 +1,4 @@
-# Ouro-1.4B on Ascend 910B3
+# Ouro-1.4B on Ascend
 
 This experimental path runs native Ouro on one NPU with BF16, synchronous
 greedy decoding and four recurrent loops. Select
@@ -28,6 +28,12 @@ The shared scheduler/model/KV owner are retained. NPU submissions drain before
 metadata or pages can be reused. CPU/CUDA do not import Torch-NPU unconditionally.
 Use `torch_npu.profiler` for NPU device profiling; built-in profiling targets
 CPU/CUDA.
+
+Hardware selection does not inspect or whitelist device model names.
+The backend requires BF16 and the Torch-NPU/CANN operations used below.
+The measurements in this recipe were collected on 910B3; other Ascend devices
+can run the same opt-in checks without a model-name assertion. Their numerical
+and performance results require validation on the actual device/runtime pair.
 
 ## Environment and installation
 
