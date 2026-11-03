@@ -40,20 +40,27 @@ extension use the Torch reference. Import it from `vllm_rlt.kernels`. The model
 call site does not check devices or extension availability. The native kernel
 flattens contiguous inputs, using 16-byte loads/stores for the aligned vector
 body and scalar accesses for the remaining elements in the same kernel.
-Contiguous views may have independently misaligned storage offsets. Below
-`352 * 1024` total elements, these inputs use a scalar kernel with one work item
-per element. At or above this cutoff, the kernel loads each input's adjacent
-aligned vectors and reassembles
-the required logical vector with register moves and bit shifts. Scalar loads
-handle input prefixes and suffixes where a full aligned read would extend
-outside the view. The output is processed in aligned vectors with a scalar
-tail; a scalar prefix also handles a misaligned output address. No input copy
-or extra kernel launch is needed. Fully aligned inputs retain their direct
-vector load/store path even for small inputs. Empty inputs return an empty output
-without launching. The cutoff is based on B300 measurements across all three
+Contiguous views may have independently misaligned storage offsets. For these
+inputs, the scalar/vector cutoff scales with the input GPU's SM count:
+`ceil(SMs * 160 / 148) * 256 * 8` total elements. This uses a B300 benchmark
+reference of 160 BF16 vector blocks on 148 SMs, 256 threads per block and eight
+BF16 elements per 16-byte vector. The eight-element reference is also used for
+FP32 so that the B300 cutoff is `320 * 1024` elements for all three dtypes; an
+FP32 vector itself still contains four elements. Some FP16/BF16 inputs with a
+scalar tail near the cutoff were approximately 2.7% slower than the scalar path
+on B300. Scaling from B300 is a heuristic, not a measured optimum on other GPUs.
+
+Below the cutoff, misaligned inputs use scalar computation with one work item
+per element. At or above it, the kernel loads each input's adjacent aligned
+vectors and reassembles the required logical vector with register moves and bit
+shifts. Scalar loads handle input prefixes and suffixes where a full aligned
+read would extend outside the view. Aligned and reconstructed inputs share the
+same vector calculation and output loop; output prefix and tail use scalar
+computation. No input copy or extra kernel launch is needed. Fully aligned inputs
+retain their direct vector loads even for small inputs. Empty inputs return an
+empty output without launching. The B300 cutoff was tested across all three
 dtypes, independent input offsets and vector remainders. It applies to total
-element count, independent of tensor rank or model width, and is not a universal
-hardware optimum.
+element count, independent of tensor rank or model width.
 
 SiLU uses FP32 arithmetic and rounds to the input dtype before multiplying by
 `up`, preserving the reference's intermediate rounding. FP16/BF16 vector paths

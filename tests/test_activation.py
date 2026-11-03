@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerics, tails, layouts and stream contracts for SiLU-and-Mul."""
 
+import json
 import math
 import subprocess
 import sys
@@ -162,7 +163,7 @@ def test_silu_and_mul_cuda_vectors_tails_and_storage_offsets(dtype, shape, offse
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_silu_and_mul_cuda_all_alignment_pairs_match_aligned_path(dtype):
     # The two inputs can have different offsets. Cover every 16-byte alignment
-    # pair, including vectors adjacent to either view boundary and short inputs.
+    # pair in the scalar fallback, including zero and short input lengths.
     elements = 16 // torch.empty((), dtype=dtype).element_size()
     counts = [*range(2 * elements + 2), 17 * elements - 1, 17 * elements + 1]
     integer = torch.int32 if dtype == torch.float32 else torch.int16
@@ -188,10 +189,12 @@ def test_silu_and_mul_cuda_all_alignment_pairs_match_aligned_path(dtype):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("count", [352 * 1024 - 1, 352 * 1024, 352 * 1024 + 1, 352 * 1024 + 7])
-def test_silu_and_mul_cuda_threshold_and_vector_offsets_match_aligned_path(dtype, count):
+@pytest.mark.parametrize("delta", range(-1, 8))
+def test_silu_and_mul_cuda_threshold_and_vector_offsets_match_aligned_path(dtype, delta):
     # Short-offset tests now take the scalar fallback. Exercise all independent
     # input alignments on both sides of the dispatch threshold and scalar tails.
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    count = math.ceil(sms * 160 / 148) * 256 * 8 + delta
     elements = 16 // torch.empty((), dtype=dtype).element_size()
     integer = torch.int32 if dtype == torch.float32 else torch.int16
     generator = torch.Generator(device="cuda").manual_seed(43)
@@ -202,6 +205,53 @@ def test_silu_and_mul_cuda_threshold_and_vector_offsets_match_aligned_path(dtype
             expected = silu_and_mul(gate.clone(), up.clone())
             actual = silu_and_mul(gate, up)
             assert torch.equal(actual.view(integer), expected.view(integer)), (dtype, count, go, uo)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_silu_and_mul_cuda_uses_device_scaled_threshold(dtype, tmp_path):
+    # Check actual launch geometry on both sides, including FP32: B300's
+    # measured cutoff is in elements, rather than FP32 vector work items.
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    threshold = math.ceil(sms * 160 / 148) * 256 * 8
+    elements = 16 // torch.empty((), dtype=dtype).element_size()
+    cases = [(threshold - 1, 1, 3), (threshold, 1, 3), (threshold, 0, 0)]
+    tensors = [
+        (
+            torch.randn(count + go, device="cuda", dtype=dtype)[go:],
+            torch.randn(count + uo, device="cuda", dtype=dtype)[uo:],
+        )
+        for count, go, uo in cases
+    ]
+    for gate, up in tensors:
+        silu_and_mul(gate, up)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        for gate, up in tensors:
+            silu_and_mul(gate, up)
+        torch.cuda.synchronize()
+    trace = tmp_path / "silu-dispatch.json"
+    prof.export_chrome_trace(str(trace))
+    events = json.loads(trace.read_text())["traceEvents"]
+    kernels = sorted(
+        (
+            event
+            for event in events
+            if event.get("cat") == "kernel" and "silu_and_mul_kernel" in event.get("name", "")
+        ),
+        key=lambda event: event["ts"],
+    )
+    assert len(kernels) == len(cases)
+    scalar_blocks = min(math.ceil((threshold - 1) / 256), 4096)
+    vector_blocks = min(math.ceil((threshold // elements) / 256), 4096)
+    assert [event["args"]["grid"][0] for event in kernels] == [
+        scalar_blocks,
+        vector_blocks,
+        vector_blocks,
+    ]
+    assert all(event["args"]["block"] == [256, 1, 1] for event in kernels)
 
 
 @pytest.mark.gpu
@@ -265,8 +315,11 @@ def test_silu_and_mul_cuda_rejects_autograd_but_allows_inference():
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("offsets", [(0, 0), (1, 3)])
-@pytest.mark.parametrize("count", [4097, 352 * 1024 + 1])
-def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype, offsets, count):
+@pytest.mark.parametrize("large", [False, True])
+def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype, offsets, large):
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    threshold = math.ceil(sms * 160 / 148) * 256 * 8
+    count = threshold + 1 if large else min(4097, threshold - 1)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         gate = torch.randn(count + offsets[0], device="cuda", dtype=dtype)[offsets[0] :]
@@ -281,6 +334,25 @@ def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype, offsets, count
     up.fill_(2)
     graph.replay()
     torch.testing.assert_close(out, silu_and_mul_reference(gate, up))
+
+
+@pytest.mark.gpu
+def test_silu_and_mul_first_misaligned_call_during_graph_capture():
+    # The device-property lookup used by dispatch must also work on first use.
+    script = textwrap.dedent("""
+        import torch
+        from vllm_rlt.kernels.activation import silu_and_mul, silu_and_mul_reference
+        n = 4097
+        gate = torch.randn(n + 1, device='cuda', dtype=torch.bfloat16)[1:]
+        up = torch.randn(n + 3, device='cuda', dtype=torch.bfloat16)[3:]
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = silu_and_mul(gate, up)
+        graph.replay()
+        torch.testing.assert_close(output, silu_and_mul_reference(gate, up), rtol=0, atol=0)
+    """)
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, timeout=60)
 
 
 @pytest.mark.gpu

@@ -2,6 +2,7 @@
 #include "../ops.h"
 
 #include <ATen/core/grad_mode.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
@@ -77,11 +78,11 @@ __device__ __forceinline__ T compute_scalar(T gate, T up) {
   return Math<T>::mul(activated, up);
 }
 
-template <typename T>
+template <typename T, bool aligned>
 __device__ __forceinline__ Vector<T> load_vector(const T* input, int64_t index,
                                                 int64_t count) {
   constexpr int elements = 16 / sizeof(T);
-  const int offset_bytes = reinterpret_cast<uintptr_t>(input + index) & 15;
+  const int offset_bytes = aligned ? 0 : reinterpret_cast<uintptr_t>(input + index) & 15;
   Vector<T> result;
   if (offset_bytes == 0) {
     *reinterpret_cast<uint4*>(&result) =
@@ -132,39 +133,29 @@ __device__ __forceinline__ Vector<T> load_vector(const T* input, int64_t index,
   return result;
 }
 
-template <typename T, bool aligned>
+enum class AccessMode { Aligned, Reconstruct, Scalar };
+
+template <typename T, AccessMode mode>
 __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t count) {
   const int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   int64_t tail_start = 0;
-  if constexpr (aligned) {
+  if constexpr (mode != AccessMode::Scalar) {
     constexpr int elements = 16 / sizeof(T);
     constexpr int pairs = 16 / sizeof(typename Math<T>::Pair);
-    const int64_t vectors = count / elements;
-    for (int64_t i = thread; i < vectors; i += stride) {
-      Vector<T> g, u, result;
-      *reinterpret_cast<uint4*>(&g) = *reinterpret_cast<const uint4*>(gate + i * elements);
-      *reinterpret_cast<uint4*>(&u) = *reinterpret_cast<const uint4*>(up + i * elements);
-#pragma unroll
-      for (int j = 0; j < pairs; ++j) {
-        result.pairs[j] = Math<T>::compute(g.pairs[j], u.pairs[j]);
-      }
-      *reinterpret_cast<uint4*>(out + i * elements) = *reinterpret_cast<uint4*>(&result);
+    int64_t prefix = 0;
+    if constexpr (mode == AccessMode::Reconstruct) {
+      prefix = min(count, static_cast<int64_t>(
+          ((16 - (reinterpret_cast<uintptr_t>(out) & 15)) & 15) / sizeof(T)));
     }
-    tail_start = vectors * elements;
-  } else {
-    constexpr int elements = 16 / sizeof(T);
-    constexpr int pairs = 16 / sizeof(typename Math<T>::Pair);
-    const int64_t prefix = min(count, static_cast<int64_t>(
-        ((16 - (reinterpret_cast<uintptr_t>(out) & 15)) & 15) / sizeof(T)));
     for (int64_t i = thread; i < prefix; i += stride) {
       out[i] = compute_scalar(gate[i], up[i]);
     }
     const int64_t vectors = (count - prefix) / elements;
     for (int64_t i = thread; i < vectors; i += stride) {
       const int64_t index = prefix + i * elements;
-      Vector<T> g = load_vector(gate, index, count);
-      Vector<T> u = load_vector(up, index, count);
+      Vector<T> g = load_vector<T, mode == AccessMode::Aligned>(gate, index, count);
+      Vector<T> u = load_vector<T, mode == AccessMode::Aligned>(up, index, count);
       Vector<T> result;
 #pragma unroll
       for (int j = 0; j < pairs; ++j) {
@@ -174,18 +165,8 @@ __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t 
     }
     tail_start = prefix + vectors * elements;
   }
-  // Only valid scalar addresses are touched, including for count < one vector.
+  // Scalar mode starts at zero; vector modes handle only their remaining tail.
   for (int64_t i = tail_start + thread; i < count; i += stride) {
-    out[i] = compute_scalar(gate[i], up[i]);
-  }
-}
-
-template <typename T>
-__global__ void silu_and_mul_scalar_kernel(const T* gate, const T* up, T* out,
-                                         int64_t count) {
-  const int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t i = thread; i < count; i += stride) {
     out[i] = compute_scalar(gate[i], up[i]);
   }
 }
@@ -200,12 +181,22 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
                             reinterpret_cast<uintptr_t>(u) |
                             reinterpret_cast<uintptr_t>(result)) & 15) == 0;
   const int64_t count = gate.numel();
-  // B300 measurements including independently shifted inputs and all vector
-  // remainders favor scalar access below this total element count.
-  constexpr int64_t misaligned_vector_threshold = 352 * 1024;
-  const bool scalar = !vectorized && count < misaligned_vector_threshold;
-  const int64_t work = scalar ? count : std::max<int64_t>(count / (16 / sizeof(T)), 1);
   constexpr int threads = 256;
+  bool scalar = false;
+  if (!vectorized) {
+    // Use 160 BF16-vector blocks on the measured 148-SM B300 as the reference.
+    // Scale that workload per SM and use the same element cutoff for all
+    // dtypes; FP32 still processes four elements per 16-byte vector.
+    constexpr int reference_sms = 148;
+    constexpr int reference_blocks = 160;
+    constexpr int reference_elements = 16 / sizeof(__nv_bfloat16);
+    const int sms = at::cuda::getDeviceProperties(gate.get_device())->multiProcessorCount;
+    const int64_t target_blocks =
+        (static_cast<int64_t>(sms) * reference_blocks + reference_sms - 1) / reference_sms;
+    const int64_t threshold = target_blocks * threads * reference_elements;
+    scalar = count < threshold;
+  }
+  const int64_t work = scalar ? count : std::max<int64_t>(count / (16 / sizeof(T)), 1);
   int max_blocks = 4096;
   if constexpr (std::is_same_v<T, float>) {
     // More blocks improve large FP32 streaming workloads. Require enough work
@@ -218,11 +209,11 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
   const int blocks = static_cast<int>(std::min<int64_t>((work + threads - 1) / threads, max_blocks));
   auto stream = c10::cuda::getCurrentCUDAStream(gate.get_device());
   if (vectorized) {
-    silu_and_mul_kernel<T, true><<<blocks, threads, 0, stream>>>(g, u, result, count);
+    silu_and_mul_kernel<T, AccessMode::Aligned><<<blocks, threads, 0, stream>>>(g, u, result, count);
   } else if (scalar) {
-    silu_and_mul_scalar_kernel<T><<<blocks, threads, 0, stream>>>(g, u, result, count);
+    silu_and_mul_kernel<T, AccessMode::Scalar><<<blocks, threads, 0, stream>>>(g, u, result, count);
   } else {
-    silu_and_mul_kernel<T, false><<<blocks, threads, 0, stream>>>(g, u, result, count);
+    silu_and_mul_kernel<T, AccessMode::Reconstruct><<<blocks, threads, 0, stream>>>(g, u, result, count);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
