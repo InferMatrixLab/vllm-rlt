@@ -89,12 +89,20 @@ retains the scheduler's default 128-token chunks.
 
 ## Validation (2026-11-03)
 
-Base 989921ac1d3897c5c43e27ec8cddbc91fa953194 rejects `--device npu`.
-Runtime 45220081159627ff4fba36a6b0b3ac10787214c8 supplies the new backend.
-Final runtime be037ed5cb9344b59830da2449b5590f3dd6c231 adds an arithmetic
-regression and makes native writes exclusive to the new backend; selected
-eager execution and original Torch execution were separately revalidated.
-Later documentation changes preserve these runtime/test contents.
+Recorded sources:
+
+- Base `989921a` rejects `--device npu`.
+- Backend revision `4522008` was used for the paired 87-question quality
+  campaign and primary performance comparison below.
+- Routing revision `be037ed` adds an arithmetic regression and makes native
+  writes exclusive to the new backend. Selected eager and original Torch
+  execution were separately revalidated at that revision.
+- Portability/interface revision `8bb68fb` removes device-name assertions,
+  supports Python 3.10 checksum calculation, and adds legacy/metadata-aware
+  attention dispatch regressions.
+
+Each result retains its measured source. Earlier quality, numerical and
+performance campaigns are not relabeled as tests of a newer revision.
 
 ~~~bash
 pre-commit run --all-files --verbose
@@ -105,33 +113,49 @@ python -m pytest tests/test_ascend.py tests/test_ascend_checkpoint.py \
   tests/test_ascend_eager.py --run-npu -q
 ~~~
 
-- Ruff/pre-commit passed; CPU 926 passed / 602 skipped. Device cases were run
-  separately:22 passed, comprising18 NPU and 4 CPU cases.
-- Final eager vs unmodified official HF:216 selected states and2016 layer
-  events exactly equal; restored Torch vs original Torch is also exact.
-- The arithmetic regression distinguishes an analytical output16 in BF16
-  eager from15.9375 in the original FP32-intermediate path, on CPU andNPU.
-- Real spawned health/completions/SSE, termination/usage, disconnect recovery
-  and shutdown pass for both explicit backends.
-- At4522008,87 selected same-device HF/native pairs score63/87 each,
-  losses[]/gains[], with87/87 complete token sequences exactly equal.
-  Parse failures19 each; length/execution limits0 each. Every pair shares a
-  physical910B3, pooled across cards4/5/6. These are reused regression cases,
-  not a held-out/full-GSM8K estimate. No threshold or scorer was relaxed.
-- Quality uses one full-prefill chunk4096 and4096 token budget. Chunked128,
+### Portability/interface checks at `8bb68fb`
+
+- Ruff/pre-commit passed; CPU **928 passed / 602 skipped**.
+- Assigned-device suite: **22 passed**, comprising 18 NPU and 4 CPU cases.
+  Both explicit backends pass spawned HTTP/SSE, termination/usage, disconnect
+  recovery and shutdown checks.
+- Legacy kernels retain their five tensor arguments; metadata-aware kernels
+  receive the validated descriptor, and stale descriptors remain rejected.
+- The actual fixture checksum block was also executed successfully under
+  Python 3.10.12, where `hashlib.file_digest` is unavailable.
+- Arithmetic kernels are unchanged by this revision. The full 87-question
+  campaign and whole-model HF layer-event comparison were not repeated here.
+
+### Earlier numerical and quality evidence
+
+- At `be037ed`, eager versus unmodified official HF has 216 selected states
+  and 2016 layer events exactly equal. Restored Torch versus original Torch
+  is also exact.
+- The analytical rounding regression distinguishes output 16 in BF16 eager
+  from 15.9375 in the original FP32-intermediate path, on CPU and NPU.
+- At `4522008`, 87 selected same-device HF/native pairs score 63/87 each,
+  with no losses or gains and 87/87 complete token sequences exactly equal.
+  Parse failures are 19 per arm; length and execution limits are zero.
+  Each pair shares a physical 910B3, pooled across three cards. These are
+  reused regression cases, not a held-out or full-GSM8K estimate.
+- Quality uses one full-prefill chunk and token budget of 4096. Chunked,
   concurrent/adaptive task quality and other models remain unqualified.
 
-Numerical bounds remain joint relative L2<=2% and atol=rtol=0.02.
-The new explicit backend is checked against released HF BF16 eager.
-It still fails 209/216 states against the old FP32-intermediate Torch reference;
-that failure remains recorded and is not called passed.
+Numerical bounds remain joint relative L2 <= 2% and atol=rtol=0.02.
+The explicit BF16 backend targets released HF eager. At `be037ed`, it still
+fails 209/216 states against the old FP32-intermediate Torch reference;
+that historical failure remains recorded and is not relabeled as passed.
 
-The earlier63/87 HF vs61/87 native observation combined different arithmetic
-with native default 128-token chunking. Changing either alone did not fix
-question 203. Matching both restores203/881/526 and the full87 regression.
-Manual question 203 replay has15 exact logits and192 exact populated KV hashes.
+The earlier HF 63/87 versus native 61/87 observation combined different
+arithmetic with native default 128-token chunking. Changing either alone did
+not fix question 203. Matching both restores questions 203/881/526 and the
+87-question regression. The manual question 203 replay has 15 exact logits
+and 192 exact populated KV hashes.
 
 ## Measured performance
+
+The primary comparison uses original Torch at `4734e19` and the explicit
+backend at `4522008`; the later confirmation uses `be037ed`.
 
 Same physical910B3, profiler disabled, P64/C1 orC8, fixed4 loops, ignore EOS,
 exactly 8 outputs/request,768 blocks,max 8 sequences / 256 batched tokens,explicit
@@ -150,7 +174,7 @@ does not isolate ScatterND. A KV-only A/B regressed 1.23% and 6.28%;
 the final runtime therefore keeps original writes on the Torch path.
 New backend native-writing optimality is not established.
 
-Final runtime be037ed confirmation on the sameNPU gives medians 4.752tok/s
+Routing-revision be037ed confirmation on the sameNPU gives medians 4.752tok/s
 at C1 and13.705tok/s at C8 (three reps each, measured after ABBA).
 Allocated peaks are about 4.97–4.99GiB; reserved peaks about 5.33GiB.
 All bursts finish with 0 live logical KV blocks and no failed repetitions.
