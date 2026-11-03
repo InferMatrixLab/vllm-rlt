@@ -143,9 +143,17 @@ __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t 
   if constexpr (mode != AccessMode::Scalar) {
     constexpr int elements = 16 / sizeof(T);
     constexpr int pairs = 16 / sizeof(typename Math<T>::Pair);
-    const int64_t vectors = count / elements;
+    int64_t prefix = 0;
+    if constexpr (mode == AccessMode::Misaligned) {
+      prefix = min(count, static_cast<int64_t>(
+          ((16 - (reinterpret_cast<uintptr_t>(out) & 15)) & 15) / sizeof(T)));
+    }
+    for (int64_t i = thread; i < prefix; i += stride) {
+      out[i] = compute_scalar(gate[i], up[i]);
+    }
+    const int64_t vectors = (count - prefix) / elements;
     for (int64_t i = thread; i < vectors; i += stride) {
-      const int64_t index = i * elements;
+      const int64_t index = prefix + i * elements;
       Vector<T> g = load_vector<T, mode == AccessMode::Aligned>(gate, index, count);
       Vector<T> u = load_vector<T, mode == AccessMode::Aligned>(up, index, count);
       Vector<T> result;
@@ -153,16 +161,9 @@ __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t 
       for (int j = 0; j < pairs; ++j) {
         result.pairs[j] = Math<T>::compute(g.pairs[j], u.pairs[j]);
       }
-      if ((reinterpret_cast<uintptr_t>(out) & 15) == 0) {
-        *reinterpret_cast<uint4*>(out + index) = *reinterpret_cast<const uint4*>(&result);
-      } else {
-        uint2* dest = reinterpret_cast<uint2*>(out + index);
-        const uint2* src = reinterpret_cast<const uint2*>(&result);
-        dest[0] = src[0];
-        dest[1] = src[1];
-      }
+      *reinterpret_cast<uint4*>(out + index) = *reinterpret_cast<const uint4*>(&result);
     }
-    tail_start = vectors * elements;
+    tail_start = prefix + vectors * elements;
   }
   // Scalar mode starts at zero; vector modes handle only their remaining tail.
   for (int64_t i = tail_start + thread; i < count; i += stride) {
@@ -175,11 +176,10 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
   const T* g = reinterpret_cast<const T*>(gate.const_data_ptr());
   const T* u = reinterpret_cast<const T*>(up.const_data_ptr());
   T* result = reinterpret_cast<T*>(out.mutable_data_ptr());
-  TORCH_CHECK((reinterpret_cast<uintptr_t>(result) & 7) == 0,
-              "silu_and_mul requires an output aligned to 8 bytes");
   // A contiguous storage-offset view is not necessarily 16-byte aligned.
-  const bool vectorized =
-      ((reinterpret_cast<uintptr_t>(g) | reinterpret_cast<uintptr_t>(u)) & 15) == 0;
+  const bool vectorized = ((reinterpret_cast<uintptr_t>(g) |
+                            reinterpret_cast<uintptr_t>(u) |
+                            reinterpret_cast<uintptr_t>(result)) & 15) == 0;
   const int64_t count = gate.numel();
   constexpr int threads = 256;
   bool scalar = false;
