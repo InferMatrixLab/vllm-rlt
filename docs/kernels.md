@@ -13,9 +13,13 @@ fallbacks. It neither compiles code nor creates a CUDA context.
 | `csrc/ops.h` | Native operator declarations |
 | `csrc/torch_bindings.cpp` | Operator schemas and CUDA dispatch registration |
 | `csrc/activation/silu_and_mul.cu` | SiLU-and-Mul CUDA validation, launch and computation |
+| `csrc/normalization/rms_norm.cu` | RMSNorm and RMSNorm-then-residual CUDA kernels |
+| `vllm_rlt/kernels/normalization.py` | RMSNorm Python entry and Torch reference |
 | `setup.py` | Optional build of `vllm_rlt._C` |
 | `tests/test_activation.py` | Reference, CUDA numerics, layouts, tails and graph replay |
+| `tests/test_normalization.py` | RMSNorm numerics, strides, alignment and graph replay |
 | `benchmarks/kernels/silu_and_mul.py` | Matched Torch/native/vLLM accuracy and latency comparison |
+| `benchmarks/kernels/rms_norm.py` | RMSNorm and residual accuracy and latency comparison |
 
 Add future kernels to the same extension and group sources by operation family.
 No backend registry or base class is required. Put future kernel performance
@@ -73,6 +77,54 @@ are disabled, consistent with Ouro's inference-only model. `torch.compile` has
 no fake kernel registration. Tests cover the operator and Ouro MLP, including
 CUDA Graph capture/replay.
 
+## RMSNorm and residual contract
+
+`rms_norm(hidden, weight, epsilon, residual=None)` returns a new tensor. Its
+reference computes the mean square and inverse square root in FP32, multiplies
+the input by that scale, rounds the normalized values to the input dtype, then
+multiplies by `weight`. When supplied, the residual is added after the weight
+multiplication. In Ouro, this fuses the existing `residual + RMSNorm(hidden)`
+order; it does not implement `RMSNorm(residual + hidden)`. The weight is a
+one-dimensional tensor of shape `[hidden_size]` and is shared across rows.
+
+With the extension installed, the native inference path supports CUDA FP32,
+FP16 and BF16 tensors of rank 1 through 4, matching one-dimensional contiguous
+weights, and matching residuals. The last input and residual dimensions must
+have stride 1. Outer dimensions may be strided, including views into a larger
+row; input, weight and residual addresses may have independent offsets. The
+output is contiguous and none of the inputs is modified. Empty tensors return
+without a kernel launch. CPU tensors, autograd, mixed dtypes and other layouts
+use the Torch reference. Nanbeige and Huginn continue to use their existing
+Torch RMSNorm path.
+
+The general CUDA kernel assigns one block per row. It sums squares in FP32,
+uses a warp reduction for widths up to 256 and a block reduction otherwise,
+then writes the scaled and weighted values, optionally with a residual. The
+aligned body loads and stores 16 bytes at a time and uses paired FP16/BF16
+arithmetic. Unaligned output heads and tails use scalar accesses; independently
+shifted input, weight and residual vectors are reconstructed from safe aligned
+reads, with scalar reads at view boundaries. Small rows retain their input
+vectors in registers across the reduction; wider rows stream them again to bound
+register usage. Aligned width 2048 has a specialized path. FP32 pairs use paired
+arithmetic on SM100 and newer, with scalar FP32 operations on earlier
+architectures. These launch choices are implementation details and are not
+claimed optimal for every GPU.
+
+The general native reduction can use a different floating-point summation order
+from PyTorch, so its result need not be bitwise equal. Ouro uses a separate
+2048-wide FP16/BF16 compatibility path that reproduces the tested PyTorch mean
+reduction order, including its row-count-dependent block width. This path
+fuses the residual, uses 8-byte vector loads and stores and paired arithmetic,
+and keeps each thread's input values in registers across the reduction. It
+supports two-dimensional inputs and residuals with 8-byte-aligned rows, including
+strided views. Since the reduction tree is a PyTorch implementation detail,
+this path is currently enabled only for PyTorch 2.13.0 on SM103; Ouro falls
+back to the Torch reference for other versions, GPUs, shapes or alignments.
+The general kernel remains available through `rms_norm(..., match_torch=False)`.
+The tested compatibility path and the general path both retain the explicit
+intermediate dtype roundings and residual order. CUDA Graph replay is supported;
+a fake kernel for `torch.compile` is not registered.
+
 ## Build and reference checks
 
 The extension builds automatically when the build environment has CUDA-enabled
@@ -87,7 +139,7 @@ python -m pip install "torch>=2.5" setuptools wheel ninja
 python -m pip install --no-build-isolation -e .
 python -m pytest tests/test_activation.py -q
 CUDA_VISIBLE_DEVICES=<allocated_gpu> python -m pytest \
-  tests/test_activation.py --run-gpu -q
+  tests/test_activation.py tests/test_normalization.py --run-gpu -q
 ```
 
 `pip` invokes setuptools, whose PyTorch `CUDAExtension`/`BuildExtension` compiles
@@ -145,3 +197,18 @@ commit. The report retains library hashes, the local diff and raw measurements.
 Optional ops-only/full profiles are captured separately after timing; full
 capture enables shapes, memory and stacks. Large traces stay under ignored
 `artifacts/`.
+
+For RMSNorm, compare the Torch reference and both native paths without vLLM:
+
+```bash
+CUDA_VISIBLE_DEVICES=<allocated_gpu> python -m benchmarks.kernels.rms_norm \
+  --output artifacts/rmsnorm/results.json \
+  --profile-dir artifacts/rmsnorm/profiles
+```
+
+An optional source-built vLLM comparison can be supplied with
+`--vllm-library <so> --vllm-namespace <namespace> --vllm-source-commit <sha>`.
+Its different intermediate rounding is reported separately from the reference
+semantics. The general native path can use a different reduction order than
+PyTorch; use the `rlt_torch_order` measurements when assessing Ouro's actual
+compatibility path.
