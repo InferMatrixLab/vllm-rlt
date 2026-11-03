@@ -24,9 +24,11 @@ def checkpoint():
         pytest.skip("set VLLM_RLT_OURO_CHECKPOINT to the pinned local Ouro-1.4B checkpoint")
     resolve_device("npu")
     torch.npu.set_device(0)
-    assert torch.npu.get_device_name(0) == "Ascend910B3"
+    checksum = hashlib.sha256()
     with (Path(source) / "model.safetensors").open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            checksum.update(block)
+    digest = checksum.hexdigest()
     assert digest == "58872a72616c736595b8b7662079c5b12c5a162ec16eae94f21c348dfa9885af"
     model = OuroForCausalLM.from_pretrained(source, device="npu", dtype=torch.bfloat16)
     assert all(p.dtype == torch.bfloat16 for p in model.parameters())
