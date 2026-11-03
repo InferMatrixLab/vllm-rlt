@@ -6,6 +6,7 @@ import math
 import subprocess
 import sys
 import textwrap
+from itertools import product
 
 import pytest
 import torch
@@ -192,29 +193,32 @@ def test_silu_and_mul_cuda_all_alignment_pairs_match_aligned_path(dtype):
 @pytest.mark.parametrize("delta", range(-1, 8))
 def test_silu_and_mul_cuda_threshold_and_vector_offsets_match_aligned_path(dtype, delta):
     # Short-offset tests now take the scalar fallback. Exercise all independent
-    # input alignments on both sides of the dispatch threshold and scalar tails.
+    # input alignments above the threshold and each possible scalar tail.
     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    count = math.ceil(sms * 160 / 148) * 256 * 8 + delta
     elements = 16 // torch.empty((), dtype=dtype).element_size()
+    count = sms * 160 * 256 * elements + delta
     integer = torch.int32 if dtype == torch.float32 else torch.int16
     generator = torch.Generator(device="cuda").manual_seed(43)
-    for go in range(elements):
-        for uo in range(elements):
-            gate = torch.randn(count + go, device="cuda", dtype=dtype, generator=generator)[go:]
-            up = torch.randn(count + uo, device="cuda", dtype=dtype, generator=generator)[uo:]
-            expected = silu_and_mul(gate.clone(), up.clone())
-            actual = silu_and_mul(gate, up)
-            assert torch.equal(actual.view(integer), expected.view(integer)), (dtype, count, go, uo)
+    gate_storage = torch.randn(
+        count + elements - 1, device="cuda", dtype=dtype, generator=generator
+    )
+    up_storage = torch.randn(count + elements - 1, device="cuda", dtype=dtype, generator=generator)
+    offsets = product(range(elements), repeat=2) if delta == 1 else [(1, 3), (elements - 1, 1)]
+    for go, uo in offsets:
+        gate = gate_storage[go : go + count]
+        up = up_storage[uo : uo + count]
+        expected = silu_and_mul(gate.clone(), up.clone())
+        actual = silu_and_mul(gate, up)
+        assert torch.equal(actual.view(integer), expected.view(integer)), (dtype, count, go, uo)
 
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_silu_and_mul_cuda_uses_device_scaled_threshold(dtype, tmp_path):
-    # Check actual launch geometry on both sides, including FP32: B300's
-    # measured cutoff is in elements, rather than FP32 vector work items.
+    # Both paths can have the same capped grid, so also inspect the kernel mode.
     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    threshold = math.ceil(sms * 160 / 148) * 256 * 8
     elements = 16 // torch.empty((), dtype=dtype).element_size()
+    threshold = sms * 160 * 256 * elements
     cases = [(threshold - 1, 1, 3), (threshold, 1, 3), (threshold, 0, 0)]
     tensors = [
         (
@@ -244,14 +248,23 @@ def test_silu_and_mul_cuda_uses_device_scaled_threshold(dtype, tmp_path):
         key=lambda event: event["ts"],
     )
     assert len(kernels) == len(cases)
-    scalar_blocks = min(math.ceil((threshold - 1) / 256), 4096)
-    vector_blocks = min(math.ceil((threshold // elements) / 256), 4096)
+
+    def blocks_for(work):
+        cap = 16384 if dtype == torch.float32 and work >= 16384 * 256 else 4096
+        return min(math.ceil(work / 256), cap)
+
+    scalar_blocks = blocks_for(threshold - 1)
+    vector_blocks = blocks_for(threshold // elements)
     assert [event["args"]["grid"][0] for event in kernels] == [
         scalar_blocks,
         vector_blocks,
         vector_blocks,
     ]
     assert all(event["args"]["block"] == [256, 1, 1] for event in kernels)
+    assert all(
+        f"AccessMode){mode}>" in event["name"]
+        for event, mode in zip(kernels, (2, 1, 0), strict=True)
+    )
 
 
 @pytest.mark.gpu
@@ -318,7 +331,8 @@ def test_silu_and_mul_cuda_rejects_autograd_but_allows_inference():
 @pytest.mark.parametrize("large", [False, True])
 def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype, offsets, large):
     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    threshold = math.ceil(sms * 160 / 148) * 256 * 8
+    elements = 16 // torch.empty((), dtype=dtype).element_size()
+    threshold = sms * 160 * 256 * elements
     count = threshold + 1 if large else min(4097, threshold - 1)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
@@ -394,15 +408,23 @@ def test_silu_and_mul_cuda_low_precision_storage_patterns(dtype, offsets):
         device="cuda",
         dtype=dtype,
     )
-    count = values.numel() * factors.numel() + 1
+    pattern_count = values.numel() * factors.numel()
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    threshold = sms * 160 * 256 * (16 // values.element_size())
+    count = max(pattern_count + 1, threshold + 1) if offsets != (0, 0) else pattern_count + 1
     gate = torch.empty(count + offsets[0], device="cuda", dtype=dtype)[offsets[0] :]
     up = torch.empty(count + offsets[1], device="cuda", dtype=dtype)[offsets[1] :]
-    gate[:-1].copy_(values.repeat(factors.numel()))
-    up[:-1].copy_(factors.repeat_interleave(values.numel()))
-    # The aligned path ends with one scalar multiplication yielding a subnormal.
+    gate.zero_()
+    up.zero_()
+    gate[:pattern_count].copy_(values.repeat(factors.numel()))
+    up[:pattern_count].copy_(factors.repeat_interleave(values.numel()))
+    # A scalar tail multiplication produces a subnormal.
     gate[-1], up[-1] = 1.0, subnormal
     actual = silu_and_mul(gate, up)
-    expected = silu_and_mul_reference(gate, up)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    expected = silu_and_mul_reference(gate[:pattern_count], up[:pattern_count])
+    actual_patterns = actual[:pattern_count]
+    torch.testing.assert_close(actual_patterns, expected, rtol=0, atol=0, equal_nan=True)
     valid = ~torch.isnan(expected)
-    assert torch.equal(actual[valid].view(torch.int16), expected[valid].view(torch.int16))
+    assert torch.equal(actual_patterns[valid].view(torch.int16), expected[valid].view(torch.int16))
+    expected_tail = silu_and_mul_reference(gate[-1:], up[-1:])
+    torch.testing.assert_close(actual[-1:], expected_tail, rtol=0, atol=0)

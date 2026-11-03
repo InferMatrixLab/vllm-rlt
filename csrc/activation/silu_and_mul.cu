@@ -184,16 +184,13 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
   constexpr int threads = 256;
   bool scalar = false;
   if (!vectorized) {
-    // Use 160 BF16-vector blocks on the measured 148-SM B300 as the reference.
-    // Scale that workload per SM and use the same element cutoff for all
-    // dtypes; FP32 still processes four elements per 16-byte vector.
-    constexpr int reference_sms = 148;
-    constexpr int reference_blocks = 160;
-    constexpr int reference_elements = 16 / sizeof(__nv_bfloat16);
+    // Use 160 reference vector blocks per SM to determine the element cutoff.
+    // The actual launch grid is calculated separately and may be capped.
+    constexpr int reference_blocks_per_sm = 160;
+    constexpr int elements_per_vector = 16 / sizeof(T);
     const int sms = at::cuda::getDeviceProperties(gate.get_device())->multiProcessorCount;
-    const int64_t target_blocks =
-        (static_cast<int64_t>(sms) * reference_blocks + reference_sms - 1) / reference_sms;
-    const int64_t threshold = target_blocks * threads * reference_elements;
+    const int64_t threshold =
+        static_cast<int64_t>(sms) * reference_blocks_per_sm * threads * elements_per_vector;
     scalar = count < threshold;
   }
   const int64_t work = scalar ? count : std::max<int64_t>(count / (16 / sizeof(T)), 1);
