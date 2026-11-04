@@ -117,20 +117,6 @@ def test_cancel_and_request_id_reuse_cannot_reuse_old_reference(draft):
         e.close()
 
 
-def test_context_bound_is_enforced_before_request_admission():
-    e = engine(
-        sparse_decode_attention_config=SparseDecodeAttentionConfig(
-            enabled=True, max_context_tokens=8
-        )
-    )
-    try:
-        with pytest.raises(ValueError, match="sparse.*context"):
-            e.add_request("too-long", [2, 3, 4], SamplingParams(max_tokens=8))
-        assert "too-long" not in e.scheduler.requests
-    finally:
-        e.close()
-
-
 @pytest.mark.parametrize("setting", ["graphs", "pipeline", "preemption", "shared"])
 def test_unqualified_execution_modes_fail_explicitly(setting):
     options = {

@@ -154,7 +154,7 @@ class SpeculativeRunner:
         runtime=None,
         compute_stream=None,
         reference_store=None,
-        sparse_decode=None,
+        sparse_decode_config=None,
     ):
         self.model, self.cache, self.config = model, cache, config
         self.metadata = cache.metadata_builder
@@ -163,7 +163,7 @@ class SpeculativeRunner:
         self.device = next(model.parameters()).device
         self.compute_stream = compute_stream
         self.reference_store = reference_store
-        self.sparse_decode = sparse_decode
+        self.sparse_decode_config = sparse_decode_config
         self.reference_generation = 0
         self.submissions = SubmissionQueue()
         self.input_buffers = {
@@ -250,7 +250,7 @@ class SpeculativeRunner:
                 result.append(kv)
                 continue
             plan = self.reference_store.build_plan(
-                owners, modes, key_retention=self.sparse_decode.key_retention
+                owners, modes, key_retention=self.sparse_decode_config.key_retention
             )
             self.reference_store.bind_positions(plan, kv.position_ids)
             result.append(replace(kv, reference_plan=plan))

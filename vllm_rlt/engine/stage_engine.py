@@ -125,7 +125,7 @@ class StageEngine:
                     config.total_ut_steps * width
                 )
         sparse_decode = sparse_decode_attention_config
-        self.sparse_decode_attention = sparse_decode
+        self.sparse_decode_config = sparse_decode
         self.reference_store = None
         if sparse_decode is not None and sparse_decode.enabled:
             if getattr(model, "requires_boundary_kv", False):
@@ -145,15 +145,10 @@ class StageEngine:
                     "sparse decode attention ordinary decode requires synchronous scheduling"
                 )
             # The index buffer never truncates the algorithm: capacity must
-            # hold the worst-case retained count over the supported serving
-            # context, which the caller may bound explicitly instead of paying
-            # for the model's full positional limit.
-            context_bound = sparse_decode.max_context_tokens or config.max_position_embeddings
-            if context_bound > config.max_position_embeddings:
-                raise ValueError(
-                    f"max_context_tokens {context_bound} exceeds the model context "
-                    f"{config.max_position_embeddings}"
-                )
+            # hold the worst-case retained count over the model's positional
+            # limit. The buffer starts small and grows on demand, so a long
+            # model context does not cost its worst case up front.
+            context_bound = config.max_position_embeddings
             required_keys = math.ceil(context_bound * sparse_decode.key_retention)
             capacity = sparse_decode.key_bucket or required_keys
             if capacity < required_keys:
@@ -186,7 +181,7 @@ class StageEngine:
                         f"sparse decode attention reference pool needs "
                         f"{reference_bytes / 1024**3:.1f} GiB but only "
                         f"{free_bytes / 1024**3:.1f} GiB is free; lower "
-                        f"max_context_tokens, key_retention or num_speculative_tokens"
+                        f"key_retention or num_speculative_tokens"
                     )
             self.reference_store = AttentionReferenceStore(
                 slots=slots,
@@ -321,7 +316,7 @@ class StageEngine:
             staged_prefill=self.scheduler.staged_prefill,
             rng=self.rng,
             reference_store=self.reference_store if speculative_config is None else None,
-            sparse_decode=self.sparse_decode_attention,
+            sparse_decode_config=self.sparse_decode_config,
         )
         self.speculative_runner = (
             SpeculativeRunner(
@@ -333,7 +328,7 @@ class StageEngine:
                 runtime=self.model_runner.runtime,
                 compute_stream=self.model_runner.core_stream,
                 reference_store=self.reference_store,
-                sparse_decode=self.sparse_decode_attention,
+                sparse_decode_config=self.sparse_decode_config,
             )
             if speculative_config is not None and not self.async_speculative
             else None
@@ -352,7 +347,7 @@ class StageEngine:
                 rng=self.rng,
                 runtime=self.model_runner.runtime,
                 reference_store=self.reference_store,
-                sparse_decode=self.sparse_decode_attention,
+                sparse_decode_config=self.sparse_decode_config,
             )
             if self.reference_store is not None:
                 # Reference lifecycle device work is ordered on the compute
@@ -469,12 +464,6 @@ class StageEngine:
         capacity = len(prompt_token_ids) + params.max_tokens - 1
         if capacity > config.max_position_embeddings:
             raise ValueError("prompt plus decode positions exceed the model context length")
-        if self.reference_store is not None:
-            bound = (
-                self.sparse_decode_attention.max_context_tokens or config.max_position_embeddings
-            )
-            if capacity > bound:
-                raise ValueError("request exceeds sparse decode attention context bound")
         cache = self.cache_manager
         required = cache.required_blocks(capacity)
         if required > cache.num_blocks:

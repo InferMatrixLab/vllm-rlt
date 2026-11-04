@@ -66,11 +66,6 @@ def add_runtime_args(parser):
         help="Retained key fraction per query/head; 1.0 is the full-retention control",
     )
     parser.add_argument(
-        "--sparse-decode-max-context",
-        type=int,
-        help="Supported serving context bound for the reference index buffer",
-    )
-    parser.add_argument(
         "--cuda-graphs",
         action="store_true",
         help="Capture decode/wavefront recurrent cores and speculative coda; sampling stays eager",
@@ -154,7 +149,6 @@ def runtime_configs(args):
         sparse_decode_attention_config=SparseDecodeAttentionConfig(
             enabled=args.sparse_decode_attention,
             key_retention=args.sparse_decode_key_retention,
-            max_context_tokens=args.sparse_decode_max_context,
         )
         if args.sparse_decode_attention
         else None,

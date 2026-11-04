@@ -100,7 +100,6 @@ def main():
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--concurrency", default="1,8")
     parser.add_argument("--blocks", type=int, default=768)
-    parser.add_argument("--sparse-context", type=int, default=512)
     args = parser.parse_args()
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -132,11 +131,7 @@ def main():
             sparse = run(
                 model,
                 concurrency,
-                SparseDecodeAttentionConfig(
-                    enabled=True,
-                    key_retention=retention,
-                    max_context_tokens=args.sparse_context,
-                ),
+                SparseDecodeAttentionConfig(enabled=True, key_retention=retention),
                 prompt_ids=prompt_ids,
                 max_tokens=args.max_tokens,
                 repeats=args.repeats,

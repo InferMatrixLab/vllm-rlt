@@ -312,17 +312,48 @@ def test_reincarnation_bumps_on_slot_reuse():
     assert int(store.incarnation[slot]) == again.incarnations[0]
 
 
+def test_stale_plan_from_a_previous_owner_cannot_touch_a_reused_slot():
+    # The incarnation must identify the physical slot's current owner. A counter
+    # keyed by (request_id, row) restarts at 1 for the next request, so the
+    # previous owner's plan carries the same number, passes the liveness check,
+    # and can overwrite the new owner's reference state.
+    store = make_store(slots=1, layers=1, heads=1, head_dim=2, key_bucket=4)
+    first = store.reserve("a", 0, 1, generation=1)
+    stale = store.build_plan([(first, 0)], [CAPTURE], key_retention=1.0)
+    store.release(first)
+
+    second = store.reserve("b", 0, 1, generation=1)
+    assert second.slots == first.slots
+    current = store.build_plan([(second, 0)], [CAPTURE], key_retention=1.0)
+    assert current.incarnations != stale.incarnations
+
+    store.capture(current, layer=0)
+    valid = store.valid.clone()
+    counts = store.counts.clone()
+    mass = store.mass.clone()
+
+    with pytest.raises(RuntimeError, match="stale"):
+        store.capture(stale, layer=0)
+    with pytest.raises(RuntimeError, match="stale"):
+        store.write_reference(
+            stale,
+            0,
+            0,
+            selected=torch.tensor([[0, 1]]),
+            counts=torch.tensor([2]),
+            mass=torch.tensor([0.5]),
+            output=torch.zeros(1, 2),
+            contribution=torch.zeros(1, 2),
+        )
+    assert torch.equal(store.valid, valid)
+    assert torch.equal(store.counts, counts)
+    assert torch.equal(store.mass, mass)
+
+
 def test_bytes_matches_layout():
     store = make_store(slots=3, layers=2, heads=2, head_dim=4, key_bucket=8)
     expected = 3 * 2 * 2 * (8 + 1 + 1 + 4 + 4) * 4 + 3 * 2 * (1 + 4) + 3 * (8 + 8 + 4)
     assert store.bytes == expected
-
-
-def test_sparse_config_validates_serving_context_bound():
-    assert SparseDecodeAttentionConfig(max_context_tokens=512).max_context_tokens == 512
-    assert SparseDecodeAttentionConfig().max_context_tokens is None
-    with pytest.raises(ValueError, match="max_context_tokens"):
-        SparseDecodeAttentionConfig(max_context_tokens=0)
 
 
 def test_device_metadata_carries_reference_plan():
@@ -583,21 +614,30 @@ def test_async_sparse_reference_incarnations_advance_across_rounds():
     e = make_speculative_engine(model, sparse=SparseDecodeAttentionConfig(enabled=True))
     store = e.reference_store
     bootstrap(e)
-    incarnations = []
+    plans = []
     original = store.build_plan
 
     def recording(owners, modes, **kwargs):
         plan = original(owners, modes, **kwargs)
-        incarnations.append(plan.incarnations)
+        plans.append((plan.slots, plan.incarnations))
         return plan
 
     store.build_plan = recording
     e.step()
     e.step()
     e._collect_speculative()
-    assert len(incarnations) >= 2
-    # Every new round is a new token incarnation, even at the same position.
-    assert incarnations[-1][0] > incarnations[0][0]
+    assert len(plans) >= 2
+    # Incarnations belong to the physical slot, so rounds may rotate through
+    # different slots and each fresh slot starts at 1. A slot must never come
+    # back with a number it already had; equality is allowed only because the
+    # capture and consume plans of one round share a lease, and therefore share
+    # its incarnation.
+    seen: dict[int, int] = {}
+    for slots, incarnations in plans:
+        for slot, incarnation in zip(slots, incarnations):
+            if slot in seen:
+                assert incarnation >= seen[slot], (slot, seen[slot], incarnation)
+            seen[slot] = incarnation
     e.abort_request("r")
     drain(e)
     assert store.outstanding == 0
@@ -693,25 +733,16 @@ def test_accept_and_retire_do_not_allocate_bucket_sized_temporaries():
 
 
 @pytest.mark.gpu
-def test_sparse_engine_bounds_reference_pool_by_serving_context():
+def test_sparse_engine_sizes_reference_capacity_from_the_model_context():
     model = tiny("cuda")
     e = make_speculative_engine(
-        model,
-        sparse=SparseDecodeAttentionConfig(enabled=True, key_retention=1.0, max_context_tokens=64),
+        model, sparse=SparseDecodeAttentionConfig(enabled=True, key_retention=1.0)
     )
-    # The pool follows the supported serving bound, not the model's 128-token
-    # positional limit.
-    assert e.reference_store.key_bucket == 64
+    # Capacity is the worst-case retained count over the model's positional
+    # limit; the buffer itself starts small and grows on demand.
+    assert e.reference_store.key_bucket == model.config.max_position_embeddings
+    assert e.reference_store.selected.shape[-1] < e.reference_store.key_bucket
     e.close()
-
-
-@pytest.mark.gpu
-def test_sparse_engine_rejects_context_beyond_model_limit():
-    model = tiny("cuda")
-    with pytest.raises(ValueError, match="exceeds the model context"):
-        make_speculative_engine(
-            model, sparse=SparseDecodeAttentionConfig(enabled=True, max_context_tokens=4096)
-        )
 
 
 @pytest.mark.gpu

@@ -122,7 +122,12 @@ class AttentionReferenceStore:
         self.accepted = torch.zeros(slots, dtype=torch.int32, device=device)
         self.free = list(range(slots))
         self._bindings: dict[int, tuple[str, int, int]] = {}
-        self._incarnations: dict[tuple[str, int], int] = {}
+        # Incarnations belong to the physical slot, not to the request that
+        # borrows it: a counter keyed by ``(request_id, row)`` restarts at 1 for
+        # the next owner, so a stale plan from the previous owner would carry
+        # the same number and pass the liveness check. Slot counters only ever
+        # increase, which makes a recycled slot's old plan unambiguously stale.
+        self._slot_incarnations: list[int] = [0] * slots
         # Retained counts are host-known: the capture decides them before it
         # submits. Keeping them here lets a reader size its gather without a
         # device readback, which RFC #156 section 6.2 forbids.
@@ -204,8 +209,8 @@ class AttentionReferenceStore:
         slots = tuple(self.free.pop() for _ in range(rows))
         incarnations = []
         for row, slot in enumerate(slots):
-            count = self._incarnations.get((request_id, row), 0) + 1
-            self._incarnations[(request_id, row)] = count
+            count = self._slot_incarnations[slot] + 1
+            self._slot_incarnations[slot] = count
             self._bindings[slot] = (request_id, generation, count)
             incarnations.append(count)
         slot_ids = self._index(slots)

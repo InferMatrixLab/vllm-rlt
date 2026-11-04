@@ -162,12 +162,12 @@ class ModelRunner:
         staged_prefill=None,
         rng: RngRegistry | None = None,
         reference_store=None,
-        sparse_decode=None,
+        sparse_decode_config=None,
     ):
         self.model = model.eval()
         self.cache_manager = cache_manager
         self.reference_store = reference_store
-        self.sparse_decode = sparse_decode
+        self.sparse_decode_config = sparse_decode_config
         self.attention_references = {}
         self.reference_generation = 0
         self.metadata = cache_manager.metadata_builder
@@ -1097,7 +1097,7 @@ class ModelRunner:
         owners.extend([None] * padding)
         modes.extend([DENSE] * padding)
         plan = self.reference_store.build_plan(
-            owners, modes, key_retention=self.sparse_decode.key_retention
+            owners, modes, key_retention=self.sparse_decode_config.key_retention
         )
         self.reference_store.bind_positions(plan, kv.position_ids)
         return replace(kv, reference_plan=plan)

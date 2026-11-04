@@ -187,7 +187,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         rng: RngRegistry | None = None,
         runtime=None,
         reference_store=None,
-        sparse_decode=None,
+        sparse_decode_config=None,
     ):
         super().__init__(
             model,
@@ -202,7 +202,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         # reference pool (RFC #156 section 5) and drives retirement from the
         # GPU acceptance counts without a host readback.
         self.reference_store = reference_store
-        self.sparse_decode = sparse_decode
+        self.sparse_decode_config = sparse_decode_config
         self._generations: dict[str, int] = {}
         sizes = speculative_capture_sizes(execution, scheduler, config)
         self.graphs = (
@@ -418,7 +418,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             return None
         owners = [(leases[lease_index], row) for lease_index, row in rows]
         return self.reference_store.build_plan(
-            owners, [mode] * len(owners), key_retention=self.sparse_decode.key_retention
+            owners, [mode] * len(owners), key_retention=self.sparse_decode_config.key_retention
         )
 
     def _draft(self, plan, tables, allocations, leases=None):

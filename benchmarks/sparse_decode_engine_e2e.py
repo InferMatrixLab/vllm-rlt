@@ -91,7 +91,6 @@ def main():
     parser.add_argument("--retentions", default="1.0,0.1")
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--cache-blocks", type=int, default=2048)
-    parser.add_argument("--sparse-context", type=int, default=64)
     args = parser.parse_args()
 
     device = args.device
@@ -130,11 +129,7 @@ def main():
             sparse = run(
                 model,
                 concurrency,
-                SparseDecodeAttentionConfig(
-                    enabled=True,
-                    key_retention=retention,
-                    max_context_tokens=args.sparse_context,
-                ),
+                SparseDecodeAttentionConfig(enabled=True, key_retention=retention),
                 prompt=args.prompt,
                 max_tokens=args.max_tokens,
                 repeats=args.repeats,

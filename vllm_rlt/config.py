@@ -208,10 +208,6 @@ class SparseDecodeAttentionConfig:
     enabled: bool = False
     key_retention: float = 1.0
     key_bucket: int | None = None
-    # Supported serving context bound for the reference index buffer. ``None``
-    # falls back to the model context; set it to the real serving bound so the
-    # pool is not sized for a context the deployment never uses.
-    max_context_tokens: int | None = None
     # ``batched`` keeps the scalar oracle's reduction shapes (bitwise contract);
     # ``fused`` launches fixed per-layer kernels without host readbacks and
     # changes consume-row numerics (see vllm_rlt.kernels.sparse_decode).
@@ -226,5 +222,3 @@ class SparseDecodeAttentionConfig:
             raise ValueError("key_retention must be in (0, 1]")
         if self.key_bucket is not None:
             _positive("key_bucket", self.key_bucket)
-        if self.max_context_tokens is not None:
-            _positive("max_context_tokens", self.max_context_tokens)

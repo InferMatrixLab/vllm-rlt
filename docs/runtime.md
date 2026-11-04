@@ -241,9 +241,7 @@ its own reference.
 ```python
 from vllm_rlt import ExecutionConfig, SparseDecodeAttentionConfig, SpeculativeConfig
 
-sparse = SparseDecodeAttentionConfig(
-    enabled=True, key_retention=0.1, max_context_tokens=512,
-)
+sparse = SparseDecodeAttentionConfig(enabled=True, key_retention=0.1)
 # Pass sparse_decode_attention_config=sparse to LLM or StageEngine.
 # Ordinary decode uses synchronous scheduling and no speculative_config.
 # For synchronous block speculation, also pass:
@@ -266,9 +264,10 @@ preemption/recovery and ordinary asynchronous decode are rejected explicitly.
 
 The retained count is `min(N, max(1, ceil(N * key_retention)))`, including the
 current position among the N causal keys. `key_bucket` controls buffer capacity,
-not the algorithm: it must hold the retained count at the supported context
-bound. `max_context_tokens=None` uses the model context; a smaller explicit
-serving bound reduces pool memory and is enforced before request admission.
+not the algorithm: it must hold the retained count over the model's positional
+limit, which is the only context bound the reference needs. The index buffer
+starts small and grows on the owner stream, so a long model context does not
+cost its worst case up front; admission never rejects a request for being long.
 The pool holds one slot per live ordinary input token, K+1 per synchronous
 block request, and two rounds of K+1 per asynchronous block request. All
 reference payload bytes contribute to automatic KV memory planning; explicit
