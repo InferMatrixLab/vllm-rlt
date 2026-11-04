@@ -13,7 +13,7 @@ vllm-rlt modifies the execution structure, configuration handling, model loading
 and attention integration for standalone loop-level scheduling and depth-aware
 paged KV caching. It does not include an upstream CDB runtime implementation.
 
-The affine INT4 reference codec in vllm_rlt/kernels/kv_quantization.py adapts
+The affine INT4 reference codec in vllm_rlt/kernels/kv_quantization/ adapts
 FlashLoop's packing.py and cross-loop residual arithmetic in cache.py, revision
 aeaadee10d75b7aa8c4a42a809f15c75d6d3bdc6, to vllm-rlt's logical KV tensor layout.
 https://github.com/Superone77/FlashLoop
