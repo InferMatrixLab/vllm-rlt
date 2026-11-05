@@ -86,7 +86,6 @@ def test_plan_groups_rows_by_mode():
     )
     assert plan.groups() == {DENSE: [0], CAPTURE: [1, 2], CONSUME: [3]}
     assert not plan.dense()
-    assert plan.reference_depth == REFERENCE_DEPTH
 
 
 def test_retained_count_follows_flashloop_ceil_rule():
@@ -820,3 +819,44 @@ def test_sparse_engine_e2e_multiple_requests_abort_and_drain():
     assert store.outstanding == 0
     assert len(store.free) == store.slots
     assert max_outstanding > 0
+
+
+def test_store_close_drops_the_device_scratch(monkeypatch):
+    released = []
+    monkeypatch.setattr(
+        "vllm_rlt.worker.attention_reference.release_workspace",
+        lambda device: released.append(device),
+    )
+    store = make_store(slots=2)
+    store.reserve("r", 0, 2)
+    store.close()
+    # Teardown must leave nothing bound and hand the kernel scratch back; the
+    # caller has drained the stream, so the tensors cannot be in use.
+    assert store.outstanding == 0
+    assert not store._bindings
+    assert released == [store.device]
+
+
+def test_release_workspace_is_scoped_to_the_closed_device():
+    from vllm_rlt.kernels.sparse_workspace import (
+        CAPTURE_SCRATCH,
+        CONSUME_SCRATCH,
+        RETENTION_SCALARS,
+        release_workspace,
+    )
+
+    cpu, other = torch.device("cpu"), torch.device("meta")
+    CAPTURE_SCRATCH[(cpu, 1)] = torch.zeros(4)
+    CONSUME_SCRATCH[(cpu, 1)] = torch.zeros(4)
+    RETENTION_SCALARS[(cpu, 0.5)] = torch.zeros(1, dtype=torch.float64)
+    CAPTURE_SCRATCH[(other, 2)] = torch.zeros(4)
+    try:
+        release_workspace(cpu)
+        assert (cpu, 1) not in CAPTURE_SCRATCH
+        assert (cpu, 1) not in CONSUME_SCRATCH
+        assert (cpu, 0.5) not in RETENTION_SCALARS
+        # A second engine on another device keeps its scratch.
+        assert (other, 2) in CAPTURE_SCRATCH
+    finally:
+        release_workspace()
+    assert not CAPTURE_SCRATCH and not CONSUME_SCRATCH and not RETENTION_SCALARS

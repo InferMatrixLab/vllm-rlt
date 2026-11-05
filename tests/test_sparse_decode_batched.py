@@ -10,6 +10,7 @@ from vllm_rlt.attention.sparse import (
     DENSE,
     batched_paged_attention,
     reference_paged_attention,
+    slot_span,
 )
 
 
@@ -165,3 +166,100 @@ def test_reference_growth_rejects_foreign_stream():
     with pytest.raises(RuntimeError, match="owner stream"):
         store.ensure_key_capacity(3)
     assert store.selected.shape[-1] == 2
+
+
+def test_slot_span_requires_every_slot_in_place():
+    # Endpoint arithmetic accepts [5, 3, 7] (5 + 3 == 7 + 1) and would then use
+    # the slice [5, 6, 7], which is another request's reference.
+    assert slot_span([5, 3, 7]) is None
+    assert slot_span([7, 6, 5]) is None
+    assert slot_span([5, 6, 8]) is None
+    assert slot_span([5, 5, 5]) is None
+    assert slot_span([3, 4, 5]) == slice(3, 6)
+    assert slot_span([5]) == slice(5, 6)
+
+
+def _fragmented_store():
+    """A store whose next three-row reservation yields slots ``[5, 3, 7]``.
+
+    ``reserve`` reverses the tail of the free list, so releasing 7, then 3, then
+    5 leaves ``[7, 3, 5]`` and the reservation comes back fragmented. Slots 6 and
+    4 stay bound to unrelated live leases, which is what a span read of
+    ``[5, 6, 7]`` would corrupt.
+    """
+    store = make_store(slots=8, layers=1, heads=2, head_dim=4, key_bucket=8)
+    held = [store.reserve(f"held{i}", i, 1) for i in range(5)]  # slots 7, 6, 5, 4, 3
+    store.release([held[0], held[4], held[2]])
+    assert store.free[-3:] == [7, 3, 5]
+    lease = store.reserve("fragmented", 0, 3)
+    assert lease.slots == (5, 3, 7)
+    return store, lease, held[1], held[3]
+
+
+def test_fragmented_consume_reads_each_rows_own_reference():
+    torch.manual_seed(157)
+    store, lease, live_six, live_four = _fragmented_store()
+    rows, heads, kv_heads, dim, block_size, extent = 3, 2, 2, 4, 8, 8
+    # A zero query makes attention uniform, so the correction is identical for
+    # every row and each output equals its own slot's reference plus one
+    # constant. Reading the span [5, 6, 7] breaks exactly one row, by 3.
+    queries = torch.zeros(rows, heads, dim)
+    keys = torch.randn(1, block_size, kv_heads, dim)
+    values = torch.randn(1, block_size, kv_heads, dim)
+    tables = torch.zeros(rows, 1, dtype=torch.int32)
+    lengths = torch.full((rows,), extent)
+
+    store.output.copy_(torch.arange(8).float()[:, None, None, None])
+    store.contribution.zero_()
+    store.mass.fill_(1.0)
+    store.counts.fill_(extent)
+    store.selected.copy_(torch.arange(extent).expand(8, 1, heads, extent))
+    for slot in lease.slots:
+        store.note_count(slot, 0, extent)
+
+    plan = store.build_plan(
+        [(lease, 0), (lease, 1), (lease, 2)], [CONSUME] * rows, key_retention=0.5
+    )
+    output = batched_paged_attention(queries, keys, values, tables, lengths, plan, layer=0).float()
+
+    own_reference = torch.tensor([5.0, 3.0, 7.0])[:, None, None]
+    correction = output - own_reference
+    torch.testing.assert_close(correction, correction[0].expand_as(correction), rtol=0, atol=1e-6)
+    # The unrelated owners keep their payload.
+    assert float(store.output[6, 0].mean()) == 6.0
+    assert float(store.output[4, 0].mean()) == 4.0
+    store.release([lease, live_six, live_four])
+
+
+def test_fragmented_capture_writes_only_the_slots_it_reserved():
+    torch.manual_seed(157)
+    store, lease, live_six, live_four = _fragmented_store()
+    rows, heads, kv_heads, dim, block_size, extent = 3, 2, 2, 4, 8, 8
+    queries = torch.randn(rows, heads, dim)
+    keys = torch.randn(1, block_size, kv_heads, dim)
+    values = torch.randn(1, block_size, kv_heads, dim)
+    tables = torch.zeros(rows, 1, dtype=torch.int32)
+    lengths = torch.full((rows,), extent)
+
+    # A sentinel per slot, so a write to the wrong slot is visible.
+    sentinel = torch.arange(8).float() - 1000.0
+    store.output.copy_(sentinel[:, None, None, None])
+    store.contribution.copy_(sentinel[:, None, None, None])
+    store.mass.copy_(sentinel[:, None, None])
+    store.counts.fill_(-1)
+
+    plan = store.build_plan(
+        [(lease, 0), (lease, 1), (lease, 2)], [CAPTURE] * rows, key_retention=1.0
+    )
+    batched_paged_attention(queries, keys, values, tables, lengths, plan, layer=0)
+
+    for slot in lease.slots:
+        assert float(store.output[slot, 0].mean()) != float(sentinel[slot]), slot
+        assert bool((store.counts[slot, 0] == extent).all()), slot
+    # Slot 6 belongs to another request: the span [5, 6, 7] overwrote it and
+    # left slot 3 unwritten.
+    for slot in (4, 6):
+        assert float(store.output[slot, 0].mean()) == float(sentinel[slot]), slot
+        assert float(store.mass[slot, 0].mean()) == float(sentinel[slot]), slot
+        assert bool((store.counts[slot, 0] == -1).all()), slot
+    store.release([lease, live_six, live_four])

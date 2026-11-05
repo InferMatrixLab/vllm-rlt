@@ -26,6 +26,7 @@ import triton.language as tl
 
 from vllm_rlt.attention.sparse import CAPTURE, CONSUME, retained_count
 from vllm_rlt.kernels.paged_attention import TritonPagedAttention, triton_paged_attention
+from vllm_rlt.kernels.sparse_workspace import CAPTURE_SCRATCH, CONSUME_SCRATCH, RETENTION_SCALARS
 from vllm_rlt.kernels.triton_attention import NUM_SPLITS
 
 
@@ -984,18 +985,12 @@ def _consume_merge_kernel(
         tl.store(out, corrected, mask=dims < HEAD_DIM)
 
 
-_RETENTION: dict[tuple[torch.device, float], torch.Tensor] = {}
-
-
 def _retention(device, key_retention):
     """A float64 device scalar, built once; Triton would pass a Python float as fp32."""
     key = (device, key_retention)
-    if key not in _RETENTION:
-        _RETENTION[key] = torch.full((1,), key_retention, dtype=torch.float64, device=device)
-    return _RETENTION[key]
-
-
-_WORKSPACE: dict = {}
+    if key not in RETENTION_SCALARS:
+        RETENTION_SCALARS[key] = torch.full((1,), key_retention, dtype=torch.float64, device=device)
+    return RETENTION_SCALARS[key]
 
 
 def _build_capture_workspace(device, rows, heads, capacity, block_d):
@@ -1028,20 +1023,17 @@ def _capture_workspace(device, rows, heads, capacity, block_d):
     """
     stream = _current_stream(device)
     shape = (rows, heads, capacity, block_d)
-    entry = _WORKSPACE.get((device, stream))
+    entry = CAPTURE_SCRATCH.get((device, stream))
     if entry is None or entry[0] != shape:
         entry = (shape, *_build_capture_workspace(device, rows, heads, capacity, block_d))
-        _WORKSPACE[(device, stream)] = entry
+        CAPTURE_SCRATCH[(device, stream)] = entry
     return entry[1:]
-
-
-_CONSUME_WORKSPACE: dict = {}
 
 
 def _consume_workspace(device, rows, heads, block_d):
     """Consume split parts, grown per stream and reused across layers."""
     stream = _current_stream(device)
-    entry = _CONSUME_WORKSPACE.get((device, stream))
+    entry = CONSUME_SCRATCH.get((device, stream))
     if (
         entry is None
         or entry[0].shape[0] < rows
@@ -1054,7 +1046,7 @@ def _consume_workspace(device, rows, heads, block_d):
             empty(rows, heads, NUM_SPLITS),
             empty(rows, heads, NUM_SPLITS, block_d),
         )
-        _CONSUME_WORKSPACE[(device, stream)] = entry
+        CONSUME_SCRATCH[(device, stream)] = entry
     return (None, *entry)
 
 

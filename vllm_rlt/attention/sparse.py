@@ -35,7 +35,7 @@ depends on a device readback.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -108,11 +108,6 @@ class SparseDecodePlan:
             grouped.setdefault(mode, []).append(row)
         return {mode: rows for mode, rows in grouped.items() if rows}
 
-    @property
-    def reference_depth(self) -> int:
-        """The zero-based depth that captures the reference state."""
-        return REFERENCE_DEPTH
-
     def dense(self) -> bool:
         """Whether the submission has no sparse work at all."""
         return all(mode == DENSE for mode in self.modes)
@@ -132,6 +127,22 @@ def retained_count(length: int, key_retention: float) -> int:
     if length < 1:
         return 0
     return min(length, max(1, math.ceil(length * key_retention)))
+
+
+def slot_span(slots: Sequence[int]) -> slice | None:
+    """The slice covering ``slots`` when they are consecutive, else ``None``.
+
+    Slot numbers follow the free-list order, not the row order, so a chunk of
+    rows can arrive fragmented (``[5, 3, 7]``). Comparing the endpoints would
+    accept that chunk — ``5 + 3 == 7 + 1`` — and then read or write ``[5, 6, 7]``,
+    which belongs to other requests. Every slot is checked against
+    ``first + offset`` instead.
+    """
+    first = slots[0]
+    for offset, slot in enumerate(slots):
+        if slot != first + offset:
+            return None
+    return slice(first, first + len(slots))
 
 
 def expand_kv(tensor: torch.Tensor, groups: int) -> torch.Tensor:
@@ -528,10 +539,11 @@ def batched_paged_attention(
                     output[row_ids] = dense_output[row_ids]
                     consumed = True
                     continue
-                # Contiguous slots turn these gathers into views, which is the
-                # difference between one index kernel per tensor and none.
-                if chunk_slots[0] + len(chunk_slots) == chunk_slots[-1] + 1:
-                    span = slice(chunk_slots[0], chunk_slots[0] + len(chunk_slots))
+                # Consecutive slots turn these gathers into views, which is the
+                # difference between one index kernel per tensor and none. The
+                # order is checked per slot, never from the endpoints.
+                span = slot_span(chunk_slots)
+                if span is not None:
                     selected = store.selected[span, layer, :, :extent].to(torch.int32)
                     ref_output = store.output[span, layer]
                     ref_contribution = store.contribution[span, layer]
@@ -626,8 +638,8 @@ def batched_paged_attention(
                 ].float()
                 contribution = _rowwise_product("hk,hkd->hd", gathered, selected_values)
                 # Only the live prefix is written, never the whole capacity.
-                if chunk_slots[0] + len(chunk_slots) == chunk_slots[-1] + 1:
-                    span = slice(chunk_slots[0], chunk_slots[0] + len(chunk_slots))
+                span = slot_span(chunk_slots)
+                if span is not None:
                     store.selected[span, layer, :, :count] = selected.to(torch.int32)
                     store.counts[span, layer] = count
                     store.mass[span, layer] = gathered.sum(dim=-1)
