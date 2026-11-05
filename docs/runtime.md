@@ -281,9 +281,10 @@ verification captures loop 2; with draft depth 2, drafting captures it.
 Full retention uses the same dense backend at later loops as a control, while
 still validating and consuming the captured reference lifecycle. The standalone
 Torch arithmetic oracle is tested separately; different attention algorithms
-need not round to identical BF16 values. See the
-[numerical diagnosis and regression report](validation/sparse-decode-numerics-20261029.md).
-Retention below 1 is approximate and
+need not round to identical BF16 values. The
+[numerical diagnosis](https://github.com/Levius-Fubuki/vllm-rlt/releases/tag/pr157-numerics-validation-20261029)
+is kept as a release attachment rather than a checked-in report. Retention below
+1 is approximate and
 needs task-quality evaluation before a deployment recommendation.
 
 ## SHARED prefill semantics
