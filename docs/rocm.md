@@ -63,6 +63,9 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | Packed prefill / `prefill_uva` | Experimental | Kernel tests pass, but the engine greedy path diverges from per-row on a real Ouro prompt; excluded from `all` |
 | Wavefront chunked prefill | Yes | `--wavefront-chunked-prefill` |
 | Prefix cache | Yes | `enable_prefix_caching=True` |
+| Priority scheduling | Yes | `priority=0` is highest; high-priority latency 7.80s → 2.22s |
+| Incremental KV | Yes | +3.8% at batch 64 |
+| Sparse decode (#157) | ROCm tests pass | 137 passed on the merged branch; not part of this PR |
 | Preemption and recovery | Yes | `enable_preemption=True`, async recovery |
 | Token pipeline | Opt-in | `SpeculativeConfig(mode="pipeline")`; 0.95x at 1.4B |
 | Synchronous self-speculation | Opt-in | Block mode; 0.51x at 1.4B, K1/draft1 0.63x |
@@ -156,6 +159,11 @@ for them.
 | token pipeline | 947 | 0.95x |
 | async self-speculation | 883 | 0.89x |
 
+Priority and incremental KV are positive: with 64 low- and 8 high-priority
+requests at 16 slots, high-priority median completion drops from 7.80s (fcfs)
+to 2.22s (priority) while total time moves 7.81s to 8.15s; incremental KV gives
+817 -> 848 tok/s at batch 64 (+3.8%).
+
 Speculation is a loss at 1.4B/24-layer: draft/verify overhead exceeds the
 accepted-token gain, so it stays opt-in. Tuning did not recover it: with graphs
 and `cuda_graph_max_batch_size` covering verification rows, block K2 reached
@@ -171,11 +179,10 @@ single win because it overlaps prefill chunks across recurrent depths.
   opt-in and is excluded from `all`; the engine-side root cause is open.
 - **PD/KV transfer**: needs two GPUs and a ROCm NIXL/UCX transport.
 - **KV quantization / INT4 residual cache**: not present on the current main
-  runtime; tracked by RFC #156.
+  runtime; tracked by RFC #156. Sparse decode from #157 passes its ROCm suites
+  on a stacked branch but is not shipped here.
 - **Profiling flags**: `--profile` / `--profile-activities` are untested on
   ROCm; `rocprofv3` is available for external traces.
-- **Priority scheduling and incremental KV**: suite coverage only, no real-model
-  A/B.
 - **FlashAttention**: NVIDIA-only by construction.
 - **Multi-node**: out of scope for this device.
 
