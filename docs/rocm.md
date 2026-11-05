@@ -139,51 +139,40 @@ explicitly did not improve throughput, so no rocBLAS fallback is used.
 
 ### Full-feature sweep
 
-Batch/concurrency and context sweep on one MI350X with Ouro-1.4B. `runtime`
-enables async + graphs + static/pad2 + UVA + WCPB + prefix; `spec` adds
-pipeline K4/draft1 on top. Short = 80-token prompt / 64 output; 1k = 1000-token
-prompt / 32 output; 4k = 4000-token prompt / 32 output.
+Short context (80-token prompt, 64 output), Ouro-1.4B:
 
-| Workload | Baseline | runtime | spec | Best speedup |
+| Workload | Baseline | runtime | spec | Best |
 | --- | ---: | ---: | ---: | ---: |
 | short b128 | 1194 | 2208 | 2069 | 1.85x |
 | short b256 | 1670 | 4329 | 2126 | 2.59x |
 | short b512 | 2008 | 4184 | 2031 | 2.08x |
-| 1k b32 | 155.7 | 407.6 | 761.0 | 4.89x |
-| 1k b64 | 176.5 | 661.5 | 894.2 | 5.07x |
-| 1k b128 | 177.9 | 1019.1 | 998.2 | 5.73x |
-| 4k b8 | 18.3 | 149.3 | 297.1 | **16.2x** |
 
-4k prefill throughput goes 2294 -> 18665 (runtime) -> 37150 tok/s (spec).
-Speculation wins once the context/output makes decode and verification
-amortize; for short 64-token outputs runtime-only is better because prefill
-dominates and spec verification adds rows.
+Long context and checkpoints (1k/4k/8k). `runtime` = async + graphs + static/pad2 + UVA + WCPB + prefix; `spec` adds pipeline K4/draft1. Huginn's optimized column is graph replay (it rejects async/spec); Nanbeige has no spec path:
 
-### 4k/8k context and other checkpoints
+| Model | Context | Batch | Out | Baseline | runtime | spec | Best |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ouro-1.4B | 1k | 32 | 32 | 155.7 | 407.6 | 761.0 | 4.89x |
+| Ouro-1.4B | 1k | 64 | 32 | 176.5 | 661.5 | 894.2 | 5.07x |
+| Ouro-1.4B | 1k | 128 | 32 | 177.9 | 1019.1 | 998.2 | 5.73x |
+| Ouro-1.4B | 4k | 4 | 128 | 37.9 | 84.8 | 263.6 | 6.96x |
+| Ouro-1.4B | 4k | 2 | 256 | 28.7 | 54.7 | 168.4 | 5.87x |
+| Ouro-1.4B | 8k | 2 | 32 | 5.0 | 46.2 | 107.2 | **21.4x** |
+| Ouro-1.4B | 8k | 1 | 128 | 10.1 | 27.7 | 80.3 | 7.95x |
+| Nanbeige4.2-3B | 1k | 32 | 32 | 167.4 | 854.7 | — | 5.11x |
+| Nanbeige4.2-3B | 1k | 64 | 32 | 176.4 | 1083.7 | — | 6.14x |
+| Nanbeige4.2-3B | 1k | 128 | 32 | 177.2 | 1464.8 | — | 8.27x |
+| Nanbeige4.2-3B | 4k | 4 | 64 | 27.7 | 199.9 | — | 7.2x |
+| Nanbeige4.2-3B | 8k | 2 | 32 | 4.2 | 87.1 | — | 20.7x |
+| Huginn-0125 | 1k | 1 | 32 | 8.8 | 9.5 | — | 1.08x |
+| Huginn-0125 | 1k | 2 | 32 | 13.6 | 14.8 | — | 1.09x |
+| Huginn-0125 | 1k | 4 | 32 | 14.0 | 14.7 | — | 1.05x |
+| Huginn-0125 | 1k | 8 | 32 | 16.5 | — | — | — |
+| Huginn-0125 | 4k | 1 | 32 | 3.1 | 3.2 | — | 1.03x |
+| Huginn-0125 | 4k | 2 | 32 | 3.1 | — | — | — |
+| Huginn-0125 | 4k | 4 | 32 | 3.1 | — | — | — |
+| Huginn-0125 | 4k | 8 | 32 | 3.1 | — | — | — |
 
-Ouro-1.4B, longer outputs and contexts:
-
-| Workload | Baseline | runtime | spec | Best |
-| --- | ---: | ---: | ---: | ---: |
-| 4k b4 / 128 out | 37.9 | 84.8 | 263.6 | **6.96x** |
-| 4k b2 / 256 out | 28.7 | 54.7 | 168.4 | **5.87x** |
-| 8k b2 / 32 out | 5.0 | 46.2 | 107.2 | **21.4x** |
-| 8k b1 / 128 out | 10.1 | 27.7 | 80.3 | **7.95x** |
-
-8k prefill throughput goes 1247 -> 11544 -> 26800 tok/s; 4k goes 1185 ->
-2650 -> 8239. Speculation keeps winning as context and output grow.
-
-Other checkpoints, 4k/8k baseline vs runtime (Nanbeige) or graphs (Huginn):
-
-| Model | Workload | Baseline | Optimized | Speedup |
-| --- | --- | ---: | ---: | ---: |
-| Nanbeige4.2-3B | 4k b4 / 64 out | 27.7 | 199.9 | **7.2x** |
-| Nanbeige4.2-3B | 8k b2 / 32 out | 4.2 | 87.1 | **20.7x** |
-| Huginn-0125 | 4k b1 / 32 out | 3.1 | 3.2 | 1.03x |
-
-Huginn is fixed-depth synchronous with 32 recurrent steps; graph replay adds
-little at batch 1, and its model configuration rejects 8k prompts (prompt plus
-decode exceeds the context limit), so only 4k is reported.
+Huginn is compute-bound by its 32 recurrent steps (throughput flat across batch), graph replay adds 3-9%, and it rejects 8k prompts (context limit). 8k Ouro prefill goes 1247 -> 11544 -> 26800 tok/s.
 
 ### Per-feature warmed A/B
 
@@ -202,10 +191,12 @@ for them.
 | WCPB | 1402 | **1.45x** |
 | prefix cache | 1105 | 1.14x |
 | all features | 2798 | **2.88x** |
-| baseline (spec family) | 994 | 1.00x |
-| sync self-speculation | 510 | 0.51x |
-| token pipeline | 947 | 0.95x |
-| async self-speculation | 883 | 0.89x |
+| baseline (spec family, 256 out) | 1527 | 1.00x |
+| sync self-speculation (256 out) | 2148 | 1.41x |
+| token pipeline (256 out) | 3270 | 2.14x |
+| async self-speculation (256 out) | 2314 | 1.48x |
+
+The spec rows are the decode-heavy 256-output case. At 32 output tokens the same configs lose (0.51x / 0.95x / 0.89x) because prefill dominates; both directions are kept in the workload-dependent section below.
 
 Priority and incremental KV are positive: with 64 low- and 8 high-priority
 requests at 16 slots, high-priority median completion drops from 7.80s (fcfs)
