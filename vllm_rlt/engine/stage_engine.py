@@ -344,11 +344,9 @@ class StageEngine:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
         if (
-            self.async_speculative
-            or (self.speculative_config and self.speculative_config.mode == "pipeline")
+            self.speculative_config and self.speculative_config.mode == "pipeline"
         ) and params.temperature != 0:
-            mode = "async" if self.async_speculative else "pipeline"
-            raise ValueError(f"{mode} speculative decoding currently requires greedy sampling")
+            raise ValueError("pipeline speculative decoding currently requires greedy sampling")
         if request_id in self._retiring_speculative:
             self._retire_speculative(wait=True, request_id=request_id)
         config = self.model.config
