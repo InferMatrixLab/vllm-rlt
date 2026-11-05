@@ -86,7 +86,7 @@ def test_plans_follow_tokens_and_keep_prompt_dense(draft, monkeypatch):
                 request_id = next(rid for rid, owner in kv.allocations if owner is allocation)
                 assert position >= len(e.scheduler.requests[request_id].prompt_token_ids)
                 assert mode == (CAPTURE if depth == 1 else CONSUME)
-                assert int(e.reference_store.position[plan.slots[row]]) == position
+                assert plan.owners[row].request_id == request_id
                 seen.append((mode, position, plan.slots[row]))
         return original(layer, kv, q)
 
@@ -146,7 +146,7 @@ def test_backend_explicitly_declares_sparse_reference_support():
 @pytest.mark.parametrize("retention", [0.1, 1.0])
 def test_cuda_sparse_preserves_dense_backend_outputs(kv_heads, retention):
     from vllm_rlt.core.kv_cache_manager import KVCacheManager
-    from vllm_rlt.worker.attention_reference import AttentionReferenceStore
+    from vllm_rlt.worker.attention_reference import SparseDecodeReferenceStore
 
     # BF16 rounding of Torch softmax and Triton split-KV can differ even for
     # identical operands. Dense/capture rows and the full-retention control
@@ -164,7 +164,7 @@ def test_cuda_sparse_preserves_dense_backend_outputs(kv_heads, retention):
         dtype=torch.bfloat16,
         backend="triton",
     )
-    store = AttentionReferenceStore(
+    store = SparseDecodeReferenceStore(
         slots=rows, layers=1, heads=heads, head_dim=dim, key_bucket=length, device="cuda"
     )
     ids = [str(i) for i in range(rows)]
@@ -199,7 +199,8 @@ def test_cuda_sparse_preserves_dense_backend_outputs(kv_heads, retention):
         )
         actual = cache._attend_prepared(0, replace(batch, reference_plan=consume), q)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        assert int(store.uses.sum()) == rows - 1
+        # Consume rows read the reference: their slots stay bound until release.
+        assert store.outstanding == len(owners)
     for lease, _ in owners:
         store.release(lease)
     for rid in ids:

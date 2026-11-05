@@ -221,8 +221,9 @@ def test_fused_capture_and_consume_track_batched_path(retention, ties, split):
     torch.testing.assert_close(captured[1], captured[0], rtol=0, atol=exact)
     torch.testing.assert_close(fused.output[:, 1], batched.output[:, 1], rtol=0, atol=exact)
     torch.testing.assert_close(fused.counts[:, 1], batched.counts[:, 1], rtol=0, atol=0)
-    # The finalize kernel marks the same rows source-ready as store.capture.
-    assert torch.equal(fused.valid, batched.valid)
+    # Both paths leave the same slots bound to their leases; availability is
+    # decided by the retained count, which the comparison above already covers.
+    assert set(fused._bindings) == set(batched._bindings)
     for row, length in enumerate(lengths.tolist()):
         slot_b, slot_f = leases[0].slots[row], leases[1].slots[row]
         count = int(batched.counts[slot_b, 1, 0])
@@ -255,7 +256,7 @@ def test_fused_capture_and_consume_track_batched_path(retention, ties, split):
         )
     torch.testing.assert_close(consumed[1], consumed[0], rtol=1e-4, atol=1e-5)
     assert not consumed[1][0].any(), "an empty row stays zero"
-    assert int(fused.uses[list(leases[1].slots), 1].min()) == 1
+    assert fused.outstanding > 0
     for store, lease in zip(stores, leases):
         store.release(lease)
 
@@ -425,7 +426,7 @@ def test_fused_split_capture_is_the_dense_backend_output_bit_for_bit(dtype):
     # O_ref is the output actually fed into the recurrence: rounded, then FP32.
     live = list(lease.slots)[1:]
     torch.testing.assert_close(store.output[live, 0], expected[1:].float(), rtol=0, atol=atol)
-    assert bool(store.valid[list(lease.slots), 0].all())
+    assert all(slot in store._bindings for slot in lease.slots)
 
 
 @pytest.mark.gpu

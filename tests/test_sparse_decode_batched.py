@@ -69,7 +69,7 @@ def test_batched_ragged_gqa_matches_scalar_oracle(
         capacity = stores[1].selected.shape[-1]
         assert torch.equal(stores[0].selected[..., :capacity], stores[1].selected)
         assert not torch.count_nonzero(stores[0].selected[..., capacity:])
-        for name in ("counts", "valid", "uses"):
+        for name in ("counts",):
             assert torch.equal(getattr(stores[0], name), getattr(stores[1], name)), name
         for name in ("mass", "output", "contribution"):
             torch.testing.assert_close(

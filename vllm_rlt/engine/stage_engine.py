@@ -23,7 +23,7 @@ from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
-from vllm_rlt.worker.attention_reference import AttentionReferenceStore
+from vllm_rlt.worker.attention_reference import SparseDecodeReferenceStore
 from vllm_rlt.worker.executor import Executor
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
@@ -183,7 +183,7 @@ class StageEngine:
                         f"{free_bytes / 1024**3:.1f} GiB is free; lower "
                         f"key_retention or num_speculative_tokens"
                     )
-            self.reference_store = AttentionReferenceStore(
+            self.reference_store = SparseDecodeReferenceStore(
                 slots=slots,
                 layers=config.num_hidden_layers,
                 heads=config.num_attention_heads,

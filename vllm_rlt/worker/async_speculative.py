@@ -51,9 +51,6 @@ class SpeculativeRequestState:
     event: torch.cuda.Event | None = None
     # Row in the runner's device slot table holding (token, position).
     slot: int | None = None
-    # Bumped per request instance so reference store bindings reject a reused
-    # request ID across generations.
-    generation: int = 0
 
 
 class SpeculativeRoundBuffer:
@@ -169,11 +166,6 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
     reservation upper bound and must never be used as the actual write position.
     """
 
-    # Sparse decode attention lifecycle; test doubles that skip __init__
-    # inherit the disabled defaults.
-    reference_store = None
-    sparse_decode = None
-
     def __init__(
         self,
         model,
@@ -203,7 +195,6 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         # GPU acceptance counts without a host readback.
         self.reference_store = reference_store
         self.sparse_decode_config = sparse_decode_config
-        self._generations: dict[str, int] = {}
         sizes = speculative_capture_sizes(execution, scheduler, config)
         self.graphs = (
             DeviceRecurrentGraphs(model, cache, execution, False, capture_sizes=sizes)
@@ -246,12 +237,8 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         host = torch.tensor([request.input_token_id, request.position], pin_memory=True)
         values = host.to(self.device, non_blocking=True)
         buffer.keepalive.extend((host, values))
-        generation = self._generations.get(rid, 0) + 1
-        self._generations[rid] = generation
         if self.config.mode == "pipeline":
-            state = SpeculativeRequestState(
-                request, allocation, values[0], values[1], generation=generation
-            )
+            state = SpeculativeRequestState(request, allocation, values[0], values[1])
         else:
             if not self.free_slots:
                 self._grow_slots()
@@ -263,7 +250,6 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 self.slot_values[slot, 0],
                 self.slot_values[slot, 1],
                 slot=slot,
-                generation=generation,
             )
         if self.config.mode == "pipeline":
             width = min(
@@ -479,10 +465,6 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         ]
         for depth in range(self.config.draft_loops, self.config.target_loops):
             reference = self._reference_plan(leases, verification_rows, depth)
-            if reference is not None and depth == self.config.draft_loops:
-                # One device-owned absolute position per reference slot; the
-                # verification rows cover every slot of the round exactly once.
-                self.reference_store.bind_positions(reference, positions)
             hidden = self._execute_recurrent_step(
                 hidden,
                 positions,

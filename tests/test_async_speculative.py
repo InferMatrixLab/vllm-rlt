@@ -351,6 +351,8 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     assert cache.allocate("short", 4) and cache.allocate("long", 10)
     runner = object.__new__(AsyncSpeculativeRunner)
     runner.cache = cache
+    runner.reference_store = None
+    runner.sparse_decode_config = None
     buffer = SimpleNamespace(
         leased=False,
         host_tables=torch.full((128,), -91, dtype=torch.int32),

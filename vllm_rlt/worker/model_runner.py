@@ -1095,7 +1095,6 @@ class ModelRunner:
         plan = self.reference_store.build_plan(
             owners, modes, key_retention=self.sparse_decode_config.key_retention
         )
-        self.reference_store.bind_positions(plan, kv.position_ids)
         return replace(kv, reference_plan=plan)
 
     def _load_hidden(self, batch, prepared, workspace, size):

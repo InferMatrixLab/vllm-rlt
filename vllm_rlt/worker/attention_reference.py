@@ -37,7 +37,7 @@ import torch
 
 from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE, SparseDecodePlan
 
-__all__ = ["ReferenceLease", "AttentionReferenceStore", "DENSE", "CAPTURE", "CONSUME"]
+__all__ = ["ReferenceLease", "SparseDecodeReferenceStore", "DENSE", "CAPTURE", "CONSUME"]
 
 
 @dataclass(frozen=True)
@@ -59,7 +59,7 @@ class ReferenceLease:
         return len(self.slots)
 
 
-class AttentionReferenceStore:
+class SparseDecodeReferenceStore:
     """Device-resident reference state for the live tokens of one stage.
 
     The store is sized by the engine, which knows how many tokens can be live
@@ -114,13 +114,9 @@ class AttentionReferenceStore:
         self.mass = torch.zeros(shape, dtype=torch.float32, device=device)
         self.output = torch.zeros((*shape, head_dim), dtype=torch.float32, device=device)
         self.contribution = torch.zeros((*shape, head_dim), dtype=torch.float32, device=device)
-        # A reference is usable per layer while its slot is live.
-        self.valid = torch.zeros((slots, layers), dtype=torch.bool, device=device)
-        # How many later loops consumed the reference of each slot and layer.
-        self.uses = torch.zeros((slots, layers), dtype=torch.int32, device=device)
-        # Identity of the token occupying each slot.
-        self.position = torch.zeros(slots, dtype=torch.int64, device=device)
-        self.accepted = torch.zeros(slots, dtype=torch.int32, device=device)
+        # Usability is decided by counts (zero means no captured reference) and
+        # by lease ownership, so no per-slot validity, use-count, position or
+        # acceptance tensor is kept: nothing reads them back.
         self.free = list(range(slots))
         # Slot ownership is the lease object itself. Object identity is exact:
         # a recycled slot is bound to a different lease, so a plan built for the
@@ -142,10 +138,6 @@ class AttentionReferenceStore:
                 self.mass,
                 self.output,
                 self.contribution,
-                self.valid,
-                self.uses,
-                self.position,
-                self.accepted,
             )
         )
 
@@ -208,13 +200,18 @@ class AttentionReferenceStore:
             raise ValueError("a reference reservation needs at least one row")
         if len(self.free) < rows:
             raise RuntimeError("no retired attention reference slots")
-        slots = tuple(self.free.pop() for _ in range(rows))
+        # Peek first: a failed device allocation must not lose the slots. They
+        # are removed from the pool only once the lease is fully built.
+        slots = tuple(reversed(self.free[-rows:]))
+        slot_ids = self._index(slots)
+        row_index = torch.arange(rows, dtype=torch.int64, device=self.device)
+        del self.free[-rows:]
         lease = ReferenceLease(
             request_id=request_id,
             request_index=request_index,
             slots=slots,
-            slot_ids=self._index(slots),
-            row_index=torch.arange(rows, dtype=torch.int64, device=self.device),
+            slot_ids=slot_ids,
+            row_index=row_index,
         )
         for slot in slots:
             self._bindings[slot] = lease
@@ -283,7 +280,6 @@ class AttentionReferenceStore:
             slots=tuple(slots),
             owners=tuple(row_owners),
             key_retention=key_retention,
-            key_bucket=self.key_bucket,
             slot_ids=self._index(slots),
             store=self,
         )
@@ -331,38 +327,17 @@ class AttentionReferenceStore:
         return self._index([plan.slots[row] for row in rows])
 
     def capture(self, plan: SparseDecodePlan, layer: int) -> None:
-        """Mark the captured rows source-ready for the given layer.
+        """Assert that a finished capture row still owns its slots.
 
-        The attention kernel writes the retained state of a capture row and
-        then calls this on the same stream, so a later reader observes a
-        complete payload.
+        The attention kernel writes the retained state of a capture row and then
+        calls this on the same stream. Nothing is recorded: a reader decides
+        availability from the retained count, and ownership from the lease.
         """
         self._require_live(plan)
-        rows = plan.groups().get(CAPTURE)
-        if not rows:
-            return
-        # Assign a tensor, not the Python scalar ``True``: a scalar store into
-        # a bool tensor through advanced indexing copies it from the host.
-        slots = self._row_slots(plan, rows)
-        self.valid[slots, layer] = torch.ones(slots.numel(), dtype=torch.bool, device=self.device)
 
     def consume(self, plan: SparseDecodePlan, layer: int) -> None:
-        """Record that the given layer consumed the reference rows."""
+        """Assert that a finished consume row still owns its slots."""
         self._require_live(plan)
-        rows = plan.groups().get(CONSUME)
-        if not rows:
-            return
-        self.uses[self._row_slots(plan, rows), layer] += 1
-
-    def bind_positions(self, plan: SparseDecodePlan, positions: torch.Tensor) -> None:
-        """Record the device-owned absolute positions of the plan's rows."""
-        self._require_live(plan)
-        if positions.shape != plan.slot_ids.shape:
-            raise ValueError("reference positions need one entry per plan row")
-        rows = [row for row, slot in enumerate(plan.slots) if slot >= 0]
-        if len(rows) < len(plan.slots):
-            positions = positions[self._index(rows)]
-        self.position[self._row_slots(plan, rows)] = positions.to(torch.int64)
 
     def write_reference(
         self,
@@ -416,7 +391,7 @@ class AttentionReferenceStore:
         host readback.
 
         Retirement is memory-bounded: it only clears the per-row metadata that
-        gates readers (``valid``, ``counts``, ``mass``), never the retained
+        gates readers (``counts`` and ``mass``), never the retained
         index buffer. An indexed read-modify-write of ``selected`` would
         materialise the whole bucket — at 24 layers, 16 heads and 65,536 keys
         that is tens of GiB for one batch — while a zero ``count`` already makes
@@ -433,12 +408,10 @@ class AttentionReferenceStore:
             [torch.full_like(lease.row_index, lease.request_index) for lease in leases]
         )
         limit = accepted.to(device=self.device, dtype=rows.dtype).index_select(0, request)
-        self.accepted[slot_ids] = limit.to(torch.int32)
         # A boolean-mask gather of the rejected slots would read its size back
         # to the host. Masked writes over the round's own rows stay on device;
         # they touch only these rows' per-layer metadata, never the index bucket.
         keep = rows <= limit
-        self.valid[slot_ids] = self.valid[slot_ids] & keep[:, None]
         self.counts[slot_ids] = torch.where(keep[:, None, None], self.counts[slot_ids], 0)
         self.mass[slot_ids] = torch.where(keep[:, None, None], self.mass[slot_ids], 0)
         # Which rows were rejected is known only on the device, so drop the host
@@ -460,10 +433,6 @@ class AttentionReferenceStore:
             # index_fill_ passes the scalar to the kernel; assigning a Python
             # scalar through an index tensor copies it from the host and blocks.
             for tensor in (
-                self.valid,
-                self.uses,
-                self.accepted,
-                self.position,
                 self.mass,
                 self.counts,
             ):
@@ -487,7 +456,6 @@ class AttentionReferenceStore:
             self._forget_counts(slots)
             slots = self._index(list(slots))
         for tensor in (
-            self.valid,
             self.mass,
             self.output,
             self.contribution,

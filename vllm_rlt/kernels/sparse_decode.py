@@ -476,7 +476,6 @@ def _select_pass_kernel(
     SLOTS,
     COUNTS,
     OUTPUT,
-    VALID,
     LSE,
     SEGHIST,
     STATE,
@@ -521,8 +520,6 @@ def _select_pass_kernel(
             out = OUT + row * out_batch_stride + head * out_head_stride + dims * out_dim_stride
             tl.store(out, dense, mask=dims < HEAD_DIM)
             slot = tl.load(SLOTS + row)
-            if head == 0:
-                tl.store(VALID + slot * NUM_LAYERS + layer, 1)
             tl.store(LSE + rh, maximum + tl.log(normalizer))
             if count > 0:
                 state = (slot * NUM_LAYERS + layer) * NUM_HEADS + head
@@ -735,7 +732,6 @@ def _capture_kernel(
     MASS,
     OUTPUT,
     CONTRIBUTION,
-    VALID,
     layer,
     top,
     score_capacity,
@@ -765,14 +761,11 @@ def _capture_kernel(
     One program scores every key, finds the ``count``-th largest score by
     bisection on its order key, and writes the retained positions in ascending
     order; equal scores keep the smaller positions, like the oracle's stable
-    sort. It also marks the reference source-ready for this layer, as
-    ``AttentionReferenceStore.capture`` does, without a separate launch.
+    sort.
     """
     row = tl.program_id(0)
     head = tl.program_id(1)
     slot = tl.load(SLOTS + row)
-    if head == 0:
-        tl.store(VALID + slot * NUM_LAYERS + layer, 1)
     length = tl.load(LENGTHS + row)
     # retained_count in float64, exactly as the host's math.ceil(length * r).
     real = length.to(tl.float64)
@@ -955,7 +948,6 @@ def _consume_merge_kernel(
     MASS,
     OUTPUT,
     CONTRIBUTION,
-    USES,
     OUT,
     layer,
     q_row_stride: tl.constexpr,
@@ -966,18 +958,12 @@ def _consume_merge_kernel(
     BLOCK_D: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
-    """``O = O_ref - C_ref + m * C_new``, merging the split parts in a fixed order.
-
-    Also counts the use, as ``AttentionReferenceStore.consume`` does.
-    """
+    """``O = O_ref - C_ref + m * C_new``, merging the split parts in a fixed order."""
     row = tl.program_id(0)
     head = tl.program_id(1)
     dims = tl.arange(0, BLOCK_D)
     out = OUT + row * q_row_stride + head * q_head_stride + dims
     slot = tl.load(SLOTS + row)
-    if head == 0:
-        uses = USES + slot * NUM_LAYERS + layer
-        tl.store(uses, tl.load(uses) + 1)
     if tl.load(LENGTHS + row) == 0:
         tl.store(out, tl.zeros((BLOCK_D,), dtype=tl.float32), mask=dims < HEAD_DIM)
     else:
@@ -1216,7 +1202,6 @@ def fused_paged_attention(
                     plan.slot_ids,
                     store.counts,
                     store.output,
-                    store.valid,
                     lse,
                     seghist,
                     state,
@@ -1312,7 +1297,6 @@ def fused_paged_attention(
             store.mass,
             store.output,
             store.contribution,
-            store.valid,
             layer,
             top,
             capacity,
@@ -1395,7 +1379,6 @@ def fused_paged_attention(
             store.mass,
             store.output,
             store.contribution,
-            store.uses,
             output,
             layer,
             output.stride(0),

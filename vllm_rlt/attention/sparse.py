@@ -32,11 +32,22 @@ host-known: the runner decides both before it submits, so a submission never
 depends on a device readback.
 """
 
+from __future__ import annotations
+
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    # Type-only: the attention layer borrows the runner-owned store, so it must
+    # not import the worker package at runtime.
+    from vllm_rlt.worker.attention_reference import (
+        ReferenceLease,
+        SparseDecodeReferenceStore,
+    )
 
 from vllm_rlt.kernels.sparse_capture import TRITON_AVAILABLE, fused_capture_scores
 from vllm_rlt.kernels.sparse_consume import selected_scores as fused_selected_scores
@@ -85,11 +96,10 @@ class SparseDecodePlan:
 
     modes: tuple[int, ...]
     slots: tuple[int, ...]
-    owners: tuple[object | None, ...]
+    owners: tuple[ReferenceLease | None, ...]
     key_retention: float
-    key_bucket: int | None
     slot_ids: torch.Tensor | None = None
-    store: object | None = None
+    store: SparseDecodeReferenceStore | None = None
 
     def groups(self) -> dict[int, list[int]]:
         """Rows per mode, in submission order."""

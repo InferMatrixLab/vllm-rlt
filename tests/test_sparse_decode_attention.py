@@ -32,7 +32,7 @@ from vllm_rlt.attention.sparse import (
     sparse_correction,
     sparse_paged_attention,
 )
-from vllm_rlt.worker.attention_reference import AttentionReferenceStore
+from vllm_rlt.worker.attention_reference import SparseDecodeReferenceStore
 from vllm_rlt.worker.metadata import MetadataBuilder
 
 tiny = tiny_ouro_model
@@ -52,7 +52,7 @@ def drain(engine):
 def make_store(**overrides):
     values = dict(slots=6, layers=2, heads=2, head_dim=4, key_bucket=8, device="cpu")
     values.update(overrides)
-    return AttentionReferenceStore(**values)
+    return SparseDecodeReferenceStore(**values)
 
 
 def fill_payload(store, slots, value=1.0):
@@ -83,7 +83,6 @@ def test_plan_groups_rows_by_mode():
         slots=(-1, 3, 4, 5),
         owners=(None, "lease-1", "lease-1", "lease-2"),
         key_retention=0.5,
-        key_bucket=None,
     )
     assert plan.groups() == {DENSE: [0], CAPTURE: [1, 2], CONSUME: [3]}
     assert not plan.dense()
@@ -179,7 +178,6 @@ def test_paged_oracle_forces_correction_without_backend_shortcut(retention, expe
     consume = store.build_plan([(lease, 0)], [CONSUME], key_retention=retention)
     output = sparse_paged_attention(q, keys, values, tables, lengths, consume, layer=0)
     assert output.item() == pytest.approx(expected)
-    assert store.uses.item() == 1
     store.release(lease)
 
 
@@ -204,12 +202,12 @@ def test_release_requires_owner_and_retires_metadata():
     fill_payload(store, lease.slots)
     store.release(lease)
     for slot in lease.slots:
-        # Readers are gated by counts/mass/valid. The retained index, output and
+        # Readers are gated by counts and mass. The retained index, output and
         # contribution buffers stay allocated and are overwritten by the next
         # capture's used prefix, so retiring never writes the whole bucket.
         assert int(store.counts[slot].sum()) == 0
         assert store.mass[slot].sum() == 0
-        assert not bool(store.valid[slot].any())
+        assert not bool(store.counts[slot].any())
     assert store.outstanding == 0
     # A retired lease cannot release its slots a second time.
     with pytest.raises(RuntimeError, match="different owner"):
@@ -227,8 +225,7 @@ def test_accept_invalidates_rejected_candidates_and_descendants():
     assert int(store.counts[accepted].max()) > 0 and int(store.counts[middle].max()) > 0
     assert int(store.counts[rejected].max()) == 0
     assert store.mass[rejected].sum() == 0
-    assert not bool(store.valid[rejected].any())
-    assert int(store.accepted[accepted]) == 1
+    assert not bool(store.counts[rejected].any())
     rejected_plan = store.build_plan([(lease, 2)], [CONSUME], key_retention=0.5)
     with pytest.raises(RuntimeError, match="no captured reference"):
         store.read_reference(rejected_plan, layer=0, row=0)
@@ -261,18 +258,44 @@ def test_accept_keeps_root_when_every_candidate_is_rejected():
         assert store.mass[slot].sum() == 0
 
 
-def test_capture_and_consume_mark_layer_state():
+def test_capture_and_consume_assert_liveness_without_state():
+    # Availability comes from the retained count and ownership from the lease, so
+    # capture and consume record nothing; they reject a plan whose slots moved on.
     store = make_store()
     lease = store.reserve("r", 0, 2)
     plan = store.build_plan([(lease, 0), (lease, 1)], [CAPTURE, CONSUME], key_retention=0.5)
-    assert not bool(store.valid[lease.slots[0], 0])
+    before = store.counts.clone()
     store.capture(plan, layer=0)
     store.capture(plan, layer=1)
-    assert bool(store.valid[lease.slots[0], 0]) and bool(store.valid[lease.slots[0], 1])
-    assert not bool(store.valid[lease.slots[1], 0])
     store.consume(plan, layer=0)
-    assert int(store.uses[lease.slots[1], 0]) == 1
-    assert int(store.uses[lease.slots[0], 0]) == 0
+    assert torch.equal(store.counts, before)
+    store.release(lease)
+    with pytest.raises(RuntimeError, match="stale"):
+        store.capture(plan, layer=0)
+
+
+def test_failed_reservation_keeps_the_pool_intact(monkeypatch):
+    # A device allocation can fail between taking slots and returning a lease.
+    # The slots must go back to the pool, or the next request starves.
+    store = make_store(slots=2)
+    original = store._index
+    attempts = {"n": 0}
+
+    def failing(values):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("injected allocation failure")
+        return original(values)
+
+    monkeypatch.setattr(store, "_index", failing)
+    with pytest.raises(RuntimeError, match="injected allocation failure"):
+        store.reserve("a", 0, 2)
+    assert len(store.free) == 2
+    assert store.outstanding == 0
+
+    lease = store.reserve("b", 0, 2)
+    assert len(lease.slots) == 2
+    assert len(store.free) == 0
 
 
 def test_stale_plan_after_a_new_lease_is_rejected():
@@ -330,7 +353,6 @@ def test_stale_plan_from_a_previous_owner_cannot_touch_a_reused_slot():
     assert current.owners[0] is second and stale.owners[0] is first
 
     store.capture(current, layer=0)
-    valid = store.valid.clone()
     counts = store.counts.clone()
     mass = store.mass.clone()
 
@@ -347,14 +369,14 @@ def test_stale_plan_from_a_previous_owner_cannot_touch_a_reused_slot():
             output=torch.zeros(1, 2),
             contribution=torch.zeros(1, 2),
         )
-    assert torch.equal(store.valid, valid)
     assert torch.equal(store.counts, counts)
     assert torch.equal(store.mass, mass)
 
 
 def test_bytes_matches_layout():
     store = make_store(slots=3, layers=2, heads=2, head_dim=4, key_bucket=8)
-    expected = 3 * 2 * 2 * (8 + 1 + 1 + 4 + 4) * 4 + 3 * 2 * (1 + 4) + 3 * (8 + 4)
+    # selected (int32 x key_bucket) + counts + mass + output + contribution
+    expected = 3 * 2 * 2 * 8 * 4 + 3 * 2 * 2 * 4 + 3 * 2 * 2 * 4 + 2 * 3 * 2 * 2 * 4 * 4
     assert store.bytes == expected
 
 
@@ -371,7 +393,6 @@ def test_device_metadata_carries_reference_plan():
         slots=(0, 1),
         owners=(object(), object()),
         key_retention=0.5,
-        key_bucket=4,
     )
     common = dict(
         allocations=(("r", object()),),
@@ -436,7 +457,7 @@ def make_reference_store(model, **overrides):
         device="cpu",
     )
     values.update(overrides)
-    return AttentionReferenceStore(**values)
+    return SparseDecodeReferenceStore(**values)
 
 
 def test_sparse_decode_matches_dense_through_model_and_kv():
@@ -456,7 +477,7 @@ def test_sparse_decode_matches_dense_through_model_and_kv():
         lease=lease,
         retention=1.0,
     )
-    assert store.uses.sum() > 0, "the sparse path never consumed a reference"
+    assert store.outstanding > 0, "the sparse path never held a reference"
     for expected, actual in zip(dense, sparse):
         assert torch.allclose(actual, expected, atol=1e-4), float((actual - expected).abs().max())
 
@@ -586,22 +607,15 @@ def test_async_sparse_reference_rejection_invalidates_rejected_rows(accepted, mo
         torch.cuda.synchronize()
         counts = [int(a) for a in accepted_counts.tolist()]
         for lease, count in zip(leases, counts):
-            observed.append(
-                (
-                    count,
-                    [float(store.mass[slot, 0, 0]) for slot in lease.slots],
-                    [int(store.accepted[slot]) for slot in lease.slots],
-                )
-            )
+            observed.append((count, [float(store.mass[slot, 0, 0]) for slot in lease.slots]))
 
     store.accept = recording
     e.step()
     e.step()
     e._collect_speculative()
     assert observed, "acceptance-driven retirement never ran"
-    for count, masses, limits in observed:
+    for count, masses in observed:
         assert count == accepted
-        assert all(limit == accepted for limit in limits)
         for row, mass in enumerate(masses):
             assert mass == (1.0 if row <= accepted else 0.0)
     e.abort_request("r")
@@ -646,12 +660,11 @@ def test_release_from_another_stream_builds_its_index_on_the_owner_stream(monkey
     # freed when release returns and can be reused there before the owner
     # stream reads it, clearing some other slot.
     owner = torch.cuda.Stream()
-    store = AttentionReferenceStore(
+    store = SparseDecodeReferenceStore(
         slots=8, layers=1, heads=1, head_dim=4, key_bucket=4, device="cuda", stream=owner
     )
     lease = store.reserve("r", 0, 2)
     other = next(slot for slot in range(store.slots) if slot not in lease.slots)
-    store.valid.fill_(True)
     torch.cuda.synchronize()
     clear, streams = store._clear, []
 
@@ -666,8 +679,8 @@ def test_release_from_another_stream_builds_its_index_on_the_owner_stream(monkey
     poison = [torch.full((1,), other, device="cuda", dtype=torch.int64) for _ in range(32)]
     torch.cuda.synchronize()
     assert streams == [owner] and len(poison) == 32
-    assert not bool(store.valid[list(lease.slots)].any())
-    assert bool(store.valid[other].all())
+    assert not any(slot in store._bindings for slot in lease.slots)
+    assert other not in lease.slots
 
 
 @pytest.mark.gpu
@@ -676,7 +689,7 @@ def test_accept_and_retire_do_not_allocate_bucket_sized_temporaries():
     # index buffer, materialising a bucket-sized temporary per batch. Retirement
     # must stay bounded by the rejected rows, not by slot count x bucket.
     torch.cuda.empty_cache()
-    store = AttentionReferenceStore(
+    store = SparseDecodeReferenceStore(
         slots=16, layers=24, heads=16, head_dim=128, key_bucket=32768, device="cuda"
     )
     lease = store.reserve("r", 0, 16)
