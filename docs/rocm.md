@@ -137,6 +137,28 @@ Micro-tuning on the same `all` configuration (batch 128, no packed):
 PyTorch already reports `preferred_blas_library=hipblaslt`; forcing it
 explicitly did not improve throughput, so no rocBLAS fallback is used.
 
+### Full-feature sweep
+
+Batch/concurrency and context sweep on one MI350X with Ouro-1.4B. `runtime`
+enables async + graphs + static/pad2 + UVA + WCPB + prefix; `spec` adds
+pipeline K4/draft1 on top. Short = 80-token prompt / 64 output; 1k = 1000-token
+prompt / 32 output; 4k = 4000-token prompt / 32 output.
+
+| Workload | Baseline | runtime | spec | Best speedup |
+| --- | ---: | ---: | ---: | ---: |
+| short b128 | 1194 | 2208 | 2069 | 1.85x |
+| short b256 | 1670 | 4329 | 2126 | 2.59x |
+| short b512 | 2008 | 4184 | 2031 | 2.08x |
+| 1k b32 | 155.7 | 407.6 | 761.0 | 4.89x |
+| 1k b64 | 176.5 | 661.5 | 894.2 | 5.07x |
+| 1k b128 | 177.9 | 1019.1 | 998.2 | 5.73x |
+| 4k b8 | 18.3 | 149.3 | 297.1 | **16.2x** |
+
+4k prefill throughput goes 2294 -> 18665 (runtime) -> 37150 tok/s (spec).
+Speculation wins once the context/output makes decode and verification
+amortize; for short 64-token outputs runtime-only is better because prefill
+dominates and spec verification adds rows.
+
 ### Per-feature warmed A/B
 
 Batch 128, 32 output tokens, one warm-up discarded, median of three runs.
