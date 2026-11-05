@@ -67,9 +67,9 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | Incremental KV | Yes | +3.8% at batch 64 |
 | Sparse decode (#157) | ROCm tests pass | `--sparse-decode-attention --sparse-decode-key-retention` on the #157 branch; 137 passed |
 | Preemption and recovery | Yes | `enable_preemption=True`, async recovery |
-| Token pipeline | Opt-in | 0.95x at 1.4B; **1.63x on Ouro-2.6B** (K2/draft1) |
-| Synchronous self-speculation | Opt-in | 0.51x at 1.4B; 1.18x on Ouro-2.6B (block K2/draft1) |
-| Asynchronous self-speculation | Opt-in | Async suite; pipeline path is the positive case |
+| Token pipeline | Opt-in | **2.14x at 1.4B (256 out)**, 1.63x on Ouro-2.6B; short-output loses |
+| Synchronous self-speculation | Opt-in | 1.41x at 1.4B (256 out); 1.18x on Ouro-2.6B |
+| Asynchronous self-speculation | Opt-in | 1.48x at 1.4B (256 out); async suite |
 | PD (prefill/decode split) | Not validated | Depends on the NIXL/UCX transport |
 | HTTP serving | Yes | `/v1/completions` |
 
@@ -164,18 +164,31 @@ requests at 16 slots, high-priority median completion drops from 7.80s (fcfs)
 to 2.22s (priority) while total time moves 7.81s to 8.15s; incremental KV gives
 817 -> 848 tok/s at batch 64 (+3.8%).
 
-Speculation is model-dependent: it loses at 1.4B/24-layer but wins on Ouro-2.6B.
-Pipeline K2/draft1 reaches **814 tok/s vs 500 baseline (1.63x)** at batch 64,
-128 output tokens; K4/draft1 is 782 (1.56x) and block K2/draft1 is 591 (1.18x).
-Greedy token match against the non-speculative baseline was 0.797 mean on four
-prompts. A 20-question GSM8K check gave 0/20 for both arms (the base checkpoint
-needs the repo's lm-eval recipe), so there is no measurable accuracy signal yet;
-the speedup stays opt-in and is not a default. At 1.4B, speculation is still a loss: draft/verify overhead exceeds the
-accepted-token gain, so it stays opt-in. Tuning did not recover it: with graphs
-and `cuda_graph_max_batch_size` covering verification rows, block K2 reached
-495 tok/s, block K1/draft1 629, and pipeline K4 792, all below the 999 baseline;
-the best remains pipeline K4 without graphs at 947 (0.95x). WCPB is the largest
-single win because it overlaps prefill chunks across recurrent depths.
+Speculation is **workload-dependent**, not simply negative. At 32 output
+tokens the 80-token prefill dominates and it loses (best 0.95x); with 256
+output tokens at batch 128 the decode-heavy path wins on Ouro-1.4B:
+
+| Config | tok/s | vs baseline |
+| --- | ---: | ---: |
+| baseline | 1527 | 1.00x |
+| pipeline K4/draft1 | 3270 | **2.14x** |
+| pipeline K6/draft1 | 3249 | 2.13x |
+| pipeline K2/draft1 | 2365 | 1.55x |
+| pipeline K4/draft2 | 2254 | 1.48x |
+| pipeline K2/draft2 | 2251 | 1.47x |
+| block K2/draft1 | 2148 | **1.41x** |
+| pipeline K1/draft1 | 1905 | 1.25x |
+| async K2/draft1 | 2314 | 1.48x |
+
+A confirmation run measured pipeline K4/draft1 at 2842 tok/s (1.82x), block
+K2/draft1 at 2251 (1.44x), and async K2/draft1 at 2314 (1.48x), with greedy
+token match 0.66-0.74 against baseline.
+
+On Ouro-2.6B (batch 64, 128 output): pipeline K2/draft1 814 vs 500 (1.63x),
+K4/draft1 782 (1.56x), block K2/draft1 591 (1.18x). Greedy token match against
+the non-speculative baseline is 0.65-0.80, and a 20-question GSM8K check scored
+0/20 for both arms, so there is no accuracy signal yet; speculation stays
+opt-in and is not a default.
 
 ### Not done on ROCm
 
