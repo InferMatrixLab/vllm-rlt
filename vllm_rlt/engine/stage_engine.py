@@ -518,6 +518,9 @@ class StageEngine:
             # Abort can enqueue reference metadata retirement after the drain
             # above. Teardown must also cover those final writes.
             self.model_runner.synchronize()
+            # The store owns the stream the fused kernels ran on, so it releases
+            # their module-level scratch here — after the drain, never before.
+            self.reference_store.close()
 
     def _discard_speculative(self):
         """Release speculative owners after the caller has drained both streams."""

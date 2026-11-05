@@ -1036,7 +1036,7 @@ class ModelRunner:
         if kv is not None:
             metadata = (kv,) + metadata
         if self.reference_store is not None:
-            metadata = tuple(self._reference_metadata(batch, kv) for kv in metadata)
+            metadata = tuple(self._prepare_sparse_reference(batch, kv) for kv in metadata)
         forward = ForwardBatch(
             Operation.RECURRENT,
             hidden=hidden[: batch.num_rows]
@@ -1063,7 +1063,7 @@ class ModelRunner:
             ):
                 self.reference_store.release(state[2])
 
-    def _reference_metadata(self, batch, kv):
+    def _prepare_sparse_reference(self, batch, kv):
         """Borrow token-owned references; prompt and padded rows remain dense.
 
         Preparation runs on core, after the request's preceding event. CODA

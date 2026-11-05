@@ -233,15 +233,17 @@ class SpeculativeRunner:
             steps = [
                 (
                     active,
-                    self._reference_metadata(layouts, [(references[i], offset) for i in active]),
+                    self._prepare_sparse_reference(
+                        layouts, [(references[i], offset) for i in active]
+                    ),
                 )
                 for offset, (active, layouts) in enumerate(steps)
             ]
             owners = [(lease, row) for lease in references for row in range(len(lease))]
-            verification = self._reference_metadata(verification, owners)
+            verification = self._prepare_sparse_reference(verification, owners)
         return tokens, steps, verification
 
-    def _reference_metadata(self, layouts, owners):
+    def _prepare_sparse_reference(self, layouts, owners):
         result = []
         for kv in layouts:
             modes = [reference_mode(depth) for _, depth, _ in kv.rows]

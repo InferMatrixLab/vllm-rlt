@@ -36,6 +36,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE, SparseDecodePlan
+from vllm_rlt.kernels.sparse_workspace import release_workspace
 
 __all__ = ["ReferenceLease", "SparseDecodeReferenceStore", "DENSE", "CAPTURE", "CONSUME"]
 
@@ -250,6 +251,20 @@ class SparseDecodeReferenceStore:
         self._bindings.clear()
         self._counts_host.clear()
         self.free = list(range(self.slots))
+
+    def close(self) -> None:
+        """Release the pool and the kernel scratch this store's device owns.
+
+        The fused kernels cache per-stream scratch at module level, which
+        nothing else can reach. This store is the execution owner of the stream
+        those launches ran on, so it drops them here. The caller must have
+        drained the stream: the tensors must not be freed under a running
+        kernel. A later engine rebuilds them lazily.
+        """
+        self.discard()
+        # The fused kernels cache per-stream scratch at module level, and this
+        # store is the execution owner of the stream they ran on.
+        release_workspace(self.device)
 
     def build_plan(self, owners, modes, *, key_retention: float) -> SparseDecodePlan:
         """Publish the plan of one submission.

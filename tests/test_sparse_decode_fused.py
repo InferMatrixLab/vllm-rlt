@@ -189,9 +189,9 @@ def test_consume_scratch_follows_the_head_dimension(monkeypatch):
         torch.cuda.synchronize()
         return output
 
-    monkeypatch.setattr(sparse_decode, "_CONSUME_WORKSPACE", {})
+    monkeypatch.setattr(sparse_decode, "CONSUME_SCRATCH", {})
     fresh = consume(128)
-    sparse_decode._CONSUME_WORKSPACE.clear()
+    sparse_decode.CONSUME_SCRATCH.clear()
     consume(16)
     # The same stream now holds 16-wide scratch; a 128-wide consume must regrow it.
     assert torch.equal(consume(128), fresh)
