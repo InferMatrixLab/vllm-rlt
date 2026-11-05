@@ -110,6 +110,50 @@ def test_fast_launches_match_triton_dispatch_bit_for_bit(context, monkeypatch):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("dim", [8, 32, 128])
+@pytest.mark.parametrize("folded", [False, True])
+def test_fused_capture_rewrites_every_retained_index(dim, folded, monkeypatch):
+    from vllm_rlt.kernels import sparse_decode
+    from vllm_rlt.kernels.paged_attention import TritonPagedAttention
+
+    monkeypatch.setattr(sparse_decode, "_PASS0_IN_SPLIT", folded)
+    keys = torch.zeros(3, 2, 2, dim, device="cuda", dtype=torch.bfloat16)
+    keys[..., 0] = torch.tensor(
+        [-0.0064, 0.0029, -0.0073, 0.0038, -0.016, -0.0247], device="cuda"
+    ).reshape(3, 2, 1)
+    values = torch.ones_like(keys)
+    q = torch.ones(1, 4, dim, device="cuda", dtype=torch.bfloat16)
+    store = make_store(
+        slots=1,
+        layers=1,
+        heads=4,
+        head_dim=dim,
+        key_bucket=6,
+        device="cuda",
+        implementation="fused",
+    )
+    # An old in-range index exposes a missed write without making this capture's
+    # contribution kernel dereference an invalid address.
+    store.selected.fill_(5)
+    lease = store.reserve("r", 0, 1)
+    plan = store.build_plan([(lease, 0)], [CAPTURE], key_retention=0.5)
+    sparse_paged_attention(
+        q,
+        keys,
+        values,
+        torch.arange(3, device="cuda", dtype=torch.int32)[None],
+        torch.tensor([6], device="cuda", dtype=torch.int32),
+        plan,
+        layer=0,
+        dense_attention=TritonPagedAttention(),
+    )
+    assert bool((store.counts[0, 0] == 3).all())
+    # Only channel 0 contributes to QK: positions 3, 1, 0 are the strict top 3.
+    expected = torch.tensor([0, 1, 3], device="cuda").expand(4, -1)
+    assert torch.equal(store.read_reference(plan, 0, 0)[0], expected)
+
+
+@pytest.mark.gpu
 def test_consume_scratch_follows_the_head_dimension(monkeypatch):
     """A stream's consume scratch must not be reused across head dimensions."""
     from vllm_rlt.kernels import sparse_decode
