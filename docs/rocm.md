@@ -60,7 +60,7 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | CUDA Graph replay | Yes | Triton backend, static buffers |
 | Multi-stream execution | Yes | `multi_stream` |
 | UVA host metadata | Yes (probed) | `hipHostGetDevicePointer` must equal the host address |
-| Packed prefill / `prefill_uva` | Yes (Triton) | Single-sequence validated; multi-sequence packed is not qualified |
+| Packed prefill / `prefill_uva` | Experimental | Kernel tests pass, but the engine greedy path diverges from per-row on a real Ouro prompt; excluded from `all` |
 | Wavefront chunked prefill | Yes | `--wavefront-chunked-prefill` |
 | Prefix cache | Yes | `enable_prefix_caching=True` |
 | Preemption and recovery | Yes | `enable_preemption=True`, async recovery |
@@ -98,55 +98,73 @@ The baseline is the same commit, model, device and wheel set with
 execution features, the same exit mode and `VLLM_RLT_UVA=0`. There was no
 earlier ROCm baseline, so every comparison here is ROCm-relative; CUDA numbers
 were not measured on this lease. One warm-up `generate` is discarded, then the
-median of three runs is reported (32 output tokens, same `ouro_delayed` exit
-mode for both arms):
+median of three runs is reported (same `ouro_delayed` exit mode for both arms):
 
 | Workload | Baseline tok/s | All features tok/s | Speedup |
 | --- | ---: | ---: | ---: |
-| short, batch 128, 32 out | 977 | 2733 | **2.80x** |
-| short, batch 256, 32 out | 1136 | 2757 | **2.43x** |
-| short, batch 512, 32 out | 1384 | 3760 | **2.72x** |
-| short, batch 128, 256 out | 1621 | 2832 | **1.75x** |
+| short, batch 128, 32 out | 977 | 2798 | **2.86x** |
+| short, batch 256, 32 out | 1136 | 2660 | **2.34x** |
+| short, batch 128, 256 out | 1621 | 2794 | **1.72x** |
 
 `all` enables async scheduling, CUDA Graphs, static buffers, power-of-two
-padding, UVA, packed prefill, WCPB and prefix cache. The gain is mostly graph
-replay plus batching: per-token host work, not GEMM throughput, was the
-bottleneck. Short runs are prefill-heavy (80 prompt tokens for 32 output
-tokens), so the speedup is larger there; with 256 output tokens the
-decode-heavy speedup is 1.75x (baseline 6.3 ms/step, all 3.6 ms/step at batch
-128). Reducing per-step host synchronization and fusing elementwise kernels are
-the remaining follow-ups.
+padding, UVA, WCPB and prefix cache. Packed prefill is excluded because its
+engine parity is still failing (see below). The gain is graph replay plus
+batching; short runs are prefill-heavy, so the 256-output decode run is the
+conservative 1.72x result (baseline 6.3 ms/step, all 3.4 ms/step at batch 128).
 
-Micro-tuning on the same `all` configuration (batch 128):
+Micro-tuning on the same `all` configuration (batch 128, no packed):
 
 | Setting | tok/s |
 | --- | ---: |
-| default | 2733 |
+| default | 2798 |
 | `HIP_FORCE_DEV_KERNARG=1` | 2781 |
 | `HSA_ENABLE_INTERRUPT=0` | 2843 |
 | both | 2827 |
 
-PyTorch already reports `preferred_blas_library=hipblaslt` on this stack;
-forcing it explicitly did not help. `rocBLAS` fallback was not needed.
+PyTorch already reports `preferred_blas_library=hipblaslt`; forcing it
+explicitly did not improve throughput, so no rocBLAS fallback is used.
 
-### Per-feature cold matrix
+### Per-feature warmed A/B
 
-Single cold run per cell, no warm-up, 64 output tokens for short and 16 for
-long; values include JIT and graph-capture cost and are useful for direction,
-not as steady-state numbers.
+Batch 128, 32 output tokens, one warm-up discarded, median of three runs.
+Non-spec configs use `baseline_delayed` (970 tok/s) as the reference; spec
+configs use the `ouro` baseline (994 tok/s), which is the only legal exit mode
+for them.
 
-| Config | short b1 | short b32 | short b128 | long b8 prefill |
-| --- | ---: | ---: | ---: | ---: |
-| baseline | 7 | 205 | 580 | 1162 |
-| async | 7 | 224 | 581 | 1158 |
-| graphs | 8 | 201 | 511 | 1076 |
-| static | 7 | 226 | 596 | 938 |
-| uva | 7 | 212 | 565 | 1159 |
-| packed (`prefill_uva`) | 8 | 192 | 556 | 931 |
-| wcpb | 7 | 228 | 562 | 1046 |
-| prefix cache | 6 | 214 | 613 | 1292 |
-| sync self-speculation | 8 | 242 | 615 | 1205 |
-| all features | 7 | 216 | 763 | 1128 |
+| Config | tok/s | vs reference |
+| --- | ---: | ---: |
+| baseline (non-spec) | 970 | 1.00x |
+| async scheduling | 1025 | 1.06x |
+| CUDA Graphs | 986 | 1.02x |
+| static buffers + pad2 | 1056 | 1.09x |
+| UVA | 1019 | 1.05x |
+| WCPB | 1402 | **1.45x** |
+| prefix cache | 1105 | 1.14x |
+| all features | 2798 | **2.88x** |
+| baseline (spec family) | 994 | 1.00x |
+| sync self-speculation | 510 | 0.51x |
+| token pipeline | 947 | 0.95x |
+| async self-speculation | 883 | 0.89x |
+
+Speculation is a loss at 1.4B/24-layer: draft/verify overhead exceeds the
+accepted-token gain, so it stays opt-in. WCPB is the largest single win because
+it overlaps prefill chunks across recurrent depths.
+
+### Not done on ROCm
+
+- **Packed prefill (`prefill_uva`)**: kernel unit tests match the Torch
+  reference, but the engine path produces different greedy tokens from per-row
+  on a real Ouro prompt even with UVA disabled and capability forced. It stays
+  opt-in and is excluded from `all`; the engine-side root cause is open.
+- **PD/KV transfer**: needs two GPUs and a ROCm NIXL/UCX transport.
+- **KV quantization / INT4 residual cache**: not present on the current main
+  runtime; tracked by RFC #156.
+- **Profiling flags**: `--profile` / `--profile-activities` are untested on
+  ROCm; `rocprofv3` is available for external traces.
+- **Priority scheduling and incremental KV**: suite coverage only, no real-model
+  A/B.
+- **FlashAttention**: NVIDIA-only by construction.
+- **Multi-node**: out of scope for this device.
 
 The CPU regression suite passes unchanged on ROCm. GPU tests use the same
 `--run-gpu` flag; FlashAttention, FA4-specific packed-prefill and multi-GPU PD tests
