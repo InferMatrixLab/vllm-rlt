@@ -159,6 +159,32 @@ Speculation wins once the context/output makes decode and verification
 amortize; for short 64-token outputs runtime-only is better because prefill
 dominates and spec verification adds rows.
 
+### 4k/8k context and other checkpoints
+
+Ouro-1.4B, longer outputs and contexts:
+
+| Workload | Baseline | runtime | spec | Best |
+| --- | ---: | ---: | ---: | ---: |
+| 4k b4 / 128 out | 37.9 | 84.8 | 263.6 | **6.96x** |
+| 4k b2 / 256 out | 28.7 | 54.7 | 168.4 | **5.87x** |
+| 8k b2 / 32 out | 5.0 | 46.2 | 107.2 | **21.4x** |
+| 8k b1 / 128 out | 10.1 | 27.7 | 80.3 | **7.95x** |
+
+8k prefill throughput goes 1247 -> 11544 -> 26800 tok/s; 4k goes 1185 ->
+2650 -> 8239. Speculation keeps winning as context and output grow.
+
+Other checkpoints, 4k/8k baseline vs runtime (Nanbeige) or graphs (Huginn):
+
+| Model | Workload | Baseline | Optimized | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| Nanbeige4.2-3B | 4k b4 / 64 out | 27.7 | 199.9 | **7.2x** |
+| Nanbeige4.2-3B | 8k b2 / 32 out | 4.2 | 87.1 | **20.7x** |
+| Huginn-0125 | 4k b1 / 32 out | 3.1 | 3.2 | 1.03x |
+
+Huginn is fixed-depth synchronous with 32 recurrent steps; graph replay adds
+little at batch 1, and its model configuration rejects 8k prompts (prompt plus
+decode exceeds the context limit), so only 4k is reported.
+
 ### Per-feature warmed A/B
 
 Batch 128, 32 output tokens, one warm-up discarded, median of three runs.
