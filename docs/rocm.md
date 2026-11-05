@@ -64,9 +64,9 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | Wavefront chunked prefill | Yes | `--wavefront-chunked-prefill` |
 | Prefix cache | Yes | `enable_prefix_caching=True` |
 | Preemption and recovery | Yes | `enable_preemption=True`, async recovery |
-| Token pipeline | Yes | `SpeculativeConfig(mode="pipeline")` |
-| Synchronous self-speculation | Yes | Block mode, fixed depth |
-| Asynchronous self-speculation | Yes | Async suite coverage |
+| Token pipeline | Opt-in | `SpeculativeConfig(mode="pipeline")`; 0.95x at 1.4B |
+| Synchronous self-speculation | Opt-in | Block mode; 0.51x at 1.4B, K1/draft1 0.63x |
+| Asynchronous self-speculation | Opt-in | Async suite coverage; 0.89x at 1.4B |
 | PD (prefill/decode split) | Not validated | Depends on the NIXL/UCX transport |
 | HTTP serving | Yes | `/v1/completions` |
 
@@ -102,9 +102,19 @@ median of three runs is reported (same `ouro_delayed` exit mode for both arms):
 
 | Workload | Baseline tok/s | All features tok/s | Speedup |
 | --- | ---: | ---: | ---: |
-| short, batch 128, 32 out | 977 | 2798 | **2.86x** |
-| short, batch 256, 32 out | 1136 | 2660 | **2.34x** |
-| short, batch 128, 256 out | 1621 | 2794 | **1.72x** |
+| short, batch 1, 64 out | 18.4 | 32.8 | **1.78x** |
+| short, batch 32, 64 out | 446 | 916 | **2.05x** |
+| short, batch 128, 64 out | 1148 | 2909 | **2.53x** |
+| short, batch 256, 64 out | 1606 | 3270 | **2.04x** |
+| short, batch 512, 64 out | 1864 | 3919 | **2.10x** |
+| long, batch 8, 32 out | 84.8 | 171.0 | **2.02x** |
+| long, batch 32, 32 out | 153.8 | 544.4 | **3.54x** |
+| long, batch 64, 32 out | 179.8 | 866.4 | **4.82x** |
+
+Long-context prefill throughput rises from 2652 to 5350 tok/s at batch 8,
+4811 to 17029 at batch 32, and 5626 to 27102 at batch 64. The long-context
+high-concurrency regime is where WCPB, async scheduling and graph replay
+compound.
 
 `all` enables async scheduling, CUDA Graphs, static buffers, power-of-two
 padding, UVA, WCPB and prefix cache. Packed prefill is excluded because its
@@ -147,8 +157,11 @@ for them.
 | async self-speculation | 883 | 0.89x |
 
 Speculation is a loss at 1.4B/24-layer: draft/verify overhead exceeds the
-accepted-token gain, so it stays opt-in. WCPB is the largest single win because
-it overlaps prefill chunks across recurrent depths.
+accepted-token gain, so it stays opt-in. Tuning did not recover it: with graphs
+and `cuda_graph_max_batch_size` covering verification rows, block K2 reached
+495 tok/s, block K1/draft1 629, and pipeline K4 792, all below the 999 baseline;
+the best remains pipeline K4 without graphs at 947 (0.95x). WCPB is the largest
+single win because it overlaps prefill chunks across recurrent depths.
 
 ### Not done on ROCm
 
