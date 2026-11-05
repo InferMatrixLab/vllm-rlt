@@ -95,36 +95,20 @@ def partition_segments(source, target, byte_limit, descriptor_limit):
         yield local, remote, size
 
 
-def nixl_backend_params(backend):
-    """Optional NIXL backend init parameters from the environment.
-
-    VLLM_RLT_NIXL_UCX_ERROR_HANDLING=none|peer sets the UCX plugin's
-    ``ucx_error_handling_mode``. With the default (peer) UCX cannot use shared
-    memory or cuda_ipc lanes, which have no peer failure handler, and emulates
-    intra-node RMA with active messages over TCP (measured 1.3-5 GB/s on a GH200
-    node). ``none`` lets UCX select cuda_ipc for device-memory WRITEs, but a peer
-    failure is then not reported as a transfer error.
-    """
-    import os
-
-    mode = os.environ.get("VLLM_RLT_NIXL_UCX_ERROR_HANDLING")
-    if backend != "UCX" or not mode:
-        return {}
-    if mode not in ("none", "peer"):
-        raise ValueError("VLLM_RLT_NIXL_UCX_ERROR_HANDLING must be 'none' or 'peer'")
-    return {"ucx_error_handling_mode": mode}
-
-
 class NixlConnector:
     def __init__(self, name, cache, hidden, config):
         from nixl._api import nixl_agent, nixl_agent_config
 
         self.config = config
-        params = nixl_backend_params(config.backend)
-        if params:
-            # nixl_agent_config cannot pass backend init parameters; create it explicitly.
+        if config.backend == "UCX":
+            # NIXL's default (peer) error handling requires a peer failure handler,
+            # which only the network transports provide, so UCX leaves the
+            # shared-memory lanes out of intra-node RMA. A lost worker is reported
+            # by the control channel, which owns worker liveness, so transfers do
+            # not need a handler of their own. nixl_agent_config cannot pass
+            # backend init parameters, so the backend is created explicitly.
             self.agent = nixl_agent(name, nixl_agent_config(backends=[]))
-            self.agent.create_backend(config.backend, params)
+            self.agent.create_backend(config.backend, {"ucx_error_handling_mode": "none"})
         else:
             self.agent = nixl_agent(name, nixl_agent_config(backends=[config.backend]))
         self.storage = (cache.key_cache, cache.value_cache, hidden)
