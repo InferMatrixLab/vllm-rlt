@@ -47,6 +47,8 @@ class AttentionBackend:
 
 
 _TORCH_CAPABILITIES = BackendCapabilities()
+# Triton's packed prefill opts in through required_capabilities (prefill_uva);
+# it is not the default because FA4 owns packed prefill on CUDA.
 _TRITON_CAPABILITIES = BackendCapabilities(
     cuda_graphs=True, async_scheduling=True, device_context_lengths=True
 )
