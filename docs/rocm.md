@@ -49,10 +49,10 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | Feature | ROCm | Notes |
 | --- | --- | --- |
 | Ouro-1.4B | Yes | Full validation and A/B benchmark |
-| Ouro-2.6B | Smoke | Shared Ouro loader; not separately qualified |
-| Ouro-1.4B/2.6B-Thinking | Shared path | Reuses Ouro; not separately qualified on ROCm |
+| Ouro-2.6B | Yes | Real-checkpoint generation; shared Ouro loader |
+| Ouro-1.4B/2.6B-Thinking | Yes | Real-checkpoint generation (bounded) |
 | Nanbeige4.2-3B | Yes | Two-loop inference |
-| Huginn-0125 | Smoke | Synchronous fixed-depth, LAST_EXITED KV |
+| Huginn-0125 | Yes | Synchronous fixed-depth, LAST_EXITED KV, graph replay 32 tokens |
 | Triton paged attention | Yes | Decode and prefill |
 | Torch reference attention | Yes | Correctness fallback |
 | FlashAttention 2/3/4 | No | NVIDIA-only kernels |
@@ -91,12 +91,43 @@ Configuration: `--attention-backend triton --async-scheduling --static-buffers
 128 --max-num-batched-tokens 16384`. Numbers are one run, not a benchmark
 contract; the first request includes Triton compilation.
 
-### Feature A/B
+### Baseline and all-features result
 
-One Ouro-1.4B run per cell on the same MI350X. Short context is an 80-token
-prompt with 64 output tokens; long context is a 1000-token prompt with 16
-output tokens. Values are output tokens/s for short context and prefill
-tokens/s for long context. `baseline` uses Triton without the feature flags.
+The baseline is the same commit, model, device and wheel set with
+`attention_backend="triton"`, `ExecutionConfig()` defaults, no optional
+execution features, the same exit mode and `VLLM_RLT_UVA=0`. There was no
+earlier ROCm baseline, so every comparison here is ROCm-relative; CUDA numbers
+were not measured on this lease. One warm-up `generate` is discarded, then the
+median of three runs is reported (32 output tokens, same `ouro_delayed` exit
+mode for both arms):
+
+| Workload | Baseline tok/s | All features tok/s | Speedup |
+| --- | ---: | ---: | ---: |
+| short, batch 128 | 977 | 2733 | **2.80x** |
+| short, batch 256 | 1136 | 2757 | **2.43x** |
+
+`all` enables async scheduling, CUDA Graphs, static buffers, power-of-two
+padding, UVA, packed prefill, WCPB and prefix cache. The gain is mostly graph
+replay plus batching: per-token host work, not GEMM throughput, was the
+bottleneck.
+
+Micro-tuning on the same `all` configuration (batch 128):
+
+| Setting | tok/s |
+| --- | ---: |
+| default | 2733 |
+| `HIP_FORCE_DEV_KERNARG=1` | 2781 |
+| `HSA_ENABLE_INTERRUPT=0` | 2843 |
+| both | 2827 |
+
+PyTorch already reports `preferred_blas_library=hipblaslt` on this stack;
+forcing it explicitly did not help. `rocBLAS` fallback was not needed.
+
+### Per-feature cold matrix
+
+Single cold run per cell, no warm-up, 64 output tokens for short and 16 for
+long; values include JIT and graph-capture cost and are useful for direction,
+not as steady-state numbers.
 
 | Config | short b1 | short b32 | short b128 | long b8 prefill |
 | --- | ---: | ---: | ---: | ---: |
@@ -110,12 +141,6 @@ tokens/s for long context. `baseline` uses Triton without the feature flags.
 | prefix cache | 6 | 214 | 613 | 1292 |
 | sync self-speculation | 8 | 242 | 615 | 1205 |
 | all features | 7 | 216 | 763 | 1128 |
-
-The single-feature effects are small at this model and workload size. The
-all-features configuration is 1.31x at short context with 128 concurrent
-requests; graph replay and packed prefill are slightly slower in isolation
-because capture and varlen setup dominate a 24-layer, four-loop model.
-These numbers describe one device and are not a general performance claim.
 
 The CPU regression suite passes unchanged on ROCm. GPU tests use the same
 `--run-gpu` flag; FlashAttention, FA4-specific packed-prefill and multi-GPU PD tests
