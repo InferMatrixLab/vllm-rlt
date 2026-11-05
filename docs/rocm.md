@@ -103,13 +103,19 @@ mode for both arms):
 
 | Workload | Baseline tok/s | All features tok/s | Speedup |
 | --- | ---: | ---: | ---: |
-| short, batch 128 | 977 | 2733 | **2.80x** |
-| short, batch 256 | 1136 | 2757 | **2.43x** |
+| short, batch 128, 32 out | 977 | 2733 | **2.80x** |
+| short, batch 256, 32 out | 1136 | 2757 | **2.43x** |
+| short, batch 512, 32 out | 1384 | 3760 | **2.72x** |
+| short, batch 128, 256 out | 1621 | 2832 | **1.75x** |
 
 `all` enables async scheduling, CUDA Graphs, static buffers, power-of-two
 padding, UVA, packed prefill, WCPB and prefix cache. The gain is mostly graph
 replay plus batching: per-token host work, not GEMM throughput, was the
-bottleneck.
+bottleneck. Short runs are prefill-heavy (80 prompt tokens for 32 output
+tokens), so the speedup is larger there; with 256 output tokens the
+decode-heavy speedup is 1.75x (baseline 6.3 ms/step, all 3.6 ms/step at batch
+128). Reducing per-step host synchronization and fusing elementwise kernels are
+the remaining follow-ups.
 
 Micro-tuning on the same `all` configuration (batch 128):
 
