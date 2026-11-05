@@ -265,7 +265,7 @@ def assert_prefix_requests_drained(e):
 
 def cold_prefix_output(prompt, params, retention):
     # Every suffix gets a new engine, including empty prefix/reference state.
-    cold = engine(retention=retention, prefix=True)
+    cold = engine(retention=retention, prefix=False)
     try:
         cold.add_request("cold", prompt, params)
         cold.step()
@@ -276,6 +276,44 @@ def cold_prefix_output(prompt, params, retention):
         return output
     finally:
         cold.close()
+
+
+def cold_prefix_outputs(e, requests, *, cancel_and_replace=None, events=None):
+    """Replay target arrivals/lifecycle on an independent cache-disabled engine.
+
+    Matching arrivals does not imply equal execution batches: prefix hits and
+    prefill chunking can still change the cold/warm schedules.
+    """
+    try:
+        assert not e.cache_manager.enable_prefix_caching
+        admitted = {
+            rid: admit_prefix_request(e, rid, prompt, params, cached_tokens=0)[0]
+            for rid, (prompt, params) in requests.items()
+        }
+        if cancel_and_replace is not None:
+            victim_id, replacement_id, prompt, params = cancel_and_replace
+            wait_for_unconsumed_capture(e, requests, events)
+            assert {event["mode"] for event in events} == {CAPTURE}
+            aborted = e.abort_request(victim_id)
+            assert aborted.finished and aborted.finish_reason == "abort"
+            del admitted[victim_id]
+            assert e.reference_store.outstanding == len(admitted)
+            admitted[replacement_id] = admit_prefix_request(
+                e, replacement_id, prompt, params, cached_tokens=0
+            )[0]
+            wait_for_unconsumed_capture(e, [replacement_id], events)
+            assert all(e.has_request(rid) for rid in admitted)
+        outputs = finish(e)
+        e.model_runner.synchronize()
+        assert set(outputs) == set(admitted)
+        assert e.cache_manager.prefix_hits == 0
+        if events is not None:
+            for request in admitted.values():
+                assert_sparse_decode(events, request, 0.5, layers=e.model.config.num_hidden_layers)
+        assert_prefix_requests_drained(e)
+        return outputs
+    finally:
+        e.close()
 
 
 def admit_prefix_request(e, rid, prompt, params, *, cached_tokens):
@@ -350,7 +388,10 @@ def test_prefix_hit_matches_its_own_cold_sparse_decode(
 def test_shared_prefix_keeps_live_sparse_references_request_local(monkeypatch):
     prompts = {"a": [2, 3, 4, 5, 6], "b": [2, 3, 4, 5, 9]}
     params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
-    expected = {rid: cold_prefix_output(prompt, params, 0.5) for rid, prompt in prompts.items()}
+    expected = cold_prefix_outputs(
+        engine(retention=0.5, prefix=False),
+        {rid: (prompt, params) for rid, prompt in prompts.items()},
+    )
     e = engine(retention=0.5, prefix=True)
     try:
         e.add_request("prime", prompts["a"], params)
@@ -383,7 +424,15 @@ def test_prefix_hit_cancel_after_capture_reuses_slots_without_old_reference(
 ):
     prompt = [2, 3, 4, 5, 10]
     params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
-    expected = cold_prefix_output(prompt, params, 0.5)
+    cold = engine(retention=0.5, prefix=False)
+    with monkeypatch.context() as patch:
+        cold_events, _ = trace_cpu_sparse(cold, patch)
+        expected = cold_prefix_outputs(
+            cold,
+            {"victim": ([2, 3, 4, 5, 9], params)},
+            cancel_and_replace=("victim", replacement_id, prompt, params),
+            events=cold_events,
+        )[replacement_id]
     e = engine(retention=0.5, prefix=True)
     try:
         e.add_request("prime", [2, 3, 4, 5, 6], params)

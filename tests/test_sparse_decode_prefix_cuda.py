@@ -13,6 +13,7 @@ from tests.test_sparse_decode_sync import (
     admit_prefix_request,
     assert_prefix_requests_drained,
     assert_sparse_decode,
+    cold_prefix_outputs,
     reference_payload,
     wait_for_unconsumed_capture,
 )
@@ -32,7 +33,7 @@ from vllm_rlt.request import RequestPhase
 pytestmark = pytest.mark.gpu
 
 
-def cuda_prefix_engine(implementation, retention=0.5, *, larger=False):
+def cuda_prefix_engine(implementation, retention=0.5, *, larger=False, prefix=True):
     if larger:
         torch.manual_seed(123)
         model = OuroForCausalLM(
@@ -55,7 +56,7 @@ def cuda_prefix_engine(implementation, retention=0.5, *, larger=False):
         cache_config=CacheConfig(
             1536 if larger else 256,
             16 if larger else 2,
-            enable_prefix_caching=True,
+            enable_prefix_caching=prefix,
             incremental_allocation=True,
         ),
         scheduler_config=SchedulerConfig(
@@ -84,7 +85,7 @@ def assert_output(actual, expected, params):
 
 def cold_output(implementation, prompt, params, **options):
     # Every target gets its own fresh model, KV cache and reference pool.
-    e = cuda_prefix_engine(implementation, **options)
+    e = cuda_prefix_engine(implementation, prefix=False, **options)
     try:
         admit_prefix_request(e, "cold", prompt, params, cached_tokens=0)
         e.step()
@@ -309,7 +310,10 @@ def test_cuda_prefix_hit_matches_its_own_cold_decode(
 def test_cuda_shared_prefix_keeps_simultaneous_references_isolated(implementation, monkeypatch):
     prompts = {"a": [2, 3, 4, 5, 6], "b": [2, 3, 4, 5, 9]}
     params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
-    expected = {rid: cold_output(implementation, prompt, params) for rid, prompt in prompts.items()}
+    expected = cold_prefix_outputs(
+        cuda_prefix_engine(implementation, prefix=False),
+        {rid: (prompt, params) for rid, prompt in prompts.items()},
+    )
     e = cuda_prefix_engine(implementation)
     try:
         e.add_request("prime", prompts["a"], params)
@@ -355,10 +359,20 @@ def test_cuda_prefix_cancel_between_capture_and_consume_reuses_slot(
 ):
     prompt = [2, 3, 4, 5, 10]
     params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
-    expected = cold_output(implementation, prompt, params)
     survivor_prompt = [2, 3, 4, 5, 11]
     survivor_params = SamplingParams(max_tokens=12, min_loops=4, max_loops=4, ignore_eos=True)
-    survivor_expected = cold_output(implementation, survivor_prompt, survivor_params)
+    cold = cuda_prefix_engine(implementation, prefix=False)
+    with monkeypatch.context() as patch:
+        cold_events, _ = trace_cuda_sparse(cold, patch)
+        expected = cold_prefix_outputs(
+            cold,
+            {
+                "victim": ([2, 3, 4, 5, 9], params),
+                "survivor": (survivor_prompt, survivor_params),
+            },
+            cancel_and_replace=("victim", replacement_id, prompt, params),
+            events=cold_events,
+        )
     e = cuda_prefix_engine(implementation)
     try:
         e.add_request("prime", [2, 3, 4, 5, 6], params)
@@ -447,8 +461,8 @@ def test_cuda_prefix_cancel_between_capture_and_consume_reuses_slot(
                         assert torch.equal(actual, saved)
         actual = finish(e)
         assert starts[id(replacement)] == (4, 5)
-        assert_output(actual[replacement_id], expected, params)
-        assert_output(actual["survivor"], survivor_expected, survivor_params)
+        assert_output(actual[replacement_id], expected[replacement_id], params)
+        assert_output(actual["survivor"], expected["survivor"], survivor_params)
         assert_sparse_decode(events, replacement, 0.5, layers=e.model.config.num_hidden_layers)
         assert_sparse_decode(events, survivor, 0.5, layers=e.model.config.num_hidden_layers)
         assert all(event["mode"] == CAPTURE for event in events if event["request"] is victim)
@@ -511,10 +525,10 @@ def test_cuda_larger_ragged_decode_matches_each_cold_prefix(
         rid: SamplingParams(max_tokens=12 + int(rid), min_loops=4, max_loops=4, ignore_eos=True)
         for rid in prompts
     }
-    expected = {
-        rid: cold_output(implementation, prompt, params[rid], larger=True)
-        for rid, prompt in prompts.items()
-    }
+    expected = cold_prefix_outputs(
+        cuda_prefix_engine(implementation, larger=True, prefix=False),
+        {rid: (prompt, params[rid]) for rid, prompt in prompts.items()},
+    )
     e = cuda_prefix_engine(implementation, larger=True)
     try:
         assert sum(p.numel() for p in e.model.parameters()) > 1_000_000
