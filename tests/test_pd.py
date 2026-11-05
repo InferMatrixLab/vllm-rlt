@@ -608,6 +608,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="PD needs two visible GPUs")
 @pytest.mark.parametrize("p_cache,d_cache", [(True, True), (True, False), (False, True)])
 @pytest.mark.parametrize("graph", [False, True])
 def test_pd_prefix_reuse_reduces_transfers_and_preserves_outputs(p_cache, d_cache, graph):

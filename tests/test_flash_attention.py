@@ -10,6 +10,10 @@ from vllm_rlt.kernels.flash_attention import FlashPagedAttention, select_version
 from vllm_rlt.kernels.paged_attention import torch_paged_attention
 from vllm_rlt.models import OuroForCausalLM
 
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None, reason="FlashAttention is NVIDIA-only"
+)
+
 
 @pytest.mark.parametrize(
     "sm,expected", [((8, 0), 2), ((8, 9), 2), ((9, 0), 3), ((10, 0), 4), ((10, 3), 4)]

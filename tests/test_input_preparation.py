@@ -280,6 +280,7 @@ def test_query_spans_and_static_padding_share_metadata_contract(monkeypatch, dev
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(torch.version.hip is not None, reason="packed prefill is FA4-specific")
 @pytest.mark.parametrize("use_uva", [False, True])
 @pytest.mark.parametrize("single_query", [False, True])
 def test_packed_metadata_supports_query_lengths_and_per_request_depths(use_uva, single_query):

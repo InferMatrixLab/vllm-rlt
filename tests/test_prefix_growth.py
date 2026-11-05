@@ -157,6 +157,7 @@ def test_lossless_preemption_preserves_looped_history():
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(torch.version.hip is not None, reason="packed prefill is FA4-specific")
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("use_uva", [False, True])
 def test_fa4_prefill_uva_prefix_growth_and_bank_reuse(graph, use_uva):
@@ -236,6 +237,7 @@ def test_priority_preempts_at_safe_boundary():
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(torch.version.hip is not None, reason="packed prefill is FA4-specific")
 @pytest.mark.parametrize("use_uva", [False, True])
 def test_prefill_uva_metadata_matches_reference_and_waits_for_consumer(use_uva):
     from vllm_rlt.worker.buffers import PackedMetadataBuffer

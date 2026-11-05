@@ -634,6 +634,7 @@ def test_cuda_graph_reserve_reduces_budget_with_fixed_memory_inputs(monkeypatch,
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA allocator residue accounting")
 def test_cuda_memory_plan_reclaims_allocator_residue_on_recreation():
     import gc
 
