@@ -32,8 +32,8 @@ def test_explicit_flash_rejected_on_rocm(rocm):
 
 
 def test_uva_override_and_cpu_fallback(monkeypatch):
-    monkeypatch.setenv("VLLM_RLT_UVA", "1")
-    assert use_uva_on(torch.device("cuda", 0))
+    assert not use_uva_on(torch.device("cpu"))
     monkeypatch.setenv("VLLM_RLT_UVA", "0")
     assert not use_uva_on(torch.device("cuda", 0))
-    assert not use_uva_on(torch.device("cpu"))
+    monkeypatch.setenv("VLLM_RLT_UVA", "1")
+    assert use_uva_on(torch.device("cuda", 0)) is torch.cuda.is_available()

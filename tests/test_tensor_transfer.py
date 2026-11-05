@@ -388,11 +388,11 @@ def test_uva_configuration_and_capability(monkeypatch):
     assert parser.parse_args([]).use_uva
     args = parser.parse_args(["--no-uva", "--prefill-uva"])
     assert not args.use_uva and args.prefill_uva
-    monkeypatch.setenv("VLLM_RLT_UVA", "1")
-    assert use_uva_on("cuda")
-    assert not use_uva_on("cuda", False)
     assert not use_uva_on("cpu")
     monkeypatch.setenv("VLLM_RLT_UVA", "0")
     assert not use_uva_on("cuda")
+    monkeypatch.setenv("VLLM_RLT_UVA", "1")
+    assert use_uva_on("cuda") is torch.cuda.is_available()
     monkeypatch.delenv("VLLM_RLT_UVA")
     assert use_uva_on("cuda") is torch.cuda.is_available()
+    assert not use_uva_on("cuda", False)
