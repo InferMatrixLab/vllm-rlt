@@ -23,6 +23,7 @@ from vllm_rlt.attention import (
     create_backend,
     validate_backend_name,
 )
+from vllm_rlt.device import resolve_device
 from vllm_rlt.request import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
@@ -133,7 +134,7 @@ class KVCacheManager:
         ):
             raise ValueError("recurrent_layers must be valid cache layer indices")
         self.storage_depths = max_loops if layout == "last_exited" else 1
-        self.device = torch.device(device)
+        self.device = resolve_device(device)
         self.dtype = dtype
         self.attention = attention or create_backend(
             backend, self.device, dtype, head_dim, block_size
@@ -683,8 +684,22 @@ class KVCacheManager:
         self._validate_tensor(v, len(batch.position_ids), "v")
         if not batch.rows:
             return
-        self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
-        self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
+        if self.device.type == "npu" and self.backend == "ascend_eager":
+            if not hasattr(self, "_npu_writer"):
+                from vllm_rlt.kernels.ascend_kv import AscendKVWriter
+
+                self._npu_writer = AscendKVWriter()
+            self._npu_writer.write(
+                self.key_cache,
+                self.value_cache,
+                layer,
+                batch,
+                k[: len(batch.rows)],
+                v[: len(batch.rows)],
+            )
+        else:
+            self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
+            self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
         for allocation, depth, position in batch.rows:
             allocation.written[self._plane(depth)][layer].add(position)
 
@@ -740,12 +755,8 @@ class KVCacheManager:
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
             )
-        return self.attention(
-            q,
-            self.key_cache[:, layer],
-            self.value_cache[:, layer],
-            batch.block_tables,
-            batch.context_lengths,
+        return self.attention.attend_metadata(
+            q, self.key_cache[:, layer], self.value_cache[:, layer], batch
         )
 
     @torch.no_grad()

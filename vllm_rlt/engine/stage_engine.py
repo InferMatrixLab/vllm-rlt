@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
+import torch
+
 from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.config import (
     CacheConfig,
@@ -70,6 +72,30 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
+        if parameter.device.type == "npu":
+            if attention_backend not in ("torch", "ascend_eager"):
+                raise ValueError(
+                    "NPU execution requires explicit attention_backend='torch' or 'ascend_eager'"
+                )
+            if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
+                raise ValueError("NPU currently supports Ouro with four loops")
+            if parameter.dtype != torch.bfloat16:
+                raise ValueError("NPU Ouro requires BF16 weights")
+            if (
+                self.execution_config.async_scheduling
+                or self.execution_config.cuda_graphs
+                or self.execution_config.prefill_uva
+                or speculative_config is not None
+                or self.stage_config.role != "prefill_decode"
+                or scheduler_config.enable_preemption
+                or cache_config.enable_prefix_caching
+                or cache_config.layout != "last_exited"
+                or self.exit_config.mode != "ouro"
+            ):
+                raise ValueError(
+                    "NPU Ouro requires synchronous local execution, ouro exit mode and "
+                    "last_exited KV without speculation, graphs, preemption or prefix caching"
+                )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
@@ -323,6 +349,10 @@ class StageEngine:
         if any(type(t) is not int or not 0 <= t < config.vocab_size for t in prompt_token_ids):
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
         max_loops = params.max_loops or config.total_ut_steps
+        if next(self.model.parameters()).device.type == "npu" and (
+            max_loops != 4 or params.exit_threshold != 1.0 or params.temperature != 0
+        ):
+            raise ValueError("NPU Ouro requests require four loops, exit_threshold=1 and greedy")
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
         if self.speculative_config is not None and (

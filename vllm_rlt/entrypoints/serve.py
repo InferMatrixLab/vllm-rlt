@@ -82,12 +82,13 @@ def main():
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokenizer-revision")
     parser.add_argument("--served-model-name")
-    parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--device", choices=["cpu", "cuda", "npu"], default="cuda")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument(
         "--attention-backend",
         type=str.lower,
         choices=[
+            "ascend_eager",
             "auto",
             "torch",
             "triton",
@@ -115,6 +116,8 @@ def main():
     limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
     if args.device == "cpu" and args.attention_backend not in ("auto", "torch"):
         parser.error("CPU execution requires --attention-backend torch or auto")
+    if args.device == "npu" and args.attention_backend not in ("torch", "ascend_eager"):
+        parser.error("NPU execution requires explicit --attention-backend torch or ascend_eager")
     torch.set_num_threads(args.cpu_threads)
     logging.basicConfig(level=logging.INFO)
     app = create_app(
