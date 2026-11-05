@@ -67,9 +67,9 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | Incremental KV | Yes | +3.8% at batch 64 |
 | Sparse decode (#157) | ROCm tests pass | 137 passed on the merged branch; not part of this PR |
 | Preemption and recovery | Yes | `enable_preemption=True`, async recovery |
-| Token pipeline | Opt-in | `SpeculativeConfig(mode="pipeline")`; 0.95x at 1.4B |
-| Synchronous self-speculation | Opt-in | Block mode; 0.51x at 1.4B, K1/draft1 0.63x |
-| Asynchronous self-speculation | Opt-in | Async suite coverage; 0.89x at 1.4B |
+| Token pipeline | Opt-in | 0.95x at 1.4B; **1.63x on Ouro-2.6B** (K2/draft1) |
+| Synchronous self-speculation | Opt-in | 0.51x at 1.4B; 1.18x on Ouro-2.6B (block K2/draft1) |
+| Asynchronous self-speculation | Opt-in | Async suite; pipeline path is the positive case |
 | PD (prefill/decode split) | Not validated | Depends on the NIXL/UCX transport |
 | HTTP serving | Yes | `/v1/completions` |
 
@@ -164,7 +164,12 @@ requests at 16 slots, high-priority median completion drops from 7.80s (fcfs)
 to 2.22s (priority) while total time moves 7.81s to 8.15s; incremental KV gives
 817 -> 848 tok/s at batch 64 (+3.8%).
 
-Speculation is a loss at 1.4B/24-layer: draft/verify overhead exceeds the
+Speculation is model-dependent: it loses at 1.4B/24-layer but wins on Ouro-2.6B.
+Pipeline K2/draft1 reaches **814 tok/s vs 500 baseline (1.63x)** at batch 64,
+128 output tokens; K4/draft1 is 782 (1.56x) and block K2/draft1 is 591 (1.18x).
+Greedy token match against the non-speculative baseline was 0.797 mean on four
+prompts, so the speedup is approximate and needs a quality check before default
+use. At 1.4B, speculation is still a loss: draft/verify overhead exceeds the
 accepted-token gain, so it stays opt-in. Tuning did not recover it: with graphs
 and `cuda_graph_max_batch_size` covering verification rows, block K2 reached
 495 tok/s, block K1/draft1 629, and pipeline K4 792, all below the 999 baseline;
