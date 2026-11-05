@@ -1,5 +1,10 @@
 """Sparse decode attention arithmetic and its per-row plan (RFC #156, section 3.2).
 
+The cross-loop sparse attention mechanism is from FlashLoop
+(https://arxiv.org/abs/2609.29812, reference implementation
+https://github.com/Superone77/FlashLoop); the kernels and serving integration in
+this repository are ours.
+
 The sparse decode algorithm keeps the attention output of a reference loop and
 replaces only the contribution of the retained keys in a later loop. The
 reference loop is loop 2 in the RFC's one-based numbering, which is depth index
@@ -63,8 +68,10 @@ class SparseDecodePlan:
     ``modes`` and ``slots`` are host-known: the runner decides both before it
     submits, so a submission never depends on a device readback. ``slots`` holds
     one reference slot per row, or ``-1`` for a row that owns no reference.
-    ``incarnations`` identifies the token that occupies each slot; a plan built
-    for a superseded incarnation is stale and must be rejected.
+    ``owners`` holds the lease each row's slot was reserved from, or ``None``
+    for a dense row. The lease is the slot's identity: a slot handed to another
+    request is bound to a different lease, so a plan built for the previous
+    owner fails the store's liveness check.
 
     A dense row runs the ordinary attention path. A capture row is the
     reference loop: it computes the dense attention and publishes the retained
@@ -78,7 +85,7 @@ class SparseDecodePlan:
 
     modes: tuple[int, ...]
     slots: tuple[int, ...]
-    incarnations: tuple[int, ...]
+    owners: tuple[object | None, ...]
     key_retention: float
     key_bucket: int | None
     slot_ids: torch.Tensor | None = None

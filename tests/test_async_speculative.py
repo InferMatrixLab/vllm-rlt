@@ -173,7 +173,7 @@ def test_second_round_executes_before_cpu_commit_at_every_rejection(accepted, mo
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("graphs", [False, True])
-def test_eos_discards_queued_round_and_request_id_can_be_reused(monkeypatch, graphs):
+def test_eos_discards_queued_round_and_the_id_frees_after_retirement(monkeypatch, graphs):
     model = tiny("cuda")
     e = make_engine(model, graphs=graphs)
     bootstrap(e, ignore_eos=False)
@@ -191,7 +191,13 @@ def test_eos_discards_queued_round_and_request_id_can_be_reused(monkeypatch, gra
     e.step()
     out = e._collect_speculative()[0]
     assert out.finished and out.token_ids[-1] == 0 and len(out.token_ids) == 2
-    # Reuse while an old ticket still exists. It must never touch the new request.
+    # The finished request is still retiring, so its id is rejected: the engine
+    # never reuses an id while the previous token may still own resources.
+    with pytest.raises(ValueError, match="duplicate request ID"):
+        e.add_request("r", [7, 8], SamplingParams(max_tokens=5, ignore_eos=True))
+    # Once retirement completes the id is free, and the new request never sees
+    # the old round's state.
+    e._retire_speculative(wait=True)
     monkeypatch.setattr(e.speculative_runner, "_coda", coda)
     e.add_request("r", [7, 8], SamplingParams(max_tokens=5, ignore_eos=True))
     output = drain(e)["r"]

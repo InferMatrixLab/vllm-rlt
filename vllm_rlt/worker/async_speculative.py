@@ -86,7 +86,7 @@ class SpeculativeRoundBuffer:
 
 
 @dataclass
-class SpeculativeRoundTicket:
+class AsyncSpeculativeOutput:
     batch: SchedulerOutput
     buffer: SpeculativeRoundBuffer
     states: tuple[SpeculativeRequestState, ...]
@@ -554,7 +554,6 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                         scheduled_request.request.request_id,
                         index,
                         scheduled_request.token_count,
-                        state.generation,
                     )
                     for index, (scheduled_request, state) in enumerate(
                         zip(scheduled_requests, states)
@@ -598,7 +597,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         if self.config.mode != "pipeline":
             self.stats.drafted_tokens += sum(s.token_count - 1 for s in scheduled_requests)
             self.stats.verified_rows += count
-        return SpeculativeRoundTicket(
+        return AsyncSpeculativeOutput(
             batch,
             buffer,
             states,
@@ -674,7 +673,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             p.tokens.copy_(torch.where(newborn, token, p.tokens))
             p.depths.masked_fill_(newborn, 0)
             p.active.copy_((surviving | newborn) & (state.position + ids < limit))
-            # Per-request wire order matches SpeculativeRoundTicket.collect():
+            # Per-request wire order matches AsyncSpeculativeOutput.collect():
             # prediction, accepted, emitted, next_position, drafted, verified.
             # A pipeline step verifies at most one token per request, so the
             # verified count equals emitted (0 or 1).

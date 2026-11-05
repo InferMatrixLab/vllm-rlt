@@ -174,7 +174,7 @@ def test_cuda_sparse_preserves_dense_backend_outputs(kv_heads, retention):
         keys = torch.randn(length, kv_heads, dim, device="cuda", dtype=torch.bfloat16)
         values = torch.randn_like(keys)
         cache.write(0, [rid] * length, [0] * length, list(range(length)), keys, values)
-        lease = store.reserve(rid, 0, 1, generation=1)
+        lease = store.reserve(rid, 0, 1)
         owners.append((lease, 0))
     batch = cache._prepare_batch(ids, [0] * rows, [length - 1] * rows)
     q = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
@@ -252,7 +252,7 @@ def test_sparse_verification_matches_serial_same_input_hidden_logits_and_kv(draf
     assert oracle.allocate("r", 16)
     store = make_reference_store(model)
     for position, token in enumerate(tokens):
-        lease = store.reserve("r", 0, 1, generation=position)
+        lease = store.reserve("r", 0, 1)
         hidden = model.prelude(torch.tensor([token]))
         for depth in range(4):
             kv = oracle._prepare_batch(["r"], [depth], [position])
@@ -324,7 +324,7 @@ def test_sync_rejection_retires_all_references_before_replacement(draft, accepte
             e.reference_store.read_reference(old, 0, 0)
         monkeypatch.setattr(e.speculative_runner, "_coda", original)
         e.step()
-        assert seen[-1].incarnations[0] > old.incarnations[0]
+        assert seen[-1].owners[0] is not old.owners[0]
         assert e.speculative_runner.stats.accepted_tokens >= accepted
     finally:
         e.close()

@@ -96,7 +96,11 @@ in mixed prefill/decode batches.
   fallback; it is not a general model-speedup claim.
 - **Sparse decode reference integration (opt-in):** cached loop-2 attention
   correction for ordinary decode and block self-speculation, with shared
-  per-token reference ownership and explicit capability limits; see the
+  per-token reference ownership and explicit capability limits. The cross-loop
+  sparse attention mechanism comes from FlashLoop
+  ([paper](https://arxiv.org/abs/2609.29812),
+  [reference implementation](https://github.com/Superone77/FlashLoop)); this
+  repository contributes the kernel and serving integration. See the
   [configuration and scope](docs/runtime.md#sparse-decode-attention-reference-path).
 - **Offline and online use:** Python API, CLI, and a streaming
   OpenAI-compatible **completions** endpoint. This is not a chat-completions API.

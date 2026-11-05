@@ -5,8 +5,8 @@ recomputes the contribution of the retained keys. The retained state is
 per token, per layer and per head, so it cannot be stored per request.
 
 This module owns that state. The store keeps one slot per live token, tracks
-which request and generation owns it, and publishes the slot views that the
-attention kernels borrow. Nothing here reads device state back to the host:
+which lease owns it, and publishes the slot views that the attention kernels
+borrow. Nothing here reads device state back to the host:
 ownership, retirement and invalidation are expressed as device operations so
 that an asynchronous round can retire its slots without a host readback.
 
@@ -21,10 +21,14 @@ that an earlier round still reads.
 
 Slot identity
 -------------
-A slot is identified by its request generation, its row inside the request and
-an incarnation counter. The incarnation changes whenever the token of that row
-changes, including a corrected token that reuses the same position after a
-rejection. A plan built for a superseded incarnation is stale and rejected.
+A slot is owned by the lease that reserved it, and the lease object is the
+identity: reserve binds the slot to a new lease, release requires that
+same lease, and a plan is live only while every slot still points at the lease
+it was built from. A slot handed to another request is bound to a different
+lease, so the previous owner's plan cannot pass. This relies on two properties
+the engine already guarantees: a request id is never reused while its previous
+token is retiring, and slots are recycled only after their last reader
+completed.
 """
 
 from dataclasses import dataclass
@@ -46,10 +50,8 @@ class ReferenceLease:
     """
 
     request_id: str
-    generation: int
     request_index: int
     slots: tuple[int, ...]
-    incarnations: tuple[int, ...]
     slot_ids: torch.Tensor
     row_index: torch.Tensor
 
@@ -118,16 +120,12 @@ class AttentionReferenceStore:
         self.uses = torch.zeros((slots, layers), dtype=torch.int32, device=device)
         # Identity of the token occupying each slot.
         self.position = torch.zeros(slots, dtype=torch.int64, device=device)
-        self.incarnation = torch.zeros(slots, dtype=torch.int64, device=device)
         self.accepted = torch.zeros(slots, dtype=torch.int32, device=device)
         self.free = list(range(slots))
-        self._bindings: dict[int, tuple[str, int, int]] = {}
-        # Incarnations belong to the physical slot, not to the request that
-        # borrows it: a counter keyed by ``(request_id, row)`` restarts at 1 for
-        # the next owner, so a stale plan from the previous owner would carry
-        # the same number and pass the liveness check. Slot counters only ever
-        # increase, which makes a recycled slot's old plan unambiguously stale.
-        self._slot_incarnations: list[int] = [0] * slots
+        # Slot ownership is the lease object itself. Object identity is exact:
+        # a recycled slot is bound to a different lease, so a plan built for the
+        # previous owner cannot match, and no per-slot counter is needed.
+        self._bindings: dict[int, ReferenceLease] = {}
         # Retained counts are host-known: the capture decides them before it
         # submits. Keeping them here lets a reader size its gather without a
         # device readback, which RFC #156 section 6.2 forbids.
@@ -147,7 +145,6 @@ class AttentionReferenceStore:
                 self.valid,
                 self.uses,
                 self.position,
-                self.incarnation,
                 self.accepted,
             )
         )
@@ -200,46 +197,42 @@ class AttentionReferenceStore:
         host = torch.tensor(values, dtype=torch.int64, pin_memory=self.device.type == "cuda")
         return host.to(self.device, non_blocking=True)
 
-    def reserve(self, request_id: str, request_index: int, rows: int, generation: int):
-        """Take one slot per verification row of a request's submission."""
+    def reserve(self, request_id: str, request_index: int, rows: int) -> ReferenceLease:
+        """Take one slot per verification row of a request's submission.
+
+        The lease is the slot's owner identity. A slot returned to the pool and
+        handed to another request is bound to a different lease object, so plans
+        that still reference the old lease cannot pass a liveness check.
+        """
         if rows < 1:
             raise ValueError("a reference reservation needs at least one row")
         if len(self.free) < rows:
             raise RuntimeError("no retired attention reference slots")
         slots = tuple(self.free.pop() for _ in range(rows))
-        incarnations = []
-        for row, slot in enumerate(slots):
-            count = self._slot_incarnations[slot] + 1
-            self._slot_incarnations[slot] = count
-            self._bindings[slot] = (request_id, generation, count)
-            incarnations.append(count)
-        slot_ids = self._index(slots)
-        # Writing host integers element by element would block on each copy.
-        self.incarnation.index_copy_(0, slot_ids, self._index(incarnations))
-        return ReferenceLease(
+        lease = ReferenceLease(
             request_id=request_id,
-            generation=generation,
             request_index=request_index,
             slots=slots,
-            incarnations=tuple(incarnations),
-            slot_ids=slot_ids,
+            slot_ids=self._index(slots),
             row_index=torch.arange(rows, dtype=torch.int64, device=self.device),
         )
+        for slot in slots:
+            self._bindings[slot] = lease
+        return lease
 
     def release(self, leases) -> None:
         """Return slots to the pool once their last reader completed.
 
         The caller orders this after the final reader/writer, e.g. by releasing
         from a ticket that already waited for the round's completion event. The
-        cleared payload never leaks into a later incarnation.
+        cleared payload never leaks into a later owner.
         """
         if isinstance(leases, ReferenceLease):
             leases = (leases,)
         cleared = []
         for lease in leases:
             for slot in lease.slots:
-                binding = self._bindings.get(slot)
-                if binding is None or binding[:2] != (lease.request_id, lease.generation):
+                if self._bindings.get(slot) is not lease:
                     raise RuntimeError("attention reference slot released by a different owner")
                 del self._bindings[slot]
                 cleared.append(slot)
@@ -266,34 +259,29 @@ class AttentionReferenceStore:
 
         ``owners`` holds one ``(lease, row)`` pair per submission row, in the
         row order of the recurrent step; ``modes`` holds the row mode of every
-        submission row. Slots and incarnations are re-read from the live
+        submission row. Slots and their owning leases are re-read from the live
         bindings, so a plan never aliases a superseded token.
         """
         if len(owners) != len(modes):
             raise ValueError("a reference plan needs one mode per row")
-        slots, incarnations = [], []
+        slots, row_owners = [], []
         for owner, mode in zip(owners, modes):
             if owner is None:
                 if mode != DENSE:
                     raise ValueError("a sparse row needs a reference owner")
                 slots.append(-1)
-                incarnations.append(0)
+                row_owners.append(None)
                 continue
             lease, row = owner
             slot = lease.slots[row]
-            binding = self._bindings.get(slot)
-            if binding is None or binding != (
-                lease.request_id,
-                lease.generation,
-                lease.incarnations[row],
-            ):
+            if self._bindings.get(slot) is not lease:
                 raise RuntimeError("attention reference slot released before its plan")
             slots.append(slot)
-            incarnations.append(binding[2])
+            row_owners.append(lease)
         return SparseDecodePlan(
             modes=tuple(modes),
             slots=tuple(slots),
-            incarnations=tuple(incarnations),
+            owners=tuple(row_owners),
             key_retention=key_retention,
             key_bucket=self.key_bucket,
             slot_ids=self._index(slots),
@@ -304,11 +292,10 @@ class AttentionReferenceStore:
         """Reject a plan whose slots were recycled or superseded."""
         if plan.store is not self:
             raise RuntimeError("attention reference plan belongs to a different store")
-        for slot, incarnation, mode in zip(plan.slots, plan.incarnations, plan.modes):
+        for slot, owner, mode in zip(plan.slots, plan.owners, plan.modes):
             if slot == -1 and mode == DENSE:
                 continue
-            binding = self._bindings.get(slot)
-            if binding is None or binding[2] != incarnation:
+            if self._bindings.get(slot) is not owner:
                 raise RuntimeError("stale attention reference plan for a retired token")
 
     def note_count(self, slot: int, layer: int, count: int) -> None:
@@ -476,7 +463,6 @@ class AttentionReferenceStore:
                 self.valid,
                 self.uses,
                 self.accepted,
-                self.incarnation,
                 self.position,
                 self.mass,
                 self.counts,

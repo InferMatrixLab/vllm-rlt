@@ -233,7 +233,11 @@ for the design.
 ## Sparse decode attention (reference path)
 
 `SparseDecodeAttentionConfig` enables the RFC #156 cached-reference correction
-for generated-token attention. Prompt prefill remains dense. Loop 2 captures
+for generated-token attention. The cross-loop sparse attention mechanism is from
+FlashLoop ([paper](https://arxiv.org/abs/2609.29812),
+[reference implementation](https://github.com/Superone77/FlashLoop)); the
+configuration, kernels and serving integration here are this repository's.
+Prompt prefill remains dense. Loop 2 captures
 per-token/per-layer/head selection, mass and contributions; loops 3 and 4 reuse
 that reference with their current selected KV. Each new input token establishes
 its own reference.

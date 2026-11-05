@@ -27,7 +27,7 @@ def test_fused_store_keeps_the_oracle_on_cpu(monkeypatch):
 
     monkeypatch.setattr(sparse, "reference_paged_attention", lambda *a, **k: calls.append(1))
     store = make_store(slots=1, layers=1, heads=2, head_dim=4, implementation="fused")
-    lease = store.reserve("cpu", 0, 1, generation=1)
+    lease = store.reserve("cpu", 0, 1)
     plan = store.build_plan([(lease, 0)], [CAPTURE], key_retention=0.5)
     q = torch.ones(1, 2, 4)
     cache = torch.ones(1, 16, 2, 4)
@@ -73,7 +73,7 @@ def test_fast_launches_match_triton_dispatch_bit_for_bit(context, monkeypatch):
             device="cuda",
             implementation="fused",
         )
-        lease = store.reserve("r", 0, rows, generation=1)
+        lease = store.reserve("r", 0, rows)
         owners = [(lease, row) for row in range(rows)]
         outputs = []
         # Layers 0, 1, 16 and 17 differ in Triton's integer specialization.
@@ -128,7 +128,7 @@ def test_consume_scratch_follows_the_head_dimension(monkeypatch):
             device="cuda",
             implementation="fused",
         )
-        lease = store.reserve("r", 0, rows, generation=1)
+        lease = store.reserve("r", 0, rows)
         owners = [(lease, row) for row in range(rows)]
         for mode in (CAPTURE, CONSUME):
             plan = store.build_plan(owners, [mode] * rows, key_retention=0.25)
@@ -190,7 +190,7 @@ def test_fused_capture_and_consume_track_batched_path(retention, ties, split):
         )
         for implementation in ("batched", "fused")
     ]
-    leases = [store.reserve("fused", 0, rows, generation=1) for store in stores]
+    leases = [store.reserve("fused", 0, rows) for store in stores]
     owners = [[(lease, row) for row in range(rows)] for lease in leases]
     q, keys, values, tables = _paged(
         rows, heads, kv_heads, dim, pages, block_size, torch.float32, 1
@@ -298,7 +298,7 @@ def test_fused_radix_selection_keeps_oracle_ties_on_repeated_scores(retention):
         for implementation in ("batched", "fused")
     ]
     for store in stores:
-        lease = store.reserve("ties", 0, rows, generation=1)
+        lease = store.reserve("ties", 0, rows)
         plan = store.build_plan(
             [(lease, r) for r in range(rows)], [CAPTURE] * rows, key_retention=retention
         )
@@ -367,7 +367,7 @@ def test_fused_parallel_select_matches_batched_across_many_parts(
     ]
     leases = []
     for store in stores:
-        lease = store.reserve("parts", 0, rows, generation=1)
+        lease = store.reserve("parts", 0, rows)
         leases.append(lease)
         plan = store.build_plan(
             [(lease, r) for r in range(rows)], [CAPTURE] * rows, key_retention=retention
@@ -412,7 +412,7 @@ def test_fused_split_capture_is_the_dense_backend_output_bit_for_bit(dtype):
         device="cuda",
         implementation="fused",
     )
-    lease = store.reserve("split", 0, rows, generation=1)
+    lease = store.reserve("split", 0, rows)
     plan = store.build_plan([(lease, r) for r in range(rows)], [CAPTURE] * rows, key_retention=0.1)
     out = sparse_paged_attention(
         q, keys, values, tables, lengths, plan, layer=0, dense_attention=backend
@@ -449,7 +449,7 @@ def test_fused_bf16_consume_matches_scalar_oracle_within_rounding():
             device="cuda",
             implementation=implementation,
         )
-        lease = store.reserve("bf16", 0, rows, generation=1)
+        lease = store.reserve("bf16", 0, rows)
         owner = [(lease, row) for row in range(rows)]
         for modes in ([CAPTURE] * rows, [CONSUME] * rows):
             plan = store.build_plan(owner, modes, key_retention=0.1)
@@ -474,7 +474,7 @@ def test_fused_consume_without_capture_is_nan_not_silent():
     store = make_store(
         slots=rows, layers=1, heads=heads, head_dim=dim, device="cuda", implementation="fused"
     )
-    lease = store.reserve("missing", 0, rows, generation=1)
+    lease = store.reserve("missing", 0, rows)
     plan = store.build_plan([(lease, 0), (lease, 1)], [CONSUME, CONSUME], key_retention=0.5)
     q, keys, values, tables = _paged(rows, heads, heads, dim, 2, 16, torch.float32, 4)
     lengths = torch.tensor([0, 9], device="cuda", dtype=torch.int32)
