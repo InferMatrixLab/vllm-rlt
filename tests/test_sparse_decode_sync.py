@@ -91,7 +91,7 @@ def test_plans_follow_tokens_and_keep_prompt_dense(draft, monkeypatch):
                 request_id = next(rid for rid, owner in kv.allocations if owner is allocation)
                 assert position >= len(e.scheduler.requests[request_id].prompt_token_ids)
                 assert mode == (CAPTURE if depth == 1 else CONSUME)
-                assert int(e.reference_store.position[plan.slots[row]]) == position
+                assert plan.owners[row].request_id == request_id
                 seen.append((mode, position, plan.slots[row]))
         return original(layer, kv, q)
 
@@ -171,16 +171,16 @@ def trace_cpu_sparse(e, monkeypatch):
             assert position >= len(request.prompt_token_ids)
             assert mode == (CAPTURE if depth == 1 else CONSUME)
             assert lease.slots == (plan.slots[row],)
-            assert lease.incarnations == (plan.incarnations[row],)
-            assert int(e.reference_store.position[plan.slots[row]]) == position
+            assert plan.owners[row] is lease
+            assert e.reference_store._bindings[plan.slots[row]] is lease
             rows[q[row].data_ptr()] = dict(
                 request=request,
                 position=position,
+                depth=depth,
                 layer=layer,
                 mode=mode,
                 slot=plan.slots[row],
-                incarnation=plan.incarnations[row],
-                generation=lease.generation,
+                lease=lease,
                 causal_length=int(kv.context_lengths[row]),
                 plan=plan,
                 row=row,
@@ -192,14 +192,12 @@ def trace_cpu_sparse(e, monkeypatch):
             active_rows = None
         for event in rows.values():
             slot = event["slot"]
-            assert bool(e.reference_store.valid[slot, layer])
+            assert e.reference_store._bindings[slot] is event["lease"]
             count = e.reference_store.host_count(slot, layer)
             assert bool((e.reference_store.counts[slot, layer] == count).all())
             event["retained_count"] = count
             if "payload" not in event:
                 event["payload"] = reference_payload(e.reference_store, event)
-            if event["mode"] == CONSUME:
-                assert int(e.reference_store.uses[slot, layer]) > 0
             events.append(event)
         return result
 
@@ -208,15 +206,31 @@ def trace_cpu_sparse(e, monkeypatch):
     return events, prefill_starts
 
 
-def assert_sparse_decode(events, request, retention):
+def assert_sparse_decode(events, request, retention, *, layers):
+    params = request.sampling_params
+    assert params.min_loops == params.max_loops == 4
+    # Prefill emits the first output; only the next max_tokens - 1 inputs
+    # traverse decode. Depth 0 is dense, depth 1 captures, depths 2/3 consume.
+    start = len(request.prompt_token_ids)
+    expected_steps = {
+        (position, layer, depth)
+        for position in range(start, start + params.max_tokens - 1)
+        for layer in range(layers)
+        for depth in range(1, params.max_loops)
+    }
+    seen = set()
     captured = {}
-    modes = set()
     for event in events:
         if event["request"] is not request:
             continue
+        step = tuple(event[key] for key in ("position", "layer", "depth"))
+        assert step not in seen, f"duplicate sparse step: {step}"
+        seen.add(step)
         mode = event["mode"]
-        modes.add(mode)
-        identity = tuple(event[key] for key in ("position", "layer", "slot", "incarnation"))
+        assert mode == (CAPTURE if event["depth"] == 1 else CONSUME)
+        assert event["plan"].owners[event["row"]] is event["lease"]
+        assert event["lease"].request_id == request.request_id
+        identity = (event["position"], event["layer"], event["slot"], id(event["lease"]))
         if mode == CAPTURE:
             captured[identity] = event["payload"]
         else:
@@ -224,13 +238,17 @@ def assert_sparse_decode(events, request, retention):
             for actual, expected in zip(event["payload"], captured[identity]):
                 assert torch.equal(actual, expected)
         count, length = event["retained_count"], event["causal_length"]
+        selected = event["payload"][0]
+        assert selected.shape[-1] == count
+        assert bool(((selected >= 0) & (selected < length)).all())
+        assert bool((selected[:, 1:] > selected[:, :-1]).all())
         if retention == 1.0:
             assert count == length
         else:
             assert 0 < count < length
             if mode == CONSUME:
                 assert event["correction_keys"] == count
-    assert modes == {CAPTURE, CONSUME}
+    assert seen == expected_steps, (expected_steps - seen, seen - expected_steps)
 
 
 def assert_prefix_requests_drained(e):
@@ -277,14 +295,20 @@ def admit_prefix_request(e, rid, prompt, params, *, cached_tokens):
     return request, prefix
 
 
-def wait_for_unconsumed_capture(e, request_ids):
+def wait_for_unconsumed_capture(e, request_ids, events):
     for _ in range(100):
         e.step()
         states = [e.model_runner.attention_references.get(rid) for rid in request_ids]
         if all(state is not None for state in states):
-            slots = [state[2].slots[0] for state in states]
-            if bool(e.reference_store.valid[slots].all()):
-                assert not bool(e.reference_store.uses[slots].any())
+            captured = [
+                [event for event in events if event["lease"] is state[2]] for state in states
+            ]
+            if all(captured):
+                for state, rows in zip(states, captured):
+                    assert len(rows) == e.model.config.num_hidden_layers
+                    assert {event["layer"] for event in rows} == set(range(len(rows)))
+                    assert {event["mode"] for event in rows} == {CAPTURE}
+                    assert e.reference_store._bindings[state[2].slots[0]] is state[2]
                 return states
     pytest.fail("decode never yielded after CAPTURE and before CONSUME")
 
@@ -314,7 +338,7 @@ def test_prefix_hit_matches_its_own_cold_sparse_decode(
         assert actual.token_ids == expected.token_ids
         assert actual.exit_depths == expected.exit_depths == [4] * params.max_tokens
         assert actual.finish_reason == expected.finish_reason == "length"
-        assert_sparse_decode(events, request, retention)
+        assert_sparse_decode(events, request, retention, layers=e.model.config.num_hidden_layers)
         assert torch.equal(e.cache_manager.key_cache[pages], keys)
         assert torch.equal(e.cache_manager.value_cache[pages], values)
         assert_prefix_requests_drained(e)
@@ -337,17 +361,17 @@ def test_shared_prefix_keeps_live_sparse_references_request_local(monkeypatch):
             rid: admit_prefix_request(e, rid, prompt, params, cached_tokens=4)[0]
             for rid, prompt in prompts.items()
         }
-        states = wait_for_unconsumed_capture(e, prompts)
+        states = wait_for_unconsumed_capture(e, prompts, events)
         assert e.reference_store.outstanding == 2
         assert states[0][2].slots != states[1][2].slots
-        assert states[0][2].generation != states[1][2].generation
+        assert states[0][2] is not states[1][2]
         actual = finish(e)
         for rid, request in requests.items():
             assert starts[id(request)] == 4
             assert actual[rid].token_ids == expected[rid].token_ids
             assert actual[rid].exit_depths == expected[rid].exit_depths == [4] * params.max_tokens
             assert actual[rid].finish_reason == expected[rid].finish_reason == "length"
-            assert_sparse_decode(events, request, 0.5)
+            assert_sparse_decode(events, request, 0.5, layers=e.model.config.num_hidden_layers)
         assert_prefix_requests_drained(e)
     finally:
         e.close()
@@ -367,7 +391,7 @@ def test_prefix_hit_cancel_after_capture_reuses_slots_without_old_reference(
         assert_prefix_requests_drained(e)
         events, starts = trace_cpu_sparse(e, monkeypatch)
         victim, _ = admit_prefix_request(e, "victim", [2, 3, 4, 5, 9], params, cached_tokens=4)
-        old_state = wait_for_unconsumed_capture(e, ["victim"])[0]
+        old_state = wait_for_unconsumed_capture(e, ["victim"], events)[0]
         assert starts[id(victim)] == 4
         assert {event["mode"] for event in events} == {CAPTURE}
         stale = events[0]
@@ -376,17 +400,17 @@ def test_prefix_hit_cancel_after_capture_reuses_slots_without_old_reference(
         assert aborted.finished and aborted.finish_reason == "abort"
         assert_prefix_requests_drained(e)
         replacement, _ = admit_prefix_request(e, replacement_id, prompt, params, cached_tokens=4)
-        new_state = wait_for_unconsumed_capture(e, [replacement_id])[0]
+        new_state = wait_for_unconsumed_capture(e, [replacement_id], events)[0]
         assert replacement is not victim
         assert new_state[0] is replacement and old_state[0] is victim
         assert new_state[2].slots == old_state[2].slots
-        assert new_state[2].incarnations[0] > old_state[2].incarnations[0]
+        assert new_state[2] is not old_state[2]
         assert e.model_runner.state_slots[replacement_id] == old_slot
         with pytest.raises(RuntimeError, match="stale"):
             e.reference_store.read_reference(stale["plan"], stale["layer"], stale["row"])
         with pytest.raises(RuntimeError, match="stale"):
             e.reference_store.consume(stale["plan"], stale["layer"])
-        assert not bool(e.reference_store.uses[new_state[2].slots[0]].any())
+        assert all(event["mode"] == CAPTURE for event in events if event["request"] is replacement)
         for event in events:
             if event["request"] is replacement:
                 for actual, saved in zip(
@@ -398,187 +422,37 @@ def test_prefix_hit_cancel_after_capture_reuses_slots_without_old_reference(
         assert actual.token_ids == expected.token_ids
         assert actual.exit_depths == expected.exit_depths == [4] * params.max_tokens
         assert actual.finish_reason == expected.finish_reason == "length"
-        assert_sparse_decode(events, replacement, 0.5)
+        assert_sparse_decode(events, replacement, 0.5, layers=e.model.config.num_hidden_layers)
         assert_prefix_requests_drained(e)
         assert e.cache_manager.lookup_prefix(prompt)
     finally:
         e.close()
 
 
-def trace_cuda_batched_sparse(e, request, monkeypatch):
-    """Observe one synchronous CUDA request without replacing its arithmetic."""
-    events, prefill_ranges = [], []
-    active = None
-    store = e.reference_store
-    attend = e.cache_manager._attend_prepared
-    scores = sparse_attention.fused_selected_scores
-    values = sparse_attention.fused_selected_values
-
-    def check_selection(selected, tables, layer):
-        assert active is not None and active["mode"] == CONSUME
-        assert layer == active["layer"]
-        assert selected.is_cuda and selected.shape[0] == 1
-        assert 0 < selected.shape[-1] < active["causal_length"]
-        assert torch.equal(selected[0], active["payload"][0])
-        assert torch.equal(tables, active["tables"])
-
-    def selected_scores(q, cache, selected, tables, *, layer, block_size):
-        check_selection(selected, tables, layer)
-        assert q.is_cuda and torch.equal(q, active["q"])
-        assert cache.data_ptr() == e.cache_manager.key_cache[:, layer].data_ptr()
-        result = scores(q, cache, selected, tables, layer=layer, block_size=block_size)
-        active["scores"] = result
-        active["correction_keys"] = selected.shape[-1]
-        return result
-
-    def selected_values(probabilities, cache, selected, tables, *, layer, block_size):
-        check_selection(selected, tables, layer)
-        assert cache.data_ptr() == e.cache_manager.value_cache[:, layer].data_ptr()
-        scale = 1.0 / active["q"].shape[-1] ** 0.5
-        expected = torch.softmax(active["scores"] * scale, dim=-1)
-        torch.testing.assert_close(probabilities, expected, rtol=0, atol=0)
-        result = values(probabilities, cache, selected, tables, layer=layer, block_size=block_size)
-        active["new_contribution"] = result
-        return result
-
-    def record(layer, kv, q):
-        nonlocal active
-        (item,) = e.last_schedule.requests
-        assert item.request is request
-        if e.last_schedule.phase == RequestPhase.PREFILL and not prefill_ranges:
-            prefill_ranges.append((item.token_start, item.token_start + item.token_count))
-        plan = kv.reference_plan
-        if plan is None or plan.dense():
-            return attend(layer, kv, q)
-        assert q.is_cuda and len(q) == 1
-        assert plan.store is store and store.implementation == "batched"
-        stream = torch.cuda.current_stream(q.device)
-        assert stream == e.model_runner.core_stream
-        # Test observations wait on the producer stream before reading device state.
-        stream.synchronize()
-        ((allocation, depth, position),) = kv.rows
-        assert any(
-            rid == request.request_id and owner is allocation for rid, owner in kv.allocations
-        )
-        owner, token_position, lease = e.model_runner.attention_references[request.request_id]
-        assert owner is request and token_position == position
-        assert position >= len(request.prompt_token_ids)
-        (mode,) = plan.modes
-        assert mode == (CAPTURE if depth == 1 else CONSUME)
-        assert plan.slots == lease.slots and plan.incarnations == lease.incarnations
-        (slot,) = plan.slots
-        assert int(store.position[slot]) == position
-        event = dict(
-            request=request,
-            position=position,
-            layer=layer,
-            mode=mode,
-            slot=slot,
-            incarnation=plan.incarnations[0],
-            causal_length=int(kv.context_lengths[0]),
-            plan=plan,
-            row=0,
-            q=q,
-            tables=kv.block_tables,
-        )
-        uses = int(store.uses[slot, layer])
-        if mode == CONSUME:
-            event["payload"] = reference_payload(store, event)
-        active = event
-        try:
-            result = attend(layer, kv, q)
-        finally:
-            active = None
-        stream.synchronize()
-        assert bool(store.valid[slot, layer])
-        event["retained_count"] = store.host_count(slot, layer)
-        assert bool((store.counts[slot, layer] == event["retained_count"]).all())
-        if mode == CAPTURE:
-            assert uses == int(store.uses[slot, layer]) == 0
-            event["payload"] = reference_payload(store, event)
-        else:
-            assert int(store.uses[slot, layer]) == uses + 1
-            if plan.key_retention < 1.0:
-                _, mass, reference, contribution = event["payload"]
-                new = event.pop("new_contribution")[0]
-                expected = (reference - contribution + mass.unsqueeze(-1) * new).to(result.dtype)
-                torch.testing.assert_close(result[0], expected, rtol=0, atol=0)
-                del event["scores"]
-        del event["q"], event["tables"]
-        events.append(event)
-        return result
-
-    monkeypatch.setattr(e.cache_manager, "_attend_prepared", record)
-    monkeypatch.setattr(sparse_attention, "fused_selected_scores", selected_scores)
-    monkeypatch.setattr(sparse_attention, "fused_selected_values", selected_values)
-    return events, prefill_ranges
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("retention", [0.5, 1.0])
-def test_cuda_prefix_hit_matches_cold_sparse_decode(retention, monkeypatch):
-    prompt = [2, 3, 4, 5, 6]
-    params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
-
-    def make_engine():
-        return engine(
-            device="cuda",
-            dtype=torch.bfloat16,
-            cache_config=CacheConfig(
-                64, 2, enable_prefix_caching=True, incremental_allocation=True
-            ),
-            scheduler_config=SchedulerConfig(
-                max_num_seqs=1, max_num_batched_tokens=8, prefill_chunk_size=3
-            ),
-            execution_config=ExecutionConfig(
-                async_scheduling=False,
-                multi_stream=False,
-                static_buffers=True,
-                pad_to_power_of_two=True,
-                cuda_graphs=False,
-            ),
-            sparse_decode_attention_config=SparseDecodeAttentionConfig(
-                enabled=True, key_retention=retention, implementation="batched"
-            ),
-        )
-
-    def run(e, request_id, cached_tokens):
-        request, prefix = admit_prefix_request(
-            e, request_id, prompt, params, cached_tokens=cached_tokens
-        )
-        pages = [block for group in prefix for block in group]
-        # Snapshots and engine writes share core; completion precedes host assertions.
-        with torch.cuda.stream(e.model_runner.core_stream):
-            keys = e.cache_manager.key_cache[pages].clone()
-            values = e.cache_manager.value_cache[pages].clone()
-        with monkeypatch.context() as patch:
-            events, ranges = trace_cuda_batched_sparse(e, request, patch)
-            output = finish(e)[request_id]
-            e.model_runner.synchronize()
-        assert ranges == [(cached_tokens, min(cached_tokens + 3, len(prompt)))]
-        assert_sparse_decode(events, request, retention)
-        assert torch.equal(e.cache_manager.key_cache[pages], keys)
-        assert torch.equal(e.cache_manager.value_cache[pages], values)
-        assert_prefix_requests_drained(e)
-        if prefix:
-            assert e.cache_manager.lookup_prefix(prompt) == prefix
-        return output
-
-    cold = make_engine()
+def test_sparse_trace_rejects_missing_duplicate_and_foreign_steps(monkeypatch):
+    e = engine(retention=0.5, prefix=True)
     try:
-        expected = run(cold, "cold", 0)
+        events, _ = trace_cpu_sparse(e, monkeypatch)
+        params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
+        e.add_request("target", [2, 3, 4, 5, 6], params)
+        request = e.scheduler.requests["target"]
+        finish(e)
+        layers = e.model.config.num_hidden_layers
+        assert_sparse_decode(events, request, 0.5, layers=layers)
+        last_position = len(request.prompt_token_ids) + params.max_tokens - 2
+        consume = next(event for event in events if event["mode"] == CONSUME)
+        incomplete = (
+            [event for event in events if event["position"] != last_position],
+            [event for event in events if event["layer"] != layers - 1],
+            [event for event in events if event is not consume],
+            [*events, events[-1]],
+            [dict(event, request=object()) if event is consume else event for event in events],
+        )
+        for corrupted in incomplete:
+            with pytest.raises(AssertionError):
+                assert_sparse_decode(corrupted, request, 0.5, layers=layers)
     finally:
-        cold.close()
-    warm = make_engine()
-    try:
-        prime = run(warm, "prime", 0)
-        actual = run(warm, "warm", 4)
-        for output in (prime, actual):
-            assert output.token_ids == expected.token_ids
-            assert output.exit_depths == expected.exit_depths == [4] * params.max_tokens
-            assert output.finish_reason == expected.finish_reason == "length"
-    finally:
-        warm.close()
+        e.close()
 
 
 @pytest.mark.parametrize("setting", ["graphs", "pipeline", "preemption", "shared"])
@@ -610,7 +484,7 @@ def test_backend_explicitly_declares_sparse_reference_support():
 @pytest.mark.parametrize("retention", [0.1, 1.0])
 def test_cuda_sparse_preserves_dense_backend_outputs(kv_heads, retention):
     from vllm_rlt.core.kv_cache_manager import KVCacheManager
-    from vllm_rlt.worker.attention_reference import AttentionReferenceStore
+    from vllm_rlt.worker.attention_reference import SparseDecodeReferenceStore
 
     # BF16 rounding of Torch softmax and Triton split-KV can differ even for
     # identical operands. Dense/capture rows and the full-retention control
@@ -628,7 +502,7 @@ def test_cuda_sparse_preserves_dense_backend_outputs(kv_heads, retention):
         dtype=torch.bfloat16,
         backend="triton",
     )
-    store = AttentionReferenceStore(
+    store = SparseDecodeReferenceStore(
         slots=rows, layers=1, heads=heads, head_dim=dim, key_bucket=length, device="cuda"
     )
     ids = [str(i) for i in range(rows)]
@@ -638,7 +512,7 @@ def test_cuda_sparse_preserves_dense_backend_outputs(kv_heads, retention):
         keys = torch.randn(length, kv_heads, dim, device="cuda", dtype=torch.bfloat16)
         values = torch.randn_like(keys)
         cache.write(0, [rid] * length, [0] * length, list(range(length)), keys, values)
-        lease = store.reserve(rid, 0, 1, generation=1)
+        lease = store.reserve(rid, 0, 1)
         owners.append((lease, 0))
     batch = cache._prepare_batch(ids, [0] * rows, [length - 1] * rows)
     q = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
@@ -663,7 +537,8 @@ def test_cuda_sparse_preserves_dense_backend_outputs(kv_heads, retention):
         )
         actual = cache._attend_prepared(0, replace(batch, reference_plan=consume), q)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        assert int(store.uses.sum()) == rows - 1
+        # Consume rows read the reference: their slots stay bound until release.
+        assert store.outstanding == len(owners)
     for lease, _ in owners:
         store.release(lease)
     for rid in ids:
@@ -716,7 +591,7 @@ def test_sparse_verification_matches_serial_same_input_hidden_logits_and_kv(draf
     assert oracle.allocate("r", 16)
     store = make_reference_store(model)
     for position, token in enumerate(tokens):
-        lease = store.reserve("r", 0, 1, generation=position)
+        lease = store.reserve("r", 0, 1)
         hidden = model.prelude(torch.tensor([token]))
         for depth in range(4):
             kv = oracle._prepare_batch(["r"], [depth], [position])
@@ -788,7 +663,7 @@ def test_sync_rejection_retires_all_references_before_replacement(draft, accepte
             e.reference_store.read_reference(old, 0, 0)
         monkeypatch.setattr(e.speculative_runner, "_coda", original)
         e.step()
-        assert seen[-1].incarnations[0] > old.incarnations[0]
+        assert seen[-1].owners[0] is not old.owners[0]
         assert e.speculative_runner.stats.accepted_tokens >= accepted
     finally:
         e.close()

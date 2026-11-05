@@ -17,9 +17,9 @@ from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import RequestPhase
 from vllm_rlt.serving.worker import EngineWorker
 from vllm_rlt.worker.async_speculative import (
+    AsyncSpeculativeOutput,
     AsyncSpeculativeRunner,
     SpeculativeRequestState,
-    SpeculativeRoundTicket,
 )
 
 
@@ -105,7 +105,7 @@ def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True
             host_result=host,
         )
         tickets.append(
-            SpeculativeRoundTicket(
+            AsyncSpeculativeOutput(
                 SchedulerOutput(RequestPhase.SPECULATIVE, [scheduled_request]),
                 buffer,
                 (state,),
@@ -382,7 +382,7 @@ def test_ticket_result_format_does_not_depend_on_statistics(mode, with_stats):
         host_result=torch.tensor(values), copy_done=Completion(), leased=True, keepalive=[]
     )
     stats = SpeculativeStats() if with_stats else None
-    ticket = SpeculativeRoundTicket(batch, buffer, (), (), 2, mode=mode, stats=stats)
+    ticket = AsyncSpeculativeOutput(batch, buffer, (), (), 2, mode=mode, stats=stats)
     result = ticket.collect()
     assert result.speculative[0].token_ids == [11]
     assert result.speculative[0].accepted_count == 0

@@ -42,7 +42,7 @@ def test_batched_ragged_gqa_matches_scalar_oracle(
         )
         for implementation in range(2)
     ]
-    leases = [store.reserve("test", 0, rows, generation=1) for store in stores]
+    leases = [store.reserve("test", 0, rows) for store in stores]
     implementations = [reference_paged_attention, batched_paged_attention]
     for modes in ([CAPTURE] * rows, [DENSE, CAPTURE, CONSUME, CONSUME, DENSE, CONSUME]):
         results = []
@@ -69,7 +69,7 @@ def test_batched_ragged_gqa_matches_scalar_oracle(
         capacity = stores[1].selected.shape[-1]
         assert torch.equal(stores[0].selected[..., :capacity], stores[1].selected)
         assert not torch.count_nonzero(stores[0].selected[..., capacity:])
-        for name in ("counts", "valid", "uses"):
+        for name in ("counts",):
             assert torch.equal(getattr(stores[0], name), getattr(stores[1], name)), name
         for name in ("mass", "output", "contribution"):
             torch.testing.assert_close(
@@ -85,7 +85,7 @@ def test_batched_ragged_gqa_matches_scalar_oracle(
 
 def test_batched_rejects_missing_and_stale_reference():
     store = make_store(slots=1, layers=1, heads=2, head_dim=4)
-    lease = store.reserve("test", 0, 1, generation=1)
+    lease = store.reserve("test", 0, 1)
     plan = store.build_plan([(lease, 0)], [CONSUME], key_retention=0.1)
     args = (
         torch.ones(1, 2, 4),
@@ -98,7 +98,7 @@ def test_batched_rejects_missing_and_stale_reference():
     with pytest.raises(RuntimeError, match="no captured reference"):
         batched_paged_attention(*args, layer=0)
     store.release(lease)
-    store.reserve("test", 0, 1, generation=2)
+    store.reserve("test", 0, 1)
     with pytest.raises(RuntimeError, match="stale attention reference"):
         batched_paged_attention(*args, layer=0)
 
@@ -114,7 +114,7 @@ def test_reference_growth_preserves_live_layers_and_budget(device):
         initial_key_capacity=2,
         device=device,
     )
-    leases = [store.reserve(str(i), i, 1, generation=1) for i in range(2)]
+    leases = [store.reserve(str(i), i, 1) for i in range(2)]
     plans = [store.build_plan([(lease, 0)], [CAPTURE], key_retention=1.0) for lease in leases]
     # Simulate queued work on the runner's owner stream before reallocating.
     if device == "cuda":

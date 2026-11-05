@@ -23,7 +23,7 @@ from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
-from vllm_rlt.worker.attention_reference import AttentionReferenceStore
+from vllm_rlt.worker.attention_reference import SparseDecodeReferenceStore
 from vllm_rlt.worker.executor import Executor
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
@@ -183,7 +183,7 @@ class StageEngine:
                         f"{free_bytes / 1024**3:.1f} GiB is free; lower "
                         f"key_retention or num_speculative_tokens"
                     )
-            self.reference_store = AttentionReferenceStore(
+            self.reference_store = SparseDecodeReferenceStore(
                 slots=slots,
                 layers=config.num_hidden_layers,
                 heads=config.num_attention_heads,
@@ -425,8 +425,12 @@ class StageEngine:
         ) and params.temperature != 0:
             mode = "async" if self.async_speculative else "pipeline"
             raise ValueError(f"{mode} speculative decoding currently requires greedy sampling")
-        if request_id in self._retiring_speculative:
-            self._retire_speculative(wait=True, request_id=request_id)
+        # A request id is never reused while its previous token is retiring:
+        # reference slots are recycled only after their last reader completed,
+        # so rejecting the duplicate keeps ownership unambiguous without a
+        # per-slot generation counter.
+        if request_id in self._retiring_speculative or request_id in self.scheduler.requests:
+            raise ValueError(f"duplicate request ID {request_id!r}: already live or still retiring")
         config = self.model.config
         if not prompt_token_ids:
             raise ValueError("prompt must contain at least one token")

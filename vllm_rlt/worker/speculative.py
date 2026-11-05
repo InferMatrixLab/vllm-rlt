@@ -164,7 +164,6 @@ class SpeculativeRunner:
         self.compute_stream = compute_stream
         self.reference_store = reference_store
         self.sparse_decode_config = sparse_decode_config
-        self.reference_generation = 0
         self.submissions = SubmissionQueue()
         self.input_buffers = {
             dtype: StagedInputTensor(dtype, self.device, use_uva=execution.use_uva)
@@ -252,7 +251,6 @@ class SpeculativeRunner:
             plan = self.reference_store.build_plan(
                 owners, modes, key_retention=self.sparse_decode_config.key_retention
             )
-            self.reference_store.bind_positions(plan, kv.position_ids)
             result.append(replace(kv, reference_plan=plan))
         return tuple(result)
 
@@ -295,14 +293,10 @@ class SpeculativeRunner:
                 references = []
                 try:
                     if self.reference_store is not None:
-                        self.reference_generation += 1
                         for index, span in enumerate(batch.requests):
                             references.append(
                                 self.reference_store.reserve(
-                                    span.request.request_id,
-                                    index,
-                                    span.token_count,
-                                    self.reference_generation,
+                                    span.request.request_id, index, span.token_count
                                 )
                             )
                     if self.config.mode == "pipeline":

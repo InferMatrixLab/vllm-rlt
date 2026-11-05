@@ -169,7 +169,6 @@ class ModelRunner:
         self.reference_store = reference_store
         self.sparse_decode_config = sparse_decode_config
         self.attention_references = {}
-        self.reference_generation = 0
         self.metadata = cache_manager.metadata_builder
         self.runtime = ModelRuntime(self.model, cache_manager)
         parameter = next(model.parameters())
@@ -1081,10 +1080,7 @@ class ModelRunner:
                 state = None
             if mode == CAPTURE:
                 if state is None:
-                    self.reference_generation += 1
-                    lease = self.reference_store.reserve(
-                        request.request_id, 0, 1, self.reference_generation
-                    )
+                    lease = self.reference_store.reserve(request.request_id, 0, 1)
                     state = (request, position, lease)
                     self.attention_references[request.request_id] = state
             if state is None:
@@ -1099,7 +1095,6 @@ class ModelRunner:
         plan = self.reference_store.build_plan(
             owners, modes, key_retention=self.sparse_decode_config.key_retention
         )
-        self.reference_store.bind_positions(plan, kv.position_ids)
         return replace(kv, reference_plan=plan)
 
     def _load_hidden(self, batch, prepared, workspace, size):
