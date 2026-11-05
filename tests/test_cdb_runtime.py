@@ -8,6 +8,7 @@ import torch
 from tests.helpers import LocalLLM as LLM
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.config import resolve_cuda_graph_rows
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import budget_blocks
 from vllm_rlt.engine.llm_engine import LLMEngine
@@ -597,7 +598,9 @@ def test_cuda_dynamic_async_respects_buffers_and_matches_sync(layout, multi_stre
     expected = LLM(base, **common).generate(prompts, params)
     execution = ExecutionConfig(async_scheduling=True, multi_stream=multi_stream)
     actual = LLM(base, execution_config=execution, **common)
-    assert actual.engine.execution_config == execution
+    assert actual.engine.execution_config == resolve_cuda_graph_rows(
+        execution, common["scheduler_config"]
+    )
     assert actual.engine.model_runner.requestspaces == {}
     assert actual.engine.model_runner.states is actual.engine.model_runner.async_state.hidden
     result = actual.generate(prompts, params)
