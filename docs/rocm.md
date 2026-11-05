@@ -48,8 +48,11 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 
 | Feature | ROCm | Notes |
 | --- | --- | --- |
-| Ouro-1.4B, Ouro-2.6B | Yes | BF16, native checkpoint loading |
+| Ouro-1.4B | Yes | Full validation and A/B benchmark |
+| Ouro-2.6B | Smoke | Shared Ouro loader; not separately qualified |
+| Ouro-1.4B/2.6B-Thinking | Shared path | Reuses Ouro; not separately qualified on ROCm |
 | Nanbeige4.2-3B | Yes | Two-loop inference |
+| Huginn-0125 | Smoke | Synchronous fixed-depth, LAST_EXITED KV |
 | Triton paged attention | Yes | Decode and prefill |
 | Torch reference attention | Yes | Correctness fallback |
 | FlashAttention 2/3/4 | No | NVIDIA-only kernels |
@@ -57,7 +60,13 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | CUDA Graph replay | Yes | Triton backend, static buffers |
 | Multi-stream execution | Yes | `multi_stream` |
 | UVA host metadata | Yes (probed) | `hipHostGetDevicePointer` must equal the host address |
-| Packed prefill / `prefill_uva` | No | FA4-specific; ROCm uses per-row prefill |
+| Packed prefill / `prefill_uva` | Yes (Triton) | Single-sequence validated; multi-sequence packed is not qualified |
+| Wavefront chunked prefill | Yes | `--wavefront-chunked-prefill` |
+| Prefix cache | Yes | `enable_prefix_caching=True` |
+| Preemption and recovery | Yes | `enable_preemption=True`, async recovery |
+| Token pipeline | Yes | `SpeculativeConfig(mode="pipeline")` |
+| Synchronous self-speculation | Yes | Block mode, fixed depth |
+| Asynchronous self-speculation | Yes | Async suite coverage |
 | PD (prefill/decode split) | Not validated | Depends on the NIXL/UCX transport |
 | HTTP serving | Yes | `/v1/completions` |
 
@@ -82,9 +91,35 @@ Configuration: `--attention-backend triton --async-scheduling --static-buffers
 128 --max-num-batched-tokens 16384`. Numbers are one run, not a benchmark
 contract; the first request includes Triton compilation.
 
+### Feature A/B
+
+One Ouro-1.4B run per cell on the same MI350X. Short context is an 80-token
+prompt with 64 output tokens; long context is a 1000-token prompt with 16
+output tokens. Values are output tokens/s for short context and prefill
+tokens/s for long context. `baseline` uses Triton without the feature flags.
+
+| Config | short b1 | short b32 | short b128 | long b8 prefill |
+| --- | ---: | ---: | ---: | ---: |
+| baseline | 7 | 205 | 580 | 1162 |
+| async | 7 | 224 | 581 | 1158 |
+| graphs | 8 | 201 | 511 | 1076 |
+| static | 7 | 226 | 596 | 938 |
+| uva | 7 | 212 | 565 | 1159 |
+| packed (`prefill_uva`) | 8 | 192 | 556 | 931 |
+| wcpb | 7 | 228 | 562 | 1046 |
+| prefix cache | 6 | 214 | 613 | 1292 |
+| sync self-speculation | 8 | 242 | 615 | 1205 |
+| all features | 7 | 216 | 763 | 1128 |
+
+The single-feature effects are small at this model and workload size. The
+all-features configuration is 1.31x at short context with 128 concurrent
+requests; graph replay and packed prefill are slightly slower in isolation
+because capture and varlen setup dominate a 24-layer, four-loop model.
+These numbers describe one device and are not a general performance claim.
+
 The CPU regression suite passes unchanged on ROCm. GPU tests use the same
-`--run-gpu` flag; FlashAttention, packed-prefill and multi-GPU PD tests skip
-because those implementations or devices are unavailable.
+`--run-gpu` flag; FlashAttention, FA4-specific packed-prefill and multi-GPU PD tests
+skip because those implementations or devices are unavailable.
 
 ## Troubleshooting
 
