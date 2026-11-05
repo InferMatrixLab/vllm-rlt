@@ -60,12 +60,12 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | CUDA Graph replay | Yes | Triton backend, static buffers |
 | Multi-stream execution | Yes | `multi_stream` |
 | UVA host metadata | Yes (probed) | `hipHostGetDevicePointer` must equal the host address |
-| Packed prefill / `prefill_uva` | Experimental | Kernel tests pass, but the engine greedy path diverges from per-row on a real Ouro prompt; excluded from `all` |
+| Packed prefill / `prefill_uva` | Opt-in | FP32 greedy matches per-row exactly; BF16 attention differs by <=0.0156 and greedy can diverge, so it stays out of `all` until an accuracy check |
 | Wavefront chunked prefill | Yes | `--wavefront-chunked-prefill` |
 | Prefix cache | Yes | `enable_prefix_caching=True` |
 | Priority scheduling | Yes | `priority=0` is highest; high-priority latency 7.80s → 2.22s |
 | Incremental KV | Yes | +3.8% at batch 64 |
-| Sparse decode (#157) | ROCm tests pass | 137 passed on the merged branch; not part of this PR |
+| Sparse decode (#157) | ROCm tests pass | `--sparse-decode-attention --sparse-decode-key-retention` on the #157 branch; 137 passed |
 | Preemption and recovery | Yes | `enable_preemption=True`, async recovery |
 | Token pipeline | Opt-in | 0.95x at 1.4B; **1.63x on Ouro-2.6B** (K2/draft1) |
 | Synchronous self-speculation | Opt-in | 0.51x at 1.4B; 1.18x on Ouro-2.6B (block K2/draft1) |
@@ -168,8 +168,9 @@ Speculation is model-dependent: it loses at 1.4B/24-layer but wins on Ouro-2.6B.
 Pipeline K2/draft1 reaches **814 tok/s vs 500 baseline (1.63x)** at batch 64,
 128 output tokens; K4/draft1 is 782 (1.56x) and block K2/draft1 is 591 (1.18x).
 Greedy token match against the non-speculative baseline was 0.797 mean on four
-prompts, so the speedup is approximate and needs a quality check before default
-use. At 1.4B, speculation is still a loss: draft/verify overhead exceeds the
+prompts. A 20-question GSM8K check gave 0/20 for both arms (the base checkpoint
+needs the repo's lm-eval recipe), so there is no measurable accuracy signal yet;
+the speedup stays opt-in and is not a default. At 1.4B, speculation is still a loss: draft/verify overhead exceeds the
 accepted-token gain, so it stays opt-in. Tuning did not recover it: with graphs
 and `cuda_graph_max_batch_size` covering verification rows, block K2 reached
 495 tok/s, block K1/draft1 629, and pipeline K4 792, all below the 999 baseline;
@@ -178,10 +179,10 @@ single win because it overlaps prefill chunks across recurrent depths.
 
 ### Not done on ROCm
 
-- **Packed prefill (`prefill_uva`)**: kernel unit tests match the Torch
-  reference, but the engine path produces different greedy tokens from per-row
-  on a real Ouro prompt even with UVA disabled and capability forced. It stays
-  opt-in and is excluded from `all`; the engine-side root cause is open.
+- **Packed prefill (`prefill_uva`)**: root cause located as BF16 accumulation,
+  not metadata: FP32 greedy output matches per-row exactly, while BF16
+  per-call attention differs by <=0.0156 and can flip greedy tokens. It stays
+  opt-in until an accuracy evaluation, and is excluded from `all`.
 - **PD/KV transfer**: needs two GPUs and a ROCm NIXL/UCX transport.
 - **KV quantization / INT4 residual cache**: not present on the current main
   runtime; tracked by RFC #156. Sparse decode from #157 passes its ROCm suites
