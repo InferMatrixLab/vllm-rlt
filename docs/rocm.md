@@ -74,8 +74,8 @@ requests with 64 output tokens each and an 80-token prompt:
 
 | Model | Output tokens/s | Requests/s |
 | --- | --- | --- |
-| Ouro-1.4B | 1176 | 18.4 |
-| Nanbeige4.2-3B | 1988 | 31.1 |
+| Ouro-1.4B | 855 | 13.4 |
+| Nanbeige4.2-3B | 1012 | 15.8 |
 
 Configuration: `--attention-backend triton --async-scheduling --static-buffers
 --pad-to-power-of-two --cuda-graphs --cuda-graph-max-graphs 64 --max-num-seqs
