@@ -207,6 +207,7 @@ class ModelRuntime:
                         batch.graphs.prepare_inputs(call, hidden)
                     hidden, gate = batch.graphs.execute(call, hidden)
                 else:
+                    self.cache.prepare_attention(kv)
                     hidden, gate = self.model.recurrent_prepared(
                         hidden, kv, self.cache, compute_gate=batch.compute_gate
                     )

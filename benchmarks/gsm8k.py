@@ -559,6 +559,8 @@ def run(args):
     import torch
     from transformers import AutoTokenizer
 
+    if getattr(args, "cuda_graphs", False) and args.backend != "native":
+        raise ValueError("--cuda-graphs applies to the native backend only")
     protocol = json.loads(Path(args.protocol).read_text())
     if (
         "baseline" in protocol
@@ -587,10 +589,14 @@ def run(args):
         raise ValueError("Checkpoint depth differs from the protocol")
     if not os.environ.get("CUDA_VISIBLE_DEVICES") or torch.cuda.device_count() != 1:
         raise RuntimeError("Run with one scheduler-assigned GPU")
+    attention_backend = getattr(args, "attention_backend", "triton")
+    cuda_graphs = getattr(args, "cuda_graphs", False)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
         "backend": args.backend,
+        "attention_backend": attention_backend,
+        "cuda_graphs": cuda_graphs,
         "protocol_sha256": file_digest(args.protocol),
         "source": source(),
         "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
@@ -609,7 +615,15 @@ def run(args):
     close_id = thinking_close_id(tokenizer) if scorer == SCORER_THINKING else None
     task = make_task(protocol["task_config"])
     start = time.monotonic()
-    generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"], exit_policy)
+    generator = Generator(
+        args.backend,
+        str(model),
+        tokenizer,
+        protocol["max_length"],
+        exit_policy,
+        attention_backend=attention_backend,
+        cuda_graphs=cuda_graphs,
+    )
     load_seconds = time.monotonic() - start
     rows = []
     try:
@@ -785,6 +799,12 @@ def main():
     )
     p = commands.add_parser("run")
     p.add_argument("--backend", choices=["transformers", "native"], required=True)
+    p.add_argument(
+        "--attention-backend",
+        choices=["torch", "triton", "flashinfer_fa2"],
+        default="triton",
+        help="Native backend's attention implementation",
+    )
     p.add_argument("--protocol", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--exit-mode", choices=["ouro", "ouro_delayed"], default="ouro")
@@ -796,6 +816,11 @@ def main():
     )
     p.add_argument("--min-loops", type=int, help="Required when --exit-threshold is below 1")
     p.add_argument("--async-scheduling", action="store_true", help="Native ouro_delayed only")
+    p.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        help="Native recurrent-core CUDA Graphs; recorded, not part of the baseline fingerprint",
+    )
     p = commands.add_parser("compare")
     p.add_argument("--transformers", "--reference", dest="transformers", required=True)
     p.add_argument("--native", "--candidate", dest="native", required=True)

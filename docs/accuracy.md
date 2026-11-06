@@ -198,6 +198,50 @@ The [Ouro evaluation settings](https://arxiv.org/html/2510.25741v5#A3.T16) do no
 pin the exact harness revision, demonstrations or token limits, so the settings
 above are explicit project choices rather than an exact paper reproduction.
 
+## Attention-backend runs
+
+`benchmarks.gsm8k run` accepts `--attention-backend {torch,triton,flashinfer_fa2}`
+for the native backend; the default stays `triton`. `--cuda-graphs` selects the
+native recurrent-core CUDA Graphs for that run. Both flags are recorded in the
+summary and do not change the frozen baseline fingerprint.
+
+On one L20 (SM89, torch 2.13.0, CUDA 13.0, FlashInfer 0.7.2.post1, Triton
+3.7.1), the default GSM8K-87 protocol (HF baseline 59/87) produced:
+
+| run | correct | accuracy | gate |
+|---|---:|---:|---|
+| triton | 61/87 | 70.11% | pass (+2.30 pp) |
+| flashinfer_fa2 eager | 59/87 | 67.82% | pass (+0.00 pp) |
+| flashinfer_fa2 + CUDA Graphs | 59/87 | 67.82% | pass (+0.00 pp) |
+
+Eager and graph FA2 are **bit-identical (87/87 token sequences)**. This backend
+disables FlashInfer's split-KV: with splitting, a row's reduction order depends
+on the planned width and batch composition, which made the earlier eager and
+graph runs differ on 18 questions. Without splits, 67/87 sequences match
+Triton; four answers flip (203, 426, 819 correct → incorrect; 871 incorrect →
+correct). There is no length-limited runaway (mean 106.7 tokens; eager 717.8 s,
+graphs 279.6 s). The no-split arithmetic reproduces the earlier split-KV graph
+run on all 87 questions; the earlier split-KV eager run scored 60/87.
+
+The `flashinfer_fa2` backend runs FlashInfer's tensor-core, CUDA-Graph-
+compatible decode wrapper; the FA2 guide records why the CUDA-core path is not
+graph-safe on SM89. CUDA Graphs remove most per-token launch overhead on this
+small model for both attention backends: a matched 64-token fixed-work run at
+concurrency 1/8/32 went from 5.49/5.55/6.32 s (FA2 eager) to 1.59/1.84/2.24 s
+(FA2 graphs), and from 5.20/5.34/6.26 s (Triton eager) to 1.52/1.76/2.20 s
+(Triton graphs). Triton graphs is 2–5% faster than FA2 graphs here, so the gain
+is graph dispatch reduction rather than the FA2 kernel; async+graphs is 1–4%
+faster than FA2 graphs. That is a launch-overhead result on one L20, not a
+production throughput qualification. A GPU test keeps `prepare_step` and
+`__call__` free of host synchronization across a plan-width bucket change (it
+runs them under `torch.cuda.set_sync_debug_mode`), and a CPU test bounds eager
+plan creation over a 1K-token decode.
+
+The stored GSM8K-87 baseline fingerprints `torch==2.13.0`; a run on another torch
+version cannot reuse its 59/87 baseline. A 10-question custom subset on torch 2.8
+was used only as an early smoke (3/10 with both backends, 8/10 identical).
+
+
 The [full 1,319-question comparison](https://github.com/InferMatrixLab/vllm-rlt/blob/d2f7db20593cccfe666b3c04c3ee50abc8c39af7/docs/benchmarks/gsm8k-bf16-20260912.md) recorded
 **62.02% native versus 61.64% Transformers** with strict matching. It includes
 per-question audits and a separate extraction diagnostic. That experiment's

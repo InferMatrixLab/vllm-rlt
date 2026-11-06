@@ -74,6 +74,7 @@ def main():
             "flash_attn_2",
             "flash_attn_3",
             "flash_attn_4",
+            "flashinfer_fa2",
         ],
         default="torch",
     )

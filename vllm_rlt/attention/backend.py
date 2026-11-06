@@ -39,6 +39,12 @@ class AttentionBackend:
     def prefill(self, *args, **kwargs):
         return self.kernel.prefill(*args, **kwargs)
 
+    def prepare_step(self, batches):
+        """Prime a stateful backend once per traversal; stateless kernels no-op."""
+        prepare = getattr(self.kernel, "prepare_step", None)
+        if prepare is not None:
+            prepare(batches)
+
     @property
     def generation(self):
         # Retain the existing Flash adapter's diagnostic attribute.
@@ -60,6 +66,7 @@ _FLASH_CAPABILITIES = {
         device_context_lengths=True,
     ),
 }
+_FLASHINFER_FA2_CAPABILITIES = BackendCapabilities(cuda_graphs=True, async_scheduling=True)
 _AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")
 
 
@@ -68,7 +75,7 @@ def backend_capabilities(implementation) -> BackendCapabilities:
 
 
 def validate_backend_name(backend: str) -> None:
-    if backend not in {"auto", "torch", "triton", *FLASH_BACKENDS}:
+    if backend not in {"auto", "torch", "triton", "flashinfer_fa2", *FLASH_BACKENDS}:
         raise ValueError("unknown attention backend")
 
 
@@ -83,6 +90,13 @@ def _create_explicit(backend, device, dtype, head_dim, block_size):
         # Probe the actual module, including its dependency imports, before selection.
         importlib.import_module("vllm_rlt.kernels.triton_attention")
         return AttentionBackend(TritonPagedAttention(), _TRITON_CAPABILITIES, {"backend": backend})
+    if backend == "flashinfer_fa2":
+        from vllm_rlt.kernels.flashinfer_fa2_attention import FlashInferFA2PagedAttention
+
+        kernel = FlashInferFA2PagedAttention(device, dtype, head_dim, block_size)
+        # Share the dict so the resolved kernel recorded after the first plan is
+        # visible through the backend's selection info.
+        return AttentionBackend(kernel, _FLASHINFER_FA2_CAPABILITIES, kernel.info)
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))

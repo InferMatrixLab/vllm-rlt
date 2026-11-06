@@ -628,6 +628,10 @@ class KVCacheManager:
             if self._allocations.get(request_id) is not allocation:
                 raise RuntimeError(f"stale prepared KV batch for request {request_id!r}")
 
+    def prepare_attention(self, batch: KVMetadata | DeviceKVMetadata) -> None:
+        """Prime a stateful attention backend once for this traversal."""
+        self.attention.prepare_step((batch,))
+
     def _validate_tensor(self, tensor, batch_size, name, *, query=False):
         if tensor.ndim != 3 or tensor.shape[0] != batch_size or tensor.shape[-1] != self.head_dim:
             raise ValueError(f"{name} must have shape [batch, heads, {self.head_dim}]")
@@ -709,6 +713,7 @@ class KVCacheManager:
         """Apply causal GQA at each row's own position and recurrence depth."""
         self._validate_layer(layer)
         batch = self._prepare_batch(request_ids, depths, positions, for_write=False)
+        self.prepare_attention(batch)
         return self._attend_prepared(layer, batch, q)
 
     @torch.no_grad()
