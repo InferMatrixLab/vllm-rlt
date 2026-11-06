@@ -64,13 +64,35 @@ class FlashPagedAttention:
         logging.getLogger(__name__).warning("Attention implementation: %s", self.info)
 
     @staticmethod
-    def check_kv_dtype(key_cache):
-        """FA has no per-vector-scale paged FP8 path; reject it explicitly."""
-        if key_cache.dtype == torch.float8_e4m3fn:
-            raise ValueError(
-                "FlashAttention backends do not support the FP8 per-vector KV cache; "
-                "use --attention-backend triton (or torch) for --kv-cache-dtype fp8_e4m3."
-            )
+    @torch.no_grad()
+    def dequantize_kv(key_cache, value_cache, block_tables, key_scale, value_scale, dtype):
+        """Stage the referenced FP8 pages as BF16/FP16 and remap the page table.
+
+        FlashAttention consumes dense bf16/fp16 paged KV; the FP8 pool keeps one
+        float32 scale per (block, token, KV head). Only pages referenced by this
+        batch are widened, so short runs stage a small working set.
+        """
+        if key_scale is None or value_scale is None:
+            raise ValueError("FP8 KV cache requires per-vector key/value scales")
+        valid = block_tables >= 0
+        ids = torch.unique(block_tables[valid])
+        if ids.numel() == 0:
+            return key_cache.to(dtype), value_cache.to(dtype), block_tables
+        lut = torch.full(
+            (int(block_tables.max()) + 1,), -1, dtype=torch.int64, device=block_tables.device
+        )
+        lut[ids] = torch.arange(ids.numel(), device=block_tables.device)
+        mapped = torch.where(valid, lut[block_tables.clamp_min(0)], block_tables).to(torch.int32)
+        # CPU torch cannot index float8 tensors directly; uint8 has the same itemsize.
+        key = (
+            key_cache.view(torch.uint8)[ids].view(torch.float8_e4m3fn).float()
+            * key_scale[ids].unsqueeze(-1)
+        ).to(dtype)
+        value = (
+            value_cache.view(torch.uint8)[ids].view(torch.float8_e4m3fn).float()
+            * value_scale[ids].unsqueeze(-1)
+        ).to(dtype)
+        return key, value, mapped
 
     def prefill(
         self,
@@ -81,6 +103,8 @@ class FlashPagedAttention:
         context_lengths,
         cu_seqlens_q,
         max_seqlen_q,
+        key_scale=None,
+        value_scale=None,
     ):
         """Attend packed chunks to their prefixes with bottom-right causal alignment.
 
@@ -88,9 +112,12 @@ class FlashPagedAttention:
         offset is prefix_length = seqlen_k - seqlen_q, including nonzero prefixes.
         K/V have already been written by the cache manager; no gathering is needed.
         """
-        self.check_kv_dtype(key_cache)
         if self.generation != 4:
             raise ValueError("packed paged prefill requires FlashAttention-4")
+        if key_cache.dtype == torch.float8_e4m3fn:
+            key_cache, value_cache, block_tables = self.dequantize_kv(
+                key_cache, value_cache, block_tables, key_scale, value_scale, q.dtype
+            )
         out = self.kernel(
             q,
             key_cache,
@@ -105,8 +132,20 @@ class FlashPagedAttention:
         )
         return out[0] if isinstance(out, tuple) else out
 
-    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
-        self.check_kv_dtype(key_cache)
+    def __call__(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        key_scale=None,
+        value_scale=None,
+    ):
+        if key_cache.dtype == torch.float8_e4m3fn:
+            key_cache, value_cache, block_tables = self.dequantize_kv(
+                key_cache, value_cache, block_tables, key_scale, value_scale, q.dtype
+            )
         if q.shape[0] == 0:
             return torch.empty_like(q)
         # The visible prefix already includes exactly the current causal position.

@@ -125,11 +125,94 @@ def test_snapshot_restore_is_bitwise_and_checks_dtype():
         plain.restore("r", snapshot)
 
 
-def test_flash_backend_rejects_fp8_kv_with_guidance():
+def test_flash_fp8_kv_staging_matches_reference():
     from vllm_rlt.kernels.flash_attention import FlashPagedAttention
 
-    with pytest.raises(ValueError, match="per-vector KV"):
-        FlashPagedAttention.check_kv_dtype(torch.empty(1, dtype=torch.float8_e4m3fn))
+    torch.manual_seed(0)
+    blocks, block_size, heads, dim = 4, 2, 2, 8
+    key = torch.randn(blocks, block_size, heads, dim).to(torch.float8_e4m3fn)
+    value = torch.randn(blocks, block_size, heads, dim).to(torch.float8_e4m3fn)
+    key_scale = torch.rand(blocks, block_size, heads) + 0.5
+    value_scale = torch.rand(blocks, block_size, heads) + 0.5
+    tables = torch.tensor([[0, -1], [3, 2]], dtype=torch.int32)
+
+    staged_key, staged_value, mapped = FlashPagedAttention.dequantize_kv(
+        key, value, tables, key_scale, value_scale, torch.bfloat16
+    )
+
+    assert mapped.shape == tables.shape
+    for row in range(tables.shape[0]):
+        for column in range(tables.shape[1]):
+            old = int(tables[row, column])
+            if old < 0:
+                assert int(mapped[row, column]) == -1
+                continue
+            new = int(mapped[row, column])
+            expected_key = (key[old].float() * key_scale[old].unsqueeze(-1)).to(torch.bfloat16)
+            expected_value = (value[old].float() * value_scale[old].unsqueeze(-1)).to(
+                torch.bfloat16
+            )
+            torch.testing.assert_close(staged_key[new], expected_key, rtol=0, atol=0)
+            torch.testing.assert_close(staged_value[new], expected_value, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+def test_flash2_paged_attention_stages_fp8_before_kernel():
+    from vllm_rlt.kernels.flash_attention import FlashPagedAttention
+
+    captured = {}
+
+    def kernel(q, k, v, **kwargs):
+        captured.update(k=k, v=v, **kwargs)
+        return torch.zeros_like(q)
+
+    attention = object.__new__(FlashPagedAttention)
+    attention.generation = 2
+    attention.kernel = kernel
+    attention.info = {}
+    q = torch.randn(3, 2, 8, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(4, 2, 2, 8, device="cuda").to(torch.float8_e4m3fn)
+    value = torch.randn(4, 2, 2, 8, device="cuda").to(torch.float8_e4m3fn)
+    key_scale = torch.rand(4, 2, 2, device="cuda") + 0.5
+    value_scale = torch.rand(4, 2, 2, device="cuda") + 0.5
+    tables = torch.tensor([[0, -1], [3, 2]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
+
+    attention(q, key, value, tables, lengths, key_scale=key_scale, value_scale=value_scale)
+
+    assert captured["k"].dtype == torch.bfloat16
+    assert captured["v"].dtype == torch.bfloat16
+    assert captured["block_table"].dtype == torch.int32
+    assert int(captured["block_table"].max()) < captured["k"].shape[0]
+
+
+@pytest.mark.gpu
+def test_flash4_paged_attention_stages_fp8_before_kernel():
+    from vllm_rlt.kernels.flash_attention import FlashPagedAttention
+
+    captured = {}
+
+    def kernel(q, k, v, **kwargs):
+        captured.update(k=k, v=v, **kwargs)
+        return torch.zeros_like(q)
+
+    attention = object.__new__(FlashPagedAttention)
+    attention.generation = 4
+    attention.kernel = kernel
+    attention.info = {}
+    q = torch.randn(3, 2, 8, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(4, 2, 2, 8, device="cuda").to(torch.float8_e4m3fn)
+    value = torch.randn(4, 2, 2, 8, device="cuda").to(torch.float8_e4m3fn)
+    key_scale = torch.rand(4, 2, 2, device="cuda") + 0.5
+    value_scale = torch.rand(4, 2, 2, device="cuda") + 0.5
+    tables = torch.tensor([[0, -1], [3, 2]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
+
+    attention(q, key, value, tables, lengths, key_scale=key_scale, value_scale=value_scale)
+
+    assert captured["k"].dtype == torch.bfloat16
+    assert captured["page_table"].dtype == torch.int32
+    assert int(captured["page_table"].max()) < captured["k"].shape[0]
 
 
 def test_backends_without_fp8_support_are_rejected():
