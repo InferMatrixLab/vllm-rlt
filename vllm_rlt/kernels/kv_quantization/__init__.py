@@ -19,6 +19,8 @@ from .nvfp4 import PackedNVFP4KV
 KVFormat = Literal["int4", "nvfp4"]
 PackedKV = PackedInt4KV | PackedNVFP4KV
 
+CODECS = {"int4": int4, "nvfp4": nvfp4}
+
 
 def pack_kv(
     values: torch.Tensor,
@@ -28,11 +30,31 @@ def pack_kv(
     group_size: int | None = None,
 ) -> PackedKV:
     """Encode logical KV; defaults are INT4 G=64 or NVFP4 G=16."""
-    if format == "int4":
-        return int4.pack(values, kind=kind, group_size=64 if group_size is None else group_size)
-    if format == "nvfp4":
-        return nvfp4.pack(values, kind=kind, group_size=16 if group_size is None else group_size)
-    raise ValueError("format must be 'int4' or 'nvfp4'")
+    codec = CODECS.get(format)
+    if codec is None:
+        raise ValueError("format must be 'int4' or 'nvfp4'")
+    if group_size is None:
+        group_size = 64 if format == "int4" else 16
+    return codec.pack(values, kind=kind, group_size=group_size)
+
+
+def pack_paged(pool: torch.Tensor, *, kind: KVKind, format: KVFormat = "int4", group_size=None):
+    """Pack a paged pool ``[pages, page_size, heads, dim]`` as one logical KV."""
+    pages, page = pool.shape[:2]
+    packed = pack_kv(
+        pool.reshape(pages * page, *pool.shape[2:]),
+        kind=kind,
+        format=format,
+        group_size=group_size,
+    )
+    return packed, (pages, page)
+
+
+def unpack_paged(packed: PackedKV, paged_shape: tuple[int, int]) -> torch.Tensor:
+    """Restore a pool packed by :func:`pack_paged` to its original page layout."""
+    pages, page = paged_shape
+    logical = unpack_kv(packed)
+    return logical.reshape(pages, page, *logical.shape[1:])
 
 
 def unpack_kv(packed: PackedKV) -> torch.Tensor:

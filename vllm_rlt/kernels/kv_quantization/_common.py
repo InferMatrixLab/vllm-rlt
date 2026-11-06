@@ -23,6 +23,20 @@ def _validate_inputs(values: torch.Tensor, *, kind: KVKind, group_size: int) -> 
         raise ValueError("KV values must use a floating-point dtype")
 
 
+def _pad_repeat(values: torch.Tensor, axis: int, multiple: int) -> torch.Tensor:
+    """Pad ``axis`` to a multiple by repeating the last slice (keeps extremes)."""
+    length = values.shape[axis]
+    pad = (-length) % multiple
+    if pad == 0:
+        return values
+    index = [slice(None)] * values.ndim
+    index[axis] = slice(length - 1, length)
+    tail = values[tuple(index)]
+    shape = list(values.shape)
+    shape[axis] = pad
+    return torch.cat([values, tail.expand(shape)], dim=axis)
+
+
 def _pack_channel_nibbles(codes: torch.Tensor) -> torch.Tensor:
     payload = codes[..., 0::2].clone(memory_format=torch.contiguous_format)
     payload[..., : codes.shape[-1] // 2] |= codes[..., 1::2] << 4

@@ -9,7 +9,13 @@ from typing import ClassVar, Literal
 
 import torch
 
-from ._common import KVKind, _pack_channel_nibbles, _unpack_channel_nibbles, _validate_inputs
+from ._common import (
+    KVKind,
+    _pack_channel_nibbles,
+    _pad_repeat,
+    _unpack_channel_nibbles,
+    _validate_inputs,
+)
 
 
 def _codes_for_group(
@@ -59,26 +65,38 @@ def pack(values: torch.Tensor, *, kind: KVKind, group_size: int = 64) -> PackedI
     _validate_inputs(values, kind=kind, group_size=group_size)
     shape = tuple(values.shape)
     axis = 0 if kind == "key" else 2
-    codes = torch.empty_like(values, dtype=torch.uint8)
-    minima, scales = [], []
-    for start in range(0, shape[axis], group_size):
-        length = min(group_size, shape[axis] - start)
-        group_codes, minimum, scale = _codes_for_group(
-            values.narrow(axis, start, length), reduce_dim=axis
-        )
-        codes.narrow(axis, start, length).copy_(group_codes)
-        minima.append(minimum)
-        scales.append(scale)
-    metadata_shape = list(shape)
-    metadata_shape[axis] = (shape[axis] + group_size - 1) // group_size
-    minimum = (
-        torch.cat(minima, dim=axis)
-        if minima
-        else torch.empty(metadata_shape, device=values.device, dtype=torch.float16)
-    )
-    scale = torch.cat(scales, dim=axis) if scales else torch.empty_like(minimum)
+    work = values.float()
+    padded = _pad_repeat(work, axis, group_size)
+    if kind == "key":
+        groups = padded.shape[0] // group_size
+        grouped = padded.view(groups, group_size, *shape[1:])
+        minimum = grouped.amin(dim=1, keepdim=True)
+        span = grouped.amax(dim=1, keepdim=True) - minimum
+        scale = torch.where(span > 0, span / 15.0, torch.ones_like(span))
+        codes = ((grouped - minimum) / scale).round_().clamp_(0, 15).to(torch.uint8)
+        codes = codes.view(padded.shape)[: shape[0]]
+        minimum = minimum.squeeze(1)
+        scale = scale.squeeze(1)
+    else:
+        groups = padded.shape[2] // group_size
+        grouped = padded.view(shape[0], shape[1], groups, group_size)
+        minimum = grouped.amin(dim=-1, keepdim=True)
+        span = grouped.amax(dim=-1, keepdim=True) - minimum
+        scale = torch.where(span > 0, span / 15.0, torch.ones_like(span))
+        codes = ((grouped - minimum) / scale).round_().clamp_(0, 15).to(torch.uint8)
+        codes = codes.view(padded.shape)[..., : shape[2]]
+        minimum = minimum.squeeze(-1)
+        scale = scale.squeeze(-1)
     payload = _pack_channel_nibbles(codes)
-    return PackedInt4KV(payload, minimum, scale, shape, values.dtype, kind, group_size)
+    return PackedInt4KV(
+        payload,
+        minimum.to(torch.float16),
+        scale.to(torch.float16),
+        shape,
+        values.dtype,
+        kind,
+        group_size,
+    )
 
 
 @torch.no_grad()

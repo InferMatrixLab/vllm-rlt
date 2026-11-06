@@ -13,7 +13,13 @@ from typing import ClassVar, Literal
 
 import torch
 
-from ._common import KVKind, _pack_channel_nibbles, _unpack_channel_nibbles, _validate_inputs
+from ._common import (
+    KVKind,
+    _pack_channel_nibbles,
+    _pad_repeat,
+    _unpack_channel_nibbles,
+    _validate_inputs,
+)
 
 
 @dataclass(frozen=True)
@@ -56,48 +62,56 @@ def pack(values: torch.Tensor, *, kind: KVKind, group_size: int = 16) -> PackedN
         raise ValueError("NVFP4 requires group_size=16")
     shape = tuple(values.shape)
     axis = 0 if kind == "key" else 2
+    work = values.float()
     global_scale = torch.ones((), device=values.device, dtype=torch.float32)
     if values.numel():
-        amax = values.abs().amax().float()
+        amax = work.abs().amax()
         global_scale = torch.where(amax > 0, 2688.0 / amax, global_scale).clamp_max_(
             torch.finfo(torch.float32).max
         )
     inverse_global = global_scale.reciprocal()
-    codes = torch.empty_like(values, dtype=torch.uint8)
-    scale_shape = list(shape)
-    scale_shape[axis] = (shape[axis] + 15) // 16
-    scales = torch.empty(
-        scale_shape,
-        dtype=torch.float8_e4m3fn,
-        device=values.device,
-    )
-    # bucketize keeps equality in the lower bin. Move odd lower-code boundaries
-    # down one FP32 ULP so midpoint ties choose the even upper code instead.
     boundaries = torch.tensor(
         [0.25, 0.75 - 2**-24, 1.25, 1.75 - 2**-23, 2.5, 3.5 - 2**-22, 5.0],
         device=values.device,
         dtype=torch.float32,
     )
-    for start in range(0, shape[axis], 16):
-        length = min(16, shape[axis] - start)
-        work = values.narrow(axis, start, length).float()
-        scale = (global_scale * (work.abs().amax(dim=axis, keepdim=True) * (1.0 / 6))).clamp_(
-            0, 448
+    padded = _pad_repeat(work, axis, 16)
+    if kind == "key":
+        groups = padded.shape[0] // 16
+        grouped = padded.view(groups, 16, *shape[1:])
+        amax = grouped.abs().amax(dim=1, keepdim=True)
+        scale = (global_scale * (amax * (1.0 / 6))).clamp_(0, 448).to(torch.float8_e4m3fn)
+        effective = scale.float() * inverse_global
+        multiplier = effective.reciprocal()
+        finite = torch.isfinite(multiplier)
+        normalized = grouped * torch.where(finite, multiplier, 0.0)
+        normalized = torch.where((effective > 0) & ~finite, grouped / effective, normalized).clamp_(
+            -6, 6
         )
-        scale = scale.to(torch.float8_e4m3fn)
-        effective_scale = scale.float() * inverse_global
-        multiplier = effective_scale.reciprocal()
-        finite_multiplier = torch.isfinite(multiplier)
-        normalized = work * torch.where(finite_multiplier, multiplier, 0.0)
-        # Preserve tiny values when only the FP32 reciprocal overflows.
-        normalized = torch.where(
-            (effective_scale > 0) & ~finite_multiplier, work / effective_scale, normalized
-        ).clamp_(-6, 6)
-        magnitude = normalized.abs().contiguous()
-        group_codes = torch.bucketize(magnitude, boundaries, out_int32=True).to(torch.uint8)
-        group_codes |= torch.signbit(normalized).to(torch.uint8) << 3
-        codes.narrow(axis, start, length).copy_(group_codes)
-        scales.select(axis, start // 16).copy_(scale.squeeze(axis))
+        codes = torch.bucketize(normalized.abs().contiguous(), boundaries, out_int32=True).to(
+            torch.uint8
+        )
+        codes |= torch.signbit(normalized).to(torch.uint8) << 3
+        codes = codes.view(padded.shape)[: shape[0]]
+        scales = scale.squeeze(1)
+    else:
+        groups = padded.shape[2] // 16
+        grouped = padded.view(shape[0], shape[1], groups, 16)
+        amax = grouped.abs().amax(dim=-1, keepdim=True)
+        scale = (global_scale * (amax * (1.0 / 6))).clamp_(0, 448).to(torch.float8_e4m3fn)
+        effective = scale.float() * inverse_global
+        multiplier = effective.reciprocal()
+        finite = torch.isfinite(multiplier)
+        normalized = grouped * torch.where(finite, multiplier, 0.0)
+        normalized = torch.where((effective > 0) & ~finite, grouped / effective, normalized).clamp_(
+            -6, 6
+        )
+        codes = torch.bucketize(normalized.abs().contiguous(), boundaries, out_int32=True).to(
+            torch.uint8
+        )
+        codes |= torch.signbit(normalized).to(torch.uint8) << 3
+        codes = codes.view(padded.shape)[..., : shape[2]]
+        scales = scale.squeeze(-1)
     return PackedNVFP4KV(
         _pack_channel_nibbles(codes), scales, global_scale, shape, values.dtype, kind
     )

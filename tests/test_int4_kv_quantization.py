@@ -49,6 +49,19 @@ def scalar_reference(values, kind, group_size):
     return torch.from_numpy(payload), torch.from_numpy(decoded).to(values.dtype)
 
 
+def test_paged_round_trip_and_registry_dispatch():
+    from vllm_rlt.kernels.kv_quantization import pack_paged, unpack_paged
+
+    torch.manual_seed(3)
+    pool = torch.randn(4, 16, 2, 8, dtype=torch.bfloat16)
+    for kind in ("key", "value"):
+        packed, paged_shape = pack_paged(pool, kind=kind, format="int4", group_size=4)
+        restored = unpack_paged(packed, paged_shape)
+        logical = pack_kv(pool.reshape(64, 2, 8), kind=kind, format="int4", group_size=4)
+        torch.testing.assert_close(restored, unpack_kv(logical).reshape(pool.shape))
+        assert restored.shape == pool.shape
+
+
 def test_known_nibble_order_and_ties_to_even():
     values = torch.tensor([0, 0.5, 1.5, 2.5, 14.5, 15]).reshape(1, 1, 6)
     packed = pack_kv(values, kind="value", group_size=6)
