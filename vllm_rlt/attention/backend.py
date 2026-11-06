@@ -61,11 +61,13 @@ _FLASH_CAPABILITIES = {
         fp8_kv=True,
         fp8_kv_graphs=False,
     ),
+    # FA3 paged FP8 is unvalidated: its source build lacks the e4m3 paged
+    # instantiation, so keep it on the Triton/FA2/FA4 paths until a wheel exists.
     3: BackendCapabilities(
         cuda_graphs=True,
         async_scheduling=True,
         device_context_lengths=True,
-        fp8_kv=True,
+        fp8_kv=False,
         fp8_kv_graphs=False,
     ),
     4: BackendCapabilities(
