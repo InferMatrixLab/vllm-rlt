@@ -215,6 +215,39 @@ def test_flash4_paged_attention_stages_fp8_before_kernel():
     assert int(captured["page_table"].max()) < captured["k"].shape[0]
 
 
+@pytest.mark.gpu
+def test_flash2_engine_matches_triton_with_fp8_kv():
+    pytest.importorskip("flash_attn")
+    from tests.helpers import tiny_ouro_config
+    from vllm_rlt.engine.llm_engine import LLMEngine
+    from vllm_rlt.models import OuroForCausalLM
+
+    torch.manual_seed(7)
+    model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
+
+    def run(backend):
+        engine = LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=64, block_size=256, kv_cache_dtype="fp8_e4m3"),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2, max_num_batched_tokens=8, prefill_chunk_size=4
+            ),
+            execution_config=ExecutionConfig(),
+            exit_config=ExitConfig("ouro"),
+            attention_backend=backend,
+        )
+        engine.add_request("a", [2, 3, 4, 5], SamplingParams(max_tokens=4, ignore_eos=True))
+        engine.add_request("b", [6, 7], SamplingParams(max_tokens=3, ignore_eos=True))
+        done = {}
+        while engine.has_unfinished_requests():
+            for output in engine.step():
+                if output.finished:
+                    done[output.request_id] = list(output.token_ids)
+        return done
+
+    assert run("flash_attn_2") == run("triton")
+
+
 def test_backends_without_fp8_support_are_rejected():
     info = {"backend": "flash", "selected_backend": "flash"}
     backend = AttentionBackend(torch_paged_attention, BackendCapabilities(), info)
