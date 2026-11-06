@@ -1,6 +1,9 @@
 import logging
+import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
+
+import torch
 
 from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.config import (
@@ -20,6 +23,7 @@ from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.worker.attention_reference import AttentionReferenceStore
 from vllm_rlt.worker.executor import Executor
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
@@ -51,6 +55,7 @@ class StageEngine:
         exit_config=None,
         execution_config=None,
         speculative_config=None,
+        sparse_decode_attention_config=None,
         stage_config=None,
         connector: StageConnector | None = None,
     ):
@@ -87,6 +92,7 @@ class StageEngine:
             speculative_config and speculative_config.mode == "pipeline"
         )
         self.async_speculative = bool(speculative_config and self.execution_config.async_scheduling)
+        scratch = 0
         if speculative_config is not None:
             if cache_config.layout != "last_exited":
                 raise ValueError("speculative decoding requires last_exited KV")
@@ -118,6 +124,149 @@ class StageEngine:
                 scratch = 2 * scratch + 8 * scheduler_config.max_num_seqs * (
                     config.total_ut_steps * width
                 )
+        sparse_decode = sparse_decode_attention_config
+        self.sparse_decode_attention = sparse_decode
+        self.reference_store = None
+        if sparse_decode is not None and sparse_decode.enabled:
+            if getattr(model, "requires_boundary_kv", False):
+                raise ValueError("sparse decode attention requires a recurrent Ouro-style model")
+            if cache_config.layout != "last_exited":
+                raise ValueError("sparse decode attention requires last_exited KV")
+            # Graph replays run only the fused kernels, which need no host
+            # work per row; other paths would silently fall back to dense.
+            graphs = self.execution_config.cuda_graphs
+            if graphs and (
+                not self.async_speculative
+                or sparse_decode.implementation != "fused"
+                or sparse_decode.key_retention >= 1.0
+            ):
+                raise ValueError(
+                    "sparse decode attention with CUDA graphs requires async block "
+                    "speculation, the fused implementation and key_retention < 1"
+                )
+            if self.pipeline_speculative and (
+                not self.async_speculative
+                or sparse_decode.implementation != "fused"
+                or sparse_decode.key_retention >= 1.0
+            ):
+                # Pipeline rows move and restart on the device; only the fused
+                # kernels read their device-decided modes and slots.
+                raise ValueError(
+                    "sparse decode attention with token pipelines requires asynchronous "
+                    "scheduling, the fused implementation and key_retention < 1"
+                )
+            if scheduler_config.mode != "refill":
+                raise ValueError("sparse decode attention requires refill scheduling")
+            if (
+                scheduler_config.enable_preemption
+                and speculative_config is not None
+                and not self.pipeline_speculative
+            ):
+                # Ordinary decode and token pipelines snapshot their live
+                # references; block rounds hold per-round leases with none.
+                raise ValueError(
+                    "sparse decode attention supports preemption only for ordinary "
+                    "decode and token pipelines"
+                )
+            # The index buffer never truncates the algorithm: capacity must
+            # hold the worst-case retained count over the supported serving
+            # context, which the caller may bound explicitly instead of paying
+            # for the model's full positional limit.
+            context_bound = sparse_decode.max_context_tokens or config.max_position_embeddings
+            if context_bound > config.max_position_embeddings:
+                raise ValueError(
+                    f"max_context_tokens {context_bound} exceeds the model context "
+                    f"{config.max_position_embeddings}"
+                )
+            required_keys = math.ceil(context_bound * sparse_decode.key_retention)
+            capacity = sparse_decode.key_bucket or required_keys
+            if capacity < required_keys:
+                raise ValueError(
+                    f"sparse decode attention key_bucket {capacity} cannot hold "
+                    f"{required_keys} retained keys for key_retention "
+                    f"{sparse_decode.key_retention}; raise key_bucket or lower key_retention"
+                )
+            # Pool capacity follows simultaneously live inputs, not requests
+            # alone. Synchronous block references retire in the same round;
+            # asynchronous speculation can retain two rounds per request.
+            slots = scheduler_config.max_num_seqs
+            if speculative_config is not None:
+                slots *= speculative_config.num_speculative_tokens + 1
+                if self.async_speculative:
+                    slots *= 2
+            # Account for the reference pool before admitting any work: it is
+            # allocated up front, so a budget that cannot fit must fail here
+            # with an actionable message instead of OOM-ing mid-batch.
+            reference_bytes = (
+                (slots + graphs)
+                * config.num_hidden_layers
+                * config.num_attention_heads
+                * (capacity * 4 + 4 + 4 * 2 * config.head_dim + 8)
+            )
+            if parameter.device.type == "cuda":
+                free_bytes, _ = torch.cuda.mem_get_info(parameter.device)
+                if reference_bytes > free_bytes:
+                    raise ValueError(
+                        f"sparse decode attention reference pool needs "
+                        f"{reference_bytes / 1024**3:.1f} GiB but only "
+                        f"{free_bytes / 1024**3:.1f} GiB is free; lower "
+                        f"max_context_tokens, key_retention or num_speculative_tokens"
+                    )
+            self.reference_store = AttentionReferenceStore(
+                slots=slots,
+                layers=config.num_hidden_layers,
+                heads=config.num_attention_heads,
+                head_dim=config.head_dim,
+                key_bucket=capacity,
+                # Graphs bake the index pool's address in: allocate it whole.
+                initial_key_capacity=capacity if graphs else min(capacity, 64),
+                device=parameter.device,
+                implementation=sparse_decode.implementation,
+                padding_slot=graphs,
+            )
+            if parameter.device.type == "cuda":
+                free_bytes, _ = torch.cuda.mem_get_info(parameter.device)
+                growth_bytes = self.reference_store.peak_capacity_bytes - self.reference_store.bytes
+                if growth_bytes > free_bytes:
+                    raise ValueError(
+                        "sparse reference index growth exceeds available device memory"
+                    )
+            logger.info(
+                "sparse decode attention: %d reference slots x %d keys x %d layers x %d heads "
+                "<= %.2f GiB growth peak (context bound %d, retention %.2f)",
+                slots,
+                capacity,
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                self.reference_store.peak_capacity_bytes / 1024**3,
+                context_bound,
+                sparse_decode.key_retention,
+            )
+            # Budget the logical maximum and copy overlap, not just the small
+            # initial allocation; short prompts must not overcommit long ones.
+            scratch += self.reference_store.peak_capacity_bytes
+            if graphs:
+                from vllm_rlt.kernels.sparse_decode import SELECT_PARTS
+                from vllm_rlt.kernels.triton_attention import NUM_SPLITS
+                from vllm_rlt.worker.cuda_graph import speculative_capture_sizes
+
+                # One capture workspace serves every bucket of the graphs.
+                rows = speculative_capture_sizes(
+                    self.execution_config, scheduler_config, speculative_config
+                )[-1]
+                width = math.ceil(config.max_position_embeddings / cache_config.block_size)
+                head_dim = 1 << (config.head_dim - 1).bit_length()
+                scratch += (
+                    4
+                    * rows
+                    * config.num_attention_heads
+                    * (width * cache_config.block_size + NUM_SPLITS * (2 + head_dim))
+                )
+                # Select scratch per row and head: radix histograms, part counts,
+                # offsets and contribution parts, plus state, lse and ticket.
+                parts = SELECT_PARTS * (4 * 256 + 1 + 2 + 1 + head_dim) * 4
+                scratch += rows * config.num_attention_heads * (parts + 5 * 2 * 8 + 8)
+        if speculative_config is not None or self.reference_store is not None:
             cache_config = replace(
                 cache_config, memory_reserve_bytes=cache_config.memory_reserve_bytes + scratch
             )
@@ -167,6 +316,7 @@ class StageEngine:
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
+                sparse_decode=self.reference_store is not None,
             ),
         )
         num_blocks, self.memory_plan = plan_cache(
@@ -217,6 +367,8 @@ class StageEngine:
             scheduler_config=scheduler_config,
             staged_prefill=self.scheduler.staged_prefill,
             rng=self.rng,
+            reference_store=self.reference_store if speculative_config is None else None,
+            sparse_decode=self.sparse_decode_attention,
         )
         self.speculative_runner = (
             SpeculativeRunner(
@@ -227,6 +379,8 @@ class StageEngine:
                 rng=self.rng,
                 runtime=self.model_runner.runtime,
                 compute_stream=self.model_runner.core_stream,
+                reference_store=self.reference_store,
+                sparse_decode=self.sparse_decode_attention,
             )
             if speculative_config is not None and not self.async_speculative
             else None
@@ -244,7 +398,15 @@ class StageEngine:
                 copy_stream=self.model_runner.copy_stream,
                 rng=self.rng,
                 runtime=self.model_runner.runtime,
+                reference_store=self.reference_store,
+                sparse_decode=self.sparse_decode_attention,
             )
+            if self.reference_store is not None:
+                # Reference lifecycle device work is ordered on the compute
+                # stream, after the readers that retire a slot.
+                self.reference_store.stream = self.model_runner.core_stream
+        if self.reference_store is not None:
+            self.reference_store.stream = self.model_runner.core_stream
         self.executor = Executor(self.model_runner, speculation=self.speculative_runner)
         self._pending_speculative = []
         self._retiring_speculative = {}
@@ -354,6 +516,12 @@ class StageEngine:
         capacity = len(prompt_token_ids) + params.max_tokens - 1
         if capacity > config.max_position_embeddings:
             raise ValueError("prompt plus decode positions exceed the model context length")
+        if self.reference_store is not None:
+            bound = (
+                self.sparse_decode_attention.max_context_tokens or config.max_position_embeddings
+            )
+            if capacity > bound:
+                raise ValueError("request exceeds sparse decode attention context bound")
         cache = self.cache_manager
         required = cache.required_blocks(capacity)
         if required > cache.num_blocks:
@@ -400,6 +568,10 @@ class StageEngine:
             self.abort_request(rid)
         if self.async_speculative:
             self._discard_speculative()
+        if self.reference_store is not None:
+            # Abort can enqueue reference metadata retirement after the drain
+            # above. Teardown must also cover those final writes.
+            self.model_runner.synchronize()
 
     def _discard_speculative(self):
         """Release speculative owners after the caller has drained both streams."""
