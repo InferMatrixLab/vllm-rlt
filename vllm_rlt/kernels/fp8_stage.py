@@ -52,6 +52,21 @@ def _stage_kernel(
         tl.store(out_value_ptr + target, value.to(out_value_ptr.dtype.element_ty))
 
 
+_BUFFERS: dict = {}
+
+
+def _buffers(entries, page, heads, dim, dtype, device):
+    key = (entries, page, heads, dim, dtype, str(device))
+    pair = _BUFFERS.get(key)
+    if pair is None:
+        pair = (
+            torch.empty((entries, page, heads, dim), dtype=dtype, device=device),
+            torch.empty((entries, page, heads, dim), dtype=dtype, device=device),
+        )
+        _BUFFERS[key] = pair
+    return pair
+
+
 def stage_fp8_kv(key_cache, value_cache, key_scale, value_scale, table, dtype):
     """Widen ``table``'s pages into compact dense K/V with one Triton launch.
 
@@ -62,8 +77,7 @@ def stage_fp8_kv(key_cache, value_cache, key_scale, value_scale, table, dtype):
     """
     page, heads, dim = key_cache.shape[1:]
     entries = table.shape[0]
-    out_key = torch.empty((entries, page, heads, dim), dtype=dtype, device=key_cache.device)
-    out_value = torch.empty_like(out_key)
+    out_key, out_value = _buffers(entries, page, heads, dim, dtype, key_cache.device)
     _stage_kernel[(entries, heads)](
         key_cache,
         value_cache,

@@ -31,6 +31,9 @@ def select_version(capability, backend):
     return selected
 
 
+_MAPPED: dict = {}
+
+
 class FlashPagedAttention:
     def __init__(self, device, dtype, head_dim, block_size, backend="flash_attn"):
         if device.type != "cuda" or torch.version.hip:
