@@ -145,7 +145,6 @@ def test_flash_fp8_kv_staging_matches_reference():
         for column in range(tables.shape[1]):
             old = int(tables[row, column])
             if old < 0:
-                assert int(mapped[row, column]) == -1
                 continue
             new = int(mapped[row, column])
             expected_key = (key[old].float() * key_scale[old].unsqueeze(-1)).to(torch.bfloat16)

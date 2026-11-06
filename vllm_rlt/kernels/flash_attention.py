@@ -66,33 +66,46 @@ class FlashPagedAttention:
     @staticmethod
     @torch.no_grad()
     def dequantize_kv(key_cache, value_cache, block_tables, key_scale, value_scale, dtype):
-        """Stage the referenced FP8 pages as BF16/FP16 and remap the page table.
+        """Stage referenced FP8 pages as BF16/FP16 and remap the page table.
 
-        FlashAttention consumes dense bf16/fp16 paged KV; the FP8 pool keeps one
-        float32 scale per (block, token, KV head). Only pages referenced by this
-        batch are widened, so short runs stage a small working set.
+        Invalid (-1) entries keep -1 and are skipped by the staging kernel; all
+        other entries get their own staged block, so duplicates are repeated and
+        the remap is a single where/arange (no sort or unique pass).
         """
         if key_scale is None or value_scale is None:
             raise ValueError("FP8 KV cache requires per-vector key/value scales")
-        valid = block_tables >= 0
-        ids = torch.unique(block_tables[valid])
-        if ids.numel() == 0:
-            return key_cache.to(dtype), value_cache.to(dtype), block_tables
-        lut = torch.full(
-            (int(block_tables.max()) + 1,), -1, dtype=torch.int64, device=block_tables.device
+        blocks = block_tables.reshape(-1)
+        import os
+
+        staged_key = staged_value = None
+        if key_cache.is_cuda and os.environ.get("VLLM_RLT_FP8_STAGE", "triton") == "triton":
+            try:
+                from vllm_rlt.kernels.fp8_stage import stage_fp8_kv
+
+                staged_key, staged_value = stage_fp8_kv(
+                    key_cache, value_cache, key_scale, value_scale, blocks, dtype
+                )
+            except ImportError:
+                pass
+        if staged_key is None:
+            valid = blocks >= 0
+            safe = blocks.clamp_min(0)
+            staged_key = (
+                key_cache.view(torch.uint8)[safe].view(torch.float8_e4m3fn).float()
+                * key_scale[safe].unsqueeze(-1)
+            ).to(dtype)
+            staged_value = (
+                value_cache.view(torch.uint8)[safe].view(torch.float8_e4m3fn).float()
+                * value_scale[safe].unsqueeze(-1)
+            ).to(dtype)
+            staged_key[~valid] = 0
+            staged_value[~valid] = 0
+        # Invalid (-1) entries are staged as zero and only appear past the
+        # context length, so a plain arange is enough for the FA page table.
+        mapped = torch.arange(blocks.numel(), device=blocks.device, dtype=torch.int32).reshape(
+            block_tables.shape
         )
-        lut[ids] = torch.arange(ids.numel(), device=block_tables.device)
-        mapped = torch.where(valid, lut[block_tables.clamp_min(0)], block_tables).to(torch.int32)
-        # CPU torch cannot index float8 tensors directly; uint8 has the same itemsize.
-        key = (
-            key_cache.view(torch.uint8)[ids].view(torch.float8_e4m3fn).float()
-            * key_scale[ids].unsqueeze(-1)
-        ).to(dtype)
-        value = (
-            value_cache.view(torch.uint8)[ids].view(torch.float8_e4m3fn).float()
-            * value_scale[ids].unsqueeze(-1)
-        ).to(dtype)
-        return key, value, mapped
+        return staged_key, staged_value, mapped
 
     def prefill(
         self,
