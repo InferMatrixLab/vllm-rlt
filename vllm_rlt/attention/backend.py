@@ -23,6 +23,8 @@ class BackendCapabilities:
     packed_matches_decode: bool = False
     # Reads an FP8 e4m3 KV pool with per-vector float32 scales.
     fp8_kv: bool = False
+    # FA stages per-batch pages with dynamic shapes; that cannot be graph-captured.
+    fp8_kv_graphs: bool = True
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
 
@@ -53,10 +55,18 @@ _TRITON_CAPABILITIES = BackendCapabilities(
 )
 _FLASH_CAPABILITIES = {
     2: BackendCapabilities(
-        cuda_graphs=True, async_scheduling=True, device_context_lengths=True, fp8_kv=True
+        cuda_graphs=True,
+        async_scheduling=True,
+        device_context_lengths=True,
+        fp8_kv=True,
+        fp8_kv_graphs=False,
     ),
     3: BackendCapabilities(
-        cuda_graphs=True, async_scheduling=True, device_context_lengths=True, fp8_kv=True
+        cuda_graphs=True,
+        async_scheduling=True,
+        device_context_lengths=True,
+        fp8_kv=True,
+        fp8_kv_graphs=False,
     ),
     4: BackendCapabilities(
         packed_prefill=True,
@@ -65,6 +75,7 @@ _FLASH_CAPABILITIES = {
         packed_matches_decode=True,
         device_context_lengths=True,
         fp8_kv=True,
+        fp8_kv_graphs=False,
     ),
 }
 _AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")
