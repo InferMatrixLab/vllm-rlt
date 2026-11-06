@@ -107,7 +107,18 @@ class _DeviceCache:
 
     def _write_prepared(self, layer, batch, k, v):
         cache = self.cache
-        if batch.active_rows is not None:
+        if cache.key_scale is not None:
+            # FP8 pools: one fused quantizing writer that honors the same row masks.
+            cache._store_layer(
+                layer,
+                batch.write_blocks,
+                batch.write_offsets,
+                k,
+                v,
+                mask=batch.write_mask,
+                active=batch.active_rows,
+            )
+        elif batch.active_rows is not None:
             from vllm_rlt.kernels.graph_kv import write_graph_kv
 
             write_graph_kv(cache.key_cache[:, layer], cache.value_cache[:, layer], batch, k, v)
@@ -130,6 +141,7 @@ class _DeviceCache:
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
+                **cache._layer_scales(layer),
             )
         return cache.attention(
             q,
@@ -137,6 +149,7 @@ class _DeviceCache:
             cache.value_cache[:, layer],
             batch.block_tables,
             batch.context_lengths,
+            **cache._layer_scales(layer),
         )
 
 

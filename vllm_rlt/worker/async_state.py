@@ -132,7 +132,7 @@ class AsyncState:
         self.planes = config.total_ut_steps if cache.layout == "last_exited" else 1
         self.hidden = torch.empty(
             (scheduler.max_num_seqs, config.hidden_size),
-            dtype=cache.key_cache.dtype,
+            dtype=cache.dtype,
             device=cache.device,
         )
         self.tokens = torch.empty(

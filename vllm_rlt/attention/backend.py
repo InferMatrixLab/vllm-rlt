@@ -21,6 +21,10 @@ class BackendCapabilities:
     # Packed rows reproduce single-query decode exactly; speculative verification
     # relies on this to match serial decoding token for token.
     packed_matches_decode: bool = False
+    # Reads an FP8 e4m3 KV pool with per-vector float32 scales.
+    fp8_kv: bool = False
+    # FA stages per-batch pages with dynamic shapes; that cannot be graph-captured.
+    fp8_kv_graphs: bool = True
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
 
@@ -45,19 +49,35 @@ class AttentionBackend:
         return getattr(self.kernel, "generation", None)
 
 
-_TORCH_CAPABILITIES = BackendCapabilities()
+_TORCH_CAPABILITIES = BackendCapabilities(fp8_kv=True)
 _TRITON_CAPABILITIES = BackendCapabilities(
-    cuda_graphs=True, async_scheduling=True, device_context_lengths=True
+    cuda_graphs=True, async_scheduling=True, device_context_lengths=True, fp8_kv=True
 )
 _FLASH_CAPABILITIES = {
-    2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
-    3: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
+    2: BackendCapabilities(
+        cuda_graphs=True,
+        async_scheduling=True,
+        device_context_lengths=True,
+        fp8_kv=True,
+        fp8_kv_graphs=False,
+    ),
+    # FA3 paged FP8 is unvalidated: its source build lacks the e4m3 paged
+    # instantiation, so keep it on the Triton/FA2/FA4 paths until a wheel exists.
+    3: BackendCapabilities(
+        cuda_graphs=True,
+        async_scheduling=True,
+        device_context_lengths=True,
+        fp8_kv=False,
+        fp8_kv_graphs=False,
+    ),
     4: BackendCapabilities(
         packed_prefill=True,
         cuda_graphs=True,
         async_scheduling=True,
         packed_matches_decode=True,
         device_context_lengths=True,
+        fp8_kv=True,
+        fp8_kv_graphs=False,
     ),
 }
 _AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")
@@ -128,6 +148,7 @@ def create_backend(
                     "cuda_graphs",
                     "async_scheduling",
                     "device_context_lengths",
+                    "fp8_kv",
                 )
                 if getattr(required_capabilities, name)
                 and not getattr(implementation.capabilities, name)

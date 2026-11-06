@@ -31,6 +31,9 @@ def select_version(capability, backend):
     return selected
 
 
+_MAPPED: dict = {}
+
+
 class FlashPagedAttention:
     def __init__(self, device, dtype, head_dim, block_size, backend="flash_attn"):
         if device.type != "cuda" or torch.version.hip:
@@ -63,6 +66,50 @@ class FlashPagedAttention:
         )
         logging.getLogger(__name__).warning("Attention implementation: %s", self.info)
 
+    @staticmethod
+    @torch.no_grad()
+    def dequantize_kv(key_cache, value_cache, block_tables, key_scale, value_scale, dtype):
+        """Stage referenced FP8 pages as BF16/FP16 and remap the page table.
+
+        Invalid (-1) entries keep -1 and are skipped by the staging kernel; all
+        other entries get their own staged block, so duplicates are repeated and
+        the remap is a single where/arange (no sort or unique pass).
+        """
+        if key_scale is None or value_scale is None:
+            raise ValueError("FP8 KV cache requires per-vector key/value scales")
+        blocks = block_tables.reshape(-1)
+        import os
+
+        staged_key = staged_value = None
+        if key_cache.is_cuda and os.environ.get("VLLM_RLT_FP8_STAGE", "triton") == "triton":
+            try:
+                from vllm_rlt.kernels.fp8_stage import stage_fp8_kv
+
+                staged_key, staged_value = stage_fp8_kv(
+                    key_cache, value_cache, key_scale, value_scale, blocks, dtype
+                )
+            except ImportError:
+                pass
+        if staged_key is None:
+            valid = blocks >= 0
+            safe = blocks.clamp_min(0)
+            staged_key = (
+                key_cache.view(torch.uint8)[safe].view(torch.float8_e4m3fn).float()
+                * key_scale[safe].unsqueeze(-1)
+            ).to(dtype)
+            staged_value = (
+                value_cache.view(torch.uint8)[safe].view(torch.float8_e4m3fn).float()
+                * value_scale[safe].unsqueeze(-1)
+            ).to(dtype)
+            staged_key[~valid] = 0
+            staged_value[~valid] = 0
+        # Invalid (-1) entries are staged as zero and only appear past the
+        # context length, so a plain arange is enough for the FA page table.
+        mapped = torch.arange(blocks.numel(), device=blocks.device, dtype=torch.int32).reshape(
+            block_tables.shape
+        )
+        return staged_key, staged_value, mapped
+
     def prefill(
         self,
         q,
@@ -72,6 +119,8 @@ class FlashPagedAttention:
         context_lengths,
         cu_seqlens_q,
         max_seqlen_q,
+        key_scale=None,
+        value_scale=None,
     ):
         """Attend packed chunks to their prefixes with bottom-right causal alignment.
 
@@ -81,6 +130,10 @@ class FlashPagedAttention:
         """
         if self.generation != 4:
             raise ValueError("packed paged prefill requires FlashAttention-4")
+        if key_cache.dtype == torch.float8_e4m3fn:
+            key_cache, value_cache, block_tables = self.dequantize_kv(
+                key_cache, value_cache, block_tables, key_scale, value_scale, q.dtype
+            )
         out = self.kernel(
             q,
             key_cache,
@@ -95,7 +148,20 @@ class FlashPagedAttention:
         )
         return out[0] if isinstance(out, tuple) else out
 
-    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
+    def __call__(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        key_scale=None,
+        value_scale=None,
+    ):
+        if key_cache.dtype == torch.float8_e4m3fn:
+            key_cache, value_cache, block_tables = self.dequantize_kv(
+                key_cache, value_cache, block_tables, key_scale, value_scale, q.dtype
+            )
         if q.shape[0] == 0:
             return torch.empty_like(q)
         # The visible prefix already includes exactly the current causal position.

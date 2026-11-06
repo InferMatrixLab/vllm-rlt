@@ -5,7 +5,7 @@ import math
 import torch
 
 from vllm_rlt.config import cuda_graph_rows
-from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.core.kv_cache_manager import KVCacheManager, kv_bytes_per_block
 from vllm_rlt.worker.buffers import execution_buffer_bytes
 from vllm_rlt.worker.cuda_graph import speculative_capture_sizes
 
@@ -56,13 +56,13 @@ def plan_cache(
 ):
     parameter = next(model.parameters())
     config, device = model.config, parameter.device
-    per_block = (
-        2
-        * config.num_hidden_layers
-        * cache.block_size
-        * config.num_key_value_heads
-        * config.head_dim
-        * parameter.element_size()
+    per_block = kv_bytes_per_block(
+        config.num_hidden_layers,
+        cache.block_size,
+        config.num_key_value_heads,
+        config.head_dim,
+        parameter.element_size(),
+        cache.kv_cache_dtype,
     )
     if cache.num_blocks is not None:
         return cache.num_blocks, {"source": "blocks", "bytes_per_block": per_block}
@@ -102,6 +102,7 @@ def plan_cache(
         dtype=parameter.dtype,
         backend=backend,
         recurrent_layers=getattr(model, "recurrent_kv_layers", None),
+        kv_cache_dtype=cache.kv_cache_dtype,
     )
     ids, positions = [], []
     for index, length in enumerate(lengths):

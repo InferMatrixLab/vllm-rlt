@@ -167,8 +167,18 @@ class StageEngine:
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
+                fp8_kv=cache_config.kv_cache_dtype == "fp8_e4m3",
             ),
         )
+        if (
+            cache_config.kv_cache_dtype == "fp8_e4m3"
+            and self.execution_config.cuda_graphs
+            and not attention.capabilities.fp8_kv_graphs
+        ):
+            raise ValueError(
+                "FP8 KV with FlashAttention stages pages per call and cannot be CUDA-graph "
+                "captured; disable cuda_graphs or use the triton backend"
+            )
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -194,6 +204,7 @@ class StageEngine:
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
+            kv_cache_dtype=cache_config.kv_cache_dtype,
         )
         self.scheduler = Scheduler(
             scheduler_config,
