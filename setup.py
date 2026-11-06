@@ -37,6 +37,7 @@ def native_build_options():
                 sources=[
                     "csrc/torch_bindings.cpp",
                     "csrc/activation/silu_and_mul.cu",
+                    "csrc/normalization/rms_norm.cu",
                 ],
                 extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
             )
