@@ -125,6 +125,13 @@ def test_snapshot_restore_is_bitwise_and_checks_dtype():
         plain.restore("r", snapshot)
 
 
+def test_flash_backend_rejects_fp8_kv_with_guidance():
+    from vllm_rlt.kernels.flash_attention import FlashPagedAttention
+
+    with pytest.raises(ValueError, match="per-vector KV"):
+        FlashPagedAttention.check_kv_dtype(torch.empty(1, dtype=torch.float8_e4m3fn))
+
+
 def test_backends_without_fp8_support_are_rejected():
     info = {"backend": "flash", "selected_backend": "flash"}
     backend = AttentionBackend(torch_paged_attention, BackendCapabilities(), info)

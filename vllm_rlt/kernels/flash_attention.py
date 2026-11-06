@@ -63,6 +63,15 @@ class FlashPagedAttention:
         )
         logging.getLogger(__name__).warning("Attention implementation: %s", self.info)
 
+    @staticmethod
+    def check_kv_dtype(key_cache):
+        """FA has no per-vector-scale paged FP8 path; reject it explicitly."""
+        if key_cache.dtype == torch.float8_e4m3fn:
+            raise ValueError(
+                "FlashAttention backends do not support the FP8 per-vector KV cache; "
+                "use --attention-backend triton (or torch) for --kv-cache-dtype fp8_e4m3."
+            )
+
     def prefill(
         self,
         q,
@@ -79,6 +88,7 @@ class FlashPagedAttention:
         offset is prefix_length = seqlen_k - seqlen_q, including nonzero prefixes.
         K/V have already been written by the cache manager; no gathering is needed.
         """
+        self.check_kv_dtype(key_cache)
         if self.generation != 4:
             raise ValueError("packed paged prefill requires FlashAttention-4")
         out = self.kernel(
@@ -96,6 +106,7 @@ class FlashPagedAttention:
         return out[0] if isinstance(out, tuple) else out
 
     def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
+        self.check_kv_dtype(key_cache)
         if q.shape[0] == 0:
             return torch.empty_like(q)
         # The visible prefix already includes exactly the current causal position.
