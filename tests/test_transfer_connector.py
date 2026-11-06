@@ -7,9 +7,10 @@ import torch
 
 from tests.helpers import RecordingConnector, make_stage_engine
 from vllm_rlt import SamplingParams
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.connector import PDStageConnector
-from vllm_rlt.request import RequestPhase
+from vllm_rlt.request import RequestStatus
 
 
 def make_connector(engine, slots=4):
@@ -58,7 +59,7 @@ def test_import_requires_commit_all_sequences_and_capacity(commit_first):
     assert sum(w.active for w in transfers) == 3
     blocked = next(w for w in transfers if not w.active)
     active = next(w for w in transfers if w.active)
-    assert blocked.request.phase == RequestPhase.RECEIVING
+    assert blocked.request.status == RequestStatus.RECEIVING
     assert engine.cache_manager.has_transfer_lease(blocked.tid)
     assert engine.scheduler.requests[active.tid] is active.request
     connector.cancel(active.tid)
@@ -76,8 +77,9 @@ def test_cancelled_export_holds_slot_and_kv_until_local_and_remote_access_end():
     event = transfer.last_event = Mock()
     event.query.return_value = False
     connector.cancel(transfer.tid)
-    assert transfer.request.phase == RequestPhase.TRANSFERRING
-    assert all(transfer.tid not in q for q in engine.scheduler.queues.values())
+    assert transfer.request.status == RequestStatus.TRANSFERRING
+    assert transfer.tid not in engine.scheduler.waiting
+    assert all(transfer.tid not in q for q in engine.scheduler.work_queues.values())
     connector.progress()
     assert not connector.free_slots
     assert engine.cache_manager.has_transfer_lease(transfer.tid)
@@ -108,7 +110,7 @@ def test_cancelled_import_waits_for_safe_notification_and_old_generation_is_igno
     current = reserve(connector, "generation-2")
     connector.progress()  # Old completion cannot activate the reused staging slot.
     connector.commit(old.tid, 1)
-    assert current.request.phase == RequestPhase.RECEIVING
+    assert current.request.status == RequestStatus.RECEIVING
     assert current.received == set()
     assert engine.cache_manager.has_transfer_lease(current.tid)
     connector.cancel(current.tid)
@@ -120,7 +122,7 @@ def test_compute_release_checks_event_and_identity_without_releasing_kv():
     engine = make_stage_engine(role="prefill")
     engine.connector = RecordingConnector()
     request = engine.reserve_transfer("r", [1, 2], SamplingParams(max_tokens=1), receiving=False)
-    while request.phase != RequestPhase.TRANSFERRING:
+    while request.status != RequestStatus.TRANSFERRING:
         engine.step()
     event = Mock()
     event.query.return_value = False
@@ -153,7 +155,7 @@ def test_mixed_connector_handles_both_transfer_directions_by_request():
     engine.scheduler._admit()
     connector.progress()
     assert incoming.active
-    assert outgoing.request.phase == RequestPhase.PREFILLING_PRELUDE
+    assert engine.scheduler.pending_work(outgoing.request) == WorkKey.PROMPT_PRELUDE
     connector.cancel(outgoing.tid)
     connector.cancel(incoming.tid)
     connector.progress()
@@ -184,10 +186,11 @@ def test_commit_validation_and_late_write_rejection():
     engine.close()
 
 
-def test_ack_alone_cannot_release_unsubmitted_or_locally_pending_export():
+def test_ack_alone_cannot_release_locally_pending_export():
     engine = make_stage_engine()
     connector = make_connector(engine, slots=1)
     transfer = reserve(connector, "out", receiving=False)
+    engine.scheduler._admit()
     connector.acknowledge(transfer.tid)
     connector.progress()
     assert transfer.tid in connector.transfers
@@ -199,17 +202,38 @@ def test_ack_alone_cannot_release_unsubmitted_or_locally_pending_export():
     transfer.chunks.append((event, 0, [], [], 1))
     connector.progress()
     assert not transfer.committed
-    assert not transfer.request.compute_released
+    assert engine.scheduler.has_admission_slot(transfer.request)
     assert engine.cache_manager.has_transfer_lease(transfer.tid)
     event.query.return_value = True
     connector.transport.submit.return_value = True
     connector.transport.busy.return_value = True
     connector.progress()
-    assert transfer.committed and transfer.request.compute_released
+    assert transfer.committed and not engine.scheduler.has_admission_slot(transfer.request)
     assert not connector.free_slots
     connector.transport.busy.return_value = False
     connector.progress()
     assert connector.free_slots == [0]
+    assert engine.cache_manager.num_used_blocks == 0
+    engine.close()
+
+
+def test_unsubmitted_export_does_not_consume_compute_slot_or_retire_on_ack():
+    engine = make_stage_engine()
+    connector = make_connector(engine, slots=1)
+    transfer = reserve(connector, "unsubmitted", receiving=False)
+    assert transfer.request.status == RequestStatus.WAITING
+    assert not engine.scheduler.has_admission_slot(transfer.request)
+    assert engine.scheduler.has_admission_capacity()
+
+    connector.acknowledge(transfer.tid)
+    connector.progress()
+    assert transfer.tid in connector.transfers
+    assert not transfer.request.compute_released
+    assert engine.cache_manager.has_transfer_lease(transfer.tid)
+
+    connector.cancel(transfer.tid)
+    connector.progress()
+    assert transfer.tid not in connector.transfers
     assert engine.cache_manager.num_used_blocks == 0
     engine.close()
 
@@ -256,15 +280,15 @@ def test_import_and_local_prompt_share_priority_admission(local_priority, remote
     connector.commit("remote", 1)
     connector.transport.poll.return_value = ([], [("peer", "remote", 0)])
     connector.progress()
-    assert engine.scheduler.requests["local"].phase == RequestPhase.WAITING
-    assert engine.scheduler.requests["remote"].phase == RequestPhase.RECEIVING
+    assert engine.scheduler.requests["local"].status == RequestStatus.WAITING
+    assert engine.scheduler.requests["remote"].status == RequestStatus.RECEIVING
     engine.scheduler._admit()
-    assert engine.scheduler.requests[winner].phase not in (
-        RequestPhase.WAITING,
-        RequestPhase.RECEIVING,
-    )
+    assert engine.scheduler.requests[winner].status == RequestStatus.ACTIVE
     loser = "remote" if winner == "local" else "local"
-    assert engine.scheduler.requests[loser].phase in (RequestPhase.WAITING, RequestPhase.RECEIVING)
+    assert engine.scheduler.requests[loser].status in (
+        RequestStatus.WAITING,
+        RequestStatus.RECEIVING,
+    )
     connector.cancel("remote")
     engine.close()
 
@@ -276,17 +300,20 @@ def test_export_holds_compute_admission_until_final_staging_read_finishes():
     engine.scheduler.config = replace(engine.scheduler.config, max_num_seqs=1)
     connector = make_connector(engine)
     transfer = reserve(connector, "export", receiving=False)
+    engine.scheduler._admit()
     engine.suspend_transfer(transfer.request)
     engine.add_request("local", [2], SamplingParams(max_tokens=1))
     event = Mock()
     event.query.return_value = False
     assert not engine.release_transfer_compute(transfer.request, ready_event=event)
     engine.scheduler._admit()
-    assert engine.scheduler.requests["local"].phase == RequestPhase.WAITING
+    assert engine.scheduler.requests["local"].status == RequestStatus.WAITING
     event.query.return_value = True
     assert engine.release_transfer_compute(transfer.request, ready_event=event)
     engine.scheduler._admit()
-    assert engine.scheduler.requests["local"].phase == RequestPhase.PREFILLING_PRELUDE
+    assert (
+        engine.scheduler.pending_work(engine.scheduler.requests["local"]) == WorkKey.PROMPT_PRELUDE
+    )
     assert engine.cache_manager.has_transfer_lease("export")
     connector.cancel("export")
     connector.progress()
@@ -311,16 +338,18 @@ def test_export_reservation_obeys_shared_compute_admission(local_priority, remot
         peer="peer",
     )
     remote = engine.scheduler.requests["remote"]
-    assert remote.phase == RequestPhase.WAITING
+    assert remote.status == RequestStatus.WAITING
     assert engine.cache_manager.has_transfer_lease("remote")
     engine.scheduler._admit()
-    assert engine.scheduler.requests[winner].phase == RequestPhase.PREFILLING_PRELUDE
+    assert (
+        engine.scheduler.pending_work(engine.scheduler.requests[winner]) == WorkKey.PROMPT_PRELUDE
+    )
     loser = "remote" if winner == "local" else "local"
-    assert engine.scheduler.requests[loser].phase == RequestPhase.WAITING
+    assert engine.scheduler.requests[loser].status == RequestStatus.WAITING
     # Reserving another export must not bypass an occupied compute slot either.
     reserve(connector, "queued", receiving=False)
     engine.scheduler._admit()
-    assert engine.scheduler.requests["queued"].phase == RequestPhase.WAITING
+    assert engine.scheduler.requests["queued"].status == RequestStatus.WAITING
     connector.cancel("queued")
     connector.cancel("remote")
     engine.close()

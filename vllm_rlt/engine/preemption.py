@@ -20,21 +20,27 @@ class PreemptionManager:
         """Discard saved state; normal request cleanup releases any resident KV."""
         self.snapshots.pop(request_id, None)
 
+    def has_snapshot(self, request_id: str) -> bool:
+        return request_id in self.snapshots
+
     def suspend(self, victim, *, offload_kv=True):
         """Release a runner slot, optionally reclaiming KV capacity as well.
 
         An already suspended resident request may be offloaded under later KV
-        pressure. Its saved phase and RNG must survive that conversion.
+        pressure. Its saved work and RNG must survive that conversion.
         """
         e = self.engine
         cache = e.cache_manager
         previous = self.snapshots.get(victim.request_id)
         if previous is None:
             e.model_runner.synchronize()
-            e._rewind_split_prefill(victim)
-            phase, hidden, token = victim.phase, victim.hidden_state, victim.input_token_tensor
+            work = e.scheduler.pending_work(victim)
+            if work is None:
+                raise ValueError("a preemption victim must have pending work")
+            work = e._rewind_split_prefill(victim, work)
+            hidden, token = victim.hidden_state, victim.input_token_tensor
         else:
-            phase, hidden, token = previous["phase"], previous["hidden"], previous["token"]
+            work, hidden, token = previous["work"], previous["hidden"], previous["token"]
 
         device = torch.device("cpu") if offload_kv else cache.device
         runner = e.speculative_runner
@@ -46,8 +52,8 @@ class PreemptionManager:
         # Build a new record before releasing resources. In particular, a failed
         # offload must leave the prior resident state available for resumption.
         snapshot = dict(
+            work=work,
             pipeline=pipeline,
-            phase=phase,
             kv=cache.snapshot(victim.request_id) if offload_kv else None,
             hidden=None if hidden is None else hidden.to(device).clone(),
             token=None if token is None else token.to(device).clone(),
@@ -68,7 +74,7 @@ class PreemptionManager:
         self.snapshots[victim.request_id] = snapshot
 
     def resume(self, request):
-        """Return the saved phase, None without saved state, or False when blocked."""
+        """Return saved work, None without a snapshot, or False when blocked."""
         state = self.snapshots.get(request.request_id)
         if state is None:
             return None
@@ -91,4 +97,4 @@ class PreemptionManager:
             torch.cuda.current_stream(cache.device).synchronize()
         del self.snapshots[request.request_id]
         self.resumptions += 1
-        return state["phase"]
+        return state["work"]

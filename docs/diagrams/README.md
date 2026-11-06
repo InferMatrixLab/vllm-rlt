@@ -34,7 +34,7 @@ do not imply that every submission executes all three operations.
 
 `scheduler-overview.svg` is the editable 1800 × 2600 source and
 `scheduler-overview.png` its 2× export. The vertical A–F spine shows admission,
-phase queues, policy/batch selection, execution, completion tracking and progress.
+WorkKey queues, policy/batch selection, execution, completion tracking and progress.
 Read top to bottom; one return arrow on the left leads from F to B. A includes waiting, safe preemption and
 restoration; KV growth pressure in C returns to the same preemption logic. C
 separates prefill granularity from batching and shows supported combinations.

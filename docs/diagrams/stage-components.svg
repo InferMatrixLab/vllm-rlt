@@ -56,7 +56,7 @@
 <text x="830" y="972" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#213951" font-weight="400" text-anchor="start">Apply progress · exit / stop · coordinate resource retirement</text>
 <rect x="150" y="845" width="480" height="210" rx="14" fill="#edf3fc" stroke="#326ca8" stroke-width="2"/>
 <text x="180" y="887" font-family="Arial,Helvetica,sans-serif" font-size="31" fill="#326ca8" font-weight="700" text-anchor="start">Scheduler</text>
-<text x="180" y="933" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#213951" font-weight="400" text-anchor="start">Policy · admission · phase queues</text>
+<text x="180" y="933" font-family="Arial,Helvetica,sans-serif" font-size="25" fill="#213951" font-weight="400" text-anchor="start">Policy · admission · WorkKey queues</text>
 <text x="180" y="978" font-family="Arial,Helvetica,sans-serif" font-size="24" fill="#213951" font-weight="400" text-anchor="start">Request registry · loop selection</text>
 <text x="180" y="1021" font-family="Arial,Helvetica,sans-serif" font-size="23" fill="#71839a" font-weight="400" text-anchor="start">operation / token range / depth</text>
 <path d="M800 900H630" fill="none" stroke="#326ca8" stroke-width="3" stroke-linejoin="round" marker-end="url(#arr)"/>
