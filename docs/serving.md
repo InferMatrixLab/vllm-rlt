@@ -7,11 +7,11 @@ to `127.0.0.1:8000`; this benchmark frontend has no authentication or TLS.
 
 Prepare the Ouro checkpoint and tokenizer separately. The official model ID
 pins revision `574fa66cb8bf5abdc979642d01cf2b79b16bfab1`; local paths are supported.
-Use a GPU scheduler reservation on shared hosts:
+Select an available GPU explicitly; a scheduler is optional:
 
 ```bash
-gpu status
-gpu run --gpu-ids <available-id> --timeout 30m --note "Ouro HTTP serving" -- \
+nvidia-smi
+CUDA_VISIBLE_DEVICES=<available-id> \
   python -m vllm_rlt.entrypoints.serve \
   --model /path/to/prepared/ouro --tokenizer /path/to/prepared/ouro \
   --device cuda --dtype bfloat16 --attention-backend triton \

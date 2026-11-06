@@ -6,17 +6,17 @@ import torch
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--run-gpu", action="store_true", help="Run CUDA tests inside a GPU reservation"
+        "--run-gpu", action="store_true", help="Run CUDA tests on explicitly selected devices"
     )
 
 
 def pytest_collection_modifyitems(config, items):
     enabled = config.getoption("--run-gpu")
     if enabled and not os.environ.get("CUDA_VISIBLE_DEVICES"):
-        raise pytest.UsageError("--run-gpu requires scheduler-provided CUDA_VISIBLE_DEVICES")
+        raise pytest.UsageError("--run-gpu requires explicit CUDA_VISIBLE_DEVICES")
     for item in items:
         if "gpu" in item.keywords and not enabled:
-            item.add_marker(pytest.mark.skip(reason="use --run-gpu inside a GPU reservation"))
+            item.add_marker(pytest.mark.skip(reason="set CUDA_VISIBLE_DEVICES and use --run-gpu"))
 
 
 @pytest.fixture(autouse=True, scope="session")
