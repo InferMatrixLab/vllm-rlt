@@ -208,16 +208,17 @@ arcs on the right indicate separate paths, not joins.
 | Diagram step | What is shown |
 | --- | --- |
 | 1. Trigger | A: failed token-capacity growth. B: no active slot during admission. Available capacity/slots bypass preemption; disabled preemption or non-priority B stops the attempt. |
-| 2. Protection | Exclude the requester, already-selected requests, pending outputs, WAITING/RECEIVING requests and transfer leases; B also excludes equal/higher-priority victims. An empty candidate set leads to the A/B defer/stop outcomes. |
-| 3. Ranking | Lower service priority first, then larger estimated footprint; pick one victim. |
+| 2. Protection | Exclude the requester, already-selected requests, pending work, RECEIVING requests and transfer leases; B also excludes WAITING and equal/higher-priority victims. Capacity reclamation can offload a WAITING resident. |
+| 3. Ranking | Lower service priority first, then larger estimated footprint; priority admission also checks whether each candidate could free sufficient KV before selecting it. |
 | 4. Suspend | Synchronize, rewind unfinished split prefill if applicable, snapshot, release device resources and retain RNG. |
-| 5. Requester | A retries once, then selects or requeues. B continues shared admission, including restore or fresh allocation/import handling, and defers if admission fails. |
+| 5. Requester | A retries after each safe victim until it can select or must requeue. B continues shared admission, including restore or fresh allocation/import handling, and defers if admission fails. |
 | 6. Victim | Shared WAITING, slot check, allocation, tensor restoration, synchronization, snapshot deletion and saved-phase enqueue. Slot shortage returns to B; failed KV allocation retains the snapshot and waits. |
 | Red exits | Cancellation discards suspended state and aborts; snapshot/restore exceptions propagate without transactional rollback in this manager. |
 
 The detailed rules below describe configuration restrictions, scan/bypass
-behavior, ordering ties and current recovery limitations. The diagram covers
-preemption policy; it does not expand the separate connector import protocol.
+behavior, ordering ties and current recovery limitations. The diagram does not
+show the priority-admission KV preflight, the failed-admission guard or the
+separate connector import protocol.
 
 #### What happens to each kind of data?
 
@@ -225,10 +226,10 @@ preemption policy; it does not expand the separate connector import protocol.
 | --- | --- | --- | --- |
 | Request identity and logical progress: token history, position, counters | The original Request stays in the registry; its ID moves to shared WAITING. Its phase becomes WAITING; the resume phase is saved separately. | Reuse the same Request and enqueue the saved phase. | `Scheduler.requests`, `Scheduler.queues`, `PreemptionManager.snapshots` |
 | Sampling RNG | Retained by the runner's RNG manager; not serialized into the CPU snapshot. | Continue the same random stream. | `ModelRunner.suspend()` preserves RNG but frees the runner execution slot. |
-| KV tensors | Copy allocated KV pages to CPU, then release the request's GPU allocation. Shared/cached pages need not all become free. | Allocate fresh GPU blocks and copy the saved pages into them. | `KVCacheManager.snapshot()` / `restore()` |
-| KV logical metadata: capacity, page count, written state per plane | Save capacity and page count; deep-copy written-state metadata into `KVSnapshot`. | Restore written-state metadata onto the new allocation. | `KVSnapshot` and cache allocation |
-| Physical KV mapping and batch execution metadata: block tables, write locations, row indices | Do not preserve the old batch as a resumable execution object. The old allocation is released. | Allocation establishes physical block mappings; subsequent batch preparation derives execution metadata from current mappings and progress. | Cache allocation and `ModelRunner.prepare_on_cpu()` / `prepare_on_gpu()` |
-| Intermediate hidden state and input-token tensor | When present, copy to CPU and clear their references on the Request. | Copy back to the cache device and attach to the same Request. | `PreemptionManager` |
+| KV tensors | Priority slot preemption retains resident KV. Under capacity pressure, copy allocated pages to CPU and release the allocation; shared/cached pages need not all become free. | Reuse the resident allocation, or allocate fresh blocks and restore saved pages. | `KVCacheManager.snapshot()` / `restore()` |
+| KV logical metadata: capacity, page count, written state per plane | Retained with resident KV, or deep-copied into `KVSnapshot` when offloaded. | Reuse resident metadata or restore it onto the new allocation. | `KVSnapshot` and cache allocation |
+| Physical KV mapping and batch execution metadata: block tables, write locations, row indices | Do not preserve the old batch as a resumable execution object. An offloaded allocation is released. | A restored allocation establishes new mappings; subsequent preparation derives metadata from current mappings and progress. | Cache allocation and `ModelRunner.prepare_on_cpu()` / `prepare_on_gpu()` |
+| Intermediate hidden state and input-token tensor | When present, clone to the cache device for a resident suspension, or to CPU for offload; clear their references on the Request. | Attach the saved tensors to the same Request on the cache device. | `PreemptionManager` |
 
 There is no dedicated queue containing snapshots. WAITING contains request IDs;
 `snapshots[request_id]` contains `phase`, `kv`, `hidden` and `token`. Persistent
@@ -249,17 +250,19 @@ rejects preemption; it requires refill scheduling with preemption disabled.
 
 | Situation | Action in the current implementation |
 | --- | --- |
-| A selected candidate needs a larger token frontier and `ensure_capacity()` fails | Attempt one safe victim, then retry allocation once for this candidate. |
-| Active-request slots are full under priority admission | Attempt one strictly lower-priority victim to free a slot. This uses the same snapshot path even if the immediate shortage is a slot rather than KV. |
+| A selected candidate needs a larger token frontier and `ensure_capacity()` fails | Reclaim safe victims until allocation succeeds or no candidate remains. |
+| Active-request slots are full under priority admission | Consider strictly lower-priority victims in rank order; skip one if admission cannot fit even with its reclaimable KV and eligible waiting resident KV. A prior failed attempt can also suppress another preemption until the budget improves. |
 | Active slots are full under FCFS, or no victim can free a priority slot | Stop that admission scan. |
-| A fresh request passes the slot check but fails its allocation budget | Defer it under admission scan/bypass rules. This branch does not independently loop over victims to make its allocation fit. |
-| Restoring a suspended request cannot allocate KV | Keep its snapshot and defer it; restoration does not itself recursively preempt other requests. The preceding priority slot check can still preempt. |
+| A fresh request passes the slot check but fails its allocation budget | Reclaim waiting resident allocations and retry; if still blocked, defer it under admission scan/bypass rules. |
+| Restoring a suspended request cannot allocate KV | Reclaim waiting resident allocations and retry; if still blocked, retain the snapshot and defer it under the same bypass limit. |
 
-Before ranking victims, exclude the requesting Request itself, WAITING and
-RECEIVING requests, requests with pending output placeholders, requests already
-selected for the current batch, and allocations with transfer leases. Priority
-admission additionally excludes equal/higher-priority requests. The selected
-batch exclusion set is empty during admission, which runs before batch selection.
+Before ranking victims, exclude the requesting Request itself, RECEIVING
+requests, requests with pending output placeholders or speculative rounds,
+requests already selected for the current batch, and allocations with transfer
+leases. A WAITING request is eligible only when it still has a resident
+allocation and the caller is reclaiming capacity, not for priority slot
+preemption. Priority admission additionally excludes equal/higher-priority
+requests. Admission runs before batch selection, so its exclusion set is empty.
 
 #### Current policy: ranking and retry
 
@@ -275,31 +278,53 @@ That footprint is not the exact number of reclaimable physical pages and does
 not account for transfer cost. Exact ties follow candidate iteration order.
 Memory-pressure selection uses this ranking even under FCFS; only priority
 admission requires the victim to be strictly lower priority than the requester.
+Priority admission tries the next ranked victim when the previous one cannot
+provide a feasible slot and KV budget.
 
-If no safe victim exists, or the one allocation retry still fails, batch
-construction returns the requesting ID to its phase queue and considers other
-candidates within the scan/token/sequence limits. It does not force an unsafe
-eviction or keep evicting until that individual request fits. A later scheduling
-attempt can try again; other candidates in the same call can also trigger their
-own capacity checks. With no selected work, no batch is returned.
+If no safe victim exists and allocation still fails, batch construction returns
+the requesting ID to its phase queue and considers other candidates within the
+scan/token/sequence limits. A later scheduling attempt can try again. With no
+selected work, no batch is returned.
 
 #### Current policy: suspend, restore and cleanup
 
 | Transition | Ordered actions |
 | --- | --- |
-| Suspend device state | Synchronize the runner's configured streams; rewind unfinished split prefill; snapshot KV, phase and optional hidden/token tensors to CPU. |
-| Relinquish resources | Suspend runner resources while retaining RNG; poll cache prefixes; free the victim's cache allocation; clear hidden/token references; store the snapshot. |
+| Suspend device state | Synchronize the runner's configured streams; rewind unfinished split prefill; save the phase and optional hidden/token tensors. KV is copied to CPU when offloaded. |
+| Relinquish resources | Suspend runner resources while retaining RNG; release KV only when offloading; clear hidden/token references; store the snapshot. |
 | Move the request | Remove the victim's old queue entries and enqueue its ID into shared WAITING. |
 | Reconsider admission | FCFS preserves waiting order; priority mode sorts by numeric priority. Admission is bounded by `admission_scan_limit` and checks active slots before attempting restoration. |
 | Restore | If allocation succeeds, copy KV and optional hidden/token tensors to device, synchronize the current CUDA stream, delete the CPU snapshot and enqueue the saved phase. If allocation fails, retain the snapshot and defer. |
 | Abort a suspended request | Discard its snapshot, release runner resources/RNG and abort it through the scheduler. |
 
-Deferred IDs are put back at the front in their existing order. Fresh admission
-has `max_admission_bypasses` accounting to prevent unlimited bypass of blocked
-requests. Successful restoration takes an early continuation: it does not use
-the common bypass-counter update. Blocked restoration also takes an early
-continuation rather than checking the fresh-allocation bypass limit. These are
-current branch behaviors, not a guarantee of starvation-free restoration.
+Deferred IDs are put back at the front in their existing order. Both fresh
+admissions and restorations count as bypasses of earlier blocked requests, and
+both fresh and restored requests stop further bypasses at
+`max_admission_bypasses`.
+
+Before a priority slot preemption, the scheduler computes an optimistic
+admission budget for each eligible victim. It excludes that victim's future
+prompt-growth reservation and counts blocks that would become available after
+releasing the victim and eligible waiting resident allocations. Shared pages are
+counted only once, and transfer-leased pages cannot be reclaimed. Fresh requests
+include their prompt/capacity budget and watermark; offloaded snapshots need
+their saved pages, while resident snapshots need no new KV. Prefix reuse counts
+both available and pending prefix publications as possible hits and accounts for
+published pages that are or would become cache-only after reclamation. This
+optimistic check may still permit an attempt that later fails; actual admission
+verifies and claims the prefix. If even this budget is insufficient, the victim
+is not suspended or rewound. An unknown custom resume callback also skips the
+preflight rejection.
+
+If a request first preempts a lower-priority active request for a slot, but its
+own fresh allocation or snapshot restoration still fails, the scheduler records
+the available budget: free blocks minus active prompt growth reservations. While
+slots remain full, it will not repeat that request's priority preemption until
+this budget improves. Successful admission removes the record; request completion
+or cancellation clears the records so capacity and eligibility can be evaluated
+again. This lets active work make progress instead of repeatedly rewinding it for
+an admission that cannot yet succeed. It can temporarily delay strict-priority
+service and is not a general starvation-freedom guarantee for all workloads.
 
 #### Implemented recovery versus possible extensions
 
@@ -311,7 +336,7 @@ current branch behaviors, not a guarantee of starvation-free restoration.
 | Choose KV swap versus discard-and-recompute | Not implemented as a selectable recovery policy. Full-depth replay of generated tokens is not assumed equivalent for RLT. |
 | Other-GPU / external-storage snapshot backend | Not implemented by `PreemptionManager`. |
 | Asynchronous pooled snapshot transfer | Not implemented by this path; the normal input-transfer buffer pools do not make snapshots asynchronous. |
-| Victim ranking by exact reclaimed bytes, swap cost or prior preemptions | Not implemented. There is no cost-based victim score or cooldown against repeated preemption. |
+| Victim ranking by exact reclaimed bytes, swap cost or prior preemptions | Not implemented. The preflight can skip an infeasible victim but does not change the victim score. |
 
 Insufficient capacity and absence of a victim are explicit defer outcomes.
 Snapshot/copy/restore exceptions are not converted by `PreemptionManager` into a
