@@ -9,6 +9,7 @@ import torch
 
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS, FlashPagedAttention
 from vllm_rlt.kernels.paged_attention import TritonPagedAttention, torch_paged_attention
+from vllm_rlt.platform import is_rocm
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,8 @@ class AttentionBackend:
 
 
 _TORCH_CAPABILITIES = BackendCapabilities()
+# Triton's packed prefill opts in through required_capabilities (prefill_uva);
+# it is not the default because FA4 owns packed prefill on CUDA.
 _TRITON_CAPABILITIES = BackendCapabilities(
     cuda_graphs=True, async_scheduling=True, device_context_lengths=True
 )
@@ -100,10 +103,12 @@ def create_backend(
 ) -> AttentionBackend:
     """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
 
-    Each candidate validates hardware/configuration and imports its implementation.
-    Only compatibility and import failures permit auto to try the next candidate;
-    kernel execution errors never trigger a runtime fallback. Execution requirements
-    filter candidates before memory profiling or device-buffer allocation.
+    ROCm skips the NVIDIA-only FlashAttention candidates and tries Triton then
+    Torch. Each candidate validates hardware/configuration and imports its
+    implementation. Only compatibility and import failures permit auto to try the
+    next candidate; kernel execution errors never trigger a runtime fallback.
+    Execution requirements filter candidates before memory profiling or
+    device-buffer allocation.
     """
     validate_backend_name(backend)
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
@@ -111,6 +116,9 @@ def create_backend(
     if backend == "auto" and device.type != "cuda":
         candidates = ("torch",)
         skipped.append(f"{device.type.upper()} uses Torch reference attention")
+    elif backend == "auto" and is_rocm():
+        candidates = ("triton", "torch")
+        skipped.append("ROCm uses Triton or Torch attention; FlashAttention is NVIDIA-only")
     for candidate in candidates:
         try:
             implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)

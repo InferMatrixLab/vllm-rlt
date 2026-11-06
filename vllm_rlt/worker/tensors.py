@@ -7,10 +7,13 @@ Readback and immutable prompt storage remain plain pinned tensors.
 
 These objects never synchronize or decide when their storage may be overwritten.
 Callers must acquire the owning buffer before writes and retire its final consumer
-before reset/reuse. CUDA graph inputs and hot hidden/KV states stay device-resident.
+before reset/reuse. Graph inputs and hot hidden/KV states stay device-resident.
 """
 
+import ctypes
+import logging
 import math
+import os
 from functools import cache, cached_property
 
 import torch
@@ -20,9 +23,49 @@ from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS
 _DTYPES = (torch.int32, torch.int64, torch.float16, torch.bfloat16, torch.float32)
 
 
+def _hip_uva_identity(device_index: int) -> bool:
+    """Whether ROCm returns the same device address for mapped pinned memory.
+
+    Triton receives the host pointer directly, so a distinct device alias is not
+    usable without passing both pointers through the runtime. hipHostGetDevicePointer
+    is a host-side query: it does not launch a kernel or fault on unmapped memory.
+    """
+    try:
+        with torch.cuda.device(device_index):
+            probe = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+            library = ctypes.CDLL("libamdhip64.so")
+            device_pointer = ctypes.c_void_p()
+            status = library.hipHostGetDevicePointer(
+                ctypes.byref(device_pointer), ctypes.c_void_p(probe.data_ptr()), 0
+            )
+            return status == 0 and device_pointer.value == probe.data_ptr()
+    except (OSError, RuntimeError):
+        return False
+
+
+@cache
+def _uva_available(device_index: int) -> bool:
+    available = device_index < torch.cuda.device_count()
+    if available and torch.version.hip:
+        available = _hip_uva_identity(device_index)
+    logging.getLogger(__name__).info(
+        "Mapped host metadata on device %d: %s", device_index, "enabled" if available else "off"
+    )
+    return available
+
+
 def use_uva_on(device, enabled=True):
-    """Mapped host reads are supported by the NVIDIA CUDA path."""
-    return enabled and torch.device(device).type == "cuda" and not torch.version.hip
+    """Mapped host reads are probed once per device; VLLM_RLT_UVA=0 forces them off."""
+    target = torch.device(device)
+    if not enabled or target.type != "cuda" or not torch.cuda.is_available():
+        return False
+    mode = os.environ.get("VLLM_RLT_UVA", "auto").strip().lower()
+    if mode in ("0", "false", "off", "no"):
+        return False
+    if mode in ("1", "true", "on", "yes"):
+        return True
+    index = target.index if target.index is not None else torch.cuda.current_device()
+    return _uva_available(index)
 
 
 @cache
@@ -36,7 +79,7 @@ def copy_tensor(source, target, *, secondary=None, use_uva=True):
     """Copy contiguous values directly to final storage, optionally casting twice.
 
     Source and outputs must stay alive through the caller's completion event.
-    D2H deliberately uses CUDA's async copy path rather than SM writes to host.
+    D2H deliberately uses the device async copy path rather than SM writes to host.
     """
     if source.numel() != target.numel() or not source.is_contiguous() or not target.is_contiguous():
         raise ValueError("copy_tensor requires equal-sized contiguous tensors")
@@ -56,10 +99,8 @@ def copy_tensor(source, target, *, secondary=None, use_uva=True):
         raise ValueError("cross-device transfers require an explicit connector")
     if source.numel() == 0:
         return target
-    direct = (
-        target.is_cuda
-        and not torch.version.hip
-        and (source.is_cuda or (use_uva_on(target.device, use_uva) and source.is_pinned()))
+    direct = target.is_cuda and (
+        source.is_cuda or (use_uva_on(target.device, use_uva) and source.is_pinned())
     )
     if direct:
         from vllm_rlt.kernels.tensor_transfer import tensor_transfer_kernel
