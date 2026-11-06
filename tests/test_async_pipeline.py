@@ -198,10 +198,13 @@ def test_cpu_prepare_finishes_while_previous_gpu_forward_is_inflight(monkeypatch
 
     def inspect_prepare(batch, **kwargs):
         result = prepare(batch, **kwargs)
-        if injected and not observations and batch.operation == Operation.RECURRENT:
+        # The submission after the delayed core (its CODA once loops are fused,
+        # or the next loop when they are not) is prepared while the core runs.
+        if injected and not observations:
             assert not delayed.query(), "prepare waited for the preceding forward"
-            assert result.kv.position_ids.device.type == "cpu"
-            assert result.kv.position_ids.is_pinned()
+            if result.kv is not None:
+                assert result.kv.position_ids.device.type == "cpu"
+                assert result.kv.position_ids.is_pinned()
             observations.append(True)
         return result
 

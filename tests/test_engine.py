@@ -22,7 +22,7 @@ def drain(engine, limit=1000):
             return outputs, trace
         emitted = engine.step()
         batch = engine.last_schedule
-        trace.append((batch.phase, tuple(i.request.request_id for i in batch.requests)))
+        trace.append((batch.phase, tuple(i.request.request_id for i in batch.requests), batch))
         for output in emitted:
             if output.finished:
                 outputs[output.request_id] = output
@@ -80,14 +80,46 @@ def test_refill_recycles_exited_token_before_slow_token_coda(mode):
     engine.add_request("fast", [1], SamplingParams(max_tokens=3, exit_threshold=0, ignore_eos=True))
     engine.add_request("slow", [2], SamplingParams(max_tokens=3, exit_threshold=1, ignore_eos=True))
     outputs, trace = drain(engine)
-    recurrent = [ids for stage, ids in trace if stage == RequestPhase.RECURRENT]
+    recurrent = [ids for stage, ids, _ in trace if stage == RequestPhase.RECURRENT]
     # In refill mode fast returns with its next token while slow is on its first.
+    # Alone in a batch, slow's remaining fixed-depth loops run as one submission.
     assert recurrent[:4] == (
         [("fast", "slow")] * 2 + [("slow", "fast")] * 2
         if mode == "refill"
-        else [("fast", "slow")] * 2 + [("slow",)] * 2
+        else [("fast", "slow")] * 2 + [("slow",), ("fast", "slow")]
     )
     assert set(outputs) == {"fast", "slow"}
+
+
+@pytest.mark.parametrize("mode", ["refill", "mixed"])
+def test_fixed_depth_decode_fuses_remaining_loops_without_changing_outputs(mode):
+    # Fixed-depth decode rows need no gate readback, so their loops share one submission.
+    model = tiny_model()
+    params = SamplingParams(max_tokens=4, exit_threshold=1, ignore_eos=True)
+    shallow = SamplingParams(max_tokens=4, max_loops=3, ignore_eos=True)
+    fused = LLMEngine(model, scheduler_config=SchedulerConfig(mode=mode))
+    fused.add_request("a", [1, 2], params)
+    fused.add_request("b", [3], shallow)
+    outputs, trace = drain(fused)
+    counts = [batch.loop_count for stage, _, batch in trace if stage == RequestPhase.RECURRENT]
+    # A batch advances by the smallest remaining depth among its rows, never one by one.
+    assert counts and max(counts) > 1 and all(1 <= c <= 4 for c in counts), counts
+    assert outputs["a"].exit_depths == [4, 4, 4, 4]
+    assert outputs["b"].exit_depths == [4, 3, 3, 3]
+    serial = LLMEngine(model, scheduler_config=SchedulerConfig(mode=mode))
+    serial.scheduler._fused_decode_loops = lambda scheduled_requests: 1
+    serial.add_request("a", [1, 2], params)
+    serial.add_request("b", [3], shallow)
+    reference, reference_trace = drain(serial)
+    assert all(
+        batch.loop_count == 1
+        for stage, _, batch in reference_trace
+        if stage == RequestPhase.RECURRENT
+    )
+    for rid in ("a", "b"):
+        assert reference[rid].token_ids == outputs[rid].token_ids
+        assert reference[rid].exit_depths == outputs[rid].exit_depths
+    assert len(reference_trace) > len(trace)
 
 
 def test_memory_pressure_waits_then_reuses_pages_and_abort_reclaims():
@@ -141,7 +173,7 @@ def test_eos_finishes_without_extra_decode_and_invalid_requests_do_not_poison_qu
     outputs, trace = drain(engine)
     assert outputs["eos"].token_ids == [0]
     assert outputs["eos"].finish_reason == "stop"
-    assert [stage for stage, _ in trace] == [RequestPhase.PREFILL, RequestPhase.CODA]
+    assert [stage for stage, *_ in trace] == [RequestPhase.PREFILL, RequestPhase.CODA]
     assert engine.cache_manager.num_used_blocks == 0
 
 
@@ -333,6 +365,8 @@ def test_repeated_short_arrivals_cannot_starve_existing_decode(mode):
     while not engine.step():
         pass
     # Leave the request at PRELUDE, also covering no_refill's fill phase.
+    # Count decode progress in loops: a fused submission advances several loops and
+    # leaves the same per-loop prefill share, so batches alone undercount decode.
     recurrent_steps = 0
     for index in range(12):
         request_id = f"short-{index}"
@@ -344,7 +378,7 @@ def test_repeated_short_arrivals_cannot_starve_existing_decode(mode):
                 scheduled_request.request.request_id == "long"
                 for scheduled_request in batch.requests
             ):
-                recurrent_steps += 1
+                recurrent_steps += batch.loop_count or 1
             if request_id not in engine.scheduler.requests:
                 break
         else:
@@ -415,3 +449,39 @@ def test_finish_reason_preserves_public_string_values(reason):
     output = RequestOutput.from_request(request)
     assert output.finished and type(output.finish_reason) is str
     assert output.finish_reason == reason.value
+
+
+def test_fused_decode_keeps_the_per_loop_prefill_share():
+    """A fused L-loop decode step leaves L prefill batches, so late prompts are admitted as fast
+    as with one-loop steps, without changing any output."""
+
+    def run(share):
+        model = tiny_model()
+        engine = LLMEngine(
+            model,
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=4,
+                prefill_share_per_loop=share,
+            ),
+        )
+        params = SamplingParams(max_tokens=12, exit_threshold=1, ignore_eos=True)
+        engine.add_request("early", [1, 2, 3], params)
+        for _ in range(4):  # early is decoding with fused loops
+            engine.step()
+        engine.add_request("late", list(range(1, 25)), params)  # six prefill chunks
+        outputs, first_late_token, step = {}, None, 0
+        while engine.has_unfinished_requests():
+            step += 1
+            for output in engine.step():
+                if output.request_id == "late" and output.token_ids and first_late_token is None:
+                    first_late_token = step
+                if output.finished:
+                    outputs[output.request_id] = (list(output.token_ids), list(output.exit_depths))
+        return outputs, first_late_token
+
+    shared, late_shared = run(True)
+    single, late_single = run(False)
+    assert shared == single  # scheduling order only; tokens and exit depths unchanged
+    assert late_shared < late_single, (late_shared, late_single)
