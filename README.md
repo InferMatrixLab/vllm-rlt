@@ -129,6 +129,11 @@ No PyPI publication is implied.
 - [Native CUDA build](docs/launching.md#automatic-native-cuda-build)
 - [Migration from v0.1.0](CHANGELOG.md)
 
+An [experimental deferred Ouro runner](docs/recipes/ouro_deferred.md) groups deep
+loops across response positions with true per-loop KV. It provides a standalone
+mixed-readout experiment and an eager same-readout reference; real-weight BF16
+quality, memory and speed qualification are still required.
+
 ## Model Support
 
 
