@@ -5,7 +5,7 @@ import math
 import torch
 
 from vllm_rlt.config import cuda_graph_rows
-from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.core.kv_cache_manager import KVCacheManager, physical_planes
 from vllm_rlt.worker.buffers import execution_buffer_bytes
 from vllm_rlt.worker.cuda_graph import speculative_capture_sizes
 
@@ -102,6 +102,7 @@ def plan_cache(
         dtype=parameter.dtype,
         backend=backend,
         recurrent_layers=getattr(model, "recurrent_kv_layers", None),
+        pack_recurrent_planes=cache.pack_recurrent_planes,
     )
     ids, positions = [], []
     for index, length in enumerate(lengths):
@@ -166,7 +167,13 @@ def plan_cache(
     # memory, particularly for tiny-model GPU tests with very small pages.
     useful_blocks = (
         math.ceil(config.max_position_embeddings / cache.block_size)
-        * (config.total_ut_steps if cache.layout == "last_exited" else 1)
+        * physical_planes(
+            config.num_hidden_layers,
+            getattr(model, "recurrent_kv_layers", None),
+            config.total_ut_steps,
+            cache.layout,
+            cache.pack_recurrent_planes,
+        )
         * scheduler.max_num_seqs
     )
     blocks = min(budget_blocks(budget, per_block), useful_blocks)
