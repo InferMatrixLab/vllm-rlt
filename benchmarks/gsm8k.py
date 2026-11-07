@@ -123,7 +123,12 @@ def select_doc_ids(population, *, limit, seed, split):
 
 
 def checkpoint_loops(config):
-    """Full recurrent depth of an Ouro checkpoint, from its config.json."""
+    """Full recurrent depth: Ouro ``total_ut_steps`` or Huginn ``mean_recurrence``."""
+    if "RavenForCausalLM" in (config.get("architectures") or []):
+        loops = config.get("mean_recurrence")
+        if type(loops) is not int or loops < 1:
+            raise ValueError("A Huginn checkpoint needs an integer mean_recurrence >= 1")
+        return loops
     loops = config.get("total_ut_steps")
     if config.get("model_type") != "ouro" or type(loops) is not int or loops < 1:
         raise ValueError("This evaluation requires an Ouro checkpoint with total_ut_steps >= 1")
