@@ -28,6 +28,7 @@ class LLM:
         exit_config=None,
         execution_config=None,
         speculative_config=None,
+        sparse_decode_attention_config=None,
     ):
         tokenizer_source = resolve_model_source(model) if isinstance(model, str) else None
         model, revision, model_config = prepare_model(model, revision=revision)
@@ -50,6 +51,7 @@ class LLM:
             exit_config=exit_config,
             execution_config=execution_config,
             speculative_config=speculative_config,
+            sparse_decode_attention_config=sparse_decode_attention_config,
         )
         self._next_request_id = 0
 

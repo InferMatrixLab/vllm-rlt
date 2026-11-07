@@ -8,6 +8,7 @@ from typing import Literal
 import numpy as np
 import torch
 
+from vllm_rlt.attention.sparse import DENSE, reference_mode
 from vllm_rlt.core.kv_cache_manager import _Allocation
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Operation, Request
@@ -82,7 +83,7 @@ class SpeculativeRoundBuffer:
 
 
 @dataclass
-class SpeculativeRoundTicket:
+class AsyncSpeculativeOutput:
     batch: SchedulerOutput
     buffer: SpeculativeRoundBuffer
     states: tuple[SpeculativeRequestState, ...]
@@ -92,6 +93,10 @@ class SpeculativeRoundTicket:
     stats: SpeculativeStats | None = None
     cached: ModelRunnerOutput | None = None
     retired: bool = False
+    # Reference leases of this round. Released on retire, after the final
+    # reader completed, so no later submission can observe or overwrite them.
+    references: tuple = ()
+    reference_store: object | None = None
 
     @property
     def has_result(self):
@@ -148,6 +153,9 @@ class SpeculativeRoundTicket:
         # collect() already waited for copy_done; normal delivery adds no wait.
         self.buffer.keepalive.clear()
         self.buffer.leased = False
+        if self.reference_store is not None and self.references:
+            self.reference_store.release(self.references)
+        self.references = ()
         self.retired = True
 
 
@@ -170,6 +178,8 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         copy_stream,
         rng: RngRegistry | None = None,
         runtime=None,
+        reference_store=None,
+        sparse_decode_config=None,
     ):
         super().__init__(
             model,
@@ -180,6 +190,11 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             runtime=runtime,
             compute_stream=compute_stream,
         )
+        # Sparse decode attention lifecycle: the runner owns the per-token
+        # reference pool (RFC #156 section 5) and drives retirement from the
+        # GPU acceptance counts without a host readback.
+        self.reference_store = reference_store
+        self.sparse_decode_config = sparse_decode_config
         sizes = speculative_capture_sizes(execution, scheduler, config)
         self.graphs = (
             DeviceRecurrentGraphs(model, cache, execution, False, capture_sizes=sizes)
@@ -230,7 +245,11 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             slot = self.free_slots.pop()
             self.slot_values[slot].copy_(values)
             state = SpeculativeRequestState(
-                request, allocation, self.slot_values[slot, 0], self.slot_values[slot, 1], slot=slot
+                request,
+                allocation,
+                self.slot_values[slot, 0],
+                self.slot_values[slot, 1],
+                slot=slot,
             )
         if self.config.mode == "pipeline":
             width = min(
@@ -264,7 +283,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         for state in self.states.values():
             state.token, state.position = new[state.slot, 0], new[state.slot, 1]
 
-    def _execute_recurrent_step(self, hidden, positions, tables, depth, allocations, active=None):
+    def _execute_recurrent_step(
+        self, hidden, positions, tables, depth, allocations, active=None, reference_plan=None
+    ):
         if isinstance(depth, torch.Tensor):
             table = tables.gather(1, depth[:, None, None].expand(-1, 1, tables.shape[2])).squeeze(1)
         else:
@@ -280,6 +301,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 (positions + 1) if active is None else torch.where(active, positions + 1, 0)
             ).int(),
             write_mask=active,
+            reference_plan=reference_plan,
         )
         forward = ForwardBatch(
             Operation.RECURRENT, hidden=hidden, metadata=(metadata,), graphs=self.graphs
@@ -365,9 +387,27 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         values = host.to(self.device, non_blocking=True)
         buffer.keepalive.extend((host, values))
         views = {name: values[start : start + size] for name, (start, size) in layout.items()}
-        return SimpleNamespace(n=n, width=width, rows=len(request_rows), offsets=offsets, **views)
+        return SimpleNamespace(
+            n=n, width=width, rows=len(request_rows), offsets=offsets, counts=counts, **views
+        )
 
-    def _draft(self, plan, tables, allocations):
+    def _reference_plan(self, leases, rows, depth):
+        """Build the sparse decode plan of one recurrent step.
+
+        ``rows`` holds one ``(lease_index, row)`` pair per step row in step
+        order. Dense steps return ``None`` so their metadata stays untouched.
+        """
+        if self.reference_store is None or leases is None:
+            return None
+        mode = reference_mode(depth)
+        if mode == DENSE:
+            return None
+        owners = [(leases[lease_index], row) for lease_index, row in rows]
+        return self.reference_store.build_plan(
+            owners, [mode] * len(owners), key_retention=self.sparse_decode_config.key_retention
+        )
+
+    def _draft(self, plan, tables, allocations, leases=None):
         from vllm_rlt.kernels.routing import gather_kernel
 
         slot_values = self.slot_values.new_empty((plan.n, 2))
@@ -394,9 +434,18 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 positions = starts[active] + offset
                 row_tables = tables[active]
             hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=row_tokens)).hidden
+            # A drafting offset covers one verification row per active request:
+            # the token at column `offset`, which the verifier later reuses.
+            rows = range(plan.n) if active is None else [int(index) for index in active]
             for depth in range(self.config.draft_loops):
+                reference = self._reference_plan(leases, [(i, offset) for i in rows], depth)
                 hidden = self._execute_recurrent_step(
-                    hidden, positions, row_tables, depth, allocations
+                    hidden,
+                    positions,
+                    row_tables,
+                    depth,
+                    allocations,
+                    reference_plan=reference,
                 )
             hidden_blocks.append(hidden)
             if drafting_count:
@@ -406,15 +455,27 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 tokens[getattr(plan, f"drafting{offset}"), offset + 1] = proposed
         return starts, tokens, hidden_blocks
 
-    def _verify(self, plan, starts, hidden_blocks, tables, allocations):
+    def _verify(self, plan, starts, hidden_blocks, tables, allocations, leases=None):
         positions = starts[plan.request_rows] + plan.row_offsets
         row_tables = tables[plan.request_rows]
         hidden = torch.cat(hidden_blocks)[plan.hidden_rows]
+        # Verification rows are request-major, matching the round plan.
+        verification_rows = [
+            (i, j) for i, count in enumerate(plan.counts) for j in range(int(count))
+        ]
         for depth in range(self.config.draft_loops, self.config.target_loops):
-            hidden = self._execute_recurrent_step(hidden, positions, row_tables, depth, allocations)
+            reference = self._reference_plan(leases, verification_rows, depth)
+            hidden = self._execute_recurrent_step(
+                hidden,
+                positions,
+                row_tables,
+                depth,
+                allocations,
+                reference_plan=reference,
+            )
         return self._coda(hidden).argmax(-1)
 
-    def _accept_and_update_state(self, plan, states, starts, tokens, target, buffer):
+    def _accept_and_update_state(self, plan, states, starts, tokens, target, buffer, leases=None):
         from vllm_rlt.kernels.routing import scatter_kernel
 
         count = len(target)
@@ -426,6 +487,10 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         drafts = torch.arange(plan.width - 1, device=self.device)[None, :] < plan.drafts[:, None]
         matches = (tokens[:, 1:] == targets[:, :-1]) & drafts
         accepted = matches.long().cumprod(1).sum(1)
+        if leases is not None and self.reference_store is not None:
+            # GPU acceptance drives retirement: rejected candidates and their
+            # dependent descendants lose their references on the device.
+            self.reference_store.accept(leases, accepted)
         # All target IDs through the first rejection equal the accepted
         # candidates followed by the correction (or final bonus).
         next_tokens = targets.gather(1, accepted[:, None]).squeeze(1)
@@ -462,14 +527,39 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             rounds = tuple(s.submitted for s in states)
             if any(s.submitted > s.delivered for s in states):
                 self.submitted_before_collect += 1
-            tables.copy_(host_tables, non_blocking=True)
-            if self.config.mode == "pipeline":
-                count = self._pipeline_step(scheduled_requests, states, tables, allocations, buffer)
-            else:
-                plan = self._round_plan(scheduled_requests, states, buffer)
-                starts, tokens, hidden_blocks = self._draft(plan, tables, allocations)
-                target = self._verify(plan, starts, hidden_blocks, tables, allocations)
-                count = self._accept_and_update_state(plan, states, starts, tokens, target, buffer)
+            # One reference slot per verification row: the round's live tokens.
+            # Outstanding rounds keep disjoint slots until their tickets retire.
+            leases = None
+            if self.reference_store is not None:
+                leases = tuple(
+                    self.reference_store.reserve(
+                        scheduled_request.request.request_id,
+                        index,
+                        scheduled_request.token_count,
+                    )
+                    for index, (scheduled_request, state) in enumerate(
+                        zip(scheduled_requests, states)
+                    )
+                )
+            try:
+                tables.copy_(host_tables, non_blocking=True)
+                if self.config.mode == "pipeline":
+                    count = self._pipeline_step(
+                        scheduled_requests, states, tables, allocations, buffer
+                    )
+                else:
+                    plan = self._round_plan(scheduled_requests, states, buffer)
+                    starts, tokens, hidden_blocks = self._draft(plan, tables, allocations, leases)
+                    target = self._verify(plan, starts, hidden_blocks, tables, allocations, leases)
+                    count = self._accept_and_update_state(
+                        plan, states, starts, tokens, target, buffer, leases
+                    )
+            except BaseException:
+                # The engine drains both streams before discarding, so releasing
+                # here cannot race a later submission for these slots.
+                if leases is not None:
+                    self.reference_store.release(leases)
+                raise
             buffer.compute_done = torch.cuda.Event()
             buffer.compute_done.record(self.compute_stream)
             for state in states:
@@ -489,7 +579,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         if self.config.mode != "pipeline":
             self.stats.drafted_tokens += sum(s.token_count - 1 for s in scheduled_requests)
             self.stats.verified_rows += count
-        return SpeculativeRoundTicket(
+        return AsyncSpeculativeOutput(
             batch,
             buffer,
             states,
@@ -497,6 +587,8 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             count,
             mode=self.config.mode,
             stats=self.stats,
+            references=leases or (),
+            reference_store=self.reference_store,
         )
 
     def _pipeline_step(self, spans, states, tables, allocations, buffer):
@@ -563,7 +655,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             p.tokens.copy_(torch.where(newborn, token, p.tokens))
             p.depths.masked_fill_(newborn, 0)
             p.active.copy_((surviving | newborn) & (state.position + ids < limit))
-            # Per-request wire order matches SpeculativeRoundTicket.collect():
+            # Per-request wire order matches AsyncSpeculativeOutput.collect():
             # prediction, accepted, emitted, next_position, drafted, verified.
             # A pipeline step verifies at most one token per request, so the
             # verified count equals emitted (0 or 1).
@@ -685,6 +777,12 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         for buffer in self.buffers:
             buffer.keepalive.clear()
             buffer.leased = False
+        # Test doubles borrow this method without the runner __init__.
+        reference_store = getattr(self, "reference_store", None)
+        if reference_store is not None:
+            # Both streams have drained and every ticket retired; any leftover
+            # binding can only come from a failed submission.
+            reference_store.discard()
 
     def synchronize(self):
         self.compute_stream.synchronize()

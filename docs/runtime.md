@@ -230,6 +230,67 @@ The same flags work with the single-device server. A streaming event may contain
 multiple committed tokens. See [RFC #43](https://github.com/InferMatrixLab/vllm-rlt/issues/43)
 for the design.
 
+## Sparse decode attention (reference path)
+
+`SparseDecodeAttentionConfig` enables the RFC #156 cached-reference correction
+for generated-token attention. The cross-loop sparse attention mechanism is from
+FlashLoop ([paper](https://arxiv.org/abs/2609.29812),
+[reference implementation](https://github.com/Superone77/FlashLoop)); the
+configuration, kernels and serving integration here are this repository's.
+Prompt prefill remains dense. Loop 2 captures
+per-token/per-layer/head selection, mass and contributions; loops 3 and 4 reuse
+that reference with their current selected KV. Each new input token establishes
+its own reference.
+
+```python
+from vllm_rlt import ExecutionConfig, SparseDecodeAttentionConfig, SpeculativeConfig
+
+sparse = SparseDecodeAttentionConfig(enabled=True, key_retention=0.1)
+# Pass sparse_decode_attention_config=sparse to LLM or StageEngine.
+# Ordinary decode uses synchronous scheduling and no speculative_config.
+# For synchronous block speculation, also pass:
+speculation = SpeculativeConfig(num_speculative_tokens=2, draft_loops=2)
+execution = ExecutionConfig(async_scheduling=False, cuda_graphs=False)
+```
+
+This path supports ordinary synchronous decode and synchronous/asynchronous
+block self-speculation with LAST_EXITED KV and refill scheduling. The Torch and
+Triton adapters declare sparse-reference support; `auto` selects a compatible
+adapter and explicit FlashAttention selection fails rather than silently
+replacing the requested backend. Dense and capture rows preserve the selected
+backend's output and original packed batch geometry. Selection, retained mass
+and contributions, and partial-retention correction use the shared PyTorch
+reference implementation. The captured output is the value actually entering
+the recurrence, stored in FP32 after the backend's output-dtype conversion.
+It has host readbacks and per-row launch costs; enabling it does not
+promise faster serving. CUDA Graphs, token pipelines, mixed scheduling,
+preemption/recovery and ordinary asynchronous decode are rejected explicitly.
+
+The retained count is `min(N, max(1, ceil(N * key_retention)))`, including the
+current position among the N causal keys. `key_bucket` controls buffer capacity,
+not the algorithm: it must hold the retained count over the model's positional
+limit, which is the only context bound the reference needs. The index buffer
+starts small and grows on the owner stream, so a long model context does not
+cost its worst case up front; admission never rejects a request for being long.
+The pool holds one slot per live ordinary input token, K+1 per synchronous
+block request, and two rounds of K+1 per asynchronous block request. All
+reference payload bytes contribute to automatic KV memory planning; explicit
+KV block overrides still require the caller to budget total peak memory.
+
+Ordinary references retire at CODA or request teardown after their last
+recurrent reader. Synchronous block references retire on the compute stream
+when every verification input has completed its final read; neither accepted
+nor rejected rows carry a reference into the next round. With draft depth 1,
+verification captures loop 2; with draft depth 2, drafting captures it.
+Full retention uses the same dense backend at later loops as a control, while
+still validating and consuming the captured reference lifecycle. The standalone
+Torch arithmetic oracle is tested separately; different attention algorithms
+need not round to identical BF16 values. The
+[numerical diagnosis](https://github.com/Levius-Fubuki/vllm-rlt/releases/tag/pr157-numerics-validation-20261029)
+is kept as a release attachment rather than a checked-in report. Retention below
+1 is approximate and
+needs task-quality evaluation before a deployment recommendation.
+
 ## SHARED prefill semantics
 
 SHARED retains one physical KV plane and completes every loop for a prompt
