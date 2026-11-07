@@ -10,7 +10,7 @@ from vllm_rlt.config import (
 from vllm_rlt.entrypoints.llm import LLM
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.request import RequestOutput
-from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.sampling_params import LoopCDParams, SamplingParams
 
 __all__ = [
     "LLM",
@@ -21,5 +21,6 @@ __all__ = [
     "SchedulerConfig",
     "SpeculativeConfig",
     "SamplingParams",
+    "LoopCDParams",
     "RequestOutput",
 ]

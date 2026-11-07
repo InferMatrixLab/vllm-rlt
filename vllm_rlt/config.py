@@ -151,9 +151,14 @@ class ExecutionConfig:
     # Select packed prefill metadata staging (and require packed attention).
     # The historical name is retained; use_uva controls its transfer mechanism.
     prefill_uva: bool = False
+    loopcd: bool = False
+    prefill_depth: int | None = None
 
     def __post_init__(self):
+        if self.prefill_depth is not None:
+            _positive("prefill_depth", self.prefill_depth)
         for name in (
+            "loopcd",
             "prefill_uva",
             "use_uva",
             "async_scheduling",
