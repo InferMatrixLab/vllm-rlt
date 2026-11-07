@@ -89,6 +89,32 @@ def test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths():
     parts = list(partition_segments(segments, segments, 333, 3))
     assert sum(n for _, _, n in parts) == len(expected)
     assert all(n <= 333 and len(src) <= 3 and src == dst for src, dst, n in parts)
+    covered = set()
+    for src, _, _ in parts:
+        for address, size, _ in src:
+            covered.update(range(address, address + size))
+    assert covered == expected
+
+
+def test_partition_merges_segments_contiguous_on_both_sides():
+    # Three adjacent 100-byte blocks on both pools collapse into one range; a target
+    # that is not adjacent at the same boundary keeps its own descriptor.
+    source = [(1000, 100, 0), (1100, 100, 0), (1200, 100, 0), (5000, 50, 0)]
+    target = [(7000, 100, 1), (7100, 100, 1), (9000, 100, 1), (9100, 50, 1)]
+    parts = list(partition_segments(source, target, 10**6, 256))
+    assert parts == [
+        (
+            [(1000, 200, 0), (1200, 100, 0), (5000, 50, 0)],
+            [(7000, 200, 1), (9000, 100, 1), (9100, 50, 1)],
+            350,
+        )
+    ]
+    # Byte limits still split a merged range, descriptor limits still bound a chunk.
+    parts = list(partition_segments(source, target, 120, 256))
+    assert [n for _, _, n in parts] == [120, 120, 110]
+    assert sum(len(src) for src, _, _ in parts) == 5
+    with pytest.raises(ValueError):
+        list(partition_segments(source, target[:-1], 10**6, 256))
 
 
 @pytest.mark.parametrize(
@@ -103,6 +129,16 @@ def test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths():
 def test_pd_configuration_validation(options):
     with pytest.raises(ValueError):
         PDConfig(**options)
+
+
+def test_pd_default_budget_keeps_a_whole_long_prompt_in_flight():
+    """Chunks are submitted and acknowledged only between engine steps, so every budget
+    round a request needs adds steps to its commit tail. The default budget holds the
+    KV of a 2048-token Ouro-1.4B prompt (24 layers x 4 depths x K/V x 2048 bf16 values)."""
+    config = PDConfig()
+    ouro_kv_bytes_per_token = 24 * 4 * 2 * 2048 * 2
+    assert config.max_inflight_bytes >= 2048 * ouro_kv_bytes_per_token
+    assert config.max_inflight_bytes % config.transfer_chunk_bytes == 0
 
 
 def test_pd_rejects_huginn_before_spawning(monkeypatch):
@@ -440,9 +476,48 @@ def test_pd_multiple_workers_and_peer_failure():
         peer = next(p for p in e.peers.values() if p.role == "prefill")
         peer.client.process.kill()
         peer.client.process.join()
+        started = time.monotonic()
         with pytest.raises(RuntimeError):
             e.step()
+        # Liveness, not a missing transfer error, ends the deployment: UCX runs
+        # without a peer failure handler and the control channel detects the exit.
+        assert time.monotonic() - started < 30
         assert e.closed and all(not p.client.process.is_alive() for p in e.peers.values())
+        assert all(p.client.closed for p in e.peers.values())
+
+
+def test_control_channel_detects_a_worker_exit_and_reaps_every_peer():
+    from vllm_rlt.engine.llm_engine import StageClient
+    from vllm_rlt.engine.stage_config import StageConfig
+    from vllm_rlt.pd.engine import PDEngine, Peer
+
+    engine = PDEngine.__new__(PDEngine)
+    engine._profile_session = None
+    engine.failure = None
+    engine.peers = {}
+    for role in ("prefill", "decode"):
+        client = StageClient(
+            tiny_ouro_config(head_dim=64),
+            device="cpu",
+            stage_config=StageConfig(stage_id=role, role=role),
+        )
+        engine.peers[role] = Peer(role, role, client)
+    try:
+        engine.peers["prefill"].client.process.kill()
+        engine.peers["prefill"].client.process.join()
+        started = time.monotonic()
+        with pytest.raises(RuntimeError) as error:
+            engine._poll()
+        assert "prefill" in str(error.value) or "control channel" in str(error.value)
+        assert time.monotonic() - started < 5
+        engine._terminate()
+    finally:
+        for peer in engine.peers.values():
+            if not peer.client.closed:
+                peer.client.join(force=True)
+    assert engine.closed
+    assert all(p.client.closed for p in engine.peers.values())
+    assert all(not p.client.process.is_alive() for p in engine.peers.values())
 
 
 @pytest.mark.gpu
@@ -715,6 +790,64 @@ def test_pd_reservations_are_reported_before_worker_acknowledgments():
     assert engine.stats() == dict(requests=1, reserved_blocks=20)
     assert len(messages) == 1 and messages[0][0] == ("decode", "reserve")
     assert not hasattr(engine, "cache_manager") and not hasattr(engine, "scheduler")
+
+
+def fake_nixl(monkeypatch):
+    """Install a fake NIXL agent package and record how the backend was created."""
+    import sys
+    import types
+
+    created = {}
+
+    class Agent:
+        def __init__(self, name, config=None):
+            created["agent_config"] = config
+
+        def create_backend(self, backend, params):
+            created["backend"] = (backend, dict(params))
+
+        def register_memory(self, tensor):
+            return tensor
+
+        def get_agent_metadata(self):
+            return b"metadata"
+
+    def agent_config(**kwargs):
+        return kwargs
+
+    package = types.ModuleType("nixl")
+    package.__path__ = []
+    api = types.ModuleType("nixl._api")
+    api.nixl_agent = Agent
+    api.nixl_agent_config = agent_config
+    monkeypatch.setitem(sys.modules, "nixl", package)
+    monkeypatch.setitem(sys.modules, "nixl._api", api)
+    return created
+
+
+def test_ucx_backend_is_created_with_error_handling_none(monkeypatch):
+    from vllm_rlt.pd.transport import NixlConnector
+
+    created = fake_nixl(monkeypatch)
+    # No hidden switch: an obsolete environment variable cannot change the mode.
+    monkeypatch.setenv("VLLM_RLT_NIXL_UCX_ERROR_HANDLING", "peer")
+    cache = KVCacheManager(3, 2, 8, 24, 4, 4)
+    connector = NixlConnector("stage", cache, torch.zeros(2, 16), PDConfig())
+    assert created["agent_config"] == {"backends": []}
+    assert created["backend"] == ("UCX", {"ucx_error_handling_mode": "none"})
+    assert connector.info["hidden_bytes"] == 64
+    element = cache.key_cache.element_size()
+    assert connector.info["block_bytes"] == cache.key_cache.stride(0) * element
+
+
+def test_non_ucx_backend_is_not_created_with_ucx_parameters(monkeypatch):
+    from vllm_rlt.pd.transport import NixlConnector
+
+    created = fake_nixl(monkeypatch)
+    cache = KVCacheManager(3, 2, 8, 24, 4, 4)
+    NixlConnector("stage", cache, torch.zeros(2, 16), PDConfig(backend="GDS"))
+    assert created["agent_config"] == {"backends": ["GDS"]}
+    assert "backend" not in created
 
 
 @pytest.mark.parametrize("pack", [False, True])
