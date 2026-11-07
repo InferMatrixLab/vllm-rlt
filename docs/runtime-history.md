@@ -243,7 +243,7 @@ BF16 `atol=0.08, rtol=0.04`. These are targeted correctness checks, not general
 model-quality evidence.
 
 For a current rerun, use the [validation commands](async-speculative.md#validation)
-on a scheduler-reserved CUDA device.
+on an explicitly selected CUDA device.
 Compare native async, synchronous speculation and async speculation with the
 same BF16 model, prompts, token budget, backend, capacity and GPU. Warm up each
 mode, alternate measurement order and retain five unprofiled observations per
