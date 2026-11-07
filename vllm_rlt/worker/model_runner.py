@@ -1027,6 +1027,15 @@ class ModelRunner:
         kv = prepared.kv
         if kv is not None:
             metadata = (kv,) + metadata
+        wise = self.cache_manager.wise
+        if wise is not None and batch.emit_gate and not wise.draft_only:
+            # Decode rows use WISE; prefill-chunk rows mixed into the batch stay dense.
+            decode_rows = [
+                flag for span in batch.spans for flag in [span.emit_gate] * span.token_count
+            ]
+            for kv_metadata in metadata:
+                if hasattr(kv_metadata, "rows"):
+                    wise.mark(kv_metadata, decode_rows)
         forward = ForwardBatch(
             Operation.RECURRENT,
             hidden=hidden[: batch.num_rows]
