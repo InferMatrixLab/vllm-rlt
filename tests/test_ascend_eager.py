@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from vllm_rlt.kernels.ascend_eager import AscendEagerAttention
+from vllm_rlt.kernels.ascend_eager import AscendEagerAttention, _flat_kv_rows, _prefill_geometry
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
@@ -28,6 +28,39 @@ def test_eager_groups_match_independent_causal_queries(kv_heads):
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
     assert torch.isfinite(actual).all()
     assert torch.count_nonzero(actual[0]) == 0
+
+
+@pytest.mark.npu
+@torch.inference_mode()
+def test_pooled_kv_reads_match_layer_views_across_pages_and_depths():
+    from vllm_rlt.core.kv_cache_manager import KVCacheManager
+    from vllm_rlt.device import resolve_device
+
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    torch.manual_seed(99)
+    cache = KVCacheManager(
+        3, 2, 64, 16, 16, 2, device=device, dtype=torch.bfloat16, backend="ascend_eager"
+    )
+    assert cache.allocate("a", 17)
+    assert cache.allocate("b", 3)
+    batch = cache._prepare_batch(["a"] * 17 + ["b"] * 3, [0] * 17 + [1] * 3, [*range(17), 0, 1, 2])
+    for layer in range(3):
+        k = torch.randn(20, 2, 64, device=device, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        cache._write_prepared(layer, batch, k, v)
+
+    q = torch.randn(20, 4, 64, device=device, dtype=torch.bfloat16)
+    for layer in range(3):
+        expected = cache.attention(
+            q,
+            cache.key_cache[:, layer],
+            cache.value_cache[:, layer],
+            batch.block_tables,
+            batch.context_lengths,
+        )
+        actual = cache._attend_prepared(layer, batch, q)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.npu
@@ -152,3 +185,108 @@ def test_bf16_probability_rounding_is_part_of_the_eager_contract(device_name):
     torch.testing.assert_close(actual, torch.full_like(actual, 16), atol=0, rtol=0)
     old_contract = torch_paged_attention(query, keys, values, table, lengths)
     assert not torch.equal(actual, old_contract)
+
+
+class _PreparedBatch:
+    """Only the host metadata the two batched attention paths consume."""
+
+    def __init__(self, rows, tables, write_blocks, write_offsets):
+        self.rows = rows
+        self.block_tables = tables
+        self.write_blocks = write_blocks
+        self.write_offsets = write_offsets
+
+
+def _batched_fixture(kind):
+    layers, blocks, block_size, kv_heads, head_dim = 3, 24, 4, 2, 8
+    head_groups, table_width = 2, 4
+    dtype = torch.bfloat16  # the Ascend eager contract is BF16 end to end
+    torch.manual_seed(913)
+    pool_k = torch.randn(blocks, layers, block_size, kv_heads, head_dim, dtype=dtype)
+    pool_v = torch.randn_like(pool_k)
+    keys, values = pool_k[:, 1], pool_v[:, 1]
+
+    first, second, third, fourth = (object() for _ in range(4))
+    if kind == "prefill_grid":
+        rows = [(a, 0, pos) for a in (first, second) for pos in range(4)]
+    elif kind == "prefill_single":
+        rows = [(first, 0, pos) for pos in range(4)]
+    elif kind == "ragged_decode":
+        rows = [(a, 0, 5) for a in (first, second, third, fourth)]
+    elif kind == "ragged_padded_tables":
+        # Mixed natural lengths: short rows have -1 in the high page slots,
+        # exactly as plan_attention_metadata pads a shorter block table.
+        rows = [(first, 0, 9), (second, 0, 1), (third, 0, 5), (fourth, 0, 2)]
+    elif kind == "single_decode":
+        rows = [(first, 0, 5)]
+    else:  # irregular: a prefill group with a missing position
+        rows = [(first, 0, 0), (first, 0, 2), (first, 0, 3)]
+
+    page_tables = {
+        id(first): [2, 5, 7, 9],
+        id(second): [3, 6, 8, 10],
+        id(third): [4, 11, 12, 13],
+        id(fourth): [14, 15, 16, 17],
+    }
+    if kind == "ragged_padded_tables":
+        page_tables = {
+            id(first): [2, 5, 7, 9],
+            id(second): [3, -1, -1, -1],
+            id(third): [4, 11, -1, -1],
+            id(fourth): [14, -1, -1, -1],
+        }
+    tables, write_blocks, write_offsets = [], [], []
+    for allocation, _depth, position in rows:
+        table = page_tables[id(allocation)]
+        tables.append(table)
+        write_blocks.append(table[position // block_size])
+        write_offsets.append(position % block_size)
+    batch = _PreparedBatch(
+        rows,
+        torch.tensor(tables, dtype=torch.int32),
+        torch.tensor(write_blocks, dtype=torch.int64),
+        torch.tensor(write_offsets, dtype=torch.int64),
+    )
+    q = torch.randn(len(rows), kv_heads * head_groups, head_dim, dtype=dtype)
+    return q, keys, values, batch
+
+
+@pytest.mark.parametrize(
+    "kind,expected_prefill,expected_ragged",
+    [
+        ("prefill_grid", 1, 0),
+        ("prefill_single", 1, 0),
+        ("ragged_decode", 0, 1),
+        ("ragged_padded_tables", 0, 1),
+        ("single_decode", 0, 0),
+        ("irregular", 0, 0),
+    ],
+)
+@torch.inference_mode()
+def test_batched_attention_paths_match_per_group_eager(kind, expected_prefill, expected_ragged):
+    """Batching may remove launches but must never change the arithmetic."""
+    q, keys, values, batch = _batched_fixture(kind)
+    kernel = AscendEagerAttention()
+    groups = kernel._plan(
+        [(id(allocation), depth) for allocation, depth, _ in batch.rows],
+        [position + 1 for _, _, position in batch.rows],
+        q.device,
+    )
+    expected = kernel._forward(
+        q, keys, values, batch.block_tables, groups,
+        flat_rows=_flat_kv_rows(keys, values),
+    )
+    actual = kernel.attend_metadata(q, keys, values, batch)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert kernel.batched_prefill_calls == expected_prefill
+    assert kernel.ragged_calls == expected_ragged
+
+
+def test_prefill_geometry_accepts_one_request_but_rejects_irregular_grids():
+    first, second = object(), object()
+    assert _prefill_geometry([(first, 0, pos) for pos in range(4)]) == (1, 4)
+    assert _prefill_geometry(
+        [(first, 0, pos) for pos in range(4)] + [(second, 0, pos) for pos in range(4)]
+    ) == (2, 4)
+    assert _prefill_geometry([(first, 0, 0), (first, 0, 2)]) is None
+    assert _prefill_geometry([(first, 0, 1)]) is None
