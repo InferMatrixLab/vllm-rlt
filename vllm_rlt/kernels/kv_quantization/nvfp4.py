@@ -13,13 +13,24 @@ from typing import ClassVar, Literal
 
 import torch
 
+from . import _common
 from ._common import (
     KVKind,
     _pack_channel_nibbles,
     _pad_repeat,
     _unpack_channel_nibbles,
     _validate_inputs,
+    group_axis,
 )
+
+format = "nvfp4"
+storage_dtype = torch.uint8
+default_group_size = 16
+
+
+def scale_shape(shape: tuple[int, int, int], group_size: int, *, kind: KVKind) -> tuple[int, ...]:
+    """Protocol hook: metadata shape for ``shape`` at ``group_size``."""
+    return _common.scale_shape(shape, group_size, kind=kind)
 
 
 @dataclass(frozen=True)
@@ -44,7 +55,15 @@ class PackedNVFP4KV:
 
     @property
     def axis(self) -> int:
-        return 0 if self.kind == "key" else 2
+        return group_axis(self.kind)
+
+    @property
+    def group_axis(self) -> int:
+        return self.axis
+
+    @property
+    def scale_shape(self) -> tuple[int, ...]:
+        return tuple(self.scale.shape)
 
     @property
     def storage_bytes(self) -> int:
@@ -53,15 +72,26 @@ class PackedNVFP4KV:
         )
 
 
+def storage_bytes(packed: PackedNVFP4KV) -> int:
+    return packed.storage_bytes
+
+
 @torch.no_grad()
-def pack(values: torch.Tensor, *, kind: KVKind, group_size: int = 16) -> PackedNVFP4KV:
-    """Encode E2M1 with nearest-even rounding and FP8-rounded block scales."""
+def pack(
+    values: torch.Tensor, *, kind: KVKind, group_size: int = default_group_size
+) -> PackedNVFP4KV:
+    """Encode E2M1 with nearest-even rounding and FP8-rounded block scales.
+
+    Groups are formed by one padded reshape along the group axis. ``global_scale``
+    is derived from the whole tensor, so it stays a single FP32 scalar.
+    """
     group_size = int(group_size)
     _validate_inputs(values, kind=kind, group_size=group_size)
     if group_size != 16:
         raise ValueError("NVFP4 requires group_size=16")
-    shape = tuple(values.shape)
-    axis = 0 if kind == "key" else 2
+    tokens, heads, channels = values.shape
+    shape = (tokens, heads, channels)
+    axis = group_axis(kind)
     work = values.float()
     global_scale = torch.ones((), device=values.device, dtype=torch.float32)
     if values.numel():
@@ -70,6 +100,8 @@ def pack(values: torch.Tensor, *, kind: KVKind, group_size: int = 16) -> PackedN
             torch.finfo(torch.float32).max
         )
     inverse_global = global_scale.reciprocal()
+    # bucketize keeps equality in the lower bin. Move odd lower-code boundaries
+    # down one FP32 ULP so midpoint ties choose the even upper code instead.
     boundaries = torch.tensor(
         [0.25, 0.75 - 2**-24, 1.25, 1.75 - 2**-23, 2.5, 3.5 - 2**-22, 5.0],
         device=values.device,
@@ -77,41 +109,30 @@ def pack(values: torch.Tensor, *, kind: KVKind, group_size: int = 16) -> PackedN
     )
     padded = _pad_repeat(work, axis, 16)
     if kind == "key":
-        groups = padded.shape[0] // 16
-        grouped = padded.view(groups, 16, *shape[1:])
-        amax = grouped.abs().amax(dim=1, keepdim=True)
-        scale = (global_scale * (amax * (1.0 / 6))).clamp_(0, 448).to(torch.float8_e4m3fn)
-        effective = scale.float() * inverse_global
-        multiplier = effective.reciprocal()
-        finite = torch.isfinite(multiplier)
-        normalized = grouped * torch.where(finite, multiplier, 0.0)
-        normalized = torch.where((effective > 0) & ~finite, grouped / effective, normalized).clamp_(
-            -6, 6
-        )
-        codes = torch.bucketize(normalized.abs().contiguous(), boundaries, out_int32=True).to(
-            torch.uint8
-        )
-        codes |= torch.signbit(normalized).to(torch.uint8) << 3
-        codes = codes.view(padded.shape)[: shape[0]]
-        scales = scale.squeeze(1)
+        grouped = padded.view(padded.shape[0] // 16, 16, *shape[1:])
+        reduce_dim = 1
     else:
-        groups = padded.shape[2] // 16
-        grouped = padded.view(shape[0], shape[1], groups, 16)
-        amax = grouped.abs().amax(dim=-1, keepdim=True)
-        scale = (global_scale * (amax * (1.0 / 6))).clamp_(0, 448).to(torch.float8_e4m3fn)
-        effective = scale.float() * inverse_global
-        multiplier = effective.reciprocal()
-        finite = torch.isfinite(multiplier)
-        normalized = grouped * torch.where(finite, multiplier, 0.0)
-        normalized = torch.where((effective > 0) & ~finite, grouped / effective, normalized).clamp_(
-            -6, 6
-        )
-        codes = torch.bucketize(normalized.abs().contiguous(), boundaries, out_int32=True).to(
-            torch.uint8
-        )
-        codes |= torch.signbit(normalized).to(torch.uint8) << 3
+        grouped = padded.view(shape[0], shape[1], padded.shape[2] // 16, 16)
+        reduce_dim = 3
+    amax = grouped.abs().amax(dim=reduce_dim, keepdim=True)
+    scale = (global_scale * (amax * (1.0 / 6))).clamp_(0, 448).to(torch.float8_e4m3fn)
+    effective = scale.float() * inverse_global
+    multiplier = effective.reciprocal()
+    finite = torch.isfinite(multiplier)
+    normalized = grouped * torch.where(finite, multiplier, 0.0)
+    # Preserve tiny values when only the FP32 reciprocal overflows.
+    normalized = torch.where((effective > 0) & ~finite, grouped / effective, normalized).clamp_(
+        -6, 6
+    )
+    codes = torch.bucketize(normalized.abs().contiguous(), boundaries, out_int32=True).to(
+        torch.uint8
+    )
+    codes |= torch.signbit(normalized).to(torch.uint8) << 3
+    scales = scale.squeeze(reduce_dim)
+    if kind == "key":
+        codes = codes.view(padded.shape)[: shape[0]]
+    else:
         codes = codes.view(padded.shape)[..., : shape[2]]
-        scales = scale.squeeze(-1)
     return PackedNVFP4KV(
         _pack_channel_nibbles(codes), scales, global_scale, shape, values.dtype, kind
     )
@@ -119,7 +140,7 @@ def pack(values: torch.Tensor, *, kind: KVKind, group_size: int = 16) -> PackedN
 
 @torch.no_grad()
 def unpack(packed: PackedNVFP4KV) -> torch.Tensor:
-    """Decode with stored block/global scales in FP32, then cast to compute dtype."""
+    """Reference/debug full decode; serving kernels should decode tiles in-register."""
     channels = packed.original_shape[2]
     codes = _unpack_channel_nibbles(packed.payload, channels, dtype=torch.uint8)
     magnitudes = torch.tensor(

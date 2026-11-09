@@ -7,39 +7,82 @@ Copyright (c) 2026 FlashLoop contributors. MIT License; see NOTICE.
 """
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Protocol, TypeVar
 
 import torch
 
 from . import int4, nvfp4
-from ._common import KVKind
-from .int4 import PackedInt4KV
-from .nvfp4 import PackedNVFP4KV
+from ._common import KVKind, PackedGroupKV
+from .int4 import PackedInt4KV as PackedInt4KV
+from .nvfp4 import PackedNVFP4KV as PackedNVFP4KV
 
-KVFormat = Literal["int4", "nvfp4"]
-PackedKV = PackedInt4KV | PackedNVFP4KV
+_Packed = TypeVar("_Packed", bound=PackedGroupKV)
 
-CODECS = {"int4": int4, "nvfp4": nvfp4}
+
+class KVCodec(Protocol[_Packed]):
+    """Logical codec contract; pack/unpack here are reference operations.
+
+    Each codec accepts only the packed type its own ``pack`` returns.
+
+    Group axes are indices in [token, head, channel], resolved by kind.
+    Serving attention stays format-specific and need not materialize decoded KV.
+    """
+
+    format: str
+    storage_dtype: torch.dtype
+    default_group_size: int
+
+    def group_axis(self, kind: KVKind) -> int: ...
+
+    def scale_shape(
+        self, shape: tuple[int, int, int], group_size: int, *, kind: KVKind
+    ) -> tuple[int, ...]: ...
+
+    def pack(self, values: torch.Tensor, *, kind: KVKind, group_size: int) -> _Packed: ...
+
+    def unpack(self, packed: _Packed) -> torch.Tensor: ...
+
+    def storage_bytes(self, packed: _Packed) -> int: ...
+
+
+KV_CODECS: dict[str, KVCodec[Any]] = {"int4": int4, "nvfp4": nvfp4}
 
 
 def pack_kv(
     values: torch.Tensor,
     *,
     kind: KVKind,
-    format: KVFormat = "int4",
+    format: str = "int4",
     group_size: int | None = None,
-) -> PackedKV:
-    """Encode logical KV; defaults are INT4 G=64 or NVFP4 G=16."""
-    codec = CODECS.get(format)
-    if codec is None:
-        raise ValueError("format must be 'int4' or 'nvfp4'")
-    if group_size is None:
-        group_size = 64 if format == "int4" else 16
-    return codec.pack(values, kind=kind, group_size=group_size)
+) -> PackedGroupKV:
+    """Reference encode; defaults are INT4 G=64 or NVFP4 G=16."""
+    if format not in KV_CODECS:
+        raise ValueError(f"unknown KV format: {format!r}")
+    codec = KV_CODECS[format]
+    return codec.pack(
+        values, kind=kind, group_size=codec.default_group_size if group_size is None else group_size
+    )
 
 
-def pack_paged(pool: torch.Tensor, *, kind: KVKind, format: KVFormat = "int4", group_size=None):
-    """Pack a paged pool ``[pages, page_size, heads, dim]`` as one logical KV."""
+def unpack_kv(packed: PackedGroupKV) -> torch.Tensor:
+    """Reference/debug full decode using the packed tensor's registered format."""
+    if packed.format not in KV_CODECS:
+        raise ValueError(f"unknown KV format: {packed.format!r}")
+    return KV_CODECS[packed.format].unpack(packed)
+
+
+def pack_paged(
+    pool: torch.Tensor,
+    *,
+    kind: KVKind,
+    format: str = "int4",
+    group_size: int | None = None,
+) -> tuple[PackedGroupKV, tuple[int, int]]:
+    """Encode a pool ``[pages, page, heads, dim]`` as one logical KV tensor.
+
+    Groups follow logical token order and may span physical pages. The returned
+    paged shape is what :func:`unpack_paged` needs to rebuild the layout.
+    """
     pages, page = pool.shape[:2]
     packed = pack_kv(
         pool.reshape(pages * page, *pool.shape[2:]),
@@ -50,20 +93,11 @@ def pack_paged(pool: torch.Tensor, *, kind: KVKind, format: KVFormat = "int4", g
     return packed, (pages, page)
 
 
-def unpack_paged(packed: PackedKV, paged_shape: tuple[int, int]) -> torch.Tensor:
-    """Restore a pool packed by :func:`pack_paged` to its original page layout."""
+def unpack_paged(packed: PackedGroupKV, paged_shape: tuple[int, int]) -> torch.Tensor:
+    """Restore a pool encoded by :func:`pack_paged` to its page layout."""
     pages, page = paged_shape
     logical = unpack_kv(packed)
     return logical.reshape(pages, page, *logical.shape[1:])
-
-
-def unpack_kv(packed: PackedKV) -> torch.Tensor:
-    """Decode using the format carried by the packed tensor."""
-    if isinstance(packed, PackedInt4KV):
-        return int4.unpack(packed)
-    if isinstance(packed, PackedNVFP4KV):
-        return nvfp4.unpack(packed)
-    raise TypeError("expected PackedInt4KV or PackedNVFP4KV")
 
 
 def _validate_positions(positions: torch.Tensor, rows: int, tokens: int) -> None:
@@ -89,7 +123,7 @@ class KVResidual:
     V groups remain within each compact row, along channels.
     """
 
-    data: PackedKV
+    data: PackedGroupKV
     positions: torch.Tensor | None
     num_tokens: int
 
@@ -108,13 +142,15 @@ def encode_residual(
     *,
     kind: KVKind,
     positions: torch.Tensor | None = None,
-    format: KVFormat = "int4",
+    format: str = "int4",
     group_size: int | None = None,
 ) -> KVResidual:
     """Encode ``current - reconstructed_previous`` in the input dtype.
 
     Optional positions map compact rows into the full predecessor and are copied
     as contiguous int32 on the input device, matching FlashLoop's index format.
+    Position checks read device scalars and synchronize; this is a reference/debug
+    path, not a serving hot path.
     """
     if (
         current.dtype != reconstructed_previous.dtype

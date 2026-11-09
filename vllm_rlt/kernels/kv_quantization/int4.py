@@ -9,13 +9,24 @@ from typing import ClassVar, Literal
 
 import torch
 
+from . import _common
 from ._common import (
     KVKind,
     _pack_channel_nibbles,
     _pad_repeat,
     _unpack_channel_nibbles,
     _validate_inputs,
+    group_axis,
 )
+
+format = "int4"
+storage_dtype = torch.uint8
+default_group_size = 64
+
+
+def scale_shape(shape: tuple[int, int, int], group_size: int, *, kind: KVKind) -> tuple[int, ...]:
+    """Protocol hook: metadata shape for ``shape`` at ``group_size``."""
+    return _common.scale_shape(shape, group_size, kind=kind)
 
 
 def _codes_for_group(
@@ -50,7 +61,15 @@ class PackedInt4KV:
 
     @property
     def axis(self) -> int:
-        return 0 if self.kind == "key" else 2
+        return group_axis(self.kind)
+
+    @property
+    def group_axis(self) -> int:
+        return self.axis
+
+    @property
+    def scale_shape(self) -> tuple[int, ...]:
+        return tuple(self.scale.shape)
 
     @property
     def storage_bytes(self) -> int:
@@ -58,50 +77,47 @@ class PackedInt4KV:
         return sum(t.numel() * t.element_size() for t in (self.payload, self.minimum, self.scale))
 
 
+def storage_bytes(packed: PackedInt4KV) -> int:
+    return packed.storage_bytes
+
+
 @torch.no_grad()
-def pack(values: torch.Tensor, *, kind: KVKind, group_size: int = 64) -> PackedInt4KV:
-    """Quantize logical KV in FP32, storing uint8 payload and FP16 parameters."""
+def pack(
+    values: torch.Tensor, *, kind: KVKind, group_size: int = default_group_size
+) -> PackedInt4KV:
+    """Quantize logical KV in FP32, storing uint8 payload and FP16 parameters.
+
+    Groups are formed by one padded reshape along the group axis; the padded
+    tail repeats the last slice so padding never moves an extreme.
+    Parameters are stored as FP16: a group whose minimum magnitude or
+    ``span / 15`` exceeds 65504 overflows to infinity, so float32/float64
+    inputs must keep both within FP16 range.
+    """
     group_size = int(group_size)
     _validate_inputs(values, kind=kind, group_size=group_size)
-    shape = tuple(values.shape)
-    axis = 0 if kind == "key" else 2
+    tokens, heads, channels = values.shape
+    shape = (tokens, heads, channels)
+    axis = group_axis(kind)
     work = values.float()
     padded = _pad_repeat(work, axis, group_size)
     if kind == "key":
-        groups = padded.shape[0] // group_size
-        grouped = padded.view(groups, group_size, *shape[1:])
-        minimum = grouped.amin(dim=1, keepdim=True)
-        span = grouped.amax(dim=1, keepdim=True) - minimum
-        scale = torch.where(span > 0, span / 15.0, torch.ones_like(span))
-        codes = ((grouped - minimum) / scale).round_().clamp_(0, 15).to(torch.uint8)
+        grouped = padded.view(padded.shape[0] // group_size, group_size, *shape[1:])
+        codes, minimum, scale = _codes_for_group(grouped, reduce_dim=1)
         codes = codes.view(padded.shape)[: shape[0]]
-        minimum = minimum.squeeze(1)
-        scale = scale.squeeze(1)
+        minimum, scale = minimum.squeeze(1), scale.squeeze(1)
     else:
-        groups = padded.shape[2] // group_size
-        grouped = padded.view(shape[0], shape[1], groups, group_size)
-        minimum = grouped.amin(dim=-1, keepdim=True)
-        span = grouped.amax(dim=-1, keepdim=True) - minimum
-        scale = torch.where(span > 0, span / 15.0, torch.ones_like(span))
-        codes = ((grouped - minimum) / scale).round_().clamp_(0, 15).to(torch.uint8)
+        grouped = padded.view(shape[0], shape[1], padded.shape[2] // group_size, group_size)
+        codes, minimum, scale = _codes_for_group(grouped, reduce_dim=3)
         codes = codes.view(padded.shape)[..., : shape[2]]
-        minimum = minimum.squeeze(-1)
-        scale = scale.squeeze(-1)
-    payload = _pack_channel_nibbles(codes)
+        minimum, scale = minimum.squeeze(3), scale.squeeze(3)
     return PackedInt4KV(
-        payload,
-        minimum.to(torch.float16),
-        scale.to(torch.float16),
-        shape,
-        values.dtype,
-        kind,
-        group_size,
+        _pack_channel_nibbles(codes), minimum, scale, shape, values.dtype, kind, group_size
     )
 
 
 @torch.no_grad()
 def unpack(packed: PackedInt4KV) -> torch.Tensor:
-    """Reconstruct with stored parameters in FP32, then cast to compute dtype."""
+    """Reference/debug full decode; serving kernels should decode tiles in-register."""
     codes = _unpack_channel_nibbles(packed.payload, packed.original_shape[2])
     axis = packed.axis
     length = packed.original_shape[axis]

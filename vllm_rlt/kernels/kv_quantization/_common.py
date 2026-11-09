@@ -4,12 +4,56 @@ Adapted from FlashLoop packing.py at aeaadee10d75b7aa8c4a42a809f15c75d6d3bdc6.
 Copyright (c) 2026 FlashLoop contributors. MIT License; see NOTICE.
 """
 
-from typing import Literal
+from typing import Literal, Protocol
 
 import torch
 
 KVKind = Literal["key", "value"]
 _DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+
+
+class PackedGroupKV(Protocol):
+    """Logical tensor encoded in groups along one axis.
+
+    ``group_axis`` and ``scale_shape`` let callers size and place parameters
+    without branching on format. Concrete formats carry their own quantization
+    parameters, and physical page ownership is managed separately.
+    """
+
+    @property
+    def format(self) -> str: ...
+
+    @property
+    def payload(self) -> torch.Tensor: ...
+
+    @property
+    def original_shape(self) -> tuple[int, int, int]: ...
+
+    @property
+    def original_dtype(self) -> torch.dtype: ...
+
+    @property
+    def group_size(self) -> int: ...
+
+    @property
+    def group_axis(self) -> int: ...
+
+    @property
+    def scale_shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def storage_bytes(self) -> int: ...
+
+
+def group_axis(kind: KVKind) -> int:
+    return 0 if kind == "key" else 2
+
+
+def scale_shape(shape: tuple[int, int, int], group_size: int, *, kind: KVKind) -> tuple[int, ...]:
+    dimensions = list(shape)
+    axis = group_axis(kind)
+    dimensions[axis] = (dimensions[axis] + group_size - 1) // group_size
+    return tuple(dimensions)
 
 
 def _validate_inputs(values: torch.Tensor, *, kind: KVKind, group_size: int) -> None:
