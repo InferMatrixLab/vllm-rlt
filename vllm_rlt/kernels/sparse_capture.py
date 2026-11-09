@@ -55,7 +55,10 @@ if TRITON_AVAILABLE:
         position = chunk * BLOCK_N + tl.arange(0, BLOCK_N)
         row_length = tl.load(l_ptr + row)
         mask = position < row_length
-        page = tl.load(t_ptr + row * PAGES + position // BLOCK_SIZE, mask=mask, other=0)
+        # Layer-interleaved KV can exceed the signed 32-bit element offset.
+        page = tl.load(t_ptr + row * PAGES + position // BLOCK_SIZE, mask=mask, other=0).to(
+            tl.int64
+        )
         offset = position % BLOCK_SIZE
         dim = tl.arange(0, DIM)
         # [BLOCK_N, DIM]
