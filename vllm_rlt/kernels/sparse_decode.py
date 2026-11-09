@@ -230,8 +230,13 @@ def _capture_split_kernel(
             # Selection pass 0 of this part: the top eight bits of the order key.
             digit = tl.where(valid_tokens, (_order_key(scores) >> 24).to(tl.int32), 256)
             # Reorder integer votes into a blocked vector; a histogram is
-            # order-independent. This avoids Triton 3.1's sliced-layout bug
-            # without changing the dense floating-point reduction.
+            # order-independent, so this changes no count, only the layout
+            # Triton 3.1 sees. Hoisting the `tl.where` above is NOT sufficient:
+            # on Triton 3.1.0 six folded-capture regression cases scored 3/6 for
+            # the original code, 3/6 for hoist-only, and 6/6 with this reorder.
+            # All three variants pass on 3.7.1, so CI cannot isolate the cause.
+            # BLOCK_T is 32 at the call site; (4, BLOCK_T // 4) requires it to be
+            # divisible by 4. The cost of the reorder has not been measured.
             digit = tl.reshape(tl.trans(tl.reshape(digit, (4, BLOCK_T // 4))), (BLOCK_T,))
             local += tl.histogram(digit, 512)
         next_maximum = tl.maximum(maximum, tl.max(scores, axis=0))

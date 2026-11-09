@@ -291,6 +291,22 @@ is kept as a release attachment rather than a checked-in report. Retention below
 1 is approximate and
 needs task-quality evaluation before a deployment recommendation.
 
+**Known limitation of `implementation="fused"`.** The declared dependency floor is
+`torch>=2.5` / `triton>=3.1`, but the fused path is only verified on Triton 3.7.1
+(with torch 2.13). On torch 2.5.1 + Triton 3.1.0 the folded capture histogram
+wrote the wrong selected indices until its votes were reordered (that fix is
+included here), and five other fused cases still fail: four non-split fallback
+cases and one asynchronous tensor-transfer compile failure. All five pass on the
+same GPU, driver and torch when Triton is switched to 3.7.1, both with and
+without the histogram fix, so they are associated with the Triton version rather
+than introduced by that change. Intermediate Triton versions were not tested and
+the torch 2.5.1 / Triton 3.7.1 pairing used for the diagnostic is not an
+officially supported dependency combination; the minimum working Triton is
+therefore unknown. CI installs the latest torch and cannot see any of this.
+Until that floor is established, treat `fused` as requiring a newer Triton than
+the declared minimum. `batched` remains the default and keeps the bitwise
+contract.
+
 ## SHARED prefill semantics
 
 SHARED retains one physical KV plane and completes every loop for a prompt
