@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_model
+from tests.test_prefix_growth import finish
 from vllm_rlt import (
     CacheConfig,
     ExecutionConfig,
@@ -15,14 +16,18 @@ from vllm_rlt import (
     SpeculativeConfig,
 )
 from vllm_rlt.attention import BackendCapabilities, create_backend
+from vllm_rlt.attention import sparse as sparse_attention
 from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE
 from vllm_rlt.engine.stage_engine import StageEngine
+from vllm_rlt.request import RequestPhase
 
 
-def engine(*, draft=None, retention=1.0, device="cpu", dtype=torch.float32, **options):
+def engine(
+    *, draft=None, retention=1.0, prefix=False, device="cpu", dtype=torch.float32, **options
+):
     values = dict(
         attention_backend="triton" if device == "cuda" else "torch",
-        cache_config=CacheConfig(512, 2, incremental_allocation=True),
+        cache_config=CacheConfig(512, 2, enable_prefix_caching=prefix, incremental_allocation=True),
         scheduler_config=SchedulerConfig(
             max_num_seqs=4, max_num_batched_tokens=16, prefill_chunk_size=3
         ),
@@ -113,6 +118,388 @@ def test_cancel_and_request_id_reuse_cannot_reuse_old_reference(draft):
             e.abort_request("r")
             assert e.reference_store.outstanding == 0
             assert e.cache_manager.num_used_blocks == 0
+    finally:
+        e.close()
+
+
+def reference_payload(store, event):
+    # read_reference returns only the retained selection, not unused capacity.
+    return tuple(
+        value.clone() for value in store.read_reference(event["plan"], event["layer"], event["row"])
+    )
+
+
+def trace_cpu_sparse(e, monkeypatch):
+    """Observe real CPU correction calls and the request/slot that supplies them."""
+    events, prefill_starts = [], {}
+    active_rows = None
+    attend = e.cache_manager._attend_prepared
+    correct = sparse_attention.sparse_correction
+
+    def correction(q, keys, values, mass, output, contribution):
+        event = active_rows[q.data_ptr()]
+        assert event["mode"] == CONSUME
+        slot, layer = event["slot"], event["layer"]
+        store = e.reference_store
+        assert mass.data_ptr() == store.mass[slot, layer].data_ptr()
+        assert output.data_ptr() == store.output[slot, layer].data_ptr()
+        assert contribution.data_ptr() == store.contribution[slot, layer].data_ptr()
+        selected = store.read_reference(event["plan"], layer, event["row"])[0]
+        event["payload"] = tuple(value.clone() for value in (selected, mass, output, contribution))
+        result = correct(q, keys, values, mass, output, contribution)
+        assert keys.shape == values.shape
+        event["correction_keys"] = keys.shape[1]
+        return result
+
+    def record(layer, kv, q):
+        nonlocal active_rows
+        if e.last_schedule.phase == RequestPhase.PREFILL:
+            for item in e.last_schedule.requests:
+                prefill_starts.setdefault(id(item.request), item.token_start)
+        plan = getattr(kv, "reference_plan", None)
+        if plan is None:
+            return attend(layer, kv, q)
+        rows = {}
+        for row, mode in enumerate(plan.modes):
+            if mode == DENSE:
+                continue
+            allocation, depth, position = kv.rows[row]
+            rid = next(rid for rid, owner in kv.allocations if owner is allocation)
+            request = e.scheduler.requests[rid]
+            owner, token_position, lease = e.model_runner.attention_references[rid]
+            assert owner is request and token_position == position
+            assert position >= len(request.prompt_token_ids)
+            assert mode == (CAPTURE if depth == 1 else CONSUME)
+            assert lease.slots == (plan.slots[row],)
+            assert plan.owners[row] is lease
+            assert e.reference_store._bindings[plan.slots[row]] is lease
+            rows[q[row].data_ptr()] = dict(
+                request=request,
+                position=position,
+                depth=depth,
+                layer=layer,
+                mode=mode,
+                slot=plan.slots[row],
+                lease=lease,
+                causal_length=int(kv.context_lengths[row]),
+                plan=plan,
+                row=row,
+            )
+        active_rows = rows
+        try:
+            result = attend(layer, kv, q)
+        finally:
+            active_rows = None
+        for event in rows.values():
+            slot = event["slot"]
+            assert e.reference_store._bindings[slot] is event["lease"]
+            count = e.reference_store.host_count(slot, layer)
+            assert bool((e.reference_store.counts[slot, layer] == count).all())
+            event["retained_count"] = count
+            if "payload" not in event:
+                event["payload"] = reference_payload(e.reference_store, event)
+            events.append(event)
+        return result
+
+    monkeypatch.setattr(e.cache_manager, "_attend_prepared", record)
+    monkeypatch.setattr(sparse_attention, "sparse_correction", correction)
+    return events, prefill_starts
+
+
+def assert_sparse_decode(events, request, retention, *, layers):
+    params = request.sampling_params
+    assert params.min_loops == params.max_loops == 4
+    # Prefill emits the first output; only the next max_tokens - 1 inputs
+    # traverse decode. Depth 0 is dense, depth 1 captures, depths 2/3 consume.
+    start = len(request.prompt_token_ids)
+    expected_steps = {
+        (position, layer, depth)
+        for position in range(start, start + params.max_tokens - 1)
+        for layer in range(layers)
+        for depth in range(1, params.max_loops)
+    }
+    seen = set()
+    captured = {}
+    for event in events:
+        if event["request"] is not request:
+            continue
+        step = tuple(event[key] for key in ("position", "layer", "depth"))
+        assert step not in seen, f"duplicate sparse step: {step}"
+        seen.add(step)
+        mode = event["mode"]
+        assert mode == (CAPTURE if event["depth"] == 1 else CONSUME)
+        assert event["plan"].owners[event["row"]] is event["lease"]
+        assert event["lease"].request_id == request.request_id
+        identity = (event["position"], event["layer"], event["slot"], id(event["lease"]))
+        if mode == CAPTURE:
+            captured[identity] = event["payload"]
+        else:
+            assert identity in captured
+            for actual, expected in zip(event["payload"], captured[identity]):
+                assert torch.equal(actual, expected)
+        count, length = event["retained_count"], event["causal_length"]
+        selected = event["payload"][0]
+        assert selected.shape[-1] == count
+        assert bool(((selected >= 0) & (selected < length)).all())
+        assert bool((selected[:, 1:] > selected[:, :-1]).all())
+        if retention == 1.0:
+            assert count == length
+        else:
+            assert 0 < count < length
+            if mode == CONSUME:
+                assert event["correction_keys"] == count
+    assert seen == expected_steps, (expected_steps - seen, seen - expected_steps)
+
+
+def assert_prefix_requests_drained(e):
+    assert not e.has_unfinished_requests()
+    assert not e.scheduler.requests
+    assert not e.cache_manager._allocations
+    assert not e.model_runner.attention_references
+    assert not e.model_runner.state_slots
+    assert e.reference_store.outstanding == 0
+    # Prefix-only pages remain cached and evictable; payload storage may persist.
+    assert e.cache_manager.num_used_blocks == 0
+    assert e.cache_manager.num_free_blocks == e.cache_manager.num_blocks
+
+
+def cold_prefix_output(prompt, params, retention):
+    # Every suffix gets a new engine, including empty prefix/reference state.
+    cold = engine(retention=retention, prefix=False)
+    try:
+        cold.add_request("cold", prompt, params)
+        cold.step()
+        assert cold.last_schedule.requests[0].token_start == 0
+        assert cold.cache_manager.prefix_hits == 0
+        output = finish(cold)["cold"]
+        assert_prefix_requests_drained(cold)
+        return output
+    finally:
+        cold.close()
+
+
+def cold_prefix_outputs(e, requests, *, cancel_and_replace=None, events=None):
+    """Replay target arrivals/lifecycle on an independent cache-disabled engine.
+
+    Matching arrivals does not imply equal execution batches: prefix hits and
+    prefill chunking can still change the cold/warm schedules.
+    """
+    try:
+        assert not e.cache_manager.enable_prefix_caching
+        admitted = {
+            rid: admit_prefix_request(e, rid, prompt, params, cached_tokens=0)[0]
+            for rid, (prompt, params) in requests.items()
+        }
+        if cancel_and_replace is not None:
+            victim_id, replacement_id, prompt, params = cancel_and_replace
+            wait_for_unconsumed_capture(e, requests, events)
+            assert {event["mode"] for event in events} == {CAPTURE}
+            aborted = e.abort_request(victim_id)
+            assert aborted.finished and aborted.finish_reason == "abort"
+            del admitted[victim_id]
+            assert e.reference_store.outstanding == len(admitted)
+            admitted[replacement_id] = admit_prefix_request(
+                e, replacement_id, prompt, params, cached_tokens=0
+            )[0]
+            wait_for_unconsumed_capture(e, [replacement_id], events)
+            assert all(e.has_request(rid) for rid in admitted)
+        outputs = finish(e)
+        e.model_runner.synchronize()
+        assert set(outputs) == set(admitted)
+        assert e.cache_manager.prefix_hits == 0
+        if events is not None:
+            for request in admitted.values():
+                assert_sparse_decode(events, request, 0.5, layers=e.model.config.num_hidden_layers)
+        assert_prefix_requests_drained(e)
+        return outputs
+    finally:
+        e.close()
+
+
+def admit_prefix_request(e, rid, prompt, params, *, cached_tokens):
+    cache = e.cache_manager
+    prefix = cache.lookup_prefix(prompt)
+    assert len(prefix) * cache.block_size == cached_tokens
+    before = cache.prefix_hits
+    e.add_request(rid, prompt, params)
+    # Admit one arrival at a time so the counter delta belongs to this request,
+    # even when another admitted request will share its prompt pages.
+    e.scheduler._admit()
+    assert cache.prefix_hits - before == cached_tokens
+    request = e.scheduler.requests[rid]
+    assert request.num_prefilled_tokens == cached_tokens
+    for depth, table in enumerate(cache.plane_block_tables(rid)):
+        assert table[: len(prefix)] == tuple(group[depth] for group in prefix)
+    return request, prefix
+
+
+def wait_for_unconsumed_capture(e, request_ids, events):
+    for _ in range(100):
+        e.step()
+        states = [e.model_runner.attention_references.get(rid) for rid in request_ids]
+        if all(state is not None for state in states):
+            captured = [
+                [event for event in events if event["lease"] is state[2]] for state in states
+            ]
+            if all(captured):
+                for state, rows in zip(states, captured):
+                    assert len(rows) == e.model.config.num_hidden_layers
+                    assert {event["layer"] for event in rows} == set(range(len(rows)))
+                    assert {event["mode"] for event in rows} == {CAPTURE}
+                    assert e.reference_store._bindings[state[2].slots[0]] is state[2]
+                return states
+    pytest.fail("decode never yielded after CAPTURE and before CONSUME")
+
+
+@pytest.mark.parametrize("retention", [0.5, 1.0])
+@pytest.mark.parametrize("suffix,cached_tokens", [([6, 7, 8], 6), ([9, 10], 4)])
+def test_prefix_hit_matches_its_own_cold_sparse_decode(
+    retention, suffix, cached_tokens, monkeypatch
+):
+    prompt = [2, 3, 4, 5] + suffix
+    params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
+    expected = cold_prefix_output(prompt, params, retention)
+    e = engine(retention=retention, prefix=True)
+    try:
+        e.add_request("prime", [2, 3, 4, 5, 6, 7, 8], params)
+        finish(e)
+        assert_prefix_requests_drained(e)
+        events, starts = trace_cpu_sparse(e, monkeypatch)
+        request, prefix = admit_prefix_request(
+            e, "target", prompt, params, cached_tokens=cached_tokens
+        )
+        pages = [block for group in prefix for block in group]
+        keys = e.cache_manager.key_cache[pages].clone()
+        values = e.cache_manager.value_cache[pages].clone()
+        actual = finish(e)["target"]
+        assert starts[id(request)] == cached_tokens
+        assert actual.token_ids == expected.token_ids
+        assert actual.exit_depths == expected.exit_depths == [4] * params.max_tokens
+        assert actual.finish_reason == expected.finish_reason == "length"
+        assert_sparse_decode(events, request, retention, layers=e.model.config.num_hidden_layers)
+        assert torch.equal(e.cache_manager.key_cache[pages], keys)
+        assert torch.equal(e.cache_manager.value_cache[pages], values)
+        assert_prefix_requests_drained(e)
+        assert e.cache_manager.lookup_prefix(prompt) == prefix
+    finally:
+        e.close()
+
+
+def test_shared_prefix_keeps_live_sparse_references_request_local(monkeypatch):
+    prompts = {"a": [2, 3, 4, 5, 6], "b": [2, 3, 4, 5, 9]}
+    params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
+    expected = cold_prefix_outputs(
+        engine(retention=0.5, prefix=False),
+        {rid: (prompt, params) for rid, prompt in prompts.items()},
+    )
+    e = engine(retention=0.5, prefix=True)
+    try:
+        e.add_request("prime", prompts["a"], params)
+        finish(e)
+        assert_prefix_requests_drained(e)
+        events, starts = trace_cpu_sparse(e, monkeypatch)
+        requests = {
+            rid: admit_prefix_request(e, rid, prompt, params, cached_tokens=4)[0]
+            for rid, prompt in prompts.items()
+        }
+        states = wait_for_unconsumed_capture(e, prompts, events)
+        assert e.reference_store.outstanding == 2
+        assert states[0][2].slots != states[1][2].slots
+        assert states[0][2] is not states[1][2]
+        actual = finish(e)
+        for rid, request in requests.items():
+            assert starts[id(request)] == 4
+            assert actual[rid].token_ids == expected[rid].token_ids
+            assert actual[rid].exit_depths == expected[rid].exit_depths == [4] * params.max_tokens
+            assert actual[rid].finish_reason == expected[rid].finish_reason == "length"
+            assert_sparse_decode(events, request, 0.5, layers=e.model.config.num_hidden_layers)
+        assert_prefix_requests_drained(e)
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("replacement_id", ["victim", "replacement"])
+def test_prefix_hit_cancel_after_capture_reuses_slots_without_old_reference(
+    replacement_id, monkeypatch
+):
+    prompt = [2, 3, 4, 5, 10]
+    params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
+    cold = engine(retention=0.5, prefix=False)
+    with monkeypatch.context() as patch:
+        cold_events, _ = trace_cpu_sparse(cold, patch)
+        expected = cold_prefix_outputs(
+            cold,
+            {"victim": ([2, 3, 4, 5, 9], params)},
+            cancel_and_replace=("victim", replacement_id, prompt, params),
+            events=cold_events,
+        )[replacement_id]
+    e = engine(retention=0.5, prefix=True)
+    try:
+        e.add_request("prime", [2, 3, 4, 5, 6], params)
+        finish(e)
+        assert_prefix_requests_drained(e)
+        events, starts = trace_cpu_sparse(e, monkeypatch)
+        victim, _ = admit_prefix_request(e, "victim", [2, 3, 4, 5, 9], params, cached_tokens=4)
+        old_state = wait_for_unconsumed_capture(e, ["victim"], events)[0]
+        assert starts[id(victim)] == 4
+        assert {event["mode"] for event in events} == {CAPTURE}
+        stale = events[0]
+        old_slot = e.model_runner.state_slots["victim"]
+        aborted = e.abort_request("victim")
+        assert aborted.finished and aborted.finish_reason == "abort"
+        assert_prefix_requests_drained(e)
+        replacement, _ = admit_prefix_request(e, replacement_id, prompt, params, cached_tokens=4)
+        new_state = wait_for_unconsumed_capture(e, [replacement_id], events)[0]
+        assert replacement is not victim
+        assert new_state[0] is replacement and old_state[0] is victim
+        assert new_state[2].slots == old_state[2].slots
+        assert new_state[2] is not old_state[2]
+        assert e.model_runner.state_slots[replacement_id] == old_slot
+        with pytest.raises(RuntimeError, match="stale"):
+            e.reference_store.read_reference(stale["plan"], stale["layer"], stale["row"])
+        with pytest.raises(RuntimeError, match="stale"):
+            e.reference_store.consume(stale["plan"], stale["layer"])
+        assert all(event["mode"] == CAPTURE for event in events if event["request"] is replacement)
+        for event in events:
+            if event["request"] is replacement:
+                for actual, saved in zip(
+                    reference_payload(e.reference_store, event), event["payload"]
+                ):
+                    assert torch.equal(actual, saved)
+        actual = finish(e)[replacement_id]
+        assert starts[id(replacement)] == 4
+        assert actual.token_ids == expected.token_ids
+        assert actual.exit_depths == expected.exit_depths == [4] * params.max_tokens
+        assert actual.finish_reason == expected.finish_reason == "length"
+        assert_sparse_decode(events, replacement, 0.5, layers=e.model.config.num_hidden_layers)
+        assert_prefix_requests_drained(e)
+        assert e.cache_manager.lookup_prefix(prompt)
+    finally:
+        e.close()
+
+
+def test_sparse_trace_rejects_missing_duplicate_and_foreign_steps(monkeypatch):
+    e = engine(retention=0.5, prefix=True)
+    try:
+        events, _ = trace_cpu_sparse(e, monkeypatch)
+        params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
+        e.add_request("target", [2, 3, 4, 5, 6], params)
+        request = e.scheduler.requests["target"]
+        finish(e)
+        layers = e.model.config.num_hidden_layers
+        assert_sparse_decode(events, request, 0.5, layers=layers)
+        last_position = len(request.prompt_token_ids) + params.max_tokens - 2
+        consume = next(event for event in events if event["mode"] == CONSUME)
+        incomplete = (
+            [event for event in events if event["position"] != last_position],
+            [event for event in events if event["layer"] != layers - 1],
+            [event for event in events if event is not consume],
+            [*events, events[-1]],
+            [dict(event, request=object()) if event is consume else event for event in events],
+        )
+        for corrupted in incomplete:
+            with pytest.raises(AssertionError):
+                assert_sparse_decode(corrupted, request, 0.5, layers=layers)
     finally:
         e.close()
 

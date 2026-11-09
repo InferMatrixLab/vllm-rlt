@@ -228,8 +228,12 @@ def _capture_split_kernel(
         )
         if HISTOGRAM:
             # Selection pass 0 of this part: the top eight bits of the order key.
-            digit = (_order_key(scores) >> 24).to(tl.int32)
-            local += tl.histogram(tl.where(valid_tokens, digit, 256), 512)
+            digit = tl.where(valid_tokens, (_order_key(scores) >> 24).to(tl.int32), 256)
+            # Reorder integer votes into a blocked vector; a histogram is
+            # order-independent. This avoids Triton 3.1's sliced-layout bug
+            # without changing the dense floating-point reduction.
+            digit = tl.reshape(tl.trans(tl.reshape(digit, (4, BLOCK_T // 4))), (BLOCK_T,))
+            local += tl.histogram(digit, 512)
         next_maximum = tl.maximum(maximum, tl.max(scores, axis=0))
         correction = tl.exp(maximum - next_maximum)
         weights = tl.exp(scores - next_maximum)
