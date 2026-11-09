@@ -125,7 +125,7 @@ live until device use completes.
 | Sync ID readback and CPU acceptance | `SpeculativeSubmission.collect()` / `SpeculativeRunner._collect_round()` in [speculative.py](../vllm_rlt/worker/speculative.py) |
 | Async submission ahead and ordered collection | `StageEngine._step_async_speculative()` / `_collect_speculative()` in [stage_engine.py](../vllm_rlt/engine/stage_engine.py) |
 | GPU acceptance and token/position update | `AsyncSpeculativeRunner._accept_and_update_state()` in [async_speculative.py](../vllm_rlt/worker/async_speculative.py) |
-| Stream events, result copy and buffer retirement | `AsyncSpeculativeRunner.submit()` and `SpeculativeRoundTicket.collect()` / `retire()` in [async_speculative.py](../vllm_rlt/worker/async_speculative.py) |
+| Stream events, result copy and buffer retirement | `AsyncSpeculativeRunner.submit()` and `AsyncSpeculativeOutput.collect()` / `retire()` in [async_speculative.py](../vllm_rlt/worker/async_speculative.py) |
 | CPU output/progress application | `Scheduler.update_from_output()` in [scheduler.py](../vllm_rlt/core/scheduler.py) |
 
 ## Configuration
