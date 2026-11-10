@@ -339,7 +339,10 @@ void launch_layout(at::Tensor& out, const at::Tensor& input, const at::Tensor& w
       y, x, w, r, layout, epsilon)
   // Each pack retains 16 bytes per thread. With enough rows, favor occupancy
   // over retaining more than two packs; smaller grids may retain up to four.
-  const int packs = 1 + (layout.hidden_size - 1) / (Threads * elements);
+  // Only complete body vectors occupy cached[]. Scalar heads/tails are held
+  // separately. A row's prefix can only reduce this upper bound.
+  const int max_vectors = layout.hidden_size / elements;
+  const int packs = (max_vectors + Threads - 1) / Threads;
   if (limit_cache && packs > 2) { RUN_RMS(0); }
   else if (packs <= 1) { RUN_RMS(1); }
   else if (packs <= 2) { RUN_RMS(2); }

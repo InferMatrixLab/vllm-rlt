@@ -132,7 +132,7 @@ def test_rmsnorm_weight_before_cast_and_residual_after_cast(
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("width", [8, 17, 128, 256, 257, 768, 2048, 2049, 4096, 8193])
+@pytest.mark.parametrize("width", [8, 17, 128, 256, 257, 768, 2048, 2049, 4096, 4097, 8193])
 @pytest.mark.parametrize("add_residual", [False, True])
 @torch.inference_mode()
 def test_rmsnorm_cuda_values_tail_and_fp32_weight(native_rms_norm, dtype, width, add_residual):
