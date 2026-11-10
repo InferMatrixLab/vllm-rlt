@@ -81,9 +81,9 @@ CUDA Graph capture/replay.
 
 `rms_norm(hidden, weight, epsilon, residual=None)` returns a new tensor. Its
 reference computes the mean square and inverse square root in FP32, multiplies
-the input by that scale, rounds the normalized values to the input dtype, then
-multiplies by `weight`. When supplied, the residual is added after the weight
-multiplication. In Ouro, this fuses the existing `residual + RMSNorm(hidden)`
+the input by that scale and by `weight` in FP32, then converts the weighted
+result to the output dtype. When supplied, the residual is added after this
+conversion, with a separate rounding to the output dtype. In Ouro, this fuses the existing `residual + RMSNorm(hidden)`
 order; it does not implement `RMSNorm(residual + hidden)`. The weight is a
 one-dimensional tensor of shape `[hidden_size]` and is shared across rows.
 
@@ -100,8 +100,9 @@ Torch RMSNorm path.
 The general CUDA kernel assigns one block per row. It sums squares in FP32,
 uses a warp reduction for widths up to 256 and a block reduction otherwise,
 then writes the scaled and weighted values, optionally with a residual. The
-aligned body loads and stores 16 bytes at a time and uses paired FP16/BF16
-arithmetic. Unaligned output heads and tails use scalar accesses; independently
+aligned body loads and stores 16 bytes at a time. Normalization and weight
+multiplication use FP32 pairs; FP16/BF16 residual addition uses dtype-specific
+paired arithmetic. Unaligned output heads and tails use scalar accesses; independently
 shifted input, weight and residual vectors are reconstructed from safe aligned
 reads, with scalar reads at view boundaries. Small rows retain their input
 vectors in registers across the reduction; wider rows stream them again to bound
@@ -110,20 +111,16 @@ arithmetic on SM100 and newer, with scalar FP32 operations on earlier
 architectures. These launch choices are implementation details and are not
 claimed optimal for every GPU.
 
-The general native reduction can use a different floating-point summation order
-from PyTorch, so its result need not be bitwise equal. Ouro uses a separate
-2048-wide FP16/BF16 compatibility path that reproduces the tested PyTorch mean
-reduction order, including its row-count-dependent block width. This path
-fuses the residual, uses 8-byte vector loads and stores and paired arithmetic,
-and keeps each thread's input values in registers across the reduction. It
-supports two-dimensional inputs and residuals with 8-byte-aligned rows, including
-strided views. Since the reduction tree is a PyTorch implementation detail,
-this path is currently enabled only for PyTorch 2.13.0 on SM103; Ouro falls
-back to the Torch reference for other versions, GPUs, shapes or alignments.
-The general kernel remains available through `rms_norm(..., match_torch=False)`.
-The tested compatibility path and the general path both retain the explicit
-intermediate dtype roundings and residual order. CUDA Graph replay is supported;
-a fake kernel for `torch.compile` is not registered.
+The native reduction can use a different floating-point summation order from
+PyTorch, so its result need not be bitwise equal. All supported inputs use the
+same generic kernel family; there is no model-specific reduction path or
+PyTorch-version/GPU-architecture compatibility gate. The Torch fallback and
+shared RMSNorm layer use the same FP32 normalization and weight multiplication
+contract. Compared with the previous layer, this removes the low-precision
+rounding before weight multiplication and can change model outputs and adaptive
+exit decisions. Model-level quality and throughput must be revalidated; previous
+compatibility-path measurements do not describe this implementation. CUDA Graph
+replay is supported; a fake kernel for `torch.compile` is not registered.
 
 ## Build and reference checks
 
@@ -198,7 +195,7 @@ Optional ops-only/full profiles are captured separately after timing; full
 capture enables shapes, memory and stacks. Large traces stay under ignored
 `artifacts/`.
 
-For RMSNorm, compare the Torch reference and both native paths without vLLM:
+For RMSNorm, compare the Torch reference and the native kernel without vLLM:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<allocated_gpu> python -m benchmarks.kernels.rms_norm \
@@ -208,13 +205,12 @@ CUDA_VISIBLE_DEVICES=<allocated_gpu> python -m benchmarks.kernels.rms_norm \
 
 An optional source-built vLLM comparison can be supplied with
 `--vllm-library <so> --vllm-namespace <namespace> --vllm-source-commit <sha>`.
-Its different intermediate rounding is reported separately from the reference
-semantics. The general native path can use a different reduction order than
-PyTorch; use the `rlt_torch_order` measurements when assessing Ouro's actual
-compatibility path.
+The benchmark reports error against the FP32 Torch reference and an FP64 oracle
+that converts the weighted result before adding the residual. The native paths
+may use different reduction orders from PyTorch.
 
-For one example of the model-level execution change, see the
-[matched B300 Graph timeline](assets/performance/ouro-rmsnorm-graph-b300.png)
-for an Ouro-1.4B BF16 request with 128 input tokens and 2 output tokens. The
-profiler trace illustrates work and launch counts; use separate unprofiled
-measurements for latency and throughput.
+The [previous B300 Graph timeline](assets/performance/ouro-rmsnorm-graph-b300.png)
+records the removed compatibility implementation, not the current kernel. It is
+retained as historical data and must not be used as current performance evidence.
+
+For the current generic implementation, see the [B300 operator and model validation](assets/performance/rmsnorm-20261110/README.md), including vLLM comparisons, regressions and the limits of the ten-question quality smoke test.

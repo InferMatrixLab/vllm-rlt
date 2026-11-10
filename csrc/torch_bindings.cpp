@@ -6,7 +6,7 @@
 
 TORCH_LIBRARY(vllm_rlt, ops) {
   ops.def("silu_and_mul(Tensor gate, Tensor up) -> Tensor");
-  ops.def("rms_norm(Tensor input, Tensor weight, float epsilon, Tensor? residual=None, bool match_torch=False) -> Tensor");
+  ops.def("rms_norm(Tensor input, Tensor weight, float epsilon, Tensor? residual=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(vllm_rlt, CUDA, ops) {

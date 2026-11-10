@@ -1,8 +1,8 @@
 """Matched RMSNorm / RMSNorm-then-residual accuracy and latency comparison.
 
 The optional vLLM library must expose the source-built ``vllm_rms_review``
-namespace. Its RMSNorm multiplication rounds differently from Ouro, so its
-error against the staged reference is reported separately from its latency.
+namespace. Normalization and weight multiplication use FP32 before conversion
+to the output dtype; an optional residual is added after that conversion.
 """
 
 import argparse
@@ -16,13 +16,13 @@ import torch
 
 from benchmarks.kernels.silu_and_mul import errors, measure, profile
 from vllm_rlt.kernels._extension import load_extension
-from vllm_rlt.kernels.normalization import _torch_order_validated, rms_norm, rms_norm_reference
+from vllm_rlt.kernels.normalization import rms_norm, rms_norm_reference
 
 
 def oracle(x, weight, epsilon, residual):
     value = x.double()
-    normalized = (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + epsilon)).to(x.dtype)
-    result = (normalized.double() * weight.double()).to(x.dtype)
+    normalized = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + epsilon)
+    result = (normalized * weight.double()).to(x.dtype)
     return result if residual is None else (residual.double() + result.double()).to(x.dtype)
 
 
@@ -70,7 +70,6 @@ def main():
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
         "capability": torch.cuda.get_device_capability(),
-        "torch_order_native_validated": _torch_order_validated(torch.cuda.current_device()),
         "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "diff_sha256": hashlib.sha256(patch).hexdigest(),
         "vllm_library": str(args.vllm_library.resolve()) if args.vllm_library else None,
@@ -82,6 +81,11 @@ def main():
         "vllm_source_commit": args.vllm_source_commit,
         "seed": 42,
         "epsilon": 1e-6,
+        "tolerances": {
+            "float32": {"rtol": 2e-6, "atol": 2e-6},
+            "float16": {"rtol": 2e-3, "atol": 2e-3},
+            "bfloat16": {"rtol": 1e-2, "atol": 1e-2},
+        },
         "repeats": args.repeats,
         "iterations": args.iterations,
         "graph_unroll": 32,
@@ -118,28 +122,19 @@ def main():
                         }
                         if vllm_op is not None:
                             funcs["vllm"] = (lambda: vllm() + residual) if add else vllm
-                        if (
-                            report["torch_order_native_validated"]
-                            and width == 2048
-                            and dtype in (torch.float16, torch.bfloat16)
-                        ):
-                            funcs["rlt_torch_order"] = lambda: rms_norm(
-                                x, weight, 1e-6, res, match_torch=True
-                            )
                         if add:
                             funcs["rlt_separate"] = lambda: rms_norm(x, weight, 1e-6) + residual
-                            if "rlt_torch_order" in funcs:
-                                funcs["rlt_torch_order_separate"] = (
-                                    lambda: rms_norm(x, weight, 1e-6, match_torch=True) + residual
-                                )
                         ref = funcs["torch"]()
                         exact = oracle(x, weight, 1e-6, res)
                         accuracy = {}
                         for name, fn in funcs.items():
                             result = fn()
+                            torch.testing.assert_close(
+                                result, ref, **report["tolerances"][dtype_name]
+                            )
                             accuracy[name] = {
-                                "vs_ouro": errors(result, ref),
-                                "vs_fp64_staged": errors(result, exact),
+                                "vs_torch": errors(result, ref),
+                                "vs_fp64": errors(result, exact),
                             }
                         row = {
                             "dtype": dtype_name,
@@ -176,10 +171,6 @@ def main():
             }
             if vllm_op is not None:
                 functions["vllm_norm_add"] = vllm_profile
-            if report["torch_order_native_validated"]:
-                functions["rlt_torch_order_norm_add"] = lambda: rms_norm(
-                    x, weight, 1e-6, residual, match_torch=True
-                )
             profile(functions, args.profile_dir)
     report["device_status_after"] = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu,clocks.sm", "--format=csv"],

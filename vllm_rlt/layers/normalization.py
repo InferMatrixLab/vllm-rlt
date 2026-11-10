@@ -4,7 +4,7 @@
 import torch
 from torch import nn
 
-from vllm_rlt.kernels import rms_norm
+from vllm_rlt.kernels.normalization import rms_norm, rms_norm_reference
 
 
 class RMSNorm(nn.Module):
@@ -22,8 +22,5 @@ class RMSNorm(nn.Module):
 
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         if self.use_native:
-            return rms_norm(hidden, self.weight, self.variance_epsilon, residual, match_torch=True)
-        value = hidden.float()
-        value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + self.variance_epsilon)
-        result = self.weight * value.to(hidden.dtype)
-        return result if residual is None else residual + result
+            return rms_norm(hidden, self.weight, self.variance_epsilon, residual)
+        return rms_norm_reference(hidden, self.weight, self.variance_epsilon, residual)

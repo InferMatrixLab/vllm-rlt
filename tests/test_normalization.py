@@ -31,11 +31,12 @@ def test_rmsnorm_weight_parameter_and_state_dict():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_rmsnorm_forward_numerics_and_dtypes(dtype):
+@pytest.mark.parametrize("use_native", [False, True])
+def test_rmsnorm_forward_numerics_and_dtypes(dtype, use_native):
     torch.manual_seed(42)
     hidden_size = 64
     eps = 1e-5
-    norm = RMSNorm(hidden_size, eps=eps).to(dtype)
+    norm = RMSNorm(hidden_size, eps=eps, use_native=use_native).to(dtype)
 
     # Random weights and input
     with torch.no_grad():
@@ -50,8 +51,8 @@ def test_rmsnorm_forward_numerics_and_dtypes(dtype):
     # Verify exact reference computation matching forward()
     x_fp32 = x.float()
     variance = x_fp32.square().mean(-1, keepdim=True)
-    normalized = (x_fp32 * torch.rsqrt(variance + eps)).to(dtype)
-    ref = norm.weight * normalized
+    normalized = x_fp32 * torch.rsqrt(variance + eps)
+    ref = (norm.weight.float() * normalized).to(dtype)
 
     assert torch.equal(out, ref)
 
@@ -93,12 +94,48 @@ def native_rms_norm():
     return rms_norm
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize(
+    "dtype,weight_value,expected_value",
+    [(torch.float16, 13.0, 9.1953125), (torch.bfloat16, 67.0, 47.5)],
+)
+@pytest.mark.parametrize("width", [8, 17])
+@torch.inference_mode()
+def test_rmsnorm_weight_before_cast_and_residual_after_cast(
+    device, dtype, weight_value, expected_value, width
+):
+    if device == "cuda":
+        from vllm_rlt.kernels._extension import load_extension
+
+        load_extension()
+        assert torch._C._dispatch_has_kernel_for_dispatch_key("vllm_rlt::rms_norm", "CUDA")
+
+    # With x=1 and epsilon=1, scale=1/sqrt(2). These weights distinguish
+    # FP32 weighting from prematurely rounding the normalized value.
+    # Width 17 also exercises scalar heads/tails alongside vector output.
+    x = torch.ones(2, width, device=device, dtype=dtype)
+    weight = torch.full((width,), weight_value, device=device, dtype=dtype)
+    expected = torch.full_like(x, expected_value)
+    actual = rms_norm(x, weight, 1.0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    scale = torch.rsqrt(torch.tensor(2.0, device=device))
+    prematurely_rounded = scale.to(dtype) * weight
+    assert torch.all(prematurely_rounded != expected[0])
+
+    # Cancelling the rounded output gives exactly zero. Adding residual in
+    # FP32 before the cast would leave a nonzero result for these values.
+    residual = -expected
+    fused = rms_norm(x, weight, 1.0, residual)
+    torch.testing.assert_close(fused, torch.zeros_like(x), rtol=0, atol=0)
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("width", [8, 17, 128, 256, 257, 768, 2048, 2049, 4096, 8193])
 @pytest.mark.parametrize("add_residual", [False, True])
 @torch.inference_mode()
-def test_rmsnorm_cuda_values_tail_and_staged_rounding(native_rms_norm, dtype, width, add_residual):
+def test_rmsnorm_cuda_values_tail_and_fp32_weight(native_rms_norm, dtype, width, add_residual):
     torch.manual_seed(42)
     x = torch.randn(3, width, device="cuda", dtype=dtype)
     weight = (torch.randn(width, device="cuda") * 0.1 + 1).to(dtype)
@@ -107,8 +144,8 @@ def test_rmsnorm_cuda_values_tail_and_staged_rounding(native_rms_norm, dtype, wi
     r_before = residual.clone() if residual is not None else None
     result = native_rms_norm(x, weight, 1e-6, residual)
     expected = rms_norm_reference(x, weight, 1e-6, residual)
-    # CUDA's reduction order differs from torch.mean; keep the dtype rounding
-    # boundaries and independently check the residual's input is untouched.
+    # Allow FP32 reduction-order differences; the weighted output is rounded
+    # before adding residual. Also check the inputs are untouched.
     tolerance = {
         torch.float32: (2e-6, 2e-6),
         torch.float16: (2e-3, 2e-3),
@@ -128,71 +165,14 @@ def test_rmsnorm_cuda_values_tail_and_staged_rounding(native_rms_norm, dtype, wi
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8, 15, 16, 17, 128, 1024])
 @pytest.mark.parametrize("add_residual", [False, True])
 @torch.inference_mode()
-def test_rmsnorm_cuda_torch_order_is_exact(native_rms_norm, dtype, rows, add_residual):
-    # The row count changes torch.mean's reduction tree. Cover the boundaries
-    # where the compatibility kernel changes its block width.
-    from vllm_rlt.kernels.normalization import _torch_order_validated
-
-    if not _torch_order_validated(torch.cuda.current_device()):
-        pytest.skip("the Torch-order CUDA kernel is not enabled on this Torch/GPU combination")
+def test_rmsnorm_cuda_row_counts(native_rms_norm, dtype, rows, add_residual):
     x = torch.randn(rows, 2048, dtype=dtype, device="cuda")
     weight = torch.randn(2048, dtype=dtype, device="cuda")
     residual = torch.randn_like(x) if add_residual else None
-    actual = native_rms_norm(x, weight, 1e-6, residual, match_torch=True)
+    actual = native_rms_norm(x, weight, 1e-6, residual)
     expected = rms_norm_reference(x, weight, 1e-6, residual)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@torch.inference_mode()
-def test_rmsnorm_cuda_torch_order_strides_and_fallback(native_rms_norm, dtype):
-    # An aligned SP-style slice can use the exact kernel, while an offset that
-    # cannot safely use its vector loads falls back to the Torch reference.
-    rows, width = 4, 2048
-    base = torch.randn(rows, width * 2 + 8, dtype=dtype, device="cuda")
-    residual_base = torch.randn_like(base)
-    weight = torch.randn(width + 1, dtype=dtype, device="cuda")
-    for offset in (0, 1):
-        x = base[:, offset : offset + width]
-        residual = residual_base[:, offset : offset + width]
-        w = weight[offset : offset + width]
-        actual = native_rms_norm(x, w, 1e-6, residual, match_torch=True)
-        expected = rms_norm_reference(x, w, 1e-6, residual)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@torch.inference_mode()
-def test_rmsnorm_cuda_torch_order_nonfinite(native_rms_norm, dtype):
-    x = torch.zeros(4, 2048, dtype=dtype, device="cuda")
-    x[1, 0] = float("inf")
-    x[2, 0] = float("-inf")
-    x[3, 0] = float("nan")
-    weight = torch.randn(2048, dtype=dtype, device="cuda")
-    residual = torch.randn_like(x)
-    actual = native_rms_norm(x, weight, 1e-6, residual, match_torch=True)
-    expected = rms_norm_reference(x, weight, 1e-6, residual)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
-
-
-@pytest.mark.gpu
-@torch.inference_mode()
-def test_rmsnorm_cuda_torch_order_graph_replay(native_rms_norm):
-    dtype = torch.bfloat16
-    x = torch.randn(17, 2048, dtype=dtype, device="cuda")
-    weight = torch.randn(2048, dtype=dtype, device="cuda")
-    residual = torch.randn_like(x)
-    native_rms_norm(x, weight, 1e-6, residual, match_torch=True)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = native_rms_norm(x, weight, 1e-6, residual, match_torch=True)
-    x.fill_(0.25)
-    residual.fill_(0.5)
-    graph.replay()
-    expected = rms_norm_reference(x, weight, 1e-6, residual)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    tol = 2e-3 if dtype == torch.float16 else 1e-2
+    torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
 
 
 @pytest.mark.gpu

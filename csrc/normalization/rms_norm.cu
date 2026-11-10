@@ -99,9 +99,7 @@ struct Arithmetic<__half> {
   __device__ static __half cast(float x) { return __float2half_rn(x); }
   __device__ static float2 pair(Pair x) { return __half22float2(x); }
   __device__ static Pair cast2(float2 x) { return __floats2half2_rn(x.x, x.y); }
-  __device__ static __half mul(__half a, __half b) { return __hmul_rn(a, b); }
   __device__ static __half add(__half a, __half b) { return __hadd_rn(a, b); }
-  __device__ static Pair mul_pair(Pair a, Pair b) { return __hmul2_rn(a, b); }
   __device__ static Pair add_pair(Pair a, Pair b) { return __hadd2_rn(a, b); }
 };
 
@@ -112,13 +110,9 @@ struct Arithmetic<__nv_bfloat16> {
   __device__ static __nv_bfloat16 cast(float x) { return __float2bfloat16_rn(x); }
   __device__ static float2 pair(Pair x) { return __bfloat1622float2(x); }
   __device__ static Pair cast2(float2 x) { return __floats2bfloat162_rn(x.x, x.y); }
-  __device__ static __nv_bfloat16 mul(__nv_bfloat16 a, __nv_bfloat16 b) {
-    return __hmul_rn(a, b);
-  }
   __device__ static __nv_bfloat16 add(__nv_bfloat16 a, __nv_bfloat16 b) {
     return __hadd_rn(a, b);
   }
-  __device__ static Pair mul_pair(Pair a, Pair b) { return __hmul2_rn(a, b); }
   __device__ static Pair add_pair(Pair a, Pair b) { return __hadd2_rn(a, b); }
 };
 
@@ -129,9 +123,7 @@ struct Arithmetic<float> {
   __device__ static float cast(float x) { return x; }
   __device__ static float2 pair(Pair x) { return x; }
   __device__ static Pair cast2(float2 x) { return x; }
-  __device__ static float mul(float a, float b) { return __fmul_rn(a, b); }
   __device__ static float add(float a, float b) { return __fadd_rn(a, b); }
-  __device__ static Pair mul_pair(Pair a, Pair b) { return mul2(a, b); }
   __device__ static Pair add_pair(Pair a, Pair b) { return add2(a, b); }
 };
 
@@ -153,107 +145,6 @@ __device__ __forceinline__ int64_t row_offset(int row, const int64_t* sizes,
   return index0 * strides[0] + index1 * strides[1] + index2 * strides[2];
 }
 
-// Ouro's 2048-wide BF16/FP16 reference uses torch.mean on an FP32 squared
-// tensor. Reproduce that reduction tree, including its row-count-dependent
-// width, because small differences can change early-exit decisions.
-template <typename T, int Threads, bool AddResidual>
-__global__ void rms_norm_torch_order_kernel(T* out, const T* input, const T* weight,
-                                             const T* residual, int64_t input_stride,
-                                             int64_t residual_stride, float epsilon) {
-  using A = Arithmetic<T>;
-  using Pair = typename A::Pair;
-  constexpr int H = 2048;
-  constexpr int Packs = H / (Threads * 4);
-  const T* x = input + static_cast<int64_t>(blockIdx.x) * input_stride;
-  const T* r = nullptr;
-  if constexpr (AddResidual) r = residual + static_cast<int64_t>(blockIdx.x) * residual_stride;
-  T* y = out + static_cast<int64_t>(blockIdx.x) * H;
-  uint2 cached[Packs];
-  float sums[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-  for (int k = 0; k < Packs; ++k) {
-    int index = 4 * (threadIdx.x + k * Threads);
-    cached[k] = *reinterpret_cast<const uint2*>(x + index);
-    const Pair* pairs = reinterpret_cast<const Pair*>(&cached[k]);
-    float2 a = A::pair(pairs[0]);
-    float2 b = A::pair(pairs[1]);
-    sums[0] = __fadd_rn(sums[0], __fmul_rn(a.x, a.x));
-    sums[1] = __fadd_rn(sums[1], __fmul_rn(a.y, a.y));
-    sums[2] = __fadd_rn(sums[2], __fmul_rn(b.x, b.x));
-    sums[3] = __fadd_rn(sums[3], __fmul_rn(b.y, b.y));
-  }
-  float sum = __fadd_rn(__fadd_rn(__fadd_rn(sums[0], sums[1]), sums[2]), sums[3]);
-  __shared__ float partial[Threads];
-  if constexpr (Threads > 32) {
-    partial[threadIdx.x] = sum;
-    for (int offset = Threads / 2; offset >= 32; offset /= 2) {
-      __syncthreads();
-      if (threadIdx.x < offset) {
-        sum = __fadd_rn(sum, partial[threadIdx.x + offset]);
-        partial[threadIdx.x] = sum;
-      }
-    }
-    __syncthreads();
-  }
-#pragma unroll
-  for (int offset = 16; offset > 0; offset /= 2) {
-    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, offset));
-  }
-  float scale;
-  if constexpr (Threads == 32) {
-    scale = threadIdx.x == 0 ? rsqrtf(__fadd_rn(__fmul_rn(sum, 1.f / H), epsilon)) : 0.f;
-    scale = __shfl_sync(0xffffffff, scale, 0);
-  } else {
-    __shared__ float shared_scale;
-    if (threadIdx.x == 0) shared_scale = rsqrtf(__fadd_rn(__fmul_rn(sum, 1.f / H), epsilon));
-    __syncthreads();
-    scale = shared_scale;
-  }
-#pragma unroll
-  for (int k = 0; k < Packs; ++k) {
-    int index = 4 * (threadIdx.x + k * Threads);
-    uint2 w = *reinterpret_cast<const uint2*>(weight + index);
-    uint2 rv{};
-    if constexpr (AddResidual) rv = *reinterpret_cast<const uint2*>(r + index);
-    uint2 result;
-    const Pair* xp = reinterpret_cast<const Pair*>(&cached[k]);
-    const Pair* wp = reinterpret_cast<const Pair*>(&w);
-    const Pair* rp = reinterpret_cast<const Pair*>(&rv);
-    Pair* yp = reinterpret_cast<Pair*>(&result);
-#pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      float2 f = A::pair(xp[j]);
-      Pair normalized = A::cast2(make_float2(__fmul_rn(f.x, scale), __fmul_rn(f.y, scale)));
-      Pair value = A::mul_pair(normalized, wp[j]);
-      if constexpr (AddResidual) value = A::add_pair(rp[j], value);
-      yp[j] = value;
-    }
-    *reinterpret_cast<uint2*>(y + index) = result;
-  }
-}
-
-template <typename T, bool AddResidual>
-void launch_torch_order(at::Tensor& out, const at::Tensor& input, const at::Tensor& weight,
-                        const std::optional<at::Tensor>& residual, float epsilon) {
-  const int rows = static_cast<int>(input.size(0));
-  const T* x = reinterpret_cast<const T*>(input.const_data_ptr());
-  const T* w = reinterpret_cast<const T*>(weight.const_data_ptr());
-  const T* r = AddResidual ? reinterpret_cast<const T*>(residual->const_data_ptr()) : nullptr;
-  T* y = reinterpret_cast<T*>(out.mutable_data_ptr());
-  const int64_t residual_stride = AddResidual ? residual->stride(0) : 0;
-  auto stream = c10::cuda::getCurrentCUDAStream(input.get_device());
-#define RUN_TORCH_ORDER(N) \
-  rms_norm_torch_order_kernel<T, N, AddResidual><<<rows, N, 0, stream>>>( \
-      y, x, w, r, input.stride(0), residual_stride, epsilon)
-  if (rows < 2) { RUN_TORCH_ORDER(512); }
-  else if (rows < 4) { RUN_TORCH_ORDER(256); }
-  else if (rows < 8) { RUN_TORCH_ORDER(128); }
-  else if (rows < 16) { RUN_TORCH_ORDER(64); }
-  else { RUN_TORCH_ORDER(32); }
-#undef RUN_TORCH_ORDER
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 template <typename T>
 __device__ __forceinline__ float2 accumulate(Vector<T> x, float2 accum) {
   using A = Arithmetic<T>;
@@ -271,8 +162,8 @@ __device__ __forceinline__ float2 accumulate(Vector<T> x, float2 accum) {
 template <typename T, bool AddResidual>
 __device__ __forceinline__ T finish_scalar(T x, T w, T residual, float scale) {
   using A = Arithmetic<T>;
-  T norm = A::cast(__fmul_rn(A::scalar(x), scale));
-  T result = A::mul(norm, w);
+  float normalized = __fmul_rn(A::scalar(x), scale);
+  T result = A::cast(__fmul_rn(normalized, A::scalar(w)));
   if constexpr (AddResidual) result = A::add(residual, result);
   return result;
 }
@@ -288,8 +179,8 @@ __device__ __forceinline__ Vector<T> finish_vector(Vector<T> x, Vector<T> w,
   for (int j = 0; j < pairs; ++j) {
     Pair x_pair = reinterpret_cast<const Pair*>(&x)[j];
     Pair w_pair = reinterpret_cast<const Pair*>(&w)[j];
-    Pair normalized = A::cast2(mul2(A::pair(x_pair), make_float2(scale, scale)));
-    Pair value = A::mul_pair(normalized, w_pair);
+    float2 normalized = mul2(A::pair(x_pair), make_float2(scale, scale));
+    Pair value = A::cast2(mul2(normalized, A::pair(w_pair)));
     if constexpr (AddResidual) {
       Pair r_pair = reinterpret_cast<const Pair*>(&residual)[j];
       value = A::add_pair(r_pair, value);
@@ -510,7 +401,7 @@ void launch(at::Tensor& out, const at::Tensor& input, const at::Tensor& weight,
 }  // namespace
 
 at::Tensor rms_norm_cuda(const at::Tensor& input, const at::Tensor& weight, double epsilon,
-                         const std::optional<at::Tensor>& residual, bool match_torch) {
+                         const std::optional<at::Tensor>& residual) {
   TORCH_CHECK(input.is_cuda() && weight.is_cuda(), "rms_norm expects CUDA inputs");
   TORCH_CHECK(input.device() == weight.device(), "rms_norm expects inputs on the same device");
   TORCH_CHECK(input.dim() >= 1 && input.dim() <= 4, "rms_norm expects rank 1 through 4");
@@ -538,27 +429,6 @@ at::Tensor rms_norm_cuda(const at::Tensor& input, const at::Tensor& weight, doub
   if (input.numel() == 0) return out;
   TORCH_CHECK(input.numel() / input.size(-1) <= std::numeric_limits<int>::max(),
               "too many rms_norm rows");
-  if (match_torch) {
-    TORCH_CHECK(input.dim() == 2 && input.size(-1) == 2048 &&
-                    (input.scalar_type() == at::kHalf || input.scalar_type() == at::kBFloat16),
-                "torch-order rms_norm requires 2D FP16/BF16 input of width 2048");
-    TORCH_CHECK((reinterpret_cast<uintptr_t>(input.const_data_ptr()) & 7) == 0 &&
-                    (reinterpret_cast<uintptr_t>(weight.const_data_ptr()) & 7) == 0 &&
-                    (input.size(0) == 1 || input.stride(0) % 4 == 0),
-                "torch-order rms_norm requires 8-byte-aligned rows and weight");
-    if (residual) {
-      TORCH_CHECK((reinterpret_cast<uintptr_t>(residual->const_data_ptr()) & 7) == 0 &&
-                      (residual->size(0) == 1 || residual->stride(0) % 4 == 0),
-                  "torch-order rms_norm requires 8-byte-aligned residual rows");
-    }
-#define LAUNCH_TORCH_ORDER(T) \
-    if (residual) launch_torch_order<T, true>(out, input, weight, residual, epsilon); \
-    else launch_torch_order<T, false>(out, input, weight, residual, epsilon)
-    if (input.scalar_type() == at::kHalf) { LAUNCH_TORCH_ORDER(__half); }
-    else { LAUNCH_TORCH_ORDER(__nv_bfloat16); }
-#undef LAUNCH_TORCH_ORDER
-    return out;
-  }
 #define LAUNCH_RMS(T) \
   if (residual) launch<T, true>(out, input, weight, residual, epsilon); \
   else launch<T, false>(out, input, weight, residual, epsilon)

@@ -1,0 +1,23 @@
+{
+  "python": "3.12.3",
+  "torch": "2.13.0+cu130",
+  "torch_cuda": "13.0",
+  "head": "59f964cc741d38643fa22edaafb931da67291f8e",
+  "native_schema": "vllm_rlt::rms_norm(Tensor input, Tensor weight, float epsilon, Tensor? residual=None) -> Tensor",
+  "vllm_schema": "vllm_rms_review::rms_norm(Tensor($0! -> ) out, Tensor input, Tensor? weight, float eps) -> ()",
+  "sha256": {
+    "csrc/normalization/rms_norm.cu": "776de1e83619825b4d637e94917058c540afd7da5d24ca2f50899607e698e971",
+    "csrc/ops.h": "4974b9ba3fbb3061391b3e704f38c8e65bd21a099bb2d3728bd98fd37db79966",
+    "csrc/torch_bindings.cpp": "af86bb016d2a9531ef0c817a4ad5dd8feb708f1829f7fe4fa2389c136a0ceadb",
+    "vllm_rlt/kernels/normalization.py": "cf7209a2fb0f58048cbe43abbc0cb814852887d5b7302f61245dd1be2068fe54",
+    "vllm_rlt/layers/normalization.py": "2fca7a125fdd0f4255561e83c35651666d9d0023d1516802524569926bccb800",
+    "vllm_rlt/models/ouro.py": "93fac83f95dc48582f1065d23d63e6db8d822041e350cff2628df25027c13e62",
+    "tests/test_normalization.py": "8bafbbf656f22cd72e05841911e2e11b471d5082eaaa071a5e7ee697dc0859d4",
+    "benchmarks/kernels/rms_norm.py": "09a4d6e9594fc22f9fd7d73e3c50659e4ff026432e6cb9338db77777d1b9cb7d",
+    "artifacts/rmsnorm-generic-20261109/vllm-source-build/build/vllm_rms_review.so": "f71fed3f96c641f4c8188b3e088787a1ffa64bd6febe865ed9056b575eb0bd5e",
+    "vllm_rlt/_C.cpython-312-x86_64-linux-gnu.so": "ffaaa582695fdaa44e7dc5573b948c69b3acea58bc9dfeb3be179584286c31d7"
+  },
+  "diff_sha256": "7550ee866c404cafa9536eaa254d6e4bd64e35fd43168c72ef1f2b3e4a775a4e",
+  "gpu_validation": "started 2026-11-10 on idle physical GPU 3; user authorized idle GPUs",
+  "cpu_tests": "947 passed, 710 skipped; final pre-commit all checks passed"
+}
