@@ -1,0 +1,92 @@
+[
+  {
+    "case": [
+      "bfloat16",
+      3073,
+      1024,
+      true
+    ],
+    "index": [
+      345,
+      107
+    ],
+    "torch_fp32_mean_reconstructed": 0.9982972741127014,
+    "torch_fp32_weighted_reconstructed": -2.0078125,
+    "torch_fp32_mean_original": 0.9982972741127014,
+    "torch_fp32_weighted_original": -2.0078125,
+    "kernel_variants": {
+      "K2": {
+        "sum": 3067.767578125,
+        "mean": 0.9982972919378458,
+        "scale": 1.0008518695831299,
+        "weighted_before_cast": -2.0078125,
+        "weighted_minus_bf16_midpoint": 0.0,
+        "output": 0.15625,
+        "bitwise_equal_to_unmodified_old": true
+      }
+    }
+  },
+  {
+    "case": [
+      "bfloat16",
+      4095,
+      1024,
+      true
+    ],
+    "index": [
+      813,
+      1655
+    ],
+    "torch_fp32_mean_reconstructed": 0.9858719706535339,
+    "torch_fp32_weighted_reconstructed": 2.445312261581421,
+    "torch_fp32_mean_original": 0.9858719706535339,
+    "torch_fp32_weighted_original": 2.445312261581421,
+    "kernel_variants": {
+      "K2": {
+        "sum": 4037.145263671875,
+        "mean": 0.9858718592605311,
+        "scale": 1.0071393251419067,
+        "weighted_before_cast": 2.445312738418579,
+        "weighted_minus_bf16_midpoint": 2.384185791015625e-07,
+        "output": -0.09375,
+        "bitwise_equal_to_unmodified_old": true
+      }
+    }
+  },
+  {
+    "case": [
+      "bfloat16",
+      8192,
+      296,
+      true
+    ],
+    "index": [
+      110,
+      6967
+    ],
+    "torch_fp32_mean_reconstructed": 1.014793872833252,
+    "torch_fp32_weighted_reconstructed": -2.0703125,
+    "torch_fp32_mean_original": 1.014793872833252,
+    "torch_fp32_weighted_original": -2.0703125,
+    "kernel_variants": {
+      "K4": {
+        "sum": 8313.1904296875,
+        "mean": 1.0147937536239624,
+        "scale": 0.9926837682723999,
+        "weighted_before_cast": -2.070312738418579,
+        "weighted_minus_bf16_midpoint": -2.384185791015625e-07,
+        "output": 0.03125,
+        "bitwise_equal_to_unmodified_old": true
+      },
+      "K0": {
+        "sum": 8313.1904296875,
+        "mean": 1.0147937536239624,
+        "scale": 0.9926837682723999,
+        "weighted_before_cast": -2.070312738418579,
+        "weighted_minus_bf16_midpoint": -2.384185791015625e-07,
+        "output": 0.03125,
+        "bitwise_equal_to_unmodified_old": true
+      }
+    }
+  }
+]

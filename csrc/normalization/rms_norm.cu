@@ -2,6 +2,7 @@
 #include "../ops.h"
 
 #include <ATen/core/grad_mode.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
@@ -207,11 +208,11 @@ __device__ __forceinline__ void write_vector(T* out, const T* weight, const T* r
   *reinterpret_cast<uint4*>(out + index) = *reinterpret_cast<const uint4*>(&result);
 }
 
-template <typename T, int Threads, bool AddResidual, bool Aligned, int StaticH, int CachePacks>
+template <typename T, int Threads, bool AddResidual, bool Aligned, int CachePacks>
 __global__ void rms_norm_kernel(T* out, const T* input, const T* weight,
                                 const T* residual, RowLayout layout, float epsilon) {
   constexpr int elements = 16 / sizeof(T);
-  const int H = StaticH ? StaticH : layout.hidden_size;
+  const int H = layout.hidden_size;
   const int row = blockIdx.x;
   const T* x = input + (layout.input_linear_stride >= 0
       ? static_cast<int64_t>(row) * layout.input_linear_stride
@@ -327,27 +328,23 @@ __global__ void rms_norm_kernel(T* out, const T* input, const T* weight,
 template <typename T, int Threads, bool AddResidual, bool Aligned>
 void launch_layout(at::Tensor& out, const at::Tensor& input, const at::Tensor& weight,
                    const std::optional<at::Tensor>& residual, RowLayout layout, int rows,
-                   float epsilon, cudaStream_t stream) {
+                   float epsilon, cudaStream_t stream, bool limit_cache) {
   const T* x = reinterpret_cast<const T*>(input.const_data_ptr());
   const T* w = reinterpret_cast<const T*>(weight.const_data_ptr());
   const T* r = residual ? reinterpret_cast<const T*>(residual->const_data_ptr()) : nullptr;
   T* y = reinterpret_cast<T*>(out.mutable_data_ptr());
   constexpr int elements = 16 / sizeof(T);
-#define RUN_RMS(H, K) \
-  rms_norm_kernel<T, Threads, AddResidual, Aligned, H, K><<<rows, Threads, 0, stream>>>( \
+#define RUN_RMS(K) \
+  rms_norm_kernel<T, Threads, AddResidual, Aligned, K><<<rows, Threads, 0, stream>>>( \
       y, x, w, r, layout, epsilon)
-  if constexpr (Aligned && Threads == 256) {
-    if (layout.hidden_size == 2048) {
-      RUN_RMS(2048, (2048 + Threads * elements - 1) / (Threads * elements));
-      return;
-    }
-  }
-  // Cache small rows; stream very wide rows to avoid unbounded register pressure.
-  const int packs = (layout.hidden_size + Threads * elements - 1) / (Threads * elements);
-  if (packs <= 1) { RUN_RMS(0, 1); }
-  else if (packs <= 2) { RUN_RMS(0, 2); }
-  else if (packs <= 4) { RUN_RMS(0, 4); }
-  else { RUN_RMS(0, 0); }
+  // Each pack retains 16 bytes per thread. With enough rows, favor occupancy
+  // over retaining more than two packs; smaller grids may retain up to four.
+  const int packs = 1 + (layout.hidden_size - 1) / (Threads * elements);
+  if (limit_cache && packs > 2) { RUN_RMS(0); }
+  else if (packs <= 1) { RUN_RMS(1); }
+  else if (packs <= 2) { RUN_RMS(2); }
+  else if (packs <= 4) { RUN_RMS(4); }
+  else { RUN_RMS(0); }
 #undef RUN_RMS
 }
 
@@ -388,12 +385,29 @@ void launch(at::Tensor& out, const at::Tensor& input, const at::Tensor& weight,
   aligned = aligned && layout.hidden_size % elements == 0;
   const int rows = static_cast<int>(input.numel() / layout.hidden_size);
   auto stream = c10::cuda::getCurrentCUDAStream(input.get_device());
+  const auto* device = at::cuda::getDeviceProperties(input.get_device());
+  const int sm_count = device->multiProcessorCount;
+  const int packs_at_256 = 1 + (layout.hidden_size - 1) / (256 * elements);
+  // One block processes one row. When there are fewer rows than SMs, give wide
+  // rows more threads. At two rows per SM, reduce the larger input caches.
+  const bool more_threads = rows < sm_count && packs_at_256 > 4 &&
+                            device->maxThreadsPerBlock >= 512;
+  const bool limit_cache = rows / sm_count >= 2;
   if (layout.hidden_size <= 256) {
-    if (aligned) launch_layout<T, 32, AddResidual, true>(out, input, weight, residual, layout, rows, epsilon, stream);
-    else launch_layout<T, 32, AddResidual, false>(out, input, weight, residual, layout, rows, epsilon, stream);
+    if (aligned) launch_layout<T, 32, AddResidual, true>(
+        out, input, weight, residual, layout, rows, epsilon, stream, limit_cache);
+    else launch_layout<T, 32, AddResidual, false>(
+        out, input, weight, residual, layout, rows, epsilon, stream, limit_cache);
+  } else if (more_threads) {
+    if (aligned) launch_layout<T, 512, AddResidual, true>(
+        out, input, weight, residual, layout, rows, epsilon, stream, limit_cache);
+    else launch_layout<T, 512, AddResidual, false>(
+        out, input, weight, residual, layout, rows, epsilon, stream, limit_cache);
   } else {
-    if (aligned) launch_layout<T, 256, AddResidual, true>(out, input, weight, residual, layout, rows, epsilon, stream);
-    else launch_layout<T, 256, AddResidual, false>(out, input, weight, residual, layout, rows, epsilon, stream);
+    if (aligned) launch_layout<T, 256, AddResidual, true>(
+        out, input, weight, residual, layout, rows, epsilon, stream, limit_cache);
+    else launch_layout<T, 256, AddResidual, false>(
+        out, input, weight, residual, layout, rows, epsilon, stream, limit_cache);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

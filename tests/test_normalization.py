@@ -178,11 +178,13 @@ def test_rmsnorm_cuda_row_counts(native_rms_norm, dtype, rows, add_residual):
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("rank", [1, 2, 3, 4])
+@pytest.mark.parametrize("width", [33, 8193])
 @pytest.mark.parametrize("add_residual", [False, True])
 @torch.inference_mode()
-def test_rmsnorm_cuda_strides_and_independent_offsets(native_rms_norm, dtype, rank, add_residual):
+def test_rmsnorm_cuda_strides_and_independent_offsets(
+    native_rms_norm, dtype, rank, width, add_residual
+):
     torch.manual_seed(123)
-    width = 33
     shape = (width,) if rank == 1 else (*((2,) * (rank - 1)), width)
     base_shape = (*shape[:-1], width + 3)
     x = torch.randn(base_shape, device="cuda", dtype=dtype)[..., 1 : width + 1]

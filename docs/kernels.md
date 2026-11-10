@@ -106,10 +106,20 @@ paired arithmetic. Unaligned output heads and tails use scalar accesses; indepen
 shifted input, weight and residual vectors are reconstructed from safe aligned
 reads, with scalar reads at view boundaries. Small rows retain their input
 vectors in registers across the reduction; wider rows stream them again to bound
-register usage. Aligned width 2048 has a specialized path. FP32 pairs use paired
+register usage. No hidden width has a dedicated specialization. FP32 pairs use paired
 arithmetic on SM100 and newer, with scalar FP32 operations on earlier
 architectures. These launch choices are implementation details and are not
 claimed optimal for every GPU.
+
+Launch selection uses the workload and the current device's actual SM count.
+Widths up to 256 use 32 threads; other widths start with 256. If there are fewer
+rows than SMs and a 256-thread block would need more than four 16-byte vectors
+per thread, use 512 threads when supported. After selecting the thread count,
+cache one, two or four vectors per thread, or reread input when more are needed.
+When there are at least two rows per SM, also reread instead of retaining more
+than two vectors per thread. Vector counts account for dtype: a 16-byte vector
+holds eight FP16/BF16 values or four FP32 values. These are general heuristics,
+not a per-model or GPU-model tuning table; measured tradeoffs remain device-dependent.
 
 The native reduction can use a different floating-point summation order from
 PyTorch, so its result need not be bitwise equal. All supported inputs use the
@@ -205,12 +215,16 @@ CUDA_VISIBLE_DEVICES=<allocated_gpu> python -m benchmarks.kernels.rms_norm \
 
 An optional source-built vLLM comparison can be supplied with
 `--vllm-library <so> --vllm-namespace <namespace> --vllm-source-commit <sha>`.
-The benchmark reports error against the FP32 Torch reference and an FP64 oracle
+The benchmark reports error against the FP32 Torch reference and an FP64 diagnostic reference
 that converts the weighted result before adding the residual. The native paths
-may use different reduction orders from PyTorch.
+may use different reduction orders from PyTorch. Near a low-precision rounding
+midpoint, a small reduction difference can become one output-dtype step before
+residual addition; cancellation can then expose a larger relative difference.
+Casting an FP64 tensor to a low-precision dtype can itself involve intermediate
+FP32 rounding, so midpoint diagnostics must inspect the value before that cast.
 
 The [previous B300 Graph timeline](assets/performance/ouro-rmsnorm-graph-b300.png)
 records the removed compatibility implementation, not the current kernel. It is
 retained as historical data and must not be used as current performance evidence.
 
-For the current generic implementation, see the [B300 operator and model validation](assets/performance/rmsnorm-20261110/README.md), including vLLM comparisons, regressions and the limits of the ten-question quality smoke test.
+For the current launch/cache policy, see the [resource-based RMSNorm validation](assets/performance/rmsnorm-policy-20261110/README.md), including remaining regressions and numerical limits. The [earlier generic implementation report](assets/performance/rmsnorm-20261110/README.md) records the pre-policy snapshot, its vLLM comparisons and the limits of the ten-question quality smoke test; its timings do not describe the current policy.
