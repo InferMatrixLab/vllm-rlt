@@ -80,7 +80,9 @@ currently **same-host CUDA** with supported Triton/FA4 paths; it is not a claim
 of universal multi-node or model support. Speculative steps are not included
 in mixed prefill/decode batches.
 
+
 <a id="features"></a>
+
 
 ### Designed for recurrent inference
 
@@ -92,6 +94,10 @@ in mixed prefill/decode batches.
   CUDA Graphs, and optional asynchronous/speculative paths. An optional native
   CUDA SiLU-and-Mul operator accelerates the Ouro activation path, with a Torch
   fallback; it is not a general model-speedup claim.
+- **Sparse decode reference integration (opt-in):** cached loop-2 attention
+  correction for ordinary decode and block self-speculation, with shared
+  per-token reference ownership and explicit capability limits; see the
+  [configuration and scope](docs/runtime.md#sparse-decode-attention-reference-path).
 - **Offline and online use:** Python API, CLI, and a streaming
   OpenAI-compatible **completions** endpoint. This is not a chat-completions API.
 
