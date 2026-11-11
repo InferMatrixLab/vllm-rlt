@@ -114,7 +114,7 @@ def model():
 def make_cache(model, layout=None, block_size=2):
     config = model.config
     return KVCacheManager(
-        num_layers=config.num_hidden_layers,
+        num_layers=config.num_kv_layers,
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         num_blocks=256,
@@ -189,6 +189,34 @@ def test_artifact_config_maps_widths_stages_and_kv_layout():
     assert config.rope_theta("sliding_attention") == 10000
     assert config.rope_theta("full_attention") == 10000000
     assert DoryConfig.from_dict(config.to_dict()) == config
+
+
+def test_kv_layers_are_compacted_away_from_mlp_sublayers():
+    config = DoryConfig.from_dict(artifact_config_dict())
+    # 72 physical sublayers, 36 of them attention: sizing the pool by the
+    # physical count would double KV memory for no benefit.
+    assert config.num_hidden_layers == 72
+    assert config.num_kv_layers == 36
+    assert config.attention_layer_ids == tuple(
+        index for index, name in enumerate(config.layer_types) if name != "mlp"
+    )
+    assert [config.kv_layer_index(index) for index in config.attention_layer_ids] == list(range(36))
+    with pytest.raises(ValueError, match="no attention KV"):
+        config.kv_layer_index(1)
+
+
+def test_engine_sizes_kv_for_attention_layers_only(model):
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=64, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=2),
+    )
+    assert engine.cache_manager.num_layers == model.config.num_kv_layers
+    assert model.config.num_kv_layers < model.config.num_hidden_layers
+    boundary = set(model.prelude_kv_layers) | set(model.coda_kv_layers)
+    recurrent = set(model.recurrent_kv_layers)
+    assert boundary.isdisjoint(recurrent)
+    assert boundary | recurrent == set(range(model.config.num_kv_layers))
 
 
 def test_last_loop_mode_uses_the_shared_plane():
@@ -273,26 +301,20 @@ def test_recurrent_kv_is_laid_out_per_loop_plane(model):
     _, cache = run_one_token_per_step(model, tokens)
     allocation = cache._get_allocation("request")
     recurrent = model.recurrent_kv_layers[0]
-    boundary = model.prelude_kv_layers[0]
+    boundary = (model.prelude_kv_layers[0], model.coda_kv_layers[0])
     for depth in range(model.config.total_ut_steps):
-        assert all(0 in allocation.written[depth][recurrent] for _ in (0,))
+        assert 0 in allocation.written[depth][recurrent]
     # Boundary stages own one history at plane 0, never one copy per loop.
-    assert 0 in allocation.written[0][boundary]
-    assert all(0 not in allocation.written[depth][boundary] for depth in range(1, 2))
+    for layer in boundary:
+        assert 0 in allocation.written[0][layer]
+        assert 0 not in allocation.written[1][layer]
 
 
 def test_last_loop_kv_shares_one_physical_plane():
     model = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode="last_loop")).eval()
-    tokens = torch.tensor([4, 7, 9])
-    _, cache = run_one_token_per_step(model, tokens)
-    allocation = cache._get_allocation("request")
-    assert len(allocation.block_tables) == 1
-    torch.testing.assert_close(
-        dense_dory_reference(model, tokens)["logits"],
-        run_one_token_per_step(model, tokens)[0]["logits"],
-        atol=3e-6,
-        rtol=3e-5,
-    )
+    _, cache = run_one_token_per_step(model, torch.tensor([4, 7, 9]))
+    # One physical plane: every loop overwrites the same layer slot.
+    assert len(cache._get_allocation("request").block_tables) == 1
 
 
 def test_windowed_attention_masks_keys_outside_the_window(model):
@@ -326,13 +348,23 @@ def test_windowed_attention_masks_keys_outside_the_window(model):
     torch.testing.assert_close(windowed[0], expected, atol=3e-6, rtol=1e-5)
 
 
-def test_windowed_attention_refuses_backends_without_masking(model):
+class _MasklessWindowedKernel:
+    """Kernel with a window entry point that the manager must never reach."""
+
+    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
+        raise AssertionError("the capability gate must reject this backend before dispatch")
+
+    def windowed(self, *args):
+        raise AssertionError("the capability gate must reject this backend before dispatch")
+
+
+def test_windowed_attention_requires_the_advertised_capability(model):
     stub = AttentionBackend(
-        torch_paged_attention, BackendCapabilities(), {"selected_backend": "stub"}
+        _MasklessWindowedKernel(), BackendCapabilities(), {"selected_backend": "stub"}
     )
     config = model.config
     cache = KVCacheManager(
-        num_layers=config.num_hidden_layers,
+        num_layers=config.num_kv_layers,
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         num_blocks=16,
@@ -348,8 +380,16 @@ def test_windowed_attention_refuses_backends_without_masking(model):
     layer = model.recurrent_kv_layers[0]
     assert cache.allocate("request", 2)
     cache.write(layer, ["request"], [0], [0], torch.randn(1, 2, 8), torch.randn(1, 2, 8))
-    with pytest.raises(NotImplementedError, match="sliding-window"):
+    with pytest.raises(NotImplementedError, match="stub attention backend"):
         cache.attend(layer, ["request"], [0], [0], torch.randn(1, 4, 8), window=2)
+
+
+def test_attention_adapter_reports_a_kernel_without_masking():
+    adapter = AttentionBackend(
+        torch_paged_attention, BackendCapabilities(), {"selected_backend": "plain"}
+    )
+    with pytest.raises(NotImplementedError, match="does not implement sliding-window masking"):
+        adapter.windowed(None, None, None, None, None)
 
 
 @pytest.mark.parametrize("sharded", [False, True])
@@ -385,6 +425,55 @@ def test_loader_rejects_unexpected_tensors(tmp_path, model):
         DoryForCausalLM.from_pretrained(tmp_path, dtype=torch.float32)
 
 
+def test_load_time_loop_override_changes_depth_and_kv_planes(tmp_path, model):
+    from safetensors.torch import save_file
+
+    (tmp_path / "config.json").write_text(json.dumps(model.config.to_dict()))
+    save_file(
+        {name: value.clone().contiguous() for name, value in model.state_dict().items()},
+        tmp_path / "model.safetensors",
+    )
+    loaded = DoryForCausalLM.from_pretrained(tmp_path, dtype=torch.float32, loops=4)
+    assert loaded.config.total_ut_steps == 4
+    tokens = torch.tensor([4, 7, 9, 3, 12])
+    actual, cache = run_one_token_per_step(loaded, tokens)
+    assert_matches_reference(actual, dense_dory_reference(loaded, tokens))
+    # One last-exited plane per loop depth, not one fixed count.
+    assert len(cache._get_allocation("request").block_tables) == 4
+
+
+def test_engine_enforces_the_declared_kv_mode_and_matches_last_loop_reference():
+    model = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode="last_loop")).eval()
+    with pytest.raises(ValueError, match="shared"):
+        LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=64, block_size=2),
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+        )
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=64, block_size=2, layout="shared"),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+    )
+    assert engine.model.kv_cache_layout == "shared"
+    prompt = [4, 7, 3]
+    engine.add_request(
+        "request", prompt, SamplingParams(max_tokens=2, min_loops=2, max_loops=2, ignore_eos=True)
+    )
+    finished = {}
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output
+    result = finished["request"]
+    assert result.exit_depths == [2, 2]
+    tokens = list(prompt)
+    for _ in range(2):
+        logits = dense_dory_reference(model, torch.tensor(tokens))["logits"]
+        tokens.append(int(logits[-1].argmax()))
+    assert result.token_ids == tokens[len(prompt) :]
+
+
 def test_engine_serves_fixed_loops_and_matches_greedy_reference(model):
     engine = LLMEngine(
         model,
@@ -418,6 +507,20 @@ def test_engine_rejects_unqualified_dory_configuration(model):
             cache_config=CacheConfig(num_blocks=256, block_size=2),
             scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
         ).add_request("request", [4, 7, 3], SamplingParams(max_tokens=1, min_loops=1, max_loops=1))
+    with pytest.raises(ValueError, match="min_loops and max_loops"):
+        # A fabricated gate of -1e4 becomes 0.0 after sigmoid, so an unchecked
+        # exit_threshold=0 would let a shallow request "exit" after min_loops.
+        LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=256, block_size=2),
+            scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
+        ).add_request(
+            "request",
+            [4, 7, 3],
+            SamplingParams(
+                max_tokens=1, min_loops=1, max_loops=2, exit_threshold=0.0, ignore_eos=True
+            ),
+        )
     with pytest.raises(ValueError, match="last_exited"):
         LLMEngine(
             model,
@@ -431,3 +534,11 @@ def test_engine_rejects_unqualified_dory_configuration(model):
             scheduler_config=SchedulerConfig(),
             execution_config=ExecutionConfig(cuda_graphs=True),
         )
+
+
+def test_model_declares_kv_layout_and_sliding_window_requirements(model):
+    assert model.kv_cache_layout == model.config.kv_cache_layout == "last_exited"
+    # Backend selection must reject a maskless backend at construction time.
+    assert model.requires_sliding_window is True
+    assert model.supports_cuda_graphs is False
+    assert model.fixed_loop_count is True

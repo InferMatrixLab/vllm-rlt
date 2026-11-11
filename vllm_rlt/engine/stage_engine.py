@@ -172,6 +172,7 @@ class StageEngine:
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
+                sliding_window=getattr(model, "requires_sliding_window", False),
             ),
         )
         num_blocks, self.memory_plan = plan_cache(
@@ -184,7 +185,7 @@ class StageEngine:
             staged_prefill=staged_prefill,
         )
         self.cache_manager = KVCacheManager(
-            num_layers=config.num_hidden_layers,
+            num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_loops=config.total_ut_steps,
@@ -330,9 +331,12 @@ class StageEngine:
         max_loops = params.max_loops or config.total_ut_steps
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
-        if getattr(self.model, "fixed_loop_count", False) and max_loops != config.total_ut_steps:
+        if getattr(self.model, "fixed_loop_count", False) and (
+            max_loops != config.total_ut_steps or params.min_loops != config.total_ut_steps
+        ):
             raise ValueError(
-                "this model always runs the configured loop count; max_loops must equal it"
+                "this model always runs the configured loop count; min_loops and "
+                "max_loops must both equal it"
             )
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0

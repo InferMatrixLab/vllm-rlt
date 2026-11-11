@@ -47,10 +47,18 @@ by the next loop, so results depend on the chunk schedule; the qualified
 schedule is one token per step. `per_loop` gives the same result for
 token-at-a-time and all-positions-at-once execution.
 
+Only the 36 attention sublayers own KV. The cache pool is sized by that compact
+count (`DoryConfig.num_kv_layers`), not by all 72 physical sublayers, and
+`StageEngine`/`plan_cache` select it through `num_kv_layers` when a model
+declares one. Attention layers therefore reach the cache through a packed
+layer id rather than their physical sublayer index.
+
 ## Supported today
 
-- Native strict safetensors loading, including packed projection key mapping and
-  the learned scale tensors.
+- Native strict safetensors loading with the artifact's per-projection key
+  names (`q/k/v/g/o_proj`, `gate_proj`/`up_proj`) and the learned scale tensors.
+  There is no fused-key remapping: a checkpoint that packs `qkv_proj` or
+  `gate_up_proj` fails loudly instead of loading approximately.
 - Synchronous eager execution: full-prompt prefill followed by ordinary token
   decoding, with the configured fixed loop count.
 - `loops=` at load time to fix 1, 2 or 4 loops.
@@ -63,15 +71,24 @@ These fail fast rather than degrade silently:
 
 - WCPB, mixed or staged prefill; asynchronous execution; PD.
 - CUDA Graphs (the sliding-window path needs host-planned KV metadata).
-- Prefix caching, snapshots and preemption of Dory requests.
+- Prefix caching.
 - Self-speculation.
 - Per-request loop counts other than the configured full depth: Dory has no
-  trained exit gate, so the runtime refuses to invent one.
+  trained exit gate, so the runtime refuses to invent one, including via
+  `min_loops` with `exit_threshold=0`.
+
+Preemption and snapshots are **not qualified** rather than enforced: the
+generic KV snapshot mechanism copies every plane, so it may well work, but no
+restoration test exists for Dory's boundary state. Keep `enable_preemption`
+off until 2E covers it.
 
 Sliding-window masking is implemented in the **Torch reference attention
-backend** only (`window=` on `KVCacheManager.attend`). Attention backends
-without masking raise instead of silently attending the full history; adding
-windowed Triton/Flash kernels and SWA storage reclamation is follow-up work.
+backend** only (`window=` on `KVCacheManager.attend`), and backend selection now
+requires the `sliding_window` capability, so a Dory engine on Triton/Flash fails
+at construction instead of mid-request. The reference kernel is a Python loop
+over rows: correct, but slow enough that it distorts memory-profiling wall time.
+Adding windowed Triton/Flash kernels and SWA storage reclamation is follow-up
+work.
 
 ## Validation status
 
@@ -85,7 +102,8 @@ Not yet performed, and required before claiming support:
 
 - Real-checkpoint BF16 comparison with the pinned upstream implementation
   (logits, generated outputs, stopping) at 1, 2 and 4 loops.
-- GPU execution; every validated path today is CPU `torch` attention.
+- GPU execution; every validated path today is CPU `torch` attention, and
+  `plan_cache`'s CUDA profiling branch is therefore also unexercised for Dory.
 - Long-context behaviour beyond the tested lengths; the artifact's 256K context
   is a configuration limit, not a qualified deployment length.
 - Performance measurement. No throughput or memory claim is made here.

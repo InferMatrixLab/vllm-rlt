@@ -245,6 +245,27 @@ class DoryConfig:
         start, end = self.stage_slices[names.index(stage)]
         return tuple(index for index in range(start, end) if self.layer_types[index] != "mlp")
 
+    @property
+    def attention_layer_ids(self) -> tuple[int, ...]:
+        """Physical indices of every attention sublayer, in cache order."""
+        return tuple(index for index, name in enumerate(self.layer_types) if name != "mlp")
+
+    @property
+    def num_kv_layers(self) -> int:
+        """KV cache layers: attention sublayers only, not all physical sublayers.
+
+        Half of Dory's 72 sublayers are MLPs, so sizing the pool by the physical
+        count would reserve twice the needed KV memory.
+        """
+        return len(self.attention_layer_ids)
+
+    def kv_layer_index(self, layer_idx: int) -> int:
+        """Map a physical sublayer index to its compact KV cache layer index."""
+        try:
+            return self.attention_layer_ids.index(layer_idx)
+        except ValueError:
+            raise ValueError(f"sublayer {layer_idx} has no attention KV") from None
+
     def rope_theta(self, layer_type: str) -> float:
         return float(self.rope_parameters[layer_type]["rope_theta"])
 
@@ -267,6 +288,8 @@ class DoryConfig:
             "_name_or_path",
             "rope_scaling",
         }
+        if values.get("rope_scaling") is not None:
+            raise ValueError("RoPE scaling is not supported")
         unknown = values.keys() - names - metadata - {"hidden_size"}
         if unknown:
             raise ValueError(f"Unsupported Dory configuration fields: {sorted(unknown)}")
@@ -318,6 +341,9 @@ class DoryAttention(nn.Module):
             gate_scale = config.d_model**0.5
         self.s_gate_factor = gate_scale**0.5 / config.initializer_range
         self.layer_type = config.layer_types[layer_idx]
+        # Physical sublayer identity and KV layer identity differ: MLP sublayers
+        # own no KV, so attention layers are packed into a compact cache index.
+        self.kv_layer_id = config.kv_layer_index(layer_idx)
         self.window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim, rope_theta=config.rope_theta(self.layer_type)
@@ -342,8 +368,8 @@ class DoryAttention(nn.Module):
         sqk = (self.sqk.float() * self.sqk_factor).view(1, self.num_heads, self.head_dim)
         q = (sqk.square() * justnorm(q).float()).to(q.dtype)
         k = justnorm(k)
-        cache._write_prepared(self.layer_idx, batch, k, v)
-        attended = cache._attend_prepared(self.layer_idx, batch, q, window=self.window)
+        cache._write_prepared(self.kv_layer_id, batch, k, v)
+        attended = cache._attend_prepared(self.kv_layer_id, batch, q, window=self.window)
         # Output gate before the projection, then fngpt justnorm over the full
         # head concatenation.
         scale = (self.s_gate.float() * self.s_gate_factor).square()
@@ -432,6 +458,8 @@ class DoryForCausalLM(nn.Module):
     fixed_loop_count = True
     # Sliding-window masking currently needs host-planned KV metadata.
     supports_cuda_graphs = False
+    # Selection must reject a backend that would silently attend full history.
+    requires_sliding_window = True
 
     def __init__(self, config: DoryConfig) -> None:
         super().__init__()
@@ -442,9 +470,17 @@ class DoryForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         # Learned vocabulary-wise logit scale of the reviewed implementation.
         self.lm_head.logit_scale = nn.Parameter(torch.empty(config.vocab_size))
-        self.prelude_kv_layers = config.attention_layers("input")
-        self.recurrent_kv_layers = config.attention_layers("recurrent")
-        self.coda_kv_layers = config.attention_layers("output")
+        # Cache layer indices are compact: only attention sublayers own KV, and
+        # boundary stages keep their own history rather than one per loop.
+        self.prelude_kv_layers = tuple(
+            config.kv_layer_index(index) for index in config.attention_layers("input")
+        )
+        self.recurrent_kv_layers = tuple(
+            config.kv_layer_index(index) for index in config.attention_layers("recurrent")
+        )
+        self.coda_kv_layers = tuple(
+            config.kv_layer_index(index) for index in config.attention_layers("output")
+        )
         self.apply(self._initialize)
         self.requires_grad_(False)
         self.eval()
@@ -469,6 +505,11 @@ class DoryForCausalLM(nn.Module):
         elif isinstance(module, DorySublayer):
             alpha = module.attn_alpha if module.is_attention else module.mlp_alpha
             nn.init.normal_(alpha, mean=0, std=std)
+
+    @property
+    def kv_cache_layout(self) -> str:
+        """Layout this model's KV mode requires; the engine enforces it."""
+        return self.config.kv_cache_layout
 
     def prelude_prepared(self, tokens, batch, cache, *, generators=None) -> torch.Tensor:
         """Embed, then run the input stage; loop zero starts from its output."""
