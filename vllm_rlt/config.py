@@ -150,11 +150,17 @@ class ExecutionConfig:
     use_uva: bool = True
     # Select packed prefill metadata staging (and require packed attention).
     # The historical name is retained; use_uva controls its transfer mechanism.
-    prefill_uva: bool = False
+    # None resolves at engine construction: on when the attention backend packs
+    # prefill (Triton opts in, FlashAttention-4 natively) with last_exited KV and
+    # ordinary (non-staged) prefill, including Huginn unless
+    # VLLM_RLT_HUGINN_PACKED_PREFILL=0; off otherwise. Measured 2.0-2.4x on
+    # 2048-token prompts (Ouro and Huginn, refill mode).
+    prefill_uva: bool | None = None
 
     def __post_init__(self):
+        if self.prefill_uva is not None and type(self.prefill_uva) is not bool:
+            raise ValueError("prefill_uva must be a boolean or None")
         for name in (
-            "prefill_uva",
             "use_uva",
             "async_scheduling",
             "multi_stream",
