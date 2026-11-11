@@ -110,13 +110,99 @@ def test_fast_launches_match_triton_dispatch_bit_for_bit(context, monkeypatch):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("context", [37, 1024, 4111, 9000])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+# The second shape is Ouro-1.4B's attention.
+@pytest.mark.parametrize(("heads", "kv_heads", "dim"), [(4, 2, 64), (16, 16, 128)])
+def test_one_program_selection_is_the_parallel_result(
+    context, dtype, heads, kv_heads, dim, monkeypatch
+):
+    from vllm_rlt.kernels import sparse_decode
+    from vllm_rlt.kernels.paged_attention import TritonPagedAttention
+
+    rows, block_size = 3, 16
+    pages = -(-context // block_size)
+    q, keys, values, tables = _paged(rows, heads, kv_heads, dim, pages, block_size, dtype, 7)
+    # Repeated keys give equal scores, so the tie rule decides part of every selection.
+    keys[:, block_size // 2 :] = keys[:, : block_size // 2]
+    lengths = torch.tensor([context, max(1, context - 17), max(1, context // 2)], device="cuda")
+    launched = []
+    launch = sparse_decode._launch
+
+    def recording(kernel, grid, *args, **meta):
+        launched.append(kernel.fn.__name__)
+        launch(kernel, grid, *args, **meta)
+
+    monkeypatch.setattr(sparse_decode, "_launch", recording)
+    # The reference runs every radix pass in the selection kernels, so both
+    # sides launch the same split kernel and store the same FP32 scores; with
+    # the first pass folded in, sm_90 may contract the split's dot products
+    # differently, and FP32 scores (not BF16 ones, whose products are exact)
+    # move by an ulp.
+    monkeypatch.setattr(sparse_decode, "_PASS0_IN_SPLIT", False)
+    results = {}
+    for one_program in (False, True):
+        monkeypatch.setattr(sparse_decode, "_ONE_PROGRAM_SELECT", one_program)
+        launched.clear()
+        store = make_store(
+            slots=rows,
+            layers=2,
+            heads=heads,
+            head_dim=dim,
+            key_bucket=context,
+            device="cuda",
+            implementation="fused",
+        )
+        lease = store.reserve("r", 0, rows)
+        owners = [(lease, row) for row in range(rows)]
+        outputs = []
+        for layer, retention in ((0, 0.1), (1, 0.5)):
+            plan = store.build_plan(owners, [CAPTURE] * rows, key_retention=retention)
+            outputs.append(
+                sparse_decode.fused_paged_attention(
+                    q,
+                    keys,
+                    values,
+                    tables,
+                    lengths,
+                    plan,
+                    layer=layer,
+                    dense_attention=TritonPagedAttention(),
+                )
+            )
+        torch.cuda.synchronize()
+        results[one_program] = (
+            outputs,
+            store.selected.clone(),
+            store.counts.clone(),
+            store.mass.clone(),
+            store.contribution.clone(),
+            store.output.clone(),
+        )
+        if one_program:
+            # Two launches per capture layer, as dense attention.
+            assert launched == ["_capture_split_kernel", "_select_one_program_kernel"] * 2
+    parallel, one = results[False], results[True]
+    for a, b in zip(parallel[0], one[0]):
+        assert torch.equal(a, b)
+    selected, counts, mass, contribution, reference = range(1, 6)
+    for field in (selected, counts, reference):
+        assert torch.equal(parallel[field], one[field])
+    # Mass and C_ref are FP32 sums the two kernels may compile a few ulps
+    # apart, for BF16 queries too. Seen on sm_90: up to 1.5e-7.
+    for field in (mass, contribution):
+        torch.testing.assert_close(one[field], parallel[field], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("dim", [8, 32, 128])
-@pytest.mark.parametrize("folded", [False, True])
-def test_fused_capture_rewrites_every_retained_index(dim, folded, monkeypatch):
+@pytest.mark.parametrize(("folded", "one_program"), [(False, False), (True, False), (True, True)])
+def test_fused_capture_rewrites_every_retained_index(dim, folded, one_program, monkeypatch):
     from vllm_rlt.kernels import sparse_decode
     from vllm_rlt.kernels.paged_attention import TritonPagedAttention
 
     monkeypatch.setattr(sparse_decode, "_PASS0_IN_SPLIT", folded)
+    monkeypatch.setattr(sparse_decode, "_ONE_PROGRAM_SELECT", one_program)
     keys = torch.zeros(3, 2, 2, dim, device="cuda", dtype=torch.bfloat16)
     keys[..., 0] = torch.tensor(
         [-0.0064, 0.0029, -0.0073, 0.0038, -0.016, -0.0247], device="cuda"
@@ -416,17 +502,19 @@ def test_fused_radix_selection_keeps_oracle_ties_on_repeated_scores(retention):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("folded", [True, False])
+@pytest.mark.parametrize(("folded", "one_program"), [(True, False), (False, False), (True, True)])
 @pytest.mark.parametrize("ties", [False, True])
 @pytest.mark.parametrize("retention", [0.1, 0.37])
 def test_fused_parallel_select_matches_batched_across_many_parts(
-    ties, retention, folded, monkeypatch
+    ties, retention, folded, one_program, monkeypatch
 ):
     import vllm_rlt.kernels.sparse_decode as fused_module
     from vllm_rlt.kernels.paged_attention import TritonPagedAttention
 
-    # The first radix pass runs inside the split kernel or as its own pass.
+    # The first radix pass runs inside the split kernel or as its own pass, or
+    # the whole selection runs in one program per row and head.
     monkeypatch.setattr(fused_module, "_PASS0_IN_SPLIT", folded)
+    monkeypatch.setattr(fused_module, "_ONE_PROGRAM_SELECT", one_program)
 
     # Long rows split into up to 16 parts; with repeated integer scores the
     # retained ties span part boundaries, so offsets and tie quotas must carry.

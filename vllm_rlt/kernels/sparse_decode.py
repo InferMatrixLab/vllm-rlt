@@ -288,6 +288,17 @@ _GATHER_BLOCK = 128
 _SEGMENT_ALIGN = 32
 # The split kernel builds the first pass's histograms while it scores the keys.
 _PASS0_IN_SPLIT = True
+# Outside CUDA-graph capture the host issues every launch, and the parallel
+# selection costs five of them per layer after the split kernel. There one
+# program per row and head merges, selects, writes and gathers instead, for two
+# launches per capture layer, as dense attention. It repeats the parallel
+# arithmetic in the same order: the output, O_ref, counts and retained
+# positions equal the parallel result (with the first pass unfolded, which
+# stores the same scores). Mass and C_ref are FP32 sums the two kernels may
+# compile a few ulps apart, for 16-bit queries too (seen at 16 heads of 128 on
+# sm_90), and the consume correction carries that into later tokens.
+# Graph replay keeps the parallel kernels, which use the GPU better.
+_ONE_PROGRAM_SELECT = True
 
 # Triton's Python dispatch costs several microseconds per launch, and a fused
 # capture makes six launches, so at short contexts in eager mode the dispatch,
@@ -727,6 +738,155 @@ def _select_contribution_kernel(
 
 
 @triton.jit
+def _select_one_program_kernel(
+    PART_M,
+    PART_L,
+    PART_O,
+    OUT,
+    SCORES,
+    V,
+    TABLES,
+    LENGTHS,
+    RETENTION,
+    SLOTS,
+    SELECTED,
+    COUNTS,
+    OUTPUT,
+    MASS,
+    CONTRIBUTION,
+    PART_MASS,
+    PART_C,
+    layer,
+    top,
+    score_capacity,
+    table_stride,
+    retained_capacity,
+    out_batch_stride: tl.constexpr,
+    out_head_stride: tl.constexpr,
+    out_dim_stride: tl.constexpr,
+    v_block_stride: tl.constexpr,
+    v_token_stride: tl.constexpr,
+    v_head_stride: tl.constexpr,
+    NUM_LAYERS: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HEAD_GROUPS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SCAN_T: tl.constexpr,
+    GATHER_T: tl.constexpr,
+    PARTS: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    """The parallel selection after the split kernel, for one row and head in one program.
+
+    Each step repeats the arithmetic of its parallel kernel: the merge of
+    ``_select_pass_kernel``, the four radix passes over the whole row, the
+    write of ``_select_write_kernel`` from offset zero, and the contribution of
+    ``_select_contribution_kernel`` in the same rank chunks, summed in the same
+    fixed order through the same scratch.
+    """
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    rh = row * NUM_HEADS + head
+    length, count = _retained(LENGTHS, row, RETENTION, top)
+    # Identical to triton_attention._paged_attention_merge_kernel.
+    parts = rh * SPLITS + tl.arange(0, SPLITS)
+    dims = tl.arange(0, BLOCK_D)
+    maxima = tl.load(PART_M + parts)
+    maximum = tl.max(maxima, axis=0)
+    scale = tl.where(maxima > -float("inf"), tl.exp(maxima - maximum), 0.0)
+    normalizer = tl.sum(tl.load(PART_L + parts) * scale, axis=0)
+    partial = tl.load(PART_O + parts[:, None] * BLOCK_D + dims[None, :])
+    accumulator = tl.sum(partial * scale[:, None], axis=0)
+    dense = accumulator / tl.maximum(normalizer, 1.0e-30)
+    out = OUT + row * out_batch_stride + head * out_head_stride + dims * out_dim_stride
+    tl.store(out, dense, mask=dims < HEAD_DIM)
+    if count > 0:
+        lse = maximum + tl.log(normalizer)
+        slot = tl.load(SLOTS + row)
+        state = (slot * NUM_LAYERS + layer) * NUM_HEADS + head
+        tl.store(COUNTS + state, count)
+        # O_ref is the output as rounded to the query dtype: the recurrence input.
+        reference = dense.to(OUT.dtype.element_ty).to(tl.float32)
+        tl.store(OUTPUT + state * HEAD_DIM + dims, reference, mask=dims < HEAD_DIM)
+        scores_row = SCORES + rh.to(tl.int64) * score_capacity
+        # Four radix passes, eight bits each, over the whole row.
+        prefix = length.to(tl.int64) * 0
+        ties_needed = count
+        chosen = count * 0
+        halves = tl.arange(0, 2)
+        for level in tl.static_range(4):
+            local = tl.zeros((512,), dtype=tl.int32)
+            for start in range(0, length, SCAN_T):
+                positions = start + tl.arange(0, SCAN_T)
+                live = positions < length
+                key = _order_key(tl.load(scores_row + positions, mask=live, other=0))
+                candidate = live & ((key >> (32 - 8 * level)) == prefix)
+                digit = ((key >> (24 - 8 * level)) & 255).to(tl.int32)
+                # Bin 256 collects the non-candidates and is dropped.
+                local += tl.histogram(tl.where(candidate, digit, 256), 512)
+            histogram = tl.sum(
+                tl.where(halves[:, None] == 0, tl.reshape(local, (2, 256)), 0), axis=0
+            )
+            prefix, ties_needed, chosen = _choose(histogram, prefix, ties_needed)
+        low = prefix
+        selected = SELECTED + state.to(tl.int64) * retained_capacity
+        written = 0
+        ties_seen = 0
+        for start in range(0, length, SCAN_T):
+            positions = start + tl.arange(0, SCAN_T)
+            live = positions < length
+            key = _order_key(tl.load(scores_row + positions, mask=live, other=0))
+            tie = (live & (key == low)).to(tl.int32)
+            take = (live & (key > low)) | (
+                (tie == 1) & (ties_seen + tl.cumsum(tie, 0) - tie < ties_needed)
+            )
+            taken = take.to(tl.int32)
+            tl.store(selected + written + tl.cumsum(taken, 0) - taken, positions, mask=take)
+            written += tl.sum(taken, axis=0)
+            ties_seen += tl.sum(tie, axis=0)
+        # The gather reads positions other threads of this program stored.
+        tl.debug_barrier()
+        kv_head = head // HEAD_GROUPS
+        table = TABLES + row * table_stride
+        chunk = tl.cdiv(tl.cdiv(count, PARTS), GATHER_T) * GATHER_T
+        for part in range(PARTS):
+            first = part * chunk
+            last = tl.minimum(first + chunk, count)
+            mass = 0.0
+            contribution = tl.zeros((BLOCK_D,), dtype=tl.float32)
+            # Names apart from the scan loops: Triton carries a name across loops.
+            for rank in range(first, last, GATHER_T):
+                ranks = rank + tl.arange(0, GATHER_T)
+                kept = ranks < last
+                at = tl.load(selected + ranks, mask=kept, other=0)
+                scores = tl.load(scores_row + at, mask=kept, other=0)
+                probabilities = tl.where(kept, tl.exp(scores - lse), 0.0)
+                blocks = tl.load(table + at // PAGE_SIZE, mask=kept, other=0).to(tl.int64)
+                values = tl.load(
+                    V
+                    + blocks[:, None] * v_block_stride
+                    + (at % PAGE_SIZE)[:, None] * v_token_stride
+                    + kv_head * v_head_stride
+                    + dims[None, :],
+                    mask=kept[:, None] & (dims[None, :] < HEAD_DIM),
+                    other=0,
+                ).to(tl.float32)
+                contribution += tl.sum(probabilities[:, None] * values, axis=0)
+                mass += tl.sum(probabilities, axis=0)
+            index = rh * PARTS + part
+            tl.store(PART_MASS + index, mass)
+            tl.store(PART_C + index * BLOCK_D + dims, contribution)
+        tl.debug_barrier()
+        chunks = rh * PARTS + tl.arange(0, PARTS)
+        total = tl.sum(tl.load(PART_MASS + chunks), axis=0)
+        summed = tl.sum(tl.load(PART_C + chunks[:, None] * BLOCK_D + dims[None, :]), axis=0)
+        tl.store(MASS + state, total)
+        tl.store(CONTRIBUTION + state * HEAD_DIM + dims, summed, mask=dims < HEAD_DIM)
+
+
+@triton.jit
 def _capture_kernel(
     Q,
     K,
@@ -1152,7 +1312,8 @@ def fused_paged_attention(
             part_c,
         ) = workspace if workspace[0].shape[0] == rows else (buffer[:rows] for buffer in workspace)
         if split:
-            folded = _PASS0_IN_SPLIT
+            one_program = _ONE_PROGRAM_SELECT and not torch.cuda.is_current_stream_capturing()
+            folded = _PASS0_IN_SPLIT and not one_program
             retention = _retention(q.device, plan.key_retention)
             _launch(
                 _capture_split_kernel,
@@ -1188,6 +1349,49 @@ def fused_paged_attention(
                 PARTS=SELECT_PARTS,
                 num_warps=4,
             )
+            if one_program:
+                _launch(
+                    _select_one_program_kernel,
+                    (rows, heads),
+                    part_m,
+                    part_l,
+                    part_o,
+                    output,
+                    scores,
+                    value_cache,
+                    block_tables,
+                    context_lengths,
+                    retention,
+                    plan.slot_ids,
+                    selected,
+                    store.counts,
+                    store.output,
+                    store.mass,
+                    store.contribution,
+                    part_mass,
+                    part_c,
+                    layer,
+                    top,
+                    capacity,
+                    block_tables.stride(0),
+                    selected.shape[-1],
+                    *output.stride(),
+                    value_cache.stride(0),
+                    value_cache.stride(1),
+                    value_cache.stride(2),
+                    NUM_LAYERS=store.layers,
+                    NUM_HEADS=heads,
+                    HEAD_DIM=dim,
+                    HEAD_GROUPS=groups,
+                    PAGE_SIZE=page,
+                    BLOCK_D=block_d,
+                    SCAN_T=_SCAN_BLOCK,
+                    GATHER_T=_GATHER_BLOCK,
+                    PARTS=SELECT_PARTS,
+                    SPLITS=NUM_SPLITS,
+                    num_warps=_SCAN_WARPS,
+                )
+                return output
             first_pass = 1 if folded else 0
             for level in range(first_pass, 4):
                 _launch(
