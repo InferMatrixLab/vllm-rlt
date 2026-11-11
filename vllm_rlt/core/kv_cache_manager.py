@@ -705,19 +705,28 @@ class KVCacheManager:
         depths: Sequence[int],
         positions: Sequence[int] | torch.Tensor,
         q: torch.Tensor,
+        *,
+        window: int | None = None,
     ) -> torch.Tensor:
         """Apply causal GQA at each row's own position and recurrence depth."""
         self._validate_layer(layer)
         batch = self._prepare_batch(request_ids, depths, positions, for_write=False)
-        return self._attend_prepared(layer, batch, q)
+        return self._attend_prepared(layer, batch, q, window=window)
 
     @torch.no_grad()
     def _attend_prepared(
-        self, layer: int, batch: KVMetadata | DeviceKVMetadata, q: torch.Tensor
+        self,
+        layer: int,
+        batch: KVMetadata | DeviceKVMetadata,
+        q: torch.Tensor,
+        *,
+        window: int | None = None,
     ) -> torch.Tensor:
         self._validate_layer(layer)
         self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
+        if window is not None:
+            return self._attend_windowed(layer, batch, q, window)
         if isinstance(batch, DeviceKVMetadata):
             return self.attention(
                 q,
@@ -746,6 +755,38 @@ class KVCacheManager:
             self.value_cache[:, layer],
             batch.block_tables,
             batch.context_lengths,
+        )
+
+    @torch.no_grad()
+    def _attend_windowed(
+        self, layer: int, batch: KVMetadata, q: torch.Tensor, window: int
+    ) -> torch.Tensor:
+        """Mask keys outside ``window`` without reclaiming their storage.
+
+        Only kernels that advertise ``sliding_window`` are used; there is no
+        silent fallback to full attention, which would change the model.
+        """
+        if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+            raise ValueError("window must be a positive integer")
+        if not self.attention_capabilities.sliding_window:
+            raise NotImplementedError(
+                f"the {self.backend} attention backend does not implement sliding-window masking"
+            )
+        if isinstance(batch, DeviceKVMetadata):
+            raise NotImplementedError("sliding-window attention needs host-planned KV metadata")
+        if batch.cu_seqlens_q is not None:
+            raise NotImplementedError("sliding-window attention needs one query row per token")
+        if not batch.rows:
+            return torch.empty_like(q)
+        for allocation, depth, position in batch.rows:
+            self._require_prefix(allocation, layer, depth, position + 1)
+        return self.attention.windowed(
+            q,
+            self.key_cache[:, layer],
+            self.value_cache[:, layer],
+            batch.block_tables,
+            batch.context_lengths,
+            window,
         )
 
     @torch.no_grad()
