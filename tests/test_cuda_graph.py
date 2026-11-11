@@ -455,7 +455,8 @@ def test_bucketed_kv_graph_combines_active_rows_and_pipeline_write_mask():
 
     keys = torch.full((4, 1, 2, 1, 4), -1.0, device="cuda")
     values = torch.full_like(keys, -2.0)
-    cache = SimpleNamespace(key_cache=keys, value_cache=values)
+    # A BF16 pool has no FP8 scales, as KVCacheManager reports them.
+    cache = SimpleNamespace(key_cache=keys, value_cache=values, key_scale=None, value_scale=None)
     batch = SimpleNamespace(
         active_rows=torch.zeros((), dtype=torch.int32, device="cuda"),
         write_mask=torch.ones(5, dtype=torch.bool, device="cuda"),

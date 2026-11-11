@@ -99,6 +99,10 @@ class NixlConnector:
     def __init__(self, name, cache, hidden, config):
         from nixl._api import nixl_agent, nixl_agent_config
 
+        if getattr(cache, "key_scale", None) is not None:
+            raise ValueError(
+                "PD transfer does not yet carry FP8 KV scales; use kv_cache_dtype='auto'"
+            )
         self.config = config
         if config.backend == "UCX":
             # NIXL's default (peer) error handling requires a peer failure handler,
