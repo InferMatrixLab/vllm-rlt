@@ -175,8 +175,9 @@ as isolated runtime speedups.
 
 <a id="roadmap"></a>
 
-For ongoing design work, see the [architecture RFC](https://github.com/InferMatrixLab/vllm-rlt/issues/32)
-and [model roadmap](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
+For the current architecture and ownership boundaries, see the
+[unified architecture guide](docs/unified_execution.md). Ongoing model and feature
+work is tracked in the [model roadmap](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
 Roadmap proposals are not released capabilities.
 
 ## Contributing
