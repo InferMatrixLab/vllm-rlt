@@ -38,11 +38,11 @@ if TRITON_AVAILABLE:
         out_ptr,
         retained,
         k_stride_block,
+        t_stride_row,
         DIM: tl.constexpr,
         KV: tl.constexpr,
         GROUPS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
-        PAGES: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -55,7 +55,9 @@ if TRITON_AVAILABLE:
         mask = slot < retained
         index = tl.load(idx_ptr + (row * heads + head) * retained + slot, mask=mask, other=0)
         # Promote the page ID before multiplying by the physical block stride.
-        page = tl.load(t_ptr + row * PAGES + index // BLOCK_SIZE, mask=mask, other=0).to(tl.int64)
+        page = tl.load(t_ptr + row * t_stride_row + index // BLOCK_SIZE, mask=mask, other=0).to(
+            tl.int64
+        )
         offset = index % BLOCK_SIZE
         dim = tl.arange(0, DIM)
         keys = tl.load(
@@ -79,11 +81,11 @@ if TRITON_AVAILABLE:
         out_ptr,
         retained,
         v_stride_block,
+        t_stride_row,
         DIM: tl.constexpr,
         KV: tl.constexpr,
         GROUPS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
-        PAGES: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -99,7 +101,7 @@ if TRITON_AVAILABLE:
             weight = tl.load(
                 p_ptr + (row * heads + head) * retained + slot, mask=mask, other=0.0
             ).to(tl.float32)
-            page = tl.load(t_ptr + row * PAGES + index // BLOCK_SIZE, mask=mask, other=0).to(
+            page = tl.load(t_ptr + row * t_stride_row + index // BLOCK_SIZE, mask=mask, other=0).to(
                 tl.int64
             )
             offset = index % BLOCK_SIZE
@@ -157,11 +159,11 @@ def selected_scores(
         out,
         retained,
         cache.stride(0),
+        block_tables.stride(0),
         DIM=dim,
         KV=kv_heads,
         GROUPS=groups,
         BLOCK_SIZE=block_size,
-        PAGES=block_tables.shape[1],
         BLOCK_K=block_k,
     )
     return out
@@ -202,11 +204,11 @@ def selected_values(
         out,
         retained,
         cache.stride(0),
+        block_tables.stride(0),
         DIM=dim,
         KV=kv_heads,
         GROUPS=groups,
         BLOCK_SIZE=block_size,
-        PAGES=block_tables.shape[1],
         BLOCK_K=block_k,
     )
     return out

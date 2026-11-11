@@ -896,15 +896,15 @@ def test_sparse_engine_e2e_multiple_requests_abort_and_drain():
     )
     store = e.reference_store
     max_outstanding = 0
-    original_reserve = store.reserve
+    original_reserve = store.reserve_round
 
     def counting_reserve(*args, **kwargs):
         nonlocal max_outstanding
-        lease = original_reserve(*args, **kwargs)
+        leases = original_reserve(*args, **kwargs)
         max_outstanding = max(max_outstanding, store.outstanding)
-        return lease
+        return leases
 
-    store.reserve = counting_reserve
+    store.reserve_round = counting_reserve
     params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in (5, 9, 50)]
     for i in range(3):
         e.add_request(str(i), [2, 3, 4], params[i])

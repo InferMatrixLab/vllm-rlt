@@ -41,11 +41,11 @@ if TRITON_AVAILABLE:
         context,
         q_stride_row,
         k_stride_block,
+        t_stride_row,
         DIM: tl.constexpr,
         GROUPS: tl.constexpr,
         KV: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
-        PAGES: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -56,7 +56,7 @@ if TRITON_AVAILABLE:
         row_length = tl.load(l_ptr + row)
         mask = position < row_length
         # Layer-interleaved KV can exceed the signed 32-bit element offset.
-        page = tl.load(t_ptr + row * PAGES + position // BLOCK_SIZE, mask=mask, other=0).to(
+        page = tl.load(t_ptr + row * t_stride_row + position // BLOCK_SIZE, mask=mask, other=0).to(
             tl.int64
         )
         offset = position % BLOCK_SIZE
@@ -126,7 +126,6 @@ def fused_capture_scores(
     if context == 0:
         return queries.new_zeros((rows, heads, 0), dtype=torch.float32)
 
-    pages = block_tables.shape[1]
     out = torch.zeros(rows, heads, context, device=queries.device, dtype=torch.float32)
     grid = (rows, kv_heads, triton.cdiv(context, block_n))
     _capture_scores_kernel[grid](
@@ -138,11 +137,11 @@ def fused_capture_scores(
         context,
         queries.stride(0),
         key_cache.stride(0),
+        block_tables.stride(0),
         DIM=dim,
         GROUPS=groups,
         KV=kv_heads,
         BLOCK_SIZE=block_size,
-        PAGES=pages,
         BLOCK_N=block_n,
     )
     # Rows are ragged; the kernel leaves the tail at zero, so mask it to -inf

@@ -209,6 +209,60 @@ def _paged(rows, heads, kv_heads, dim, pages, block_size, dtype, seed):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("implementation", ["fused", "batched"])
+def test_page_table_growth_compiles_nothing(implementation):
+    """A request that crosses a KV page widens the round's tables by one column.
+
+    Without CUDA graphs every such round launches with the new table stride; a
+    kernel specialised on it stalls the host on a compile once per page.
+    """
+    from triton.runtime.jit import JITFunction
+
+    from vllm_rlt.kernels import sparse_capture, sparse_consume, sparse_decode, triton_attention
+    from vllm_rlt.kernels.paged_attention import TritonPagedAttention
+
+    modules = (sparse_capture, sparse_consume, sparse_decode, triton_attention)
+    kernels = [k for m in modules for k in vars(m).values() if isinstance(k, JITFunction)]
+
+    def compiled():
+        return sum(len(cache[0]) for kernel in kernels for cache in kernel.device_caches.values())
+
+    rows, heads, kv_heads, dim, block_size, context = 2, 4, 2, 64, 16, 500
+    q, keys, values, tables = _paged(rows, heads, kv_heads, dim, 37, block_size, torch.bfloat16, 5)
+    lengths = torch.tensor([context, context - 9], device="cuda")
+    store = make_store(
+        slots=rows,
+        layers=2,
+        heads=heads,
+        head_dim=dim,
+        key_bucket=context,
+        device="cuda",
+        implementation=implementation,
+    )
+    lease = store.reserve("r", 0, rows)
+    owners = [(lease, row) for row in range(rows)]
+    counts = []
+    # Widths that share Triton's integer specialisation (not 1, not a multiple of 16).
+    for pages in (33, 33, 34, 35, 37):
+        for mode in (CAPTURE, CONSUME):
+            plan = store.build_plan(owners, [mode] * rows, key_retention=0.1)
+            sparse_paged_attention(
+                q,
+                keys,
+                values,
+                tables[:, :pages].contiguous(),
+                lengths,
+                plan,
+                layer=1,
+                dense_attention=TritonPagedAttention(),
+            )
+        torch.cuda.synchronize()
+        counts.append(compiled())
+    assert counts[0] > 0
+    assert counts == [counts[0]] * len(counts)
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("retention", [0.1, 0.5])
 @pytest.mark.parametrize("ties", [False, True])
 # The Triton backend takes the split capture; any other callable takes the fallback.

@@ -167,7 +167,7 @@ def _capture_split_kernel(
     v_token_stride: tl.constexpr,
     v_head_stride: tl.constexpr,
     v_dim_stride: tl.constexpr,
-    table_stride: tl.constexpr,
+    table_stride,
     HEAD_DIM: tl.constexpr,
     HEAD_GROUPS: tl.constexpr,
     NUM_HEADS: tl.constexpr,
