@@ -295,12 +295,9 @@ class SpeculativeRunner:
                 references = []
                 try:
                     if self.reference_store is not None:
-                        for index, span in enumerate(batch.requests):
-                            references.append(
-                                self.reference_store.reserve(
-                                    span.request.request_id, index, span.token_count
-                                )
-                            )
+                        references = self.reference_store.reserve_round(
+                            (span.request.request_id, span.token_count) for span in batch.requests
+                        )
                     if self.config.mode == "pipeline":
                         submission = self._submit_pipeline(batch)
                     else:

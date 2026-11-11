@@ -38,7 +38,14 @@ import torch
 from vllm_rlt.attention.sparse import CAPTURE, CONSUME, DENSE, SparseDecodePlan
 from vllm_rlt.kernels.sparse_workspace import release_workspace
 
-__all__ = ["ReferenceLease", "SparseDecodeReferenceStore", "DENSE", "CAPTURE", "CONSUME"]
+__all__ = [
+    "ReferenceLease",
+    "ReferenceRound",
+    "SparseDecodeReferenceStore",
+    "DENSE",
+    "CAPTURE",
+    "CONSUME",
+]
 
 
 @dataclass(frozen=True)
@@ -55,9 +62,31 @@ class ReferenceLease:
     slots: tuple[int, ...]
     slot_ids: torch.Tensor
     row_index: torch.Tensor
+    # Set when the lease was reserved together with the other requests of its
+    # round: the round's concatenated device indices, shared by its leases.
+    round: "ReferenceRound | None" = None
 
     def __len__(self) -> int:
         return len(self.slots)
+
+
+@dataclass(frozen=True, eq=False)
+class ReferenceRound:
+    """The device indices of every lease of one submission, uploaded once.
+
+    ``slot_ids``, ``rows`` and ``requests`` hold one entry per verification
+    row in lease order. Acceptance and retirement address the whole round, so
+    they read these instead of concatenating per-lease tensors every round.
+    ``owner_stream`` records whether the indices were allocated on the store's
+    owner stream; only then may retirement reuse them (see ``release``).
+    """
+
+    leases: tuple
+    slots: tuple[int, ...]
+    slot_ids: torch.Tensor
+    rows: torch.Tensor
+    requests: torch.Tensor
+    owner_stream: bool
 
 
 class SparseDecodeReferenceStore:
@@ -123,10 +152,14 @@ class SparseDecodeReferenceStore:
         # a recycled slot is bound to a different lease, so a plan built for the
         # previous owner cannot match, and no per-slot counter is needed.
         self._bindings: dict[int, ReferenceLease] = {}
+        # Bumped whenever a binding is removed. A plan built at the current
+        # epoch has seen no release since, so its liveness needs no row walk.
+        self._epoch = 0
         # Retained counts are host-known: the capture decides them before it
         # submits. Keeping them here lets a reader size its gather without a
-        # device readback, which RFC #156 section 6.2 forbids.
-        self._counts_host: dict[tuple[int, int], int] = {}
+        # device readback, which RFC #156 section 6.2 forbids. Keyed by slot so
+        # that retiring a slot is one dictionary operation, not one per layer.
+        self._counts_host: dict[int, dict[int, int]] = {}
 
     @property
     def bytes(self) -> int:
@@ -218,6 +251,80 @@ class SparseDecodeReferenceStore:
             self._bindings[slot] = lease
         return lease
 
+    def reserve_round(self, requests) -> tuple[ReferenceLease, ...]:
+        """Reserve the leases of one submission with a single index upload.
+
+        ``requests`` holds one ``(request_id, rows)`` pair per request in
+        submission order; the request index is its position. Reserving per
+        request costs a pinned allocation, a host-to-device copy and an
+        ``arange`` each, which is host time proportional to the concurrency on
+        the submission path. The round uploads one ``[3, rows]`` table instead
+        and every lease borrows views of it.
+        """
+        requests = tuple(requests)
+        total = 0
+        for _, rows in requests:
+            if rows < 1:
+                raise ValueError("a reference reservation needs at least one row")
+            total += rows
+        if not requests:
+            return ()
+        if len(self.free) < total:
+            raise RuntimeError("no retired attention reference slots")
+        # Same order as per-request reserve(): each request pops its rows off
+        # the end of the pool, so a round and a sequence of reserves agree.
+        slots = tuple(reversed(self.free[-total:]))
+        row_of, request_of = [], []
+        for index, (_, rows) in enumerate(requests):
+            row_of.extend(range(rows))
+            request_of.extend([index] * rows)
+        table = self._index((slots, row_of, request_of))
+        # Without an owner stream on CUDA the indices live on whichever stream
+        # reserved them, which need not be the one that later retires them.
+        owner = self.device.type != "cuda" or (
+            self.stream is not None and torch.cuda.current_stream(self.device) == self.stream
+        )
+        leases, start = [], 0
+        for index, (request_id, rows) in enumerate(requests):
+            stop = start + rows
+            leases.append(
+                ReferenceLease(
+                    request_id=request_id,
+                    request_index=index,
+                    slots=slots[start:stop],
+                    slot_ids=table[0, start:stop],
+                    row_index=table[1, start:stop],
+                )
+            )
+            start = stop
+        leases = tuple(leases)
+        shared = ReferenceRound(
+            leases=leases,
+            slots=slots,
+            slot_ids=table[0],
+            rows=table[1],
+            requests=table[2],
+            owner_stream=owner,
+        )
+        # Nothing below can fail: the slots leave the pool only now.
+        del self.free[-total:]
+        for lease in leases:
+            object.__setattr__(lease, "round", shared)
+            for slot in lease.slots:
+                self._bindings[slot] = lease
+        return leases
+
+    @staticmethod
+    def _round_of(leases) -> "ReferenceRound | None":
+        """The shared round when ``leases`` is exactly one round's leases."""
+        shared = leases[0].round if leases else None
+        if shared is None or len(shared.leases) != len(leases):
+            return None
+        for lease, own in zip(leases, shared.leases):
+            if lease is not own:
+                return None
+        return shared
+
     def release(self, leases) -> None:
         """Return slots to the pool once their last reader completed.
 
@@ -227,6 +334,7 @@ class SparseDecodeReferenceStore:
         """
         if isinstance(leases, ReferenceLease):
             leases = (leases,)
+        leases = tuple(leases)
         cleared = []
         for lease in leases:
             for slot in lease.slots:
@@ -235,8 +343,15 @@ class SparseDecodeReferenceStore:
                 del self._bindings[slot]
                 cleared.append(slot)
         if cleared:
+            self._epoch += 1
             self.free.extend(cleared)
             self._forget_counts(cleared)
+            shared = self._round_of(leases)
+            if shared is not None and shared.owner_stream:
+                # The round's index already lives on the owner stream, so its
+                # memory cannot be reused before these fills ran: no upload.
+                self._clear(shared.slot_ids)
+                return
             if self.stream is None:
                 self._clear(self._index(cleared))
                 return
@@ -249,6 +364,7 @@ class SparseDecodeReferenceStore:
     def discard(self) -> None:
         """Free every binding without device work; the caller has drained."""
         self._bindings.clear()
+        self._epoch += 1
         self._counts_host.clear()
         self.free = list(range(self.slots))
 
@@ -297,12 +413,17 @@ class SparseDecodeReferenceStore:
             key_retention=key_retention,
             slot_ids=self._index(slots),
             store=self,
+            epoch=self._epoch,
         )
 
     def _require_live(self, plan: SparseDecodePlan) -> None:
         """Reject a plan whose slots were recycled or superseded."""
         if plan.store is not self:
             raise RuntimeError("attention reference plan belongs to a different store")
+        if plan.epoch == self._epoch:
+            # No slot was released since build_plan checked every binding, and
+            # a slot changes owner only through a release.
+            return
         for slot, owner, mode in zip(plan.slots, plan.owners, plan.modes):
             if slot == -1 and mode == DENSE:
                 continue
@@ -315,17 +436,25 @@ class SparseDecodeReferenceStore:
         The count is decided by the capture, so it never needs a device
         readback; ``host_count`` is the reader-side counterpart.
         """
-        self._counts_host[(slot, layer)] = count
+        counts = self._counts_host.get(slot)
+        if counts is None:
+            counts = self._counts_host[slot] = {}
+        counts[layer] = count
 
     def _forget_counts(self, slots) -> None:
         """Drop the host counts of host-known slots, so none sizes a later read."""
+        counts = self._counts_host
+        if not counts:
+            # The fused capture decides its counts on the device and never
+            # notes one, so there is nothing to walk on its retirement path.
+            return
         for slot in slots:
-            for layer in range(self.layers):
-                self._counts_host.pop((int(slot), layer), None)
+            counts.pop(int(slot), None)
 
     def host_count(self, slot: int, layer: int) -> int | None:
         """Retained keys of ``(slot, layer)``, or ``None`` before a capture."""
-        return self._counts_host.get((slot, layer))
+        counts = self._counts_host.get(slot)
+        return None if counts is None else counts.get(layer)
 
     def _row_slots(self, plan: SparseDecodePlan, rows: list[int]) -> torch.Tensor:
         """Slot ids of ``rows`` without a host-to-device copy of a Python list.
@@ -417,11 +546,15 @@ class SparseDecodeReferenceStore:
         leases = tuple(leases)
         if not leases:
             return
-        slot_ids = torch.cat([lease.slot_ids for lease in leases])
-        rows = torch.cat([lease.row_index for lease in leases])
-        request = torch.cat(
-            [torch.full_like(lease.row_index, lease.request_index) for lease in leases]
-        )
+        shared = self._round_of(leases)
+        if shared is not None:
+            slot_ids, rows, request = shared.slot_ids, shared.rows, shared.requests
+        else:
+            slot_ids = torch.cat([lease.slot_ids for lease in leases])
+            rows = torch.cat([lease.row_index for lease in leases])
+            request = torch.cat(
+                [torch.full_like(lease.row_index, lease.request_index) for lease in leases]
+            )
         limit = accepted.to(device=self.device, dtype=rows.dtype).index_select(0, request)
         # A boolean-mask gather of the rejected slots would read its size back
         # to the host. Masked writes over the round's own rows stay on device;
@@ -433,7 +566,8 @@ class SparseDecodeReferenceStore:
         # counts of every row of these leases: a later reader then sizes from
         # the device counts, which are zero for rejected rows, and a stale host
         # count can never size a gather.
-        self._forget_counts(slot for lease in leases for slot in lease.slots)
+        if self._counts_host:
+            self._forget_counts(slot for lease in leases for slot in lease.slots)
 
     def _clear(self, slots: torch.Tensor) -> None:
         """Retire the metadata of the given slots, ordered on the owner stream.

@@ -37,6 +37,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 import torch
@@ -100,6 +101,20 @@ class SparseDecodePlan:
     key_retention: float
     slot_ids: torch.Tensor | None = None
     store: SparseDecodeReferenceStore | None = None
+    # The store's release epoch when the plan was built. While it is unchanged
+    # no slot was released, so every layer of the submission can skip the
+    # per-row ownership walk; ``-1`` always takes the walk.
+    epoch: int = -1
+
+    @cached_property
+    def uniform_mode(self) -> int | None:
+        """The single row mode of the submission, or ``None`` when rows differ.
+
+        The attention layer asks this once per layer; the answer is a property
+        of the plan, so it is computed once per submission.
+        """
+        modes = set(self.modes)
+        return modes.pop() if len(modes) == 1 else None
 
     def groups(self) -> dict[int, list[int]]:
         """Rows per mode, in submission order."""
@@ -110,7 +125,7 @@ class SparseDecodePlan:
 
     def dense(self) -> bool:
         """Whether the submission has no sparse work at all."""
-        return all(mode == DENSE for mode in self.modes)
+        return self.uniform_mode == DENSE
 
 
 def retained_count(length: int, key_retention: float) -> int:

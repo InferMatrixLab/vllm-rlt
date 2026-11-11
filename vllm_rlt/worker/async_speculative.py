@@ -366,11 +366,14 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         add("drafts", counts - 1)
         ranks = np.cumsum(counts[None, :] > np.arange(width)[:, None], axis=1) - 1
         sizes = (counts[None, :] > np.arange(width)[:, None]).sum(1)
-        offsets = []
+        offsets, active_requests = [], []
         for offset in range(width):
             active = np.nonzero(counts > offset)[0]
             drafting = np.nonzero(counts[active] > offset + 1)[0]
             offsets.append((len(active), len(drafting)))
+            # The host copy names the reference owners of a ragged offset; the
+            # uploaded copy below must never be read back for that.
+            active_requests.append(None if len(active) == n else active.tolist())
             if len(active) < n:
                 add(f"active{offset}", active)
             if len(drafting):
@@ -388,7 +391,13 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         buffer.keepalive.extend((host, values))
         views = {name: values[start : start + size] for name, (start, size) in layout.items()}
         return SimpleNamespace(
-            n=n, width=width, rows=len(request_rows), offsets=offsets, counts=counts, **views
+            n=n,
+            width=width,
+            rows=len(request_rows),
+            offsets=offsets,
+            counts=counts,
+            active_requests=active_requests,
+            **views,
         )
 
     def _reference_plan(self, leases, rows, depth):
@@ -436,7 +445,11 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=row_tokens)).hidden
             # A drafting offset covers one verification row per active request:
             # the token at column `offset`, which the verifier later reuses.
-            rows = range(plan.n) if active is None else [int(index) for index in active]
+            # Host-known: iterating the uploaded index would read every element
+            # back and drain the compute stream once per active request.
+            rows = plan.active_requests[offset]
+            if rows is None:
+                rows = range(plan.n)
             for depth in range(self.config.draft_loops):
                 reference = self._reference_plan(leases, [(i, offset) for i in rows], depth)
                 hidden = self._execute_recurrent_step(
@@ -463,8 +476,14 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         verification_rows = [
             (i, j) for i, count in enumerate(plan.counts) for j in range(int(count))
         ]
+        # Every verification loop of one mode addresses the same rows and
+        # slots, so the loops share one plan instead of uploading it again.
+        plans = {}
         for depth in range(self.config.draft_loops, self.config.target_loops):
-            reference = self._reference_plan(leases, verification_rows, depth)
+            mode = reference_mode(depth)
+            if mode not in plans:
+                plans[mode] = self._reference_plan(leases, verification_rows, depth)
+            reference = plans[mode]
             hidden = self._execute_recurrent_step(
                 hidden,
                 positions,
@@ -531,15 +550,10 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             # Outstanding rounds keep disjoint slots until their tickets retire.
             leases = None
             if self.reference_store is not None:
-                leases = tuple(
-                    self.reference_store.reserve(
-                        scheduled_request.request.request_id,
-                        index,
-                        scheduled_request.token_count,
-                    )
-                    for index, (scheduled_request, state) in enumerate(
-                        zip(scheduled_requests, states)
-                    )
+                # One index upload for the round, not one per request.
+                leases = self.reference_store.reserve_round(
+                    (scheduled_request.request.request_id, scheduled_request.token_count)
+                    for scheduled_request in scheduled_requests
                 )
             try:
                 tables.copy_(host_tables, non_blocking=True)

@@ -49,6 +49,10 @@ def drain(engine):
     pytest.fail("engine failed to drain")
 
 
+# One submission: (request id, verification rows) per request.
+ROUND = (("a", 3), ("b", 1), ("c", 2))
+
+
 def make_store(**overrides):
     values = dict(slots=6, layers=2, heads=2, head_dim=4, key_bucket=8, device="cpu")
     values.update(overrides)
@@ -245,6 +249,106 @@ def test_accept_drops_host_counts_so_rejected_rows_cannot_size_a_read():
     rejected = store.build_plan([(lease, 2)], [CONSUME], key_retention=0.5)
     with pytest.raises(RuntimeError, match="no captured reference"):
         store.read_reference(rejected, layer=0, row=0)
+
+
+def test_round_reservation_matches_per_request_reserves():
+    # One upload per round must hand out the same slots, in the same order,
+    # as reserving request by request; the leases are then interchangeable.
+    separate = make_store(slots=12)
+    expected = [separate.reserve(name, index, rows) for index, (name, rows) in enumerate(ROUND)]
+    store = make_store(slots=12)
+    leases = store.reserve_round(ROUND)
+    assert [lease.slots for lease in leases] == [lease.slots for lease in expected]
+    assert [lease.request_index for lease in leases] == [0, 1, 2]
+    assert [lease.slot_ids.tolist() for lease in leases] == [list(e.slots) for e in expected]
+    assert [lease.row_index.tolist() for lease in leases] == [[0, 1, 2], [0], [0, 1]]
+    shared = leases[0].round
+    assert all(lease.round is shared for lease in leases)
+    assert shared.requests.tolist() == [0, 0, 0, 1, 2, 2]
+    assert store.outstanding == 6 and len(store.free) == 6
+
+
+def test_round_reservation_fails_without_losing_slots():
+    store = make_store(slots=4)
+    with pytest.raises(RuntimeError, match="no retired"):
+        store.reserve_round(ROUND)
+    with pytest.raises(ValueError, match="at least one row"):
+        store.reserve_round([("a", 2), ("b", 0)])
+    assert store.outstanding == 0 and len(store.free) == 4
+    assert store.reserve_round(()) == ()
+
+
+@pytest.mark.parametrize("accepted", [[0, 0, 0], [2, 0, 1], [1, 0, 0]])
+def test_round_accept_equals_per_lease_accept(accepted):
+    # The round's shared indices must invalidate exactly what the per-lease
+    # concatenation does, including when a subset of the round is passed.
+    def run(reserve):
+        store = make_store(slots=12)
+        leases = reserve(store)
+        fill_payload(store, [slot for lease in leases for slot in lease.slots])
+        store.accept(leases, torch.tensor(accepted))
+        return store.counts.clone(), store.mass.clone()
+
+    per_request = run(
+        lambda store: [store.reserve(n, i, rows) for i, (n, rows) in enumerate(ROUND)]
+    )
+    whole_round = run(lambda store: store.reserve_round(ROUND))
+    assert torch.equal(per_request[0], whole_round[0])
+    assert torch.equal(per_request[1], whole_round[1])
+    # A partial set of leases cannot borrow the round's indices.
+    store = make_store(slots=12)
+    leases = store.reserve_round(ROUND)
+    fill_payload(store, [slot for lease in leases for slot in lease.slots])
+    store.accept(leases[:1], torch.tensor([0]))
+    assert int(store.counts[leases[0].slots[1]].max()) == 0
+    assert int(store.counts[leases[2].slots[1]].max()) == 1
+
+
+def test_plan_liveness_shortcut_is_dropped_by_any_release():
+    # A plan skips the per-row ownership walk only while no slot was released
+    # since it was built. Releasing an unrelated lease must send it back to the
+    # walk (still live); releasing its own lease must reject it.
+    store = make_store(slots=12)
+    first, second = store.reserve_round([("a", 2)]), store.reserve_round([("b", 2)])
+    plan = store.build_plan([(first[0], 0), (first[0], 1)], [CAPTURE, CAPTURE], key_retention=0.5)
+    assert plan.epoch == store._epoch
+    store.capture(plan, layer=0)
+    store.release(second)
+    assert plan.epoch != store._epoch
+    store.capture(plan, layer=0)
+    store.release(first)
+    with pytest.raises(RuntimeError, match="stale"):
+        store.capture(plan, layer=0)
+    # The released round's slots are reusable and cleared.
+    assert store.outstanding == 0 and len(store.free) == 12
+    renewed = store.reserve_round([("a", 2)])
+    current = store.build_plan(
+        [(renewed[0], 0), (renewed[0], 1)], [CAPTURE, CAPTURE], key_retention=0.5
+    )
+    store.capture(current, layer=0)
+    with pytest.raises(RuntimeError, match="stale"):
+        store.capture(plan, layer=0)
+
+
+def test_round_release_clears_metadata_and_host_counts():
+    store = make_store(slots=12)
+    leases = store.reserve_round(ROUND)
+    slots = [slot for lease in leases for slot in lease.slots]
+    fill_payload(store, slots)
+    for slot in slots:
+        store.note_count(slot, 1, 3)
+    assert store.host_count(slots[0], 1) == 3 and store.host_count(slots[0], 0) is None
+    store.release(leases)
+    assert not bool(store.counts[slots].any()) and not bool(store.mass[slots].any())
+    assert all(store.host_count(slot, 1) is None for slot in slots)
+    assert store.outstanding == 0
+
+
+def test_uniform_mode_summarises_the_submission():
+    assert SparseDecodePlan((CAPTURE, CAPTURE), (0, 1), (None, None), 0.5).uniform_mode == CAPTURE
+    assert SparseDecodePlan((CAPTURE, CONSUME), (0, 1), (None, None), 0.5).uniform_mode is None
+    assert SparseDecodePlan((DENSE, DENSE), (-1, -1), (None, None), 0.5).dense()
+    assert not SparseDecodePlan((DENSE, CONSUME), (-1, 1), (None, None), 0.5).dense()
 
 
 def test_accept_keeps_root_when_every_candidate_is_rejected():

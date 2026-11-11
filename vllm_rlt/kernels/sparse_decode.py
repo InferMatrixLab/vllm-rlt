@@ -1061,12 +1061,12 @@ def _consume_workspace(device, rows, heads, block_d):
 
 def supports(plan, q, dense_attention) -> bool:
     """Whether the fused path covers this submission; otherwise use the batched path."""
-    modes = set(plan.modes)
+    mode = plan.uniform_mode
     return (
         q.is_cuda
         and q.shape[-1] <= 256
         and plan.key_retention < 1.0
-        and (modes == {CONSUME} or (modes == {CAPTURE} and dense_attention is not None))
+        and (mode == CONSUME or (mode == CAPTURE and dense_attention is not None))
     )
 
 
