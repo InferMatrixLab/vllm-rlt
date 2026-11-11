@@ -4,15 +4,23 @@ LAST-EXITED copies the last computed per-layer KV into skipped deeper planes.
 SHARED overwrites a single plane and needs no exit copies. Optional incremental
 allocation separates logical capacity from physical pages. Immutable full-depth
 prompt blocks can be shared through the prefix cache.
+
+Optional INT4/NVFP4 quantization follows FlashLoop's group-plus-window policy.
+Block ids then name logical pages, each owning one slot in a packed pool. A
+page is staged in a small BF16 pool while it is written and moves to its packed
+slot once it leaves the latest ``window`` tokens. Attention reads both through
+a Torch reference path; fused kernels are future work.
 """
 
 import hashlib
 import struct
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from numbers import Integral
+from typing import Any
 
 import torch
 
@@ -23,9 +31,76 @@ from vllm_rlt.attention import (
     create_backend,
     validate_backend_name,
 )
+from vllm_rlt.kernels.kv_quantization import KV_CODECS, pack_kv, unpack_kv
+from vllm_rlt.kernels.kv_quantization._common import KVKind
 from vllm_rlt.request import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
+
+# Pages per codec call when attention decodes or the engine packs, which
+# bounds FP32 codec temporaries independently of context and batch size.
+_DECODE_CHUNK_PAGES = 64
+_PACK_CHUNK_PAGES = 8
+
+
+def staging_pages_bound(
+    *, block_size: int, window: int, tokens_per_step: int, requests: int, planes: int
+) -> int:
+    """BF16 staging pages that quantized KV can need at once.
+
+    After packing, each request's plane keeps at most ``window + block_size - 1``
+    unpacked tokens, starting on a page boundary. One step then writes at most
+    ``tokens_per_step`` tokens per plane, shared by all requests; request ``r``'s
+    ``t_r`` tokens add at most ``t_r // block_size + 1`` pages.
+    """
+    retained = -(-(window + block_size - 1) // block_size)
+    return planes * (requests * (retained + 1) + tokens_per_step // block_size)
+
+
+def codec_page_scratch_bytes(
+    *, group_size: int, block_size: int, num_kv_heads: int, head_dim: int
+) -> int:
+    """Codec temporaries per page of one layer and kind, in a pack or decode call.
+
+    V groups pad channels to a multiple of the group size, so temporaries follow
+    the padded shape. Measured CPU peaks stay below 12 bytes per padded element
+    plus 16 per group; the element term is doubled for allocator rounding.
+    """
+    channels = -(-head_dim // group_size) * group_size
+    elements = block_size * num_kv_heads * channels
+    return 24 * elements + 16 * -(-elements // group_size)
+
+
+def codec_scratch_bytes(
+    *, group_size: int, block_size: int, num_kv_heads: int, head_dim: int, num_layers: int
+) -> int:
+    """Codec temporaries of the largest pack or decode chunk."""
+    pages = max(_DECODE_CHUNK_PAGES, _PACK_CHUNK_PAGES * num_layers)
+    return pages * codec_page_scratch_bytes(
+        group_size=group_size,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+
+
+def packed_page_bytes(
+    *,
+    format: str,
+    group_size: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    num_layers: int,
+    dtype: torch.dtype,
+) -> int:
+    """Bytes of one block id's packed K and V slots across every layer."""
+    page = torch.zeros((block_size, num_kv_heads, head_dim), dtype=dtype)
+    kinds: tuple[KVKind, ...] = ("key", "value")
+    return num_layers * sum(
+        pack_kv(page, kind=kind, format=format, group_size=group_size).storage_bytes
+        for kind in kinds
+    )
 
 
 @dataclass
@@ -57,6 +132,8 @@ class _Allocation:
     written: list[list[_WrittenPositions]]
     transfer_leases: set[str] = field(default_factory=set)
     release_requested: bool = False
+    # Quantized KV: leading pages per plane that live in the packed pool.
+    packed_pages: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -85,6 +162,14 @@ class KVCacheManager:
     are zero-based throughout the interface.
     """
 
+    # Set by the constructor's positive-integer validation loop.
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+    num_blocks: int
+    block_size: int
+    max_loops: int
+
     def __init__(
         self,
         num_layers: int,
@@ -103,6 +188,10 @@ class KVCacheManager:
         recurrent_layers: Sequence[int] | None = None,
         *,
         attention: AttentionBackend | None = None,
+        kv_quantization: str | None = None,
+        kv_quantization_group_size: int | None = None,
+        kv_quantization_window: int = 64,
+        kv_quantization_staging_blocks: int | None = None,
     ):
         for name, value in (
             ("num_layers", num_layers),
@@ -140,11 +229,20 @@ class KVCacheManager:
         )
         self.attention_info = self.attention.info
         self.backend = self.attention_info["selected_backend"]
-        shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
+        pool_blocks = self._init_quantization(
+            kv_quantization,
+            kv_quantization_group_size,
+            kv_quantization_window,
+            kv_quantization_staging_blocks,
+            enable_prefix_caching=enable_prefix_caching,
+        )
+        # With quantization these BF16 pages only stage recent KV.
+        shape = (pool_blocks, num_layers, block_size, num_kv_heads, head_dim)
         self.key_cache = torch.empty(shape, device=self.device, dtype=dtype)
         self.value_cache = torch.empty_like(self.key_cache)
         # Resolve an implicit CUDA index to the actual storage device once.
         self.device = self.key_cache.device
+        self._init_packed_pool()
         self._free_blocks = list(reversed(range(num_blocks)))
         self._allocations: dict[str, _Allocation] = {}
         self.enable_prefix_caching = enable_prefix_caching
@@ -157,6 +255,91 @@ class KVCacheManager:
         self.prefix_hits = self.prefix_queries = 0
         if enable_prefix_caching and layout != "last_exited":
             raise ValueError("prefix caching requires last_exited KV")
+
+    def _init_quantization(
+        self, format, group_size, window, staging_blocks, *, enable_prefix_caching
+    ) -> int:
+        """Validate the quantized layout; return how many BF16 pages to allocate."""
+        self.kv_quantization = format
+        self.kv_quantization_group_size = None
+        self.kv_quantization_window = window
+        if format is None:
+            return self.num_blocks
+        if format not in KV_CODECS:
+            raise ValueError(f"unknown KV quantization format: {format!r}")
+        if group_size is None:
+            group_size = KV_CODECS[format].default_group_size
+        if type(group_size) is not int or group_size <= 0:
+            raise ValueError("kv_quantization_group_size must be a positive integer")
+        if format == "nvfp4" and group_size != 16:
+            raise ValueError("NVFP4 requires kv_quantization_group_size=16")
+        # The newest token must stay staged until finalize copies it to deeper planes.
+        if type(window) is not int or window <= 0:
+            raise ValueError("kv_quantization_window must be a positive integer")
+        # K groups then never span pages, so each page packs on its own.
+        if self.block_size % group_size:
+            raise ValueError("block_size must be a multiple of kv_quantization_group_size")
+        # SHARED rewrites a token's KV at every depth, after its page may be packed.
+        if self.layout != "last_exited":
+            raise ValueError("KV quantization requires last_exited KV")
+        # Shared prompt pages would need cross-request pack ownership.
+        if enable_prefix_caching:
+            raise ValueError("KV quantization does not support prefix caching")
+        # A page packs once every layer of its plane has left the window.
+        if len(self.recurrent_layers) != self.num_layers:
+            raise ValueError("KV quantization requires every cache layer to be recurrent")
+        if staging_blocks is None:
+            staging_blocks = self.num_blocks
+        if type(staging_blocks) is not int or staging_blocks <= 0:
+            raise ValueError("kv_quantization_staging_blocks must be a positive integer")
+        self.kv_quantization_group_size = group_size
+        # More staging pages than logical pages can never be used.
+        return min(staging_blocks, self.num_blocks)
+
+    def _init_packed_pool(self) -> None:
+        # Per block id: its BF16 staging page or -1, and whether it is packed.
+        self._staging_of = [-1] * self.num_blocks
+        self._packed_page = [False] * self.num_blocks
+        self._free_staging = list(reversed(range(self.key_cache.shape[0])))
+        self._packed_templates: dict[str, Any] = {}
+        self._packed_pools: dict[str, dict[str, torch.Tensor]] = {}
+        # Packing and page release bump this; cached per-batch index plans then rebuild.
+        self._epoch = 0
+        self._write_slots: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._attention_plans: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        if self.kv_quantization is None:
+            return
+        page = torch.zeros(
+            (self.block_size, self.num_kv_heads, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        kinds: tuple[KVKind, ...] = ("key", "value")
+        for kind in kinds:
+            # The codec's own output for one page fixes every pool's shape and dtype.
+            # Registered codecs return dataclasses; the protocol type does not say so.
+            template: Any = pack_kv(
+                page,
+                kind=kind,
+                format=self.kv_quantization,
+                group_size=self.kv_quantization_group_size,
+            )
+            pool = {}
+            for item in fields(template):
+                value = getattr(template, item.name)
+                if isinstance(value, torch.Tensor):
+                    pool[item.name] = torch.empty(
+                        (self.num_blocks, self.num_layers, *value.shape),
+                        dtype=value.dtype,
+                        device=self.device,
+                    )
+            self._packed_templates[kind] = template
+            self._packed_pools[kind] = pool
+        # Pages join along tokens into one codec call unless a parameter is
+        # per-tensor (NVFP4's global scale), which must stay per page and layer.
+        self._joinable = all(
+            storage.ndim > 2 for pool in self._packed_pools.values() for storage in pool.values()
+        )
 
     @property
     def attention_capabilities(self) -> BackendCapabilities:
@@ -173,7 +356,22 @@ class KVCacheManager:
         return self.num_blocks - self.num_free_blocks
 
     @property
+    def num_staging_blocks(self) -> int:
+        return self.key_cache.shape[0]
+
+    @property
+    def num_free_staging_blocks(self) -> int:
+        return len(self._free_staging)
+
+    @property
     def bytes_per_block(self) -> int:
+        """Bytes one block id owns: its BF16 page, or its packed slot when quantized."""
+        if self.kv_quantization is not None:
+            return sum(
+                storage[0].numel() * storage.element_size()
+                for pool in self._packed_pools.values()
+                for storage in pool.values()
+            )
         return (
             2
             * self.num_layers
@@ -193,6 +391,7 @@ class KVCacheManager:
             self._refs[b] -= 1
             assert self._refs[b] >= 0
             if not self._refs[b]:
+                self._release_page(b)
                 self._free_blocks.append(b)
 
     def _claim(self, count):
@@ -313,6 +512,7 @@ class KVCacheManager:
                 [_WrittenPositions(prefix=length) for _ in range(self.num_layers)]
                 for _ in range(self.storage_depths)
             ],
+            packed_pages=[0] * self.storage_depths,
         )
         self.prefix_queries += 1
         self.prefix_hits += length
@@ -347,6 +547,8 @@ class KVCacheManager:
             raise ValueError("invalid KV truncation frontier")
         if allocation.transfer_leases:
             raise ValueError("cannot truncate KV during a transfer")
+        if any(pages * self.block_size > frontier for pages in allocation.packed_pages):
+            raise ValueError("cannot truncate packed KV")
         for table in allocation.block_tables:
             if any(self._refs[b] > 1 for b in table[frontier // self.block_size :]):
                 raise ValueError("cannot truncate shared prefix pages")
@@ -473,6 +675,8 @@ class KVCacheManager:
         Copying page by page avoids a request-sized temporary on a device
         that is already full, which is exactly when preemption happens.
         """
+        if self.kv_quantization is not None:
+            raise ValueError("snapshots of quantized KV are not supported")
         allocation = self._get_allocation(request_id)
         if allocation.transfer_leases:
             raise RuntimeError("cannot snapshot KV during a transfer")
@@ -497,6 +701,8 @@ class KVCacheManager:
         decision belongs to the scheduler. The copies go on the current
         stream; the caller decides when other streams may read them.
         """
+        if self.kv_quantization is not None:
+            raise ValueError("snapshots of quantized KV are not supported")
         allocation = self._get_allocation(request_id)
         if allocation.max_tokens != snapshot.max_tokens:
             raise ValueError("snapshot capacity does not match the allocation")
@@ -509,6 +715,221 @@ class KVCacheManager:
             self.key_cache[block].copy_(snapshot.keys[row])
             self.value_cache[block].copy_(snapshot.values[row])
         allocation.written = deepcopy(snapshot.written)
+
+    # Quantized storage. Block ids are logical pages: each owns a packed slot in
+    # every layer and borrows a BF16 staging page while it is being written.
+
+    def _release_page(self, block: int) -> None:
+        if self.kv_quantization is None:
+            return
+        slot = self._staging_of[block]
+        if slot >= 0:
+            self._free_staging.append(slot)
+            self._staging_of[block] = -1
+        self._packed_page[block] = False
+        self._epoch += 1
+
+    def _stage_page(self, block: int) -> int:
+        if self._packed_page[block]:
+            raise RuntimeError(f"cannot write packed KV page {block}")
+        slot = self._staging_of[block]
+        if slot < 0:
+            if not self._free_staging:
+                raise RuntimeError(
+                    "BF16 KV staging pool is exhausted; raise kv_quantization_staging_blocks"
+                )
+            slot = self._staging_of[block] = self._free_staging.pop()
+        return slot
+
+    def _staging_writes(self, batch: KVMetadata) -> torch.Tensor:
+        """Staging page of every written row, assigned on the batch's first write."""
+        cached = self._write_slots.get(batch)
+        if cached is not None and cached[0] == self._epoch:
+            return cached[1]
+        slots = [
+            self._stage_page(
+                allocation.block_tables[self._plane(depth)][position // self.block_size]
+            )
+            for allocation, depth, position in batch.rows
+        ]
+        tensor = torch.tensor(slots, dtype=torch.long, device=self.device)
+        self._write_slots[batch] = (self._epoch, tensor)
+        return tensor
+
+    def _page_plan(self, pages: Sequence[int]):
+        """Index tensors that gather ``pages`` from the staging and packed pools."""
+        staged, slots, packed, blocks = [], [], [], []
+        for index, block in enumerate(pages):
+            if self._packed_page[block]:
+                packed.append(index)
+                blocks.append(block)
+            elif self._staging_of[block] >= 0:
+                staged.append(index)
+                slots.append(self._staging_of[block])
+            else:
+                raise RuntimeError(f"KV page {block} was read before it was written")
+
+        def tensor(values):
+            return torch.tensor(values, dtype=torch.long, device=self.device)
+
+        return len(pages), tensor(staged), tensor(slots), tensor(packed), tensor(blocks)
+
+    def _gather_pages(self, layer: int, plan) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return BF16 ``[pages, block_size, heads, dim]`` K/V for a page plan."""
+        count, staged, slots, packed, blocks = plan
+        # Keep at least one page so empty batches still pass a valid pool.
+        shape = (max(count, 1), self.block_size, self.num_kv_heads, self.head_dim)
+        keys = torch.empty(shape, dtype=self.dtype, device=self.device)
+        values = torch.empty_like(keys)
+        if staged.numel():
+            keys[staged] = self.key_cache[slots, layer]
+            values[staged] = self.value_cache[slots, layer]
+        # Decode in chunks so FP32 temporaries stay bounded for long contexts.
+        for start in range(0, packed.numel(), _DECODE_CHUNK_PAGES):
+            rows = packed[start : start + _DECODE_CHUNK_PAGES]
+            chunk = blocks[start : start + _DECODE_CHUNK_PAGES]
+            keys[rows] = self._decode_pages("key", layer, chunk)
+            values[rows] = self._decode_pages("value", layer, chunk)
+        return keys, values
+
+    def _decode_pages(self, kind: str, layer: int, blocks: torch.Tensor) -> torch.Tensor:
+        template = self._packed_templates[kind]
+        tensors = {
+            name: storage[blocks, layer] for name, storage in self._packed_pools[kind].items()
+        }
+        count, page = blocks.numel(), template.original_shape
+        if self._joinable:
+            joined = replace(
+                template,
+                original_shape=(count * page[0], *page[1:]),
+                **{name: tensor.flatten(0, 1) for name, tensor in tensors.items()},
+            )
+            return unpack_kv(joined).view(count, *page)
+        return torch.stack(
+            [
+                unpack_kv(replace(template, **{name: t[index] for name, t in tensors.items()}))
+                for index in range(count)
+            ]
+        )
+
+    def _encode_pages(self, kind: KVKind, pages: torch.Tensor, blocks: list[int]) -> None:
+        """Pack ``[pages, layers, block_size, heads, dim]`` into each block's slot."""
+        items = pages.flatten(0, 1)
+        page_ids = [block for block in blocks for _ in range(self.num_layers)]
+        layer_ids = list(range(self.num_layers)) * len(blocks)
+        pool = self._packed_pools[kind]
+        group = self.kv_quantization_group_size
+        if self._joinable:
+            packed = pack_kv(
+                items.flatten(0, 1), kind=kind, format=self.kv_quantization, group_size=group
+            )
+            index = (
+                torch.tensor(page_ids, dtype=torch.long, device=self.device),
+                torch.tensor(layer_ids, dtype=torch.long, device=self.device),
+            )
+            for name, storage in pool.items():
+                storage[index] = getattr(packed, name).view(len(page_ids), *storage.shape[2:])
+            return
+        for item, page, layer in zip(items, page_ids, layer_ids):
+            packed = pack_kv(item, kind=kind, format=self.kv_quantization, group_size=group)
+            for name, storage in pool.items():
+                storage[page, layer] = getattr(packed, name)
+
+    def _ready_pages(self, allocation: _Allocation, plane: int) -> range:
+        # A page packs once every layer has written past its end plus the window.
+        frontier = min(written.prefix for written in allocation.written[plane])
+        end = max(0, frontier - self.kv_quantization_window) // self.block_size
+        return range(allocation.packed_pages[plane], end)
+
+    def ready_pages(self) -> int:
+        """Pages that have left the BF16 window but are not packed yet."""
+        if self.kv_quantization is None:
+            return 0
+        return sum(
+            len(self._ready_pages(allocation, plane))
+            for allocation in self._allocations.values()
+            for plane in range(self.storage_depths)
+        )
+
+    @torch.no_grad()
+    def pack_ready(self) -> int:
+        """Pack every ready page and free its staging page; return the page count.
+
+        The caller must have finished all device work that writes or reads these
+        staging pages, and later work must observe the packed slots. Each page is
+        packed once, per layer, so NVFP4 keeps one global scale per page and layer.
+        """
+        if self.kv_quantization is None:
+            return 0
+        items = [
+            (allocation, plane, page, allocation.block_tables[plane][page])
+            for allocation in self._allocations.values()
+            for plane in range(self.storage_depths)
+            for page in self._ready_pages(allocation, plane)
+        ]
+        if not items:
+            return 0
+        blocks = [block for *_, block in items]
+        if any(self._staging_of[block] < 0 for block in blocks):
+            raise RuntimeError("a ready KV page has no staged storage")
+        kinds: tuple[tuple[torch.Tensor, KVKind], ...] = (
+            (self.key_cache, "key"),
+            (self.value_cache, "value"),
+        )
+        for start in range(0, len(blocks), _PACK_CHUNK_PAGES):
+            chunk = blocks[start : start + _PACK_CHUNK_PAGES]
+            slots = torch.tensor(
+                [self._staging_of[block] for block in chunk], dtype=torch.long, device=self.device
+            )
+            for cache, kind in kinds:
+                self._encode_pages(kind, cache[slots], chunk)
+        for allocation, plane, page, block in items:
+            self._free_staging.append(self._staging_of[block])
+            self._staging_of[block] = -1
+            self._packed_page[block] = True
+            allocation.packed_pages[plane] = page + 1
+        self._epoch += 1
+        return len(items)
+
+    def _attention_plan(self, batch: KVMetadata):
+        """Gather plan and remapped tables for every page a row actually reads."""
+        cached = self._attention_plans.get(batch)
+        if cached is not None and cached[0] == self._epoch:
+            return cached[1]
+        tables = batch.block_tables.tolist()
+        lengths = batch.context_lengths.tolist()
+        index: dict[int, int] = {}
+        remapped = []
+        for table, length in zip(tables, lengths):
+            needed = (length + self.block_size - 1) // self.block_size
+            # Entries past a row's context are never read; point them at page 0.
+            remapped.append(
+                [index.setdefault(b, len(index)) if j < needed else 0 for j, b in enumerate(table)]
+            )
+        plan = (
+            self._page_plan(list(index)),
+            torch.tensor(remapped, dtype=torch.int32, device=self.device).reshape(
+                batch.block_tables.shape
+            ),
+        )
+        self._attention_plans[batch] = (self._epoch, plan)
+        return plan
+
+    def _attend_quantized(self, layer: int, batch: KVMetadata, q: torch.Tensor) -> torch.Tensor:
+        """Reference path: decode the batch's pages to BF16, then run the backend."""
+        plan, tables = self._attention_plan(batch)
+        keys, values = self._gather_pages(layer, plan)
+        if batch.cu_seqlens_q is not None:
+            return self.attention.prefill(
+                q,
+                keys,
+                values,
+                tables,
+                batch.context_lengths,
+                batch.cu_seqlens_q,
+                batch.max_seqlen_q,
+            )
+        return self.attention(q, keys, values, tables, batch.context_lengths)
 
     def _plane(self, depth: int) -> int:
         return depth if self.layout == "last_exited" else 0
@@ -667,6 +1088,8 @@ class KVCacheManager:
         self._validate_layer(layer)
         self._require_live_batch(batch)
         if isinstance(batch, DeviceKVMetadata):
+            if self.kv_quantization is not None:
+                raise RuntimeError("quantized KV requires host-prepared metadata")
             self._validate_tensor(k, len(batch.position_ids), "k")
             self._validate_tensor(v, len(batch.position_ids), "v")
             if batch.write_mask is not None:
@@ -683,8 +1106,9 @@ class KVCacheManager:
         self._validate_tensor(v, len(batch.position_ids), "v")
         if not batch.rows:
             return
-        self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
-        self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
+        blocks = batch.write_blocks if self.kv_quantization is None else self._staging_writes(batch)
+        self.key_cache[blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
+        self.value_cache[blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
         for allocation, depth, position in batch.rows:
             allocation.written[self._plane(depth)][layer].add(position)
 
@@ -719,6 +1143,8 @@ class KVCacheManager:
         self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
         if isinstance(batch, DeviceKVMetadata):
+            if self.kv_quantization is not None:
+                raise RuntimeError("quantized KV requires host-prepared metadata")
             return self.attention(
                 q,
                 self.key_cache[:, layer],
@@ -730,6 +1156,8 @@ class KVCacheManager:
             return torch.empty_like(q)
         for allocation, depth, position in batch.rows:
             self._require_prefix(allocation, layer, depth, position + 1)
+        if self.kv_quantization is not None:
+            return self._attend_quantized(layer, batch, q)
         if batch.cu_seqlens_q is not None:
             return self.attention.prefill(
                 q,
@@ -760,6 +1188,12 @@ class KVCacheManager:
             allocation.block_tables[self._plane(depth)][logical_page]
             for depth in range(exit_depth + 1, self.max_loops)
         ]
+        if self.kv_quantization is not None:
+            # The window keeps the newest token's page staged in every plane.
+            source = self._staging_of[source]
+            if source < 0:
+                raise RuntimeError("finalized KV page is not staged")
+            destinations = [self._stage_page(destination) for destination in destinations]
         # Basic-index copies avoid a blocking host->device index tensor on the
         # boundary stream. That transfer would serialize final core and routing.
         for destination in destinations:
@@ -791,6 +1225,11 @@ class KVCacheManager:
         ):
             raise ValueError("read length exceeds the request's reserved token budget")
         self._require_prefix(allocation, layer, depth, length)
+        if self.kv_quantization is not None:
+            table = allocation.block_tables[self._plane(depth)]
+            pages = table[: (length + self.block_size - 1) // self.block_size]
+            keys, values = self._gather_pages(layer, self._page_plan(pages))
+            return keys.flatten(0, 1)[:length], values.flatten(0, 1)[:length]
         positions = torch.arange(length, device=self.device)
         table = torch.tensor(
             allocation.block_tables[self._plane(depth)], device=self.device, dtype=torch.long

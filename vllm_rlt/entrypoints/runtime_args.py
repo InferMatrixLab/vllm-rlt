@@ -36,6 +36,14 @@ def add_runtime_args(parser):
         help="Copy metadata to the GPU instead of reading mapped host memory",
     )
     parser.add_argument("--kv-layout", choices=["last_exited", "shared"], default="last_exited")
+    parser.add_argument(
+        "--kv-quantization",
+        choices=["int4", "nvfp4"],
+        help="Pack KV pages outside the latest window (Torch reference attention path)",
+    )
+    parser.add_argument("--kv-quantization-group-size", type=int)
+    parser.add_argument("--kv-quantization-window", type=int, default=64)
+    parser.add_argument("--kv-quantization-staging-blocks", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
     parser.add_argument("--memory-reserve-bytes", type=int, default=256 * 1024 * 1024)
@@ -109,6 +117,10 @@ def runtime_configs(args):
             gpu_memory_utilization=args.gpu_memory_utilization,
             kv_cache_memory_bytes=args.kv_cache_memory_bytes,
             memory_reserve_bytes=args.memory_reserve_bytes,
+            kv_quantization=args.kv_quantization,
+            kv_quantization_group_size=args.kv_quantization_group_size,
+            kv_quantization_window=args.kv_quantization_window,
+            kv_quantization_staging_blocks=args.kv_quantization_staging_blocks,
         ),
         exit_config=ExitConfig(
             mode=args.exit_mode,

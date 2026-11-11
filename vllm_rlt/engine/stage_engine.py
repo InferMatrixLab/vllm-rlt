@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
+import torch
+
 from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.config import (
     CacheConfig,
@@ -70,6 +72,17 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
+        if cache_config.kv_quantization is not None:
+            # Pages pack between synchronous steps, and only the manager's
+            # host-prepared write/attend path knows where a page lives.
+            if self.execution_config.async_scheduling:
+                raise ValueError("KV quantization requires synchronous scheduling")
+            if self.execution_config.cuda_graphs:
+                raise ValueError("KV quantization does not support CUDA graphs")
+            if speculative_config is not None:
+                raise ValueError("KV quantization does not support speculative decoding")
+            if scheduler_config.enable_preemption:
+                raise ValueError("KV quantization does not support preemption")
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
@@ -194,6 +207,10 @@ class StageEngine:
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
+            kv_quantization=cache_config.kv_quantization,
+            kv_quantization_group_size=cache_config.kv_quantization_group_size,
+            kv_quantization_window=cache_config.kv_quantization_window,
+            kv_quantization_staging_blocks=self.memory_plan.get("kv_staging_blocks"),
         )
         self.scheduler = Scheduler(
             scheduler_config,
@@ -269,6 +286,9 @@ class StageEngine:
 
     @connector.setter
     def connector(self, connector):
+        # StageWorker attaches its connector after construction, so check here.
+        if connector is not None and self.cache_manager.kv_quantization is not None:
+            raise ValueError("KV quantization does not support PD transfer")
         self._connector = connector
         self._connector_blocked = set()
         self.scheduler.execution_ready = (
@@ -483,7 +503,9 @@ class StageEngine:
             # Only host-dependent decisions collect now. Prompt/PRELUDE submissions
             # advance logically under their event without a readback wait.
             result = ticket.collect() if ticket.has_result else None
-            return self._update(batch, result)
+            outputs = self._update(batch, result)
+            self._pack_kv()
+            return outputs
         except Exception:
             if self.connector is not None:
                 raise  # Transfer leases remain quarantined until peer shutdown.
@@ -492,6 +514,17 @@ class StageEngine:
                 if scheduled_request.request.request_id in self.scheduler.requests:
                     self.abort_request(scheduled_request.request.request_id)
             raise
+
+    def _pack_kv(self):
+        cache = self.cache_manager
+        if cache.kv_quantization is None or not cache.ready_pages():
+            return
+        # Drain every stream so packing reads complete staging pages, and finish
+        # before a later step reuses a freed staging page or reads a packed slot.
+        self.model_runner.synchronize()
+        cache.pack_ready()
+        if cache.device.type == "cuda":
+            torch.cuda.synchronize(cache.device)
 
     def _schedule(self, *, prefer_recurrent=False):
         self._connector_blocked.clear()
