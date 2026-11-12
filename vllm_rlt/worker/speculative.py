@@ -2,6 +2,14 @@
 
 Temporary tensors belong to a submission until collection. Requests expose only committed
 outputs; Scheduler applies returned tokens and KV commits; Engine coordinates cleanup.
+
+Boundary-KV models (attention in PRELUDE and CODA) keep one boundary history at
+depth 0. PRELUDE KV depends only on the input tokens, so a candidate's prelude
+is the target's whenever the candidate is accepted. CODA KV depends on the
+state it reads: a draft CODA stores draft-depth KV at its own position, which is
+never below the committed frontier, and the target CODA of that position stores
+over it before any target row attends it. Target rows therefore read target
+history only; a rejected suffix is cut by ``truncate_suffix``.
 """
 
 from contextlib import nullcontext
@@ -154,6 +162,9 @@ class SpeculativeRunner:
         compute_stream=None,
     ):
         self.model, self.cache, self.config = model, cache, config
+        self.boundary_kv = getattr(model, "requires_boundary_kv", False)
+        # Windowed attention needs one query row per token.
+        self.row_queries = getattr(model, "requires_sliding_window", False)
         self.metadata = cache.metadata_builder
         self.runtime = runtime if runtime is not None else ModelRuntime(model, cache)
         self.pipeline_states: dict[str, PipelineState] = {}
@@ -175,7 +186,12 @@ class SpeculativeRunner:
 
     def _packed(self, packed):
         capabilities = self.cache.attention_capabilities
-        return packed and capabilities.packed_prefill and capabilities.packed_matches_decode
+        return (
+            packed
+            and not self.row_queries
+            and capabilities.packed_prefill
+            and capabilities.packed_matches_decode
+        )
 
     def _prepare_inputs(self, batch):
         """Plan all host-known inputs, then publish one snapshot per dtype."""
@@ -202,7 +218,21 @@ class SpeculativeRunner:
             active = [i for i, span in enumerate(requests) if offset < span.token_count]
             ids = [requests[i].request.request_id for i in active]
             positions = [requests[i].token_start + offset for i in active]
-            steps.append((active, metadata(ids, positions, range(self.config.draft_loops))))
+            layouts = metadata(ids, positions, range(self.config.draft_loops))
+            # Depth 0 addresses the boundary history: the prelude of these rows
+            # reuses the first loop's view, the draft CODA covers drafting rows.
+            coda = None
+            if self.boundary_kv:
+                drafting = [
+                    row for row, i in enumerate(active) if offset + 1 < requests[i].token_count
+                ]
+                if len(drafting) == len(active):
+                    coda = layouts[0]
+                elif drafting:
+                    coda = metadata(
+                        [ids[row] for row in drafting], [positions[row] for row in drafting], (0,)
+                    )[0]
+            steps.append((active, layouts, coda))
         ids, positions = [], []
         for span in requests:
             ids.extend([span.request.request_id] * span.token_count)
@@ -210,16 +240,26 @@ class SpeculativeRunner:
         verification = metadata(
             ids, positions, range(self.config.draft_loops, self.config.target_loops), packed=True
         )
+        target_coda = metadata(ids, positions, (0,))[0] if self.boundary_kv else None
         uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
         tokens = uploaded[tokens.dtype].as_strided(
             tokens.shape, tokens.stride(), tokens.storage_offset()
         )
+
+        def bind(kv):
+            return None if kv is None else self.metadata.bind(kv, uploaded)
+
         steps = [
-            (active, tuple(self.metadata.bind(kv, uploaded) for kv in layouts))
-            for active, layouts in steps
+            (active, tuple(bind(kv) for kv in layouts), bind(coda))
+            for active, layouts, coda in steps
         ]
-        verification = tuple(self.metadata.bind(kv, uploaded) for kv in verification)
-        return tokens, steps, verification
+        verification = tuple(bind(kv) for kv in verification)
+        return tokens, steps, verification, bind(target_coda)
+
+    def _prelude(self, tokens, boundary=None):
+        return self.runtime.forward(
+            ForwardBatch(Operation.PRELUDE, tokens=tokens, prelude_coda_kv_metadata=boundary)
+        ).hidden
 
     def _recurrent(self, hidden, metadata):
         forward = ForwardBatch(
@@ -235,12 +275,13 @@ class SpeculativeRunner:
         """
         return self.rng.acquire(request.request_id, request.sampling_params, logits.device)
 
-    def _coda(self, hidden):
+    def _coda(self, hidden, boundary=None):
         return self.runtime.forward(
             self.runtime.prepare(
                 ForwardBatch(
                     Operation.CODA,
                     hidden=hidden,
+                    prelude_coda_kv_metadata=boundary,
                     graphs=self.coda_graphs,
                 )
             )
@@ -260,8 +301,7 @@ class SpeculativeRunner:
                 if self.config.mode == "pipeline":
                     submission = self._submit_pipeline(batch)
                 else:
-                    inputs, steps, verification = self._prepare_inputs(batch)
-                    submission = self._submit_round(batch, inputs, steps, verification)
+                    submission = self._submit_round(batch, *self._prepare_inputs(batch))
                 self.submissions.complete(submission.event)
                 return submission
         except Exception:
@@ -321,38 +361,69 @@ class SpeculativeRunner:
             ids.extend([request.request_id] * len(state.tokens))
         for buffer in self.input_buffers.values():
             buffer.reset()
-        new = [t for t in tokens if t.hidden is None]
-        input_view = self.input_buffers[torch.int64].append([t.token for t in new])
+        new = [i for i, t in enumerate(tokens) if t.hidden is None]
+        input_view = self.input_buffers[torch.int64].append([tokens[i].token for i in new])
+
+        def stage(values, dtype):
+            return self.input_buffers[dtype].append(values)
+
+        positions = [t.position for t in tokens]
         layouts = self.metadata.build(
             ids,
             [[t.depth + offset for t in tokens] for offset in range(self.config.draft_loops)],
-            [t.position for t in tokens],
+            positions,
             packed=False,
         )
-        layouts = stage_metadata(
-            layouts, lambda values, dtype: self.input_buffers[dtype].append(values)
-        )
+        layouts = stage_metadata(layouts, stage)
+        # Rows that read a draft or target distribution after this step's loops.
+        endpoints = [
+            i
+            for i, t in enumerate(tokens)
+            if t.depth + self.config.draft_loops
+            in (self.config.draft_loops, self.config.target_loops)
+        ]
+        prelude_kv = coda_kv = None
+        if self.boundary_kv:
+            # Boundary history lives at depth 0. A request's rows stay ordered by
+            # position and every row stores before any row attends, so a draft
+            # row reads the target KV its predecessor stores in the same call.
+            def boundary(rows):
+                if not rows:
+                    return None
+                return stage_metadata(
+                    self.metadata.build(
+                        [ids[i] for i in rows],
+                        [[0] * len(rows)],
+                        [positions[i] for i in rows],
+                        packed=False,
+                    ),
+                    stage,
+                )[0]
+
+            prelude_kv, coda_kv = boundary(new), boundary(endpoints)
         uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
         if new:
             inputs = uploaded[input_view.dtype].as_strided(
                 input_view.shape, input_view.stride(), input_view.storage_offset()
             )
-            hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=inputs)).hidden
-            for token, row in zip(new, hidden):
-                token.hidden = row
+            hidden = self._prelude(
+                inputs, None if prelude_kv is None else self.metadata.bind(prelude_kv, uploaded)
+            )
+            for i, row in zip(new, hidden):
+                tokens[i].hidden = row
         hidden = self._recurrent(
             torch.stack([t.hidden for t in tokens]),
             tuple(self.metadata.bind(kv, uploaded) for kv in layouts),
         )
-        endpoints = []
-        for i, (token, row) in enumerate(zip(tokens, hidden)):
+        for token, row in zip(tokens, hidden):
             token.hidden = row
             token.depth += self.config.draft_loops
-            if token.depth in (self.config.draft_loops, self.config.target_loops):
-                endpoints.append(i)
         # Synchronous execution reads decisions in collect(), before the next step.
         choices = (
-            self._coda(hidden[endpoints]).argmax(-1)
+            self._coda(
+                hidden[endpoints],
+                None if coda_kv is None else self.metadata.bind(coda_kv, uploaded),
+            ).argmax(-1)
             if endpoints
             else hidden.new_empty(0, dtype=torch.long)
         )
@@ -415,7 +486,7 @@ class SpeculativeRunner:
             results.append(SpeculativeResult(emitted, accepted, kv_frontier=frontier))
         return results
 
-    def _submit_round(self, batch, inputs, steps, verification):
+    def _submit_round(self, batch, inputs, steps, verification, target_coda=None):
         scheduled_requests = batch.requests
         proposals = [[] for _ in scheduled_requests]
         states = [[] for _ in scheduled_requests]
@@ -423,8 +494,8 @@ class SpeculativeRunner:
         # prelude input, and all of them are read back once after verification.
         drafted = []
         # Each step consumes the previous step's GPU-resident sampled IDs.
-        for offset, (active, metadata) in enumerate(steps):
-            hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=inputs)).hidden
+        for offset, (active, metadata, draft_coda) in enumerate(steps):
+            hidden = self._prelude(inputs, metadata[0] if self.boundary_kv else None)
             hidden = self._recurrent(hidden, metadata)
             drafting = []
             for row, i in enumerate(active):
@@ -433,7 +504,7 @@ class SpeculativeRunner:
                     drafting.append((row, i))
             if not drafting:
                 break
-            logits = self._coda(torch.stack([hidden[row] for row, _ in drafting]))
+            logits = self._coda(torch.stack([hidden[row] for row, _ in drafting]), draft_coda)
             inputs = logits.argmax(-1)
             for row, (_, i) in enumerate(drafting):
                 request = scheduled_requests[i].request
@@ -446,7 +517,7 @@ class SpeculativeRunner:
         # Verification rows are contiguous by request, matching prepared metadata.
         hidden = torch.stack([h for request_states in states for h in request_states])
         hidden = self._recurrent(hidden, verification)
-        logits = self._coda(hidden)
+        logits = self._coda(hidden, target_coda)
         event = None
         if self.device.type == "cuda":
             event = torch.cuda.Event()
