@@ -434,6 +434,166 @@ def test_stage_client_cuda_async_generation_and_close(speculative, device):
     assert client.stats()["used_blocks"] == 0
 
 
+@pytest.mark.gpu
+def test_stage_client_cuda_random_sampling_reuses_external_id_with_a_new_generation():
+    from vllm_rlt.engine.llm_engine import StageClient
+
+    client = StageClient(
+        tiny_ouro_config(head_dim=64),
+        device="cuda",
+        dtype="bfloat16",
+        seed=123,
+        cache_config=CacheConfig(128, 4),
+        attention_backend="triton",
+    )
+    params = SamplingParams(max_tokens=3, temperature=0.8, top_k=5, seed=9, ignore_eos=True)
+    long_params = SamplingParams(max_tokens=60, temperature=0.8, top_k=5, seed=9, ignore_eos=True)
+    try:
+        client.add_request("reuse", [1, 2, 3], params)
+        first = drain(client)["reuse"]
+        assert len(first[0]) == params.max_tokens
+
+        # Let the worker advance this request's RNG slot before aborting. Aborting
+        # must drop that slot in the worker, not only in the parent process.
+        client.add_request("reuse", [1, 2, 3], long_params)
+        old_generation = client.requests["reuse"]
+        for _ in range(200):
+            outputs = client.step()
+            if outputs:
+                break
+        else:
+            pytest.fail("worker produced no output before abort")
+        # Aborting a finished request would make the replay assertion a
+        # coincidence, so require a live, unfinished request here.
+        assert client.has_request("reuse")
+        assert not any(output.finished for output in outputs)
+        client.abort_request("reuse")
+        assert "reuse" not in client.requests
+
+        client.add_request("reuse", [1, 2, 3], params)
+        new_generation = client.requests["reuse"]
+        # The external ID is reused, but the execution identity is not.
+        assert new_generation != old_generation
+        reused = drain(client)["reuse"]
+        # The dropped slot restarts from the request seed instead of continuing
+        # the aborted stream.
+        assert reused == first
+        assert client.stats()["used_blocks"] == 0
+    finally:
+        client.close()
+
+
+class _RecordingChannel:
+    """Capture worker messages without a pipe; no inbound commands are queued."""
+
+    def __init__(self):
+        self.messages = []
+
+    def send(self, message):
+        self.messages.append(message)
+
+    def poll(self, timeout=0):
+        return False
+
+    def recv(self):
+        raise RuntimeError("no inbound messages")
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_worker_release_drops_the_aborted_rng_entry(device):
+    from vllm_rlt.engine.worker import StageWorker
+    from vllm_rlt.models import ModelConfig
+
+    channel = _RecordingChannel()
+    config = tiny_ouro_config(head_dim=64)
+    options = dict(
+        seed=123,
+        dtype="bfloat16" if device == "cuda" else "float32",
+        revision=None,
+        model_config=ModelConfig(config),
+        engine=dict(
+            attention_backend="triton" if device == "cuda" else "torch",
+            cache_config=CacheConfig(128, 4),
+            scheduler_config=SchedulerConfig(max_num_seqs=2),
+        ),
+    )
+    worker = StageWorker(
+        StageConfig(stage_id="local"),
+        device,
+        channel,
+        config,
+        options,
+    )
+    engine = worker.engine
+
+    def step_until_sampled(request_id):
+        for _ in range(200):
+            request = engine.scheduler.requests.get(request_id)
+            generator = engine.rng.peek(request_id)
+            if request is not None and generator is not None and request.generated_token_ids:
+                return generator
+            for output in engine.step():
+                worker.output(output)
+        pytest.fail(f"request {request_id!r} did not sample a token")
+
+    params = SamplingParams(max_tokens=60, temperature=0.8, top_k=7, seed=9, ignore_eos=True)
+    try:
+        worker.command(dict(kind="add", request_id="reuse", tokens=[1, 2, 3], params=params))
+        old = step_until_sampled("reuse")
+        assert old.device.type == torch.device(device).type
+        assert engine.has_request("reuse")
+
+        # Termination is owned by the worker. The parent StageClient cannot see
+        # this registry, so assert the cleanup at the worker-side boundary.
+        worker.command(dict(kind="abort", request_id="reuse"))
+        assert not engine.has_request("reuse")
+        assert engine.rng.peek("reuse") is None
+        assert engine.cache_manager.num_used_blocks == 0
+
+        # A new request reusing the same worker-side ID starts a fresh stream.
+        worker.command(dict(kind="add", request_id="reuse", tokens=[1, 2, 3], params=params))
+        fresh = step_until_sampled("reuse")
+        assert fresh is not old
+        worker.command(dict(kind="abort", request_id="reuse"))
+        assert engine.rng.peek("reuse") is None
+    finally:
+        engine.close()
+
+
+@pytest.mark.gpu
+def test_public_llm_cuda_random_sampling_reaches_the_worker():
+    from vllm_rlt import LLM
+
+    torch.manual_seed(123)
+    llm = LLM(
+        tiny_ouro_config(head_dim=64),
+        device="cuda",
+        dtype="bfloat16",
+        attention_backend="triton",
+        cache_config=CacheConfig(128, 4),
+    )
+    params = SamplingParams(
+        max_tokens=4, temperature=0.8, top_k=5, top_p=0.9, seed=7, ignore_eos=True
+    )
+    try:
+        first = llm.generate([[1, 2, 3]], params)[0]
+        second = llm.generate([[1, 2, 3]], params)[0]
+        # StageClient maps external IDs to internal generations and back, so the
+        # caller still sees its own request IDs on both outputs.
+        assert (first.request_id, second.request_id) == ("0", "1")
+        assert len(first.token_ids) == params.max_tokens
+        assert len(second.token_ids) == params.max_tokens
+        # The worker dropped the finished request's slot, so the same seed replays
+        # its stream across two independent requests.
+        assert second.token_ids == first.token_ids
+        assert llm.engine.process.is_alive()
+    finally:
+        llm.close()
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_connector_becoming_ready_after_selection_is_not_a_scheduler_stall(asynchronous):
     from unittest.mock import Mock
