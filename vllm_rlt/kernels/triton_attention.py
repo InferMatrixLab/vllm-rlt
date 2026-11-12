@@ -47,15 +47,20 @@ def _paged_attention_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     SPLITS: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
     split = tl.program_id(2)
     kv_head = head // HEAD_GROUPS
     length = tl.load(LENGTHS + row)
-    # Equal tile-aligned parts of this row's context; trailing parts may be empty.
-    split_tokens = ((length + SPLITS - 1) // SPLITS + BLOCK_T - 1) // BLOCK_T * BLOCK_T
-    begin = split * split_tokens
+    # WINDOW=0 covers the full context; otherwise only the last WINDOW keys are
+    # read, which is a sliding sublayer's mask. Out-of-window keys stay stored.
+    covered = length if WINDOW == 0 else tl.minimum(length, WINDOW)
+    # Equal tile-aligned parts of the covered range; trailing parts may be empty.
+    split_tokens = ((covered + SPLITS - 1) // SPLITS + BLOCK_T - 1) // BLOCK_T * BLOCK_T
+    window_start = length - covered
+    begin = window_start + split * split_tokens
     end = tl.minimum(length, begin + split_tokens)
     dims = tl.arange(0, BLOCK_D)
     query = tl.load(
@@ -142,8 +147,14 @@ def _paged_attention_merge_kernel(
     )
 
 
-def paged_attention(q, key_cache, value_cache, block_tables, context_lengths):
-    """Launch split-KV parts over [row, head, split], then merge per [row, head]."""
+def paged_attention(q, key_cache, value_cache, block_tables, context_lengths, window=0):
+    """Launch split-KV parts over [row, head, split], then merge per [row, head].
+
+    ``window`` masks each row to its last ``window`` keys (0 keeps the full
+    context); it never reclaims storage.
+    """
+    if type(window) is not int or window < 0:
+        raise ValueError("window must be a nonnegative integer")
     output = torch.empty_like(q)
     if q.shape[0] == 0:
         return output
@@ -173,6 +184,7 @@ def paged_attention(q, key_cache, value_cache, block_tables, context_lengths):
         BLOCK_D=block_d,
         BLOCK_T=32,
         SPLITS=NUM_SPLITS,
+        WINDOW=window,
         num_warps=4,
     )
     _paged_attention_merge_kernel[(rows, heads)](

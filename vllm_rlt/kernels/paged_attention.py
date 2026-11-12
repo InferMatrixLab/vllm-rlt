@@ -89,6 +89,7 @@ def triton_paged_attention(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
+    window: int = 0,
 ) -> torch.Tensor:
     """Dispatch explicitly to Triton, with no silent reference fallback."""
     if q.device.type != "cuda":
@@ -98,7 +99,7 @@ def triton_paged_attention(
     # Keep Triton optional and avoid loading its runtime for CPU-only callers.
     from vllm_rlt.kernels.triton_attention import paged_attention
 
-    return paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
+    return paged_attention(q, key_cache, value_cache, block_tables, context_lengths, window=window)
 
 
 def triton_paged_prefill(
@@ -117,6 +118,11 @@ class TritonPagedAttention:
 
     def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
         return triton_paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
+
+    def windowed(self, q, key_cache, value_cache, block_tables, context_lengths, window):
+        return triton_paged_attention(
+            q, key_cache, value_cache, block_tables, context_lengths, window=window
+        )
 
     def prefill(self, *args, **kwargs):
         return triton_paged_prefill(*args, **kwargs)

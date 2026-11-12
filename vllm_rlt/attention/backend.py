@@ -57,7 +57,7 @@ class AttentionBackend:
 
 _TORCH_CAPABILITIES = BackendCapabilities(sliding_window=True)
 _TRITON_CAPABILITIES = BackendCapabilities(
-    cuda_graphs=True, async_scheduling=True, device_context_lengths=True
+    cuda_graphs=True, async_scheduling=True, device_context_lengths=True, sliding_window=True
 )
 _FLASH_CAPABILITIES = {
     2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
