@@ -484,6 +484,13 @@ def test_invalid_k(k):
         SpeculativeConfig(k)
 
 
+def test_wise_draft_requires_block_speculation():
+    # Pipeline rounds have no WISE draft path; only block speculation accepts it.
+    assert SpeculativeConfig(4, draft_attention="wise").mode == "block"
+    with pytest.raises(ValueError, match="requires block speculation"):
+        SpeculativeConfig(4, draft_loops=1, mode="pipeline", draft_attention="wise")
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["triton", "flash_attn_4"])
 def test_gpu_sampling_and_greedy_match_replay_with_ragged_requests(backend):

@@ -95,9 +95,11 @@ class FlashPagedAttention:
         )
         return out[0] if isinstance(out, tuple) else out
 
-    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
+    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths, return_lse=False):
+        """Decode attention; with ``return_lse`` also the [rows, heads] natural-log normalizers."""
         if q.shape[0] == 0:
-            return torch.empty_like(q)
+            empty = torch.empty_like(q)
+            return (empty, q.new_empty(q.shape[:2], dtype=torch.float32)) if return_lse else empty
         # The visible prefix already includes exactly the current causal position.
         # Do not append K/V here: the cache manager has written it at this depth.
         query = q.unsqueeze(1)
@@ -114,6 +116,7 @@ class FlashPagedAttention:
                 # Auto splitting depends on batch size and changes BF16 reductions.
                 # Keep the partition fixed across scheduler batch compositions.
                 num_splits=1,
+                **({"return_lse": True} if return_lse else {}),
             )
         else:
             page_argument = "block_table" if self.generation == 2 else "page_table"
@@ -124,7 +127,18 @@ class FlashPagedAttention:
                 cache_seqlens=context_lengths,
                 causal=True,
                 **{page_argument: block_tables},
+                **({"return_softmax_lse": True} if return_lse else {}),
             )
+        lse = None
         if isinstance(out, tuple):
-            out = out[0]  # FA4 beta returns (output, optional LSE).
+            out, lse = out[0], out[1]  # FA4 beta returns (output, optional LSE).
+        if return_lse:
+            # [rows, heads, 1] or [rows, 1, heads]; one query position per row.
+            rows, heads = q.shape[:2]
+            lse = (
+                lse.reshape(rows, heads)
+                if lse.shape[1] == heads
+                else lse.transpose(1, 2).reshape(rows, heads)
+            )
+            return out.squeeze(1), lse.float()
         return out.squeeze(1)

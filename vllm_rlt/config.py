@@ -180,6 +180,10 @@ class SpeculativeConfig:
     draft_loops: int = 2
     target_loops: int = 4
     mode: str = "block"
+    # "truncate": draft reads out after draft_loops. "wise": draft runs every
+    # target loop, with WISE working-set attention after draft_loops; the
+    # verification recomputes those loops densely from the shared draft_loops state.
+    draft_attention: str = "truncate"
 
     def __post_init__(self):
         for name in ("num_speculative_tokens", "draft_loops", "target_loops"):
@@ -190,3 +194,7 @@ class SpeculativeConfig:
             raise ValueError("pipeline draft_loops must divide target_loops")
         if self.draft_loops >= self.target_loops:
             raise ValueError("draft_loops must be smaller than target_loops")
+        if self.draft_attention not in ("truncate", "wise"):
+            raise ValueError("draft_attention must be 'truncate' or 'wise'")
+        if self.draft_attention == "wise" and self.mode != "block":
+            raise ValueError("draft_attention='wise' requires block speculation")
