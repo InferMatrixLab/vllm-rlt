@@ -43,7 +43,10 @@ GENERATED_TOKENS = 4
 # spread on this checkpoint. Observed margins from this run are reported below;
 # these bounds leave room for backend arithmetic without hiding a wrong model.
 TOP_K = 20
-MAX_TOP_DEVIATION = 1.0
+# BF16 (GPU) versus FP32 (CPU) logits on this checkpoint: measured 0.0422,
+# 0.0656 and 0.0712 at 1, 2 and 4 loops with 20/20 top-20 overlap. The bound
+# leaves ~3x margin for backend arithmetic without hiding a wrong model.
+MAX_TOP_DEVIATION = 0.25
 
 
 def load(device, dtype, loops):
