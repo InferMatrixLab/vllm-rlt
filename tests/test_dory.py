@@ -219,6 +219,60 @@ def test_engine_sizes_kv_for_attention_layers_only(model):
     assert boundary | recurrent == set(range(model.config.num_kv_layers))
 
 
+def test_default_layer_types_match_the_released_attention_pattern():
+    config = DoryConfig()
+    assert len(config.layer_types) == 72
+    assert config.layer_types.count("sliding_attention") == 27
+    assert config.layer_types.count("full_attention") == 9
+    assert config.layer_types.count("mlp") == 36
+    assert config.layer_types == tuple(artifact_layer_types())
+    # Every fourth attention pair is full attention; nothing defaults to all-sliding.
+    full = [
+        index
+        for index in config.attention_layer_ids
+        if config.layer_types[index] != "sliding_attention"
+    ]
+    assert full == [6, 14, 22, 30, 38, 46, 54, 62, 70]
+
+
+def test_omitted_layer_types_builds_the_released_pattern_and_matches_reference():
+    torch.manual_seed(11)
+    model = DoryForCausalLM(tiny_dory_config(layer_types=None)).eval()
+    assert set(model.config.layer_types) == {"sliding_attention", "full_attention", "mlp"}
+    tokens = torch.tensor([4, 7, 9, 3, 12])
+    actual, _ = run_one_token_per_step(model, tokens)
+    assert_matches_reference(actual, dense_dory_reference(model, tokens))
+
+
+def test_omitted_layer_types_requires_paired_stages():
+    with pytest.raises(ValueError, match="attention/MLP pairs"):
+        tiny_dory_config(
+            layer_types=None,
+            n_input_layers=3,
+            num_hidden_layers=9,
+            n_recurrent_layers=4,
+            n_output_layers=2,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        # `eos or ()` used to normalize False into "no EOS", disabling stopping.
+        ({"eos_token_id": False}, "integers"),
+        ({"eos_token_id": (2, False)}, "integers"),
+        ({"bos_token_id": False}, "integers"),
+        ({"pad_token_id": False}, "integers"),
+        ({"eos_token_id": "2"}, "eos_token_id must be"),
+        ({"layer_types": "sliding_attention"}, "layer_types must be a sequence"),
+        ({"rope_parameters": [("sliding_attention", {})]}, "rope_parameters must map"),
+    ],
+)
+def test_config_rejects_malformed_special_tokens_and_shapes(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        tiny_dory_config(**overrides)
+
+
 def test_last_loop_mode_uses_the_shared_plane():
     config = DoryConfig.from_dict(
         {**artifact_config_dict(), "recurrent_kv_cache_mode": "last_loop"}

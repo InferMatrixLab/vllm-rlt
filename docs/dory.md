@@ -18,6 +18,14 @@ either attention or MLP, plus an NGPT slerp residual:
 | Recurrent (`n_recurrent_layers`) | 40 (20 attention, 20 MLP) | per loop depth, or one shared plane |
 | Output (`n_output_layers`) | 16 (8 attention, 8 MLP) | boundary KV at depth 0 |
 
+`layer_types` maps every physical sublayer to `sliding_attention`,
+`full_attention` or `mlp`, and the released artifact lists 27 sliding and 9
+full attention sublayers: every fourth attention pair is full attention. When
+`layer_types` is omitted the constructor generates exactly that pattern, and
+refuses anything that is not attention/MLP pairs so a custom stack cannot fall
+back to an all-sliding architecture by accident. `sliding_window` (1024 in the
+artifact) applies only to `sliding_attention` sublayers.
+
 The recurrent stage runs `n_recurrent_loops` times. Before every loop the
 retained input-stage output is combined with the state and re-normalized, so
 the runner carries `[recurrent state, injection input]` and

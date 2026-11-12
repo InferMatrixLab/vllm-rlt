@@ -157,10 +157,9 @@ class DoryConfig:
 
         layer_types = self.layer_types
         if layer_types is None:
-            layer_types = tuple(
-                "sliding_attention" if index % 2 == 0 else "mlp"
-                for index in range(self.num_hidden_layers)
-            )
+            layer_types = self._released_layer_types()
+        elif isinstance(layer_types, str | bytes) or not isinstance(layer_types, list | tuple):
+            raise ValueError("layer_types must be a sequence of sublayer types")
         else:
             layer_types = tuple(layer_types)
             if len(layer_types) != self.num_hidden_layers:
@@ -188,6 +187,8 @@ class DoryConfig:
         parameters = self.rope_parameters
         if parameters is None:
             parameters = _DEFAULT_ROPE_PARAMETERS
+        elif not isinstance(parameters, dict):
+            raise ValueError("rope_parameters must map layer types to rotary settings")
         parameters = {name: dict(values) for name, values in parameters.items()}
         for name in set(layer_types) - {"mlp"}:
             if name not in parameters:
@@ -202,8 +203,19 @@ class DoryConfig:
                 raise ValueError("rope_theta must be finite and positive")
         object.__setattr__(self, "rope_parameters", parameters)
 
+        # Reject malformed input before normalization: `eos or ()` would turn a
+        # boolean False into "no EOS", silently disabling stopping.
         eos = self.eos_token_id
-        eos = (eos,) if isinstance(eos, int) and not isinstance(eos, bool) else tuple(eos or ())
+        if eos is None:
+            eos = ()
+        elif isinstance(eos, bool):
+            raise ValueError("special token IDs must be integers")
+        elif isinstance(eos, int):
+            eos = (eos,)
+        elif isinstance(eos, list | tuple):
+            eos = tuple(eos)
+        else:
+            raise ValueError("eos_token_id must be an integer, a sequence of integers, or None")
         for token_id in (*eos, self.bos_token_id, self.pad_token_id):
             if token_id is None:
                 continue
@@ -212,6 +224,23 @@ class DoryConfig:
             if not 0 <= token_id < self.vocab_size:
                 raise ValueError("special token IDs must be vocabulary indices")
         object.__setattr__(self, "eos_token_id", eos or None)
+
+    def _released_layer_types(self) -> tuple[str, ...]:
+        """Released Dory layout, used when ``layer_types`` is omitted.
+
+        The pinned artifact lists 27 sliding and 9 full attention sublayers: every
+        fourth attention pair uses full attention. An all-sliding fallback would
+        be a *different* architecture that still loads a strict checkpoint, so a
+        stack that is not attention/MLP pairs must pass ``layer_types`` instead.
+        """
+        counts = (self.n_input_layers, self.n_recurrent_layers, self.n_output_layers)
+        if self.num_hidden_layers % 2 or any(count % 2 for count in counts):
+            raise ValueError("layer_types is required unless every stage holds attention/MLP pairs")
+        names = []
+        for pair in range(self.num_hidden_layers // 2):
+            names.append("full_attention" if pair % 4 == 3 else "sliding_attention")
+            names.append("mlp")
+        return tuple(names)
 
     @property
     def hidden_size(self) -> int:
