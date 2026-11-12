@@ -425,12 +425,15 @@ class StageEngine:
         ) and params.temperature != 0:
             mode = "async" if self.async_speculative else "pipeline"
             raise ValueError(f"{mode} speculative decoding currently requires greedy sampling")
-        # A request id is never reused while its previous token is retiring:
-        # reference slots are recycled only after their last reader completed,
-        # so rejecting the duplicate keeps ownership unambiguous without a
-        # per-slot generation counter.
-        if request_id in self._retiring_speculative or request_id in self.scheduler.requests:
-            raise ValueError(f"duplicate request ID {request_id!r}: already live or still retiring")
+        # Abort-then-resubmit is a normal client retry, so a retiring id is
+        # drained rather than rejected: waiting releases the previous
+        # generation's references before the new request starts, which is what
+        # makes lease identity sufficient without a per-slot counter. A request
+        # that is still live is rejected — the caller has to abort it first.
+        if request_id in self._retiring_speculative:
+            self._retire_speculative(wait=True, request_id=request_id)
+        if request_id in self.scheduler.requests:
+            raise ValueError(f"duplicate request ID {request_id!r}: already live")
         config = self.model.config
         if not prompt_token_ids:
             raise ValueError("prompt must contain at least one token")
