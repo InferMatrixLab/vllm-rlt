@@ -215,9 +215,9 @@ def parse_trace(path, output, metadata):
             "Memory events describe visible allocations, not total device memory.",
         ],
     )
-    if "cuda" in (metadata["config"].get("activities") or ()) and not any(
-        counts[c] for c in ("kernel", "gpu_memcpy", "gpu_memset")
-    ):
+    # Older metadata may omit the resolved activities stored by ProfileSession.
+    activities = metadata.get("activities", metadata["config"].get("activities")) or ()
+    if "cuda" in activities and not any(counts[c] for c in ("kernel", "gpu_memcpy", "gpu_memset")):
         summary["notes"].append("No CUDA device events recorded; device coverage is unverified.")
     _write_json_atomic(output / "summary.json", summary)
 
