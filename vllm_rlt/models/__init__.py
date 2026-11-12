@@ -117,20 +117,38 @@ def special_token_ids(tokenizer):
     return ids
 
 
-def load_tokenizer(source, *, revision=None):
-    """Load cached tokenizer assets, asking before any missing Hub download."""
+def _auto_tokenizer(source, revision, *, local_files_only):
+    """Resolve the tokenizer, tolerating a config transformers does not model.
+
+    transformers builds the checkpoint config while choosing the tokenizer
+    class, so a configuration it rejects would fail before any tokenizer file is
+    read. Dory is such a case: its ``layer_types`` list ``mlp`` sublayers, which
+    the generic validator does not allow. Passing an empty config skips that
+    lookup; the tokenizer class still comes from ``tokenizer_config.json``.
+    """
     from transformers import AutoTokenizer
 
+    kwargs = {"revision": revision, "trust_remote_code": False}
+    if local_files_only:
+        kwargs["local_files_only"] = True
+    try:
+        return AutoTokenizer.from_pretrained(source, **kwargs)
+    except ValueError:
+        from transformers import PretrainedConfig
+
+        return AutoTokenizer.from_pretrained(source, **kwargs, config=PretrainedConfig())
+
+
+def load_tokenizer(source, *, revision=None):
+    """Load cached tokenizer assets, asking before any missing Hub download."""
     source = resolve_model_source(source)
     try:
-        return AutoTokenizer.from_pretrained(
-            source, revision=revision, trust_remote_code=False, local_files_only=True
-        )
+        return _auto_tokenizer(source, revision, local_files_only=True)
     except OSError:
         if Path(source).is_dir():
             raise
     _confirm_download(source)
-    return AutoTokenizer.from_pretrained(source, revision=revision, trust_remote_code=False)
+    return _auto_tokenizer(source, revision, local_files_only=False)
 
 
 class AutoModelForCausalLM:

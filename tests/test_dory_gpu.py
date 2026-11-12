@@ -118,7 +118,10 @@ def test_dory_gpu_triton_matches_cpu_dense_oracle(kv_mode):
     reference = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode=kv_mode)).eval()
     torch.manual_seed(42)
     reference.load_state_dict(
-        {name: value.cpu() for name, value in make_gpu_model(recurrent_kv_cache_mode=kv_mode).state_dict().items()}
+        {
+            name: value.cpu()
+            for name, value in make_gpu_model(recurrent_kv_cache_mode=kv_mode).state_dict().items()
+        }
     )
     expected = dense_dory_reference(reference, tokens)["logits"]
     model = make_gpu_model(recurrent_kv_cache_mode=kv_mode)

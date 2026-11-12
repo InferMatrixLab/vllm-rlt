@@ -15,6 +15,7 @@ quantities (top-1, top-5 overlap, the largest deviation among the top logits,
 and the generated tokens) instead of assuming equality.
 """
 
+import gc
 import os
 
 import pytest
@@ -24,7 +25,7 @@ from tests.reference.dory import dense_dory_reference
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import DoryForCausalLM
+from vllm_rlt.models import DoryForCausalLM, load_tokenizer
 
 CHECKPOINT = os.environ.get("DORY_CHECKPOINT")
 
@@ -52,6 +53,7 @@ def load(device, dtype, loops):
 def staged_logits(model, tokens, backend="triton"):
     """Reference schedule: one token per step, staged prelude/core/coda."""
     config = model.config
+    device = next(model.parameters()).device
     cache = KVCacheManager(
         num_layers=config.num_kv_layers,
         num_kv_heads=config.num_key_value_heads,
@@ -59,7 +61,7 @@ def staged_logits(model, tokens, backend="triton"):
         num_blocks=64,
         block_size=16,
         max_loops=config.total_ut_steps,
-        device=model.device,
+        device=device,
         dtype=next(model.parameters()).dtype,
         backend=backend,
         layout=config.kv_cache_layout,
@@ -70,9 +72,7 @@ def staged_logits(model, tokens, backend="triton"):
     logits = []
     for position in range(len(tokens)):
         boundary = cache._prepare_batch(ids[:1], [0], [position])
-        hidden = model.prelude_prepared(
-            tokens[position : position + 1].to(model.device), boundary, cache
-        )
+        hidden = model.prelude_prepared(tokens[position : position + 1].to(device), boundary, cache)
         for depth in range(config.total_ut_steps):
             core = cache._prepare_batch(ids[:1], [depth], [position])
             hidden, _ = model.recurrent_prepared(hidden, core, cache)
@@ -99,10 +99,13 @@ def greedy_from_logits(model, tokens, count, device=None):
 
 
 def prompt_tokens():
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
+    tokenizer = load_tokenizer(CHECKPOINT)
     return tokenizer(PROMPT_TEXT, return_tensors="pt").input_ids[0], tokenizer
+
+
+def wide_cpu_threads():
+    """The FP32 oracle is CPU-bound and the session fixture pins one thread."""
+    torch.set_num_threads(min(32, os.cpu_count() or 1))
 
 
 def report(loops, gpu, cpu, tokens):
@@ -134,6 +137,7 @@ def report(loops, gpu, cpu, tokens):
 
 
 def test_real_checkpoint_bf16_matches_fp32_reference_in_both_directions():
+    wide_cpu_threads()
     tokens, _ = prompt_tokens()
     results = {}
     for loops in LOOP_COUNTS:
@@ -143,6 +147,7 @@ def test_real_checkpoint_bf16_matches_fp32_reference_in_both_directions():
             results[loops] = report(loops, gpu, cpu, tokens)
         finally:
             del gpu, cpu
+            gc.collect()
             torch.cuda.empty_cache()
 
     for loops, result in results.items():
