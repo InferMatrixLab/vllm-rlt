@@ -117,6 +117,18 @@ def special_token_ids(tokenizer):
     return ids
 
 
+def _rejected_config_errors():
+    """Errors transformers raises when it refuses a checkpoint configuration."""
+    errors = [ValueError]
+    try:
+        from huggingface_hub.errors import StrictDataclassClassValidationError
+    except ImportError:  # older huggingface_hub has no strict dataclass validation
+        pass
+    else:
+        errors.append(StrictDataclassClassValidationError)
+    return tuple(errors)
+
+
 def _auto_tokenizer(source, revision, *, local_files_only):
     """Resolve the tokenizer, tolerating a config transformers does not model.
 
@@ -133,7 +145,7 @@ def _auto_tokenizer(source, revision, *, local_files_only):
         kwargs["local_files_only"] = True
     try:
         return AutoTokenizer.from_pretrained(source, **kwargs)
-    except ValueError:
+    except _rejected_config_errors():
         from transformers import PretrainedConfig
 
         return AutoTokenizer.from_pretrained(source, **kwargs, config=PretrainedConfig())
