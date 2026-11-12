@@ -175,7 +175,8 @@ class AsyncState:
         was_reserved = rid in self.slots
         slot = self.reserve_slot(request)
         previous = self.table_versions.get(rid)
-        current = allocation.block_tables
+        # Page entries per logical plane: physical blocks, or flattened pages when packed.
+        current = self.cache.entry_tables(allocation)
         if previous != current:
             for plane, pages in enumerate(current):
                 old = previous[plane] if previous is not None else ()

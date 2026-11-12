@@ -20,9 +20,11 @@ class CacheConfig:
     incremental_allocation: bool = False
     # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
+    # Share physical blocks among deeper planes when only some layers recur.
+    pack_recurrent_planes: bool = True
 
     def __post_init__(self):
-        for name in ("enable_prefix_caching", "incremental_allocation"):
+        for name in ("enable_prefix_caching", "incremental_allocation", "pack_recurrent_planes"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if not 0 <= self.watermark_ratio < 1:

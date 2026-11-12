@@ -27,7 +27,11 @@ Code: [manager](../vllm_rlt/core/kv_cache_manager.py),
 ## Capacity, validity and lifetime
 
 `required_blocks(tokens)` counts physical blocks across storage planes.
-LAST_EXITED has one plane per recurrent depth; SHARED has one plane. A request's
+LAST_EXITED has one plane per recurrent depth; SHARED has one plane. With plane
+packing (see [KV layout computation](kv_layout_computation.md#7-plane-packing-for-partially-recurrent-models))
+several deeper planes share one physical block, `block_tables` has
+`physical_planes` entries and `_entries(allocation, depth)` maps a depth to
+layer-flattened page entries; written state stays per logical plane. A request's
 maximum input extent is prompt length plus `max_tokens - 1`: the last sampled
 output is not fed back into the model.
 
