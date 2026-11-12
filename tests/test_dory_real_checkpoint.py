@@ -115,12 +115,9 @@ def report(loops, gpu, cpu, tokens):
     top_cpu_ids = torch.topk(cpu_logits[-1], TOP_K).indices
     overlap = len(set(top_gpu.indices.tolist()) & set(top_cpu_ids.tolist()))
     reference_ids = top_cpu_ids.to(gpu_logits.device)
-    deviation = (
-        (gpu_logits[-1][reference_ids] - cpu_logits[-1][reference_ids].to(gpu_logits.device))
-        .abs()
-        .max()
-        .item()
-    )
+    gpu_top = gpu_logits[-1][reference_ids].float().cpu()
+    cpu_top = cpu_logits[-1][top_cpu_ids].float()
+    deviation = (gpu_top - cpu_top).abs().max().item()
     gpu_greedy = greedy_from_logits(gpu, tokens.tolist(), GENERATED_TOKENS, device="cuda")
     cpu_greedy = greedy_from_logits(cpu, tokens.tolist(), GENERATED_TOKENS)
     print(
