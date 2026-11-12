@@ -79,7 +79,10 @@ class StageEngine:
                 raise ValueError(
                     "boundary-KV models do not support staged prefill required by this scheduler"
                 )
-            if self.execution_config.async_scheduling or self.execution_config.prefill_uva:
+            if self.execution_config.prefill_uva or (
+                self.execution_config.async_scheduling
+                and not getattr(model, "supports_async_scheduling", False)
+            ):
                 raise ValueError(
                     "boundary-KV models require synchronous scheduling without prefill UVA"
                 )
@@ -145,10 +148,16 @@ class StageEngine:
                     speculative_config.num_speculative_tokens,
                 )
         if self.execution_config.async_scheduling:
-            if not self.async_speculative and self.exit_config.mode not in (
-                "ouro_delayed",
-                "random_lookahead",
-                "trace",
+            # A fixed-loop model has no exit decision to delay or look ahead to.
+            if (
+                not self.async_speculative
+                and not getattr(model, "fixed_loop_count", False)
+                and self.exit_config.mode
+                not in (
+                    "ouro_delayed",
+                    "random_lookahead",
+                    "trace",
+                )
             ):
                 raise ValueError(
                     "async scheduling requires ouro_delayed, random_lookahead or trace exit mode"

@@ -629,5 +629,44 @@ def test_model_declares_kv_layout_and_sliding_window_requirements(model):
     assert model.kv_cache_layout == model.config.kv_cache_layout == "last_exited"
     # Backend selection must reject a maskless backend at construction time.
     assert model.requires_sliding_window is True
-    assert model.supports_cuda_graphs is False
+    # Graphs and ordinary asynchronous scheduling are qualified for Dory.
+    assert getattr(model, "supports_cuda_graphs", True) is True
+    assert model.supports_async_scheduling is True
     assert model.fixed_loop_count is True
+
+
+def test_fixed_depth_requests_need_no_exit_signal(model):
+    """Asynchronous scheduling reads a score back only when it can end a request."""
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=256, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
+    )
+    # exit_threshold below one would otherwise ask for every loop's score.
+    params = SamplingParams(
+        max_tokens=1, min_loops=2, max_loops=2, exit_threshold=0.5, ignore_eos=True
+    )
+    engine.add_request("request", [4, 7, 3], params)
+    request = engine.scheduler.requests["request"]
+    for loops_done in range(model.config.total_ut_steps):
+        request.loops_done = loops_done
+        assert not engine.scheduler.needs_exit_signal(request)
+    engine.abort_request("request")
+
+
+def test_exit_written_ignores_boundary_layers(model):
+    """Finalizing a token depends on the recurrent layers only: the output stage
+    runs after the exit and boundary KV lives at depth 0."""
+    cache = make_cache(model)
+    assert cache.allocate("request", 1)
+    tokens = torch.tensor([5])
+    boundary = cache._prepare_batch(["request"], [0], [0])
+    hidden = model.prelude_prepared(tokens, boundary, cache)
+    for depth in range(model.config.total_ut_steps):
+        assert not cache.exit_written("request", 0, depth)
+        core = cache._prepare_batch(["request"], [depth], [0])
+        hidden, _ = model.recurrent_prepared(hidden, core, cache)
+        assert cache.exit_written("request", 0, depth)
+    # The output stage has not run, so "every layer" is still false.
+    assert not cache.token_written("request", 0, model.config.total_ut_steps - 1)
+    cache.free("request")
