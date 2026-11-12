@@ -219,6 +219,16 @@ def test_engine_sizes_kv_for_attention_layers_only(model):
     assert boundary | recurrent == set(range(model.config.num_kv_layers))
 
 
+def test_padding_index_survives_token_id_zero():
+    torch.manual_seed(3)
+    model = DoryForCausalLM(tiny_dory_config(pad_token_id=0))
+    # Token 0 is a valid vocabulary index, so it must not collapse to "no padding".
+    assert model.backbone.embeddings.padding_idx == 0
+    assert int(torch.count_nonzero(model.backbone.embeddings.weight[0])) == 0
+    no_padding = DoryForCausalLM(tiny_dory_config(pad_token_id=None))
+    assert no_padding.backbone.embeddings.padding_idx is None
+
+
 def test_default_layer_types_match_the_released_attention_pattern():
     config = DoryConfig()
     assert len(config.layer_types) == 72

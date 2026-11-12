@@ -463,9 +463,7 @@ class DoryBackbone(nn.Module):
 
     def __init__(self, config: DoryConfig) -> None:
         super().__init__()
-        self.embeddings = nn.Embedding(
-            config.vocab_size, config.d_model, config.pad_token_id if config.pad_token_id else None
-        )
+        self.embeddings = nn.Embedding(config.vocab_size, config.d_model, config.pad_token_id)
         self.layers = nn.ModuleList(
             DorySublayer(config, index) for index in range(config.num_hidden_layers)
         )
