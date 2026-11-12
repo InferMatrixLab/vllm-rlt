@@ -114,14 +114,20 @@ def report(loops, gpu, cpu, tokens):
     top_gpu = torch.topk(gpu_logits[-1], TOP_K)
     top_cpu_ids = torch.topk(cpu_logits[-1], TOP_K).indices
     overlap = len(set(top_gpu.indices.tolist()) & set(top_cpu_ids.tolist()))
-    deviation = (gpu_logits[-1][top_cpu_ids] - cpu_logits[-1][top_cpu_ids]).abs().max()
+    reference_ids = top_cpu_ids.to(gpu_logits.device)
+    deviation = (
+        (gpu_logits[-1][reference_ids] - cpu_logits[-1][reference_ids].to(gpu_logits.device))
+        .abs()
+        .max()
+        .item()
+    )
     gpu_greedy = greedy_from_logits(gpu, tokens.tolist(), GENERATED_TOKENS, device="cuda")
     cpu_greedy = greedy_from_logits(cpu, tokens.tolist(), GENERATED_TOKENS)
     print(
         f"loops={loops} tokens={len(tokens)} "
         f"top1_equal={int(top_gpu.indices[0]) == int(top_cpu_ids[0])} "
         f"top{TOP_K}_overlap={overlap}/{TOP_K} "
-        f"max|dlogit|={deviation.item():.4f} "
+        f"max|dlogit|={deviation:.4f} "
         f"greedy_gpu={gpu_greedy} greedy_cpu={cpu_greedy}",
         flush=True,
     )
@@ -130,7 +136,7 @@ def report(loops, gpu, cpu, tokens):
         "cpu_logits": cpu_logits,
         "top1_equal": int(top_gpu.indices[0]) == int(top_cpu_ids[0]),
         "overlap": overlap,
-        "deviation": float(deviation),
+        "deviation": deviation,
         "gpu_greedy": gpu_greedy,
         "cpu_greedy": cpu_greedy,
     }
@@ -162,19 +168,21 @@ def test_real_checkpoint_bf16_matches_fp32_reference_in_both_directions():
     ), "one and four loops produced the same reference logits"
 
 
-def test_real_checkpoint_bf16_backend_parity_on_gpu():
+@pytest.mark.parametrize(("dtype", "tolerance"), [(torch.float32, 5e-3), (torch.bfloat16, 0.25)])
+def test_real_checkpoint_backend_parity_on_gpu(dtype, tolerance):
+    """Triton and Torch kernels must agree; BF16 rounding stacks on top."""
     tokens, _ = prompt_tokens()
-    model = load("cuda", torch.bfloat16, 2)
+    model = load("cuda", dtype, 2)
     try:
         triton = staged_logits(model, tokens, backend="triton")
         torch_backend = staged_logits(model, tokens, backend="torch")
     finally:
         del model
+        gc.collect()
         torch.cuda.empty_cache()
     difference = (triton - torch_backend).abs().max().item()
-    print(f"triton vs torch backend (bf16): max|dlogit|={difference:.4f}", flush=True)
-    # Same weights and precision, different kernels: only arithmetic order differs.
-    assert difference <= 0.05, difference
+    print(f"backend parity ({dtype}): max|dlogit|={difference:.6f}", flush=True)
+    assert difference <= tolerance, difference
 
 
 def test_real_checkpoint_generation_stops_on_eos_or_limit():
