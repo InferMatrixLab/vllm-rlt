@@ -96,7 +96,9 @@ These fail fast rather than degrade silently:
 
 - WCPB, mixed or staged prefill; packed prefill metadata (`prefill_uva`); PD.
 - Prefix caching.
-- Self-speculation.
+- Self-speculation combined with CUDA Graphs, asynchronous scheduling,
+  preemption or `last_loop` KV, and sampled token-pipeline speculation. The
+  synchronous eager form is supported; see below.
 - Per-request loop counts other than the configured full depth: Dory has no
   trained exit gate, so the runtime refuses to invent one, including via
   `min_loops` with `exit_threshold=0`.
@@ -112,6 +114,43 @@ the `sliding_window` capability, so a Flash-backed Dory engine fails at
 construction instead of attending full history. Masking accepts host-planned,
 graph-private and device-owned metadata; storage reclamation of out-of-window
 pages stays with 2B.
+
+## Synchronous self-speculation
+
+`SpeculativeConfig(K, draft_loops=d, target_loops=T, mode=...)` drafts with the
+first `d` recurrent loops and verifies with all `T`, where `T` is the loop count
+the model was loaded with. It needs `per_loop` KV, synchronous eager execution
+and fixed-depth requests (`min_loops == max_loops == T`). Qualified depth pairs
+are 1→2, 1→4 and 2→4.
+
+| Mode | Sampling | Round |
+| --- | --- | --- |
+| `block` | greedy, or temperature/top-k/top-p with rejection sampling | `K` draft tokens one after another, then one verification of `K + 1` positions |
+| `pipeline` | greedy | every submission advances each retained token by `d` loops; `d` must divide `T` |
+
+What a draft shares with the target, and what it does not:
+
+- **Input stage.** Prelude KV depends only on the input tokens. A candidate's
+  prelude is the target's prelude whenever the candidate is accepted, so it is
+  computed once.
+- **Recurrent loops.** With `per_loop` KV, loop `i` of a position reads only
+  loop `i` of earlier positions. The draft's loops `0..d-1` are the target's
+  first `d` loops; verification continues from the retained state with loops
+  `d..T-1`.
+- **Output stage.** CODA attention reads the state it is given, so draft CODA
+  KV (after `d` loops) differs from target CODA KV (after `T` loops) at the
+  same position. A draft CODA stores at its own position, which is never below
+  the committed frontier, and the target CODA of that position stores over it
+  before any target row attends it. Target rows therefore read target history
+  only. Draft rows read target history for committed positions and draft
+  history for positions still in flight; that affects acceptance, never the
+  committed output.
+- **Rollback.** After a rejection the scheduler cuts every plane, boundary
+  layers included, back to the committed frontier (`truncate_suffix`); the next
+  round stores over the stale slots.
+
+Sliding-window attention takes one query row per token, so verification uses
+per-row attention rather than a packed call.
 
 ## Validation status
 
@@ -206,14 +245,94 @@ cohorts into one decode wave and BF16 greedy tokens depend on batch
 composition. FP32 is therefore the exact check; BF16 agreement is not promised
 across batch shapes.
 
+### Self-speculation
+
+`tests/test_dory_speculative.py` (54 CPU cases) checks block and token-pipeline
+speculation for the depth pairs 1→2, 1→4 and 2→4 against the dense oracle:
+greedy tokens for ragged batches, a forced rejection at every draft position,
+all-accepted rounds with the bonus token, EOS inside an accepted prefix, output
+and context limits, cancellation with ID reuse, cleanup after a failed round,
+seeded sampling replay, the rejection-sampling output distribution, and the
+rejected combinations. After every round the committed KV equals the serial
+target history and nothing is written above the committed frontier. On one
+GH200 the file passes together with `tests/test_dory_gpu.py` and
+`tests/test_speculative.py` (251 passed; the only failures are 12
+`flash_attn_4` cases whose optional package is not installed there).
+
+Real checkpoint, Triton, synchronous eager, greedy, WikiText prompts, one GH200
+(torch 2.14.0+cu130). Speculative tokens are compared with the non-speculative
+baseline of the same process:
+
+| Dtype | Loops | Shape (requests × prompt + generated) | Arms | Requests with identical tokens |
+| --- | --- | --- | --- | --- |
+| FP32 | 2 | 8 × 512 + 64 | block 1→2 K=1/3/4, pipeline 1→2 K=1/3 | 8/8 every arm |
+| FP32 | 4 | 8 × 512 + 64 | block and pipeline, 1→4 and 2→4, K=3 | 8/8 every arm |
+| FP32 | 2 | 32 × 937 + 128 | block 1→2 K=3, pipeline 1→2 K=1/3 | 32/32 every arm |
+| FP32 | 4 | 16 × 512 + 96 | block and pipeline, 1→4 and 2→4, K=3 | 16/16 every arm |
+| BF16 | 2 and 4 | 8 × 512 + 64 | same arms as the first two rows | 3–6 of 8 per arm |
+
+BF16 is not token-exact, and that is not specific to speculation: serving the
+same eight BF16 requests without speculation in waves of four or one instead of
+eight also leaves only 2–4 of 8 requests token-identical, while the FP32
+baseline is identical across wave sizes (32/32). Speculation changes the batch
+shapes of the same per-row arithmetic, BF16 rounding then differs, and greedy
+near-ties flip; every later token of that request diverges. FP32 is therefore
+the exact check, and BF16 output is a valid greedy continuation up to rounding,
+not a bit-reproduction of the baseline.
+
+Acceptance (accepted / drafted, BF16): 1→2 0.78–0.93, 2→4 0.90–0.98, 1→4
+0.72–0.93.
+
+Whole-run wall time in seconds (all requests submitted at once, prefill
+included; BF16; one pinned host core; arms interleaved, mean of two repetitions
+except where marked †; decode-phase committed tokens/s in parentheses):
+
+| Loops | Shape | Baseline | Block d=1 K=3 | Pipeline d=1 K=3 | Pipeline d=1 K=1 |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 128 × 468 + 128 | 34.5 (697) | 31.9 (1133) | 23.0 (1249) | 27.1 (948) |
+| 2 | 64 × 937 + 128 | 37.6 (330) | 34.8 (618) | 24.0 (678) | 28.2 (488) |
+| 2 | 32 × 1875 + 128 | 39.5 (171) | 38.4 (298) | 25.4 (359) | 29.9 (256) |
+| 2 | 8 × 7500 + 128 | 41.3 (45) | 31.9 (83) | 29.8 (85) | 33.0 (66) |
+| 2 | 1 × 8000 + 128 | 18.3 (8.3) | 17.6 (8.9) | 12.1 (13.2) | 14.8 (10.3) |
+| 2 | 2 × 32000 + 96 | 60.1 (12.9) | 52.6 (19.9) | 49.7 (24.8) | 52.2 (18.6) |
+
+| Loops | Shape | Baseline | Block d=1 K=3 † | Block d=2 K=3 | Pipeline d=1 K=3 † | Pipeline d=2 K=3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 | 64 × 937 + 96 | 49.0 (197) | 39.8 (496) | 47.1 (412) | 33.0 (397) | 32.1 (470) |
+| 4 | 8 × 7500 + 96 | 59.9 (25.5) | 44.9 (58) | 46.8 (53) | 45.3 (50) | 42.8 (61) |
+| 4 | 1 × 8000 + 96 | 23.3 (5.0) | 14.5 (9.2) | 17.7 (7.1) | 15.9 (8.1) | 15.4 (8.4) |
+
+Reading the numbers:
+
+- The pipeline is the faster mode in every two-loop shape (wall time −25 % to
+  −39 % up to 8K prompts). Block speculation gains little wall time at high
+  concurrency (−3 % to −8 % for 32–128 requests): its first round runs K draft
+  steps before the first token is delivered, which adds 5–11 s to the time until
+  every request has a first token, so its decode-phase rate overstates the
+  benefit and wall time is the figure to use.
+- At 2 × 32000 the run is dominated by ~42 s of prompt processing that
+  speculation does not touch; the generated part is short (96 tokens).
+- Single runs vary: the two single-request block repetitions were 21.2 s and
+  13.9 s, the baseline 20.1 s and 16.4 s. Eager Dory is bound by host-side
+  per-step cost, which is why fewer engine steps per committed token helps at
+  all; these ratios should not be carried over to a graph-captured path.
+- The longest context exercised is 32,096 tokens (two requests). Peak allocated
+  memory was 74–82 GiB with the automatically sized KV pool; every arm released
+  its KV blocks.
+
 ### Not yet performed
 
 - A runtime-to-runtime comparison against vLLM once a Dory-capable build is
   available.
 - Long-context behaviour beyond 32K tokens: the longest measured prompt is
   32,256 tokens, far below the artifact's 256K configuration limit, which is
-  not a qualified deployment length.
+  not a qualified deployment length. Dense-oracle logit parity is still only
+  qualified on the 5-token prompt above.
 - Windowed Flash-backed kernels.
 - Graph-captured prefill, open-loop arrival traces and sampled decoding on the
   real checkpoint in Graph or async mode. The measurements above are
   closed-loop, greedy, and their time to first token is eager prefill.
+- Self-speculation with CUDA graphs, asynchronous scheduling, preemption,
+  sampled token-pipeline, adaptive exit, or a draft width above the fixed K.
+- Sampled speculation on the real checkpoint (the rejection-sampling contract is
+  qualified on the tiny CPU model only).
