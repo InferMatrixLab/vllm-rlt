@@ -62,10 +62,11 @@ class StageEngine:
         parameter = next(model.parameters())
         config = model.config
         if getattr(model, "requires_boundary_kv", False):
-            if cache_config.layout != "last_exited":
-                raise ValueError("Huginn requires last_exited KV")
+            required_layout = getattr(model, "kv_cache_layout", "last_exited")
+            if cache_config.layout != required_layout:
+                raise ValueError(f"boundary-KV models require {required_layout} KV")
             if cache_config.enable_prefix_caching:
-                raise ValueError("Huginn prefix caching is not yet supported")
+                raise ValueError("boundary-KV prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
@@ -76,12 +77,16 @@ class StageEngine:
         if getattr(model, "requires_boundary_kv", False):
             if staged_prefill:
                 raise ValueError(
-                    "Huginn does not support staged prefill required by this scheduler"
+                    "boundary-KV models do not support staged prefill required by this scheduler"
                 )
             if self.execution_config.async_scheduling or self.execution_config.prefill_uva:
-                raise ValueError("Huginn requires synchronous scheduling without prefill UVA")
+                raise ValueError(
+                    "boundary-KV models require synchronous scheduling without prefill UVA"
+                )
             if speculative_config is not None:
-                raise ValueError("Huginn speculative decoding is not yet supported")
+                raise ValueError("boundary-KV speculative decoding is not yet supported")
+        if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
+            raise ValueError("this model does not support CUDA graphs yet")
         self.speculative_config = speculative_config
         self.pipeline_speculative = bool(
             speculative_config and speculative_config.mode == "pipeline"
@@ -168,6 +173,7 @@ class StageEngine:
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
+                sliding_window=getattr(model, "requires_sliding_window", False),
             ),
         )
         num_blocks, self.memory_plan = plan_cache(
@@ -180,7 +186,7 @@ class StageEngine:
             staged_prefill=staged_prefill,
         )
         self.cache_manager = KVCacheManager(
-            num_layers=config.num_hidden_layers,
+            num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_loops=config.total_ut_steps,
@@ -326,6 +332,13 @@ class StageEngine:
         max_loops = params.max_loops or config.total_ut_steps
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
+        if getattr(self.model, "fixed_loop_count", False) and (
+            max_loops != config.total_ut_steps or params.min_loops != config.total_ut_steps
+        ):
+            raise ValueError(
+                "this model always runs the configured loop count; min_loops and "
+                "max_loops must both equal it"
+            )
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
