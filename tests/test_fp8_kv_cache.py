@@ -83,6 +83,24 @@ def test_attention_equals_attention_over_dequantized_values():
         torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
+def test_windowed_attention_reads_fp8_scales():
+    cache = make_cache()
+    reference = make_cache("auto")
+    assert cache.allocate("r", 11) and reference.allocate("r", 11)
+    fill(cache, "r", 11)
+    for layer in range(cache.num_layers):
+        for depth in range(4):
+            k, v = cache.read(layer, "r", depth)
+            reference.write(layer, ["r"] * 11, [depth] * 11, list(range(11)), k, v)
+    q = torch.randn(3, 2, 8)
+    rows = (["r"] * 3, [0, 2, 3], [10, 4, 7])
+    for layer in range(cache.num_layers):
+        got = cache.attend(layer, *rows, q, window=3)
+        want = reference.attend(layer, *rows, q, window=3)
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+        assert not torch.allclose(got, cache.attend(layer, *rows, q))
+
+
 def test_torch_kernel_scales_multiply_each_token_vector():
     codes, scale = quantize_fp8(torch.randn(5, 4, 2, 8))  # [block, token, head, dim]
     tables = torch.tensor([[3, 1, 4]], dtype=torch.int32)
