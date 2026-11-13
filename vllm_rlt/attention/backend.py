@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS, FlashPagedAttention
-from vllm_rlt.kernels.paged_attention import TritonPagedAttention, torch_paged_attention
+from vllm_rlt.kernels.paged_attention import TorchPagedAttention, TritonPagedAttention
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class BackendCapabilities:
     fp8_kv_graphs: bool = True
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
+    # Mask keys outside a per-layer sliding window (not storage reclamation).
+    sliding_window: bool = False
 
 
 @dataclass
@@ -43,13 +45,21 @@ class AttentionBackend:
     def prefill(self, *args, **kwargs):
         return self.kernel.prefill(*args, **kwargs)
 
+    def windowed(self, *args, **kwargs):
+        """Sliding-window attention; kernels without masking refuse the call."""
+        method = getattr(self.kernel, "windowed", None)
+        if method is None:
+            selected = self.info.get("selected_backend", "this attention backend")
+            raise NotImplementedError(f"{selected} does not implement sliding-window masking")
+        return method(*args, **kwargs)
+
     @property
     def generation(self):
         # Retain the existing Flash adapter's diagnostic attribute.
         return getattr(self.kernel, "generation", None)
 
 
-_TORCH_CAPABILITIES = BackendCapabilities(fp8_kv=True)
+_TORCH_CAPABILITIES = BackendCapabilities(fp8_kv=True, sliding_window=True)
 _TRITON_CAPABILITIES = BackendCapabilities(
     cuda_graphs=True, async_scheduling=True, device_context_lengths=True, fp8_kv=True
 )
@@ -106,7 +116,7 @@ def _create_explicit(backend, device, dtype, head_dim, block_size):
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))
-    return AttentionBackend(torch_paged_attention, _TORCH_CAPABILITIES, {"backend": "torch"})
+    return AttentionBackend(TorchPagedAttention(), _TORCH_CAPABILITIES, {"backend": "torch"})
 
 
 def create_backend(
@@ -149,6 +159,7 @@ def create_backend(
                     "async_scheduling",
                     "device_context_lengths",
                     "fp8_kv",
+                    "sliding_window",
                 )
                 if getattr(required_capabilities, name)
                 and not getattr(implementation.capabilities, name)

@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from .config import ModelConfig, prepare_model
+from .dory import DoryConfig, DoryForCausalLM
 from .huginn import HuginnConfig, HuginnForCausalLM
 from .nanbeige import NanbeigeConfig, NanbeigeForCausalLM
 from .ouro import OuroConfig, OuroForCausalLM
@@ -17,6 +18,7 @@ MODEL_MAPPING = {
     "ouro": OuroForCausalLM,
     "nanbeige": NanbeigeForCausalLM,
     "huginn_raven": HuginnForCausalLM,
+    "dory": DoryForCausalLM,
 }
 
 
@@ -192,6 +194,8 @@ __all__ = [
     "NanbeigeForCausalLM",
     "HuginnConfig",
     "HuginnForCausalLM",
+    "DoryConfig",
+    "DoryForCausalLM",
     "AutoModelForCausalLM",
     "resolve_local_model_path",
     "resolve_model_source",

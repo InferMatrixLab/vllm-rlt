@@ -43,7 +43,7 @@ license-files = ["LICENSE", "NOTICE"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-markers = ["gpu: requires a scheduler-reserved CUDA device"]
+markers = ["gpu: requires an explicitly selected CUDA device and --run-gpu"]
 
 [tool.ruff]
 line-length = 100
