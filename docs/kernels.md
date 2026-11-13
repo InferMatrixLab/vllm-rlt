@@ -38,10 +38,31 @@ nor copies incompatible inputs.
 when the extension is installed; CPU inputs and installations without the
 extension use the Torch reference. Import it from `vllm_rlt.kernels`. The model
 call site does not check devices or extension availability. The native kernel
-flattens contiguous inputs, using 16-byte
-loads/stores for the aligned vector body and scalar accesses for the remaining
-elements in the same kernel. Contiguous views with misaligned storage offsets
-use scalar accesses. Empty inputs return an empty output without launching.
+flattens contiguous inputs, using 16-byte loads/stores for the aligned vector
+body and scalar accesses for the remaining elements in the same kernel.
+Contiguous views may have independently misaligned storage offsets. For these
+inputs, the scalar/vector cutoff scales with the input GPU's actual SM count:
+`SMs * 160 * 256 * (16 / sizeof(dtype))` total elements. The reference is 160
+vector blocks per SM, with 256 threads and 16 bytes per vector: eight FP16/BF16
+elements or four FP32 elements. On a 148-SM B300, the corresponding cutoffs are
+48,496,640 FP16/BF16 elements and 24,248,320 FP32 elements. The reference block
+count specifies the workload cutoff; the actual launch grid is computed below
+and may be capped. This threshold is a heuristic, not a measured optimum.
+
+Below the cutoff, misaligned inputs use scalar computation with one work item
+per element. At or above it, the kernel loads each input's adjacent aligned
+vectors and reassembles the required logical vector with register moves and bit
+shifts. Scalar loads handle input prefixes and suffixes where a full aligned
+read would extend outside the view. Aligned and misaligned vector paths share the
+same calculation and output loop; output prefix and tail use scalar
+computation. No input copy or extra kernel launch is needed. Fully aligned inputs
+retain their direct vector loads even for small inputs. Empty inputs return an
+empty output without launching. On B300, correctness was tested for all
+independent 16-byte input offsets just above the cutoff and for every vector
+remainder with selected offsets. The cutoff applies to total element count,
+independent of tensor rank or model width. Raising it to 160 reference blocks
+per SM also sends many previously vectorized inputs through the slower scalar
+path; the performance impact depends on the workload.
 
 SiLU uses FP32 arithmetic and rounds to the input dtype before multiplying by
 `up`, preserving the reference's intermediate rounding. FP16/BF16 vector paths
@@ -55,10 +76,11 @@ stream.
 
 Blocks have 256 threads. The grid is capped at 4096 blocks, except for FP32
 workloads with at least `16384 * 256` work items: these use up to 16384 blocks.
-Each aligned work item processes four FP32 elements; an unaligned work item
-processes one scalar. The threshold requires enough work to fill the larger
-grid. This keeps small and medium shapes' launch geometry unchanged. Grid sizes,
-16/32-byte transfers and scalar/packed FP32 products were compared on B300;
+Each vector work item processes four FP32 elements or eight FP16/BF16 elements;
+the scalar path for small misaligned inputs processes one element per work item.
+The streaming threshold requires
+enough work to fill the larger grid. Aligned inputs retain their existing launch
+geometry. Grid sizes, 16/32-byte transfers and scalar/packed FP32 products were compared on B300;
 the selected configuration is not a universal hardware optimum.
 
 Ouro's inference MLP calls this registered operator directly. Availability is
