@@ -223,6 +223,10 @@ class StageEngine:
             if prefer_packed and sliding_window
             else None
         )
+        if cache_config.reclaim_swa and (
+            not getattr(model, "fixed_loop_count", False) or self.exit_config.mode != "ouro"
+        ):
+            raise ValueError("SWA reclamation requires ordinary fixed-loop ouro execution")
         attention = create_backend(
             attention_backend,
             parameter.device,
@@ -268,6 +272,11 @@ class StageEngine:
             staged_prefill=staged_prefill,
             fp8_scale=fp8_scale,
         )
+        if (
+            getattr(model, "kv_layer_windows", None) is not None
+            and scheduler_config.enable_preemption
+        ):
+            raise NotImplementedError("grouped KV does not support preemption snapshots")
         self.cache_manager = KVCacheManager(
             num_layers=kv_layers,
             num_kv_heads=config.num_key_value_heads,
@@ -286,6 +295,11 @@ class StageEngine:
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
             kv_cache_dtype=cache_config.kv_cache_dtype,
             fp8_scale=fp8_scale,
+            layer_windows=getattr(model, "kv_layer_windows", None),
+            reclaim_swa=cache_config.reclaim_swa,
+            max_submission_tokens=min(
+                scheduler_config.prefill_chunk_size, scheduler_config.max_num_batched_tokens
+            ),
         )
         self.scheduler = Scheduler(
             scheduler_config,
@@ -620,6 +634,7 @@ class StageEngine:
             return []
         try:
             ticket = self.executor.submit(batch)
+            self.cache_manager.finish_submission(ticket.event)
             # Only host-dependent decisions collect now. Prompt/PRELUDE submissions
             # advance logically under their event without a readback wait.
             result = ticket.collect() if ticket.has_result else None

@@ -511,6 +511,12 @@ class DoryForCausalLM(nn.Module):
         self.coda_kv_layers = tuple(
             config.kv_layer_index(index) for index in config.attention_layers("output")
         )
+        self.kv_layer_windows = {
+            config.kv_layer_index(index): (
+                config.sliding_window if config.layer_types[index] == "sliding_attention" else None
+            )
+            for index in config.attention_layer_ids
+        }
         self.apply(self._initialize)
         self.requires_grad_(False)
         self.eval()

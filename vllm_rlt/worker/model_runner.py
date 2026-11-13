@@ -658,12 +658,16 @@ class ModelRunner:
         cache = self.cache_manager
         spans = sorted(batch.spans, key=lambda span: span.token_count, reverse=True)
         ids = [span.request.request_id for span in spans]
-        base = self._stage_metadata(
-            ids,
-            [[span.depth for span in spans]],
-            [span.token_start + span.token_count - 1 for span in spans],
-            padded_rows=self._size(len(spans)),
-        )[0]
+        base = (
+            None
+            if cache.grouped
+            else self._stage_metadata(
+                ids,
+                [[span.depth for span in spans]],
+                [span.token_start + span.token_count - 1 for span in spans],
+                padded_rows=self._size(len(spans)),
+            )[0]
+        )
         groups, positions, blocks, tokens, contexts = [], [], [], [], []
         for offset in range(spans[0].token_count):
             active = [span for span in spans if offset < span.token_count]
@@ -671,13 +675,15 @@ class ModelRunner:
             for row, span in enumerate(active):
                 position = span.token_start + offset
                 positions.append(position)
-                blocks.append(base.rows[row][0].block_tables[0][position // cache.block_size])
+                if not cache.grouped:
+                    blocks.append(base.rows[row][0].block_tables[0][position // cache.block_size])
                 tokens.append(span.input_tokens[offset])
                 contexts.append(position + 1)
             size = self._size(len(active))
             padding = size - len(active)
             positions.extend([0] * padding)
-            blocks.extend([0] * padding)
+            if not cache.grouped:
+                blocks.extend([0] * padding)
             tokens.extend([0] * padding)
             contexts.extend([0] * padding)
             outputs = tuple(
@@ -687,24 +693,33 @@ class ModelRunner:
             )
             groups.append((start, size, active, outputs))
         n = len(positions)
-        wide = self.input_buffers[torch.int64].append(
-            positions + blocks + [p % cache.block_size for p in positions]
-        )
-        lengths = self.input_buffers[torch.int32].append(contexts)
+        if not cache.grouped:
+            wide = self.input_buffers[torch.int64].append(
+                positions + blocks + [p % cache.block_size for p in positions]
+            )
+            lengths = self.input_buffers[torch.int32].append(contexts)
         token_ids = self.input_buffers[torch.int64].append(tokens)
         inputs = []
         for start, size, active, outputs in groups:
             count, end = len(active), start + size
-            metadata = self.metadata.prepare_shared_rows(
-                base,
-                active,
-                positions[start : start + count],
-                position_ids=wide[start:end],
-                write_blocks=wide[n + start : n + start + count],
-                write_offsets=wide[2 * n + start : 2 * n + start + count],
-                context_lengths=lengths[start:end],
-                loop_count=batch.loop_count,
-            )
+            if cache.grouped:
+                metadata = self._stage_metadata(
+                    ids[:count],
+                    [[span.depth + loop for span in active] for loop in range(batch.loop_count)],
+                    positions[start : start + count],
+                    padded_rows=size,
+                )
+            else:
+                metadata = self.metadata.prepare_shared_rows(
+                    base,
+                    active,
+                    positions[start : start + count],
+                    position_ids=wide[start:end],
+                    write_blocks=wide[n + start : n + start + count],
+                    write_offsets=wide[2 * n + start : 2 * n + start + count],
+                    context_lengths=lengths[start:end],
+                    loop_count=batch.loop_count,
+                )
             kv = metadata[0]
             requests = tuple(span.request for span in active)
             coda, coda_rows = self._prepare_prefill_coda(
@@ -959,6 +974,7 @@ class ModelRunner:
         prepared = replace(prepared, workspace=workspace)
         if (
             workspace is not None
+            and not self.cache_manager.grouped
             and batch.operation == Operation.RECURRENT
             and not (batch.emit_gate and self.graphs is not None)
             and batch.loop_count == 1
