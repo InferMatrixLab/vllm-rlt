@@ -53,6 +53,30 @@ def test_cpu_auto_reports_torch_and_runs_reference_attention(caplog):
     torch.testing.assert_close(selected(q, k, v, table, lengths), explicit(q, k, v, table, lengths))
 
 
+def test_sparse_auto_filters_flash_and_explicit_flash_fails(packages, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    required = BackendCapabilities(sparse_decode=True)
+    selected = create_backend(
+        "auto",
+        torch.device("cuda"),
+        torch.bfloat16,
+        128,
+        16,
+        required_capabilities=required,
+    )
+    assert selected.info["selected_backend"] == "triton"
+    assert "sparse_decode" in selected.info["selection_reason"]
+    with pytest.raises(ValueError, match="lacks required capabilities: sparse_decode"):
+        create_backend(
+            "flash_attn_4",
+            torch.device("cuda"),
+            torch.bfloat16,
+            128,
+            16,
+            required_capabilities=required,
+        )
+
+
 @pytest.mark.parametrize(
     "sm,dtype,head_dim,block_size,missing,expected",
     [

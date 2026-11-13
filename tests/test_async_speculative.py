@@ -173,7 +173,7 @@ def test_second_round_executes_before_cpu_commit_at_every_rejection(accepted, mo
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("graphs", [False, True])
-def test_eos_discards_queued_round_and_request_id_can_be_reused(monkeypatch, graphs):
+def test_eos_discards_queued_round_and_resubmitting_the_id_drains_it(monkeypatch, graphs):
     model = tiny("cuda")
     e = make_engine(model, graphs=graphs)
     bootstrap(e, ignore_eos=False)
@@ -191,9 +191,13 @@ def test_eos_discards_queued_round_and_request_id_can_be_reused(monkeypatch, gra
     e.step()
     out = e._collect_speculative()[0]
     assert out.finished and out.token_ids[-1] == 0 and len(out.token_ids) == 2
-    # Reuse while an old ticket still exists. It must never touch the new request.
+    # Resubmitting a finished id is a client retry: the engine drains the
+    # retiring generation before the new request starts, so the new request
+    # never observes the old round's state. A still-live id is rejected
+    # instead, which test_stage_engine covers.
     monkeypatch.setattr(e.speculative_runner, "_coda", coda)
     e.add_request("r", [7, 8], SamplingParams(max_tokens=5, ignore_eos=True))
+    assert "r" not in e._retiring_speculative
     output = drain(e)["r"]
     assert len(output.token_ids) == 5
     assert e.speculative_runner.discarded_rounds == 1
@@ -345,6 +349,8 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     assert cache.allocate("short", 4) and cache.allocate("long", 10)
     runner = object.__new__(AsyncSpeculativeRunner)
     runner.cache = cache
+    runner.reference_store = None
+    runner.sparse_decode_config = None
     buffer = SimpleNamespace(
         leased=False,
         host_tables=torch.full((128,), -91, dtype=torch.int32),

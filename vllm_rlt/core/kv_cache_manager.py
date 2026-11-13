@@ -23,6 +23,7 @@ from vllm_rlt.attention import (
     create_backend,
     validate_backend_name,
 )
+from vllm_rlt.attention.sparse import sparse_paged_attention
 from vllm_rlt.request import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
@@ -725,8 +726,29 @@ class KVCacheManager:
         self._validate_layer(layer)
         self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
+        plan = batch.reference_plan
         if window is not None:
+            # Sliding-window masking and sparse-reference correction are separate
+            # modes; combining them would silently drop the window, so refuse.
+            if plan is not None and not plan.dense():
+                raise NotImplementedError(
+                    "sliding-window attention is not implemented for sparse decode rows"
+                )
             return self._attend_windowed(layer, batch, q, window)
+        if not isinstance(batch, DeviceKVMetadata):
+            for allocation, depth, position in batch.rows:
+                self._require_prefix(allocation, layer, depth, position + 1)
+        if plan is not None and not plan.dense():
+            return sparse_paged_attention(
+                q,
+                self.key_cache[:, layer],
+                self.value_cache[:, layer],
+                batch.block_tables,
+                batch.context_lengths,
+                plan,
+                layer=layer,
+                dense_attention=self.attention,
+            )
         if isinstance(batch, DeviceKVMetadata):
             return self.attention(
                 q,
@@ -737,8 +759,6 @@ class KVCacheManager:
             )
         if not batch.rows:
             return torch.empty_like(q)
-        for allocation, depth, position in batch.rows:
-            self._require_prefix(allocation, layer, depth, position + 1)
         if batch.cu_seqlens_q is not None:
             return self.attention.prefill(
                 q,
