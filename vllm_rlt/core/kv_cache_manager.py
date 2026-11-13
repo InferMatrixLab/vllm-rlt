@@ -784,6 +784,22 @@ class KVCacheManager:
         if staged.numel():
             keys[staged] = self.key_cache[slots, layer]
             values[staged] = self.value_cache[slots, layer]
+        if self.device.type == "cuda":
+            # Decode straight into the destination rows; no FP32 temporaries.
+            from vllm_rlt.kernels.kv_quantization.triton_decode import decode_pages_into
+
+            for kind, out in (("key", keys), ("value", values)):
+                decode_pages_into(
+                    out,
+                    packed,
+                    blocks,
+                    self._packed_pools[kind],
+                    layer,
+                    format=self.kv_quantization,
+                    kind=kind,
+                    group_size=self.kv_quantization_group_size,
+                )
+            return keys, values
         # Decode in chunks so FP32 temporaries stay bounded for long contexts.
         for start in range(0, packed.numel(), _DECODE_CHUNK_PAGES):
             rows = packed[start : start + _DECODE_CHUNK_PAGES]
