@@ -128,10 +128,10 @@ def make_cache(model, layout=None, block_size=2):
     )
 
 
-def run_one_token_per_step(model, tokens):
+def run_one_token_per_step(model, tokens, cache=None):
     """Execute the declared reference schedule: one token row at a time."""
     config = model.config
-    cache = make_cache(model)
+    cache = make_cache(model) if cache is None else cache
     assert cache.allocate("request", len(tokens))
     loops = [[] for _ in range(config.total_ut_steps)]
     logits = []
@@ -148,10 +148,10 @@ def run_one_token_per_step(model, tokens):
     return {"logits": torch.stack(logits), "loops": [torch.stack(item) for item in loops]}, cache
 
 
-def run_all_positions_at_once(model, tokens):
+def run_all_positions_at_once(model, tokens, cache=None):
     """Same schedule, but every stage call carries all causal positions."""
     config = model.config
-    cache = make_cache(model)
+    cache = make_cache(model) if cache is None else cache
     assert cache.allocate("request", len(tokens))
     positions = list(range(len(tokens)))
     ids = ["request"] * len(tokens)

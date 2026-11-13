@@ -391,6 +391,8 @@ class Scheduler:
         initial_tokens = min(
             len(request.prompt_token_ids), cached_tokens + self.config.prefill_chunk_size
         )
+        if cache.reclaim_swa:
+            initial_tokens = min(initial_tokens, cache.max_submission_tokens)
         if not cache.incremental_allocation:
             initial_tokens = capacity
         reserve_outputs = cache.incremental_allocation and self.suspend_callback is None
