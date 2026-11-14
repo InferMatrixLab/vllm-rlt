@@ -435,6 +435,18 @@ class KVCacheManager:
         plane = allocation.written[self._plane(depth)]
         return all(position in plane[layer] for layer in range(self.num_layers))
 
+    def exit_written(self, request_id: str, position: int, depth: int) -> bool:
+        """Whether every recurrent layer has written KV for ``position`` at ``depth``.
+
+        Boundary layers keep their history at depth 0 and the output stage runs
+        after the exit, so they take no part in finalizing a token.
+        """
+        allocation = self._get_allocation(request_id)
+        self._validate_depth(depth)
+        self._validate_position(allocation, position)
+        plane = allocation.written[self._plane(depth)]
+        return all(position in plane[layer] for layer in self.recurrent_layers)
+
     def mark_finalized(self, request_id: str, position: int, exit_depth: int) -> None:
         """Mark the token written at every depth deeper than ``exit_depth``.
 
@@ -772,14 +784,15 @@ class KVCacheManager:
             raise NotImplementedError(
                 f"the {self.backend} attention backend does not implement sliding-window masking"
             )
-        if isinstance(batch, DeviceKVMetadata):
-            raise NotImplementedError("sliding-window attention needs host-planned KV metadata")
         if batch.cu_seqlens_q is not None:
             raise NotImplementedError("sliding-window attention needs one query row per token")
-        if not batch.rows:
-            return torch.empty_like(q)
-        for allocation, depth, position in batch.rows:
-            self._require_prefix(allocation, layer, depth, position + 1)
+        # Device-owned positions are ordered by the runner's stream; the host
+        # frontier lags them, as for unwindowed attention.
+        if not isinstance(batch, DeviceKVMetadata):
+            if not batch.rows:
+                return torch.empty_like(q)
+            for allocation, depth, position in batch.rows:
+                self._require_prefix(allocation, layer, depth, position + 1)
         return self.attention.windowed(
             q,
             self.key_cache[:, layer],

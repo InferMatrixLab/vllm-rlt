@@ -140,7 +140,7 @@ No PyPI publication is implied.
 | Ouro-2.6B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
 | Nanbeige4.2-3B | Native Nanbeige | Fixed two-loop inference | [Runtime](docs/runtime.md) |
 | Huginn-0125 | Native Huginn | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/runtime.md) |
-| NVIDIA-Nemotron-Labs-Dory1.0-4B | Native Dory | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Torch sliding-window masking; real-checkpoint numerics not yet qualified | [Dory baseline](docs/dory.md) |
+| NVIDIA-Nemotron-Labs-Dory1.0-4B | Native Dory | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified | [Dory baseline](docs/dory.md) |
 
 Shared implementation does not qualify every checkpoint/feature combination;
 see the linked guides for validation scope and limitations. See

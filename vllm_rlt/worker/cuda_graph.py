@@ -119,8 +119,20 @@ class _DeviceCache:
             cache.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
             cache.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
 
-    def _attend_prepared(self, layer, batch, q):
+    def _attend_prepared(self, layer, batch, q, *, window=None):
         cache = self.cache
+        if window is not None:
+            # The window is a kernel constant; lengths and tables stay graph inputs.
+            if batch.cu_seqlens_q is not None:
+                raise NotImplementedError("sliding-window attention needs one query row per token")
+            return cache.attention.windowed(
+                q,
+                cache.key_cache[:, layer],
+                cache.value_cache[:, layer],
+                batch.block_tables,
+                batch.context_lengths,
+                window,
+            )
         if batch.cu_seqlens_q is not None:
             return cache.attention.prefill(
                 q,
@@ -398,6 +410,8 @@ class CodaGraphs:
     def __init__(self, model, execution, cache=None, *, bucketed=False, capture_sizes=None):
         self.model, self.execution = model, execution
         self.cache = cache
+        # The boundary layers whose KV one replay reads and writes.
+        self.kv_layers = getattr(model, "coda_kv_layers", ()) if cache is not None else ()
         if bucketed and cache is not None:
             raise ValueError("bucketed coda graphs require a row-independent Ouro head")
         self.capture_sizes = (capture_sizes or graph_capture_sizes(execution)) if bucketed else None
@@ -455,7 +469,7 @@ class CodaGraphs:
         if self.cache is not None:
             self.cache._require_live_batch(batch)
             for allocation, depth, position in batch.rows:
-                for layer in self.model.coda_kv_layers:
+                for layer in self.kv_layers:
                     self.cache._require_prefix(allocation, layer, depth, position)
         if entry is not None:
             stream = torch.cuda.current_stream(hidden.device)
@@ -467,20 +481,21 @@ class CodaGraphs:
                 entry.hidden[: len(hidden)].copy_(hidden)
                 entry.hidden[len(hidden) :].zero_()
             if entry.graph is None:
-                run = (
-                    (
-                        lambda: self.model.coda_prepared(
-                            entry.hidden, entry.metadata, _DeviceCache(self.cache)
-                        )
-                    )
-                    if self.cache is not None
-                    else (lambda: self.model.coda(entry.hidden))
-                )
                 entry.graph, entry.output = _capture(
-                    entry.hidden, self.stream, self.pool, run, startup=startup
+                    entry.hidden, self.stream, self.pool, lambda: self._run(entry), startup=startup
                 )
                 self.captures += 1
         call.inputs_ready = True
+
+    def _run(self, entry):
+        if self.cache is None:
+            return self.model.coda(entry.hidden)
+        return self.model.coda_prepared(entry.hidden, entry.metadata, _DeviceCache(self.cache))
+
+    def _eager(self, hidden, batch):
+        if self.cache is None:
+            return self.model.coda(hidden)
+        return self.model.coda_prepared(hidden, batch, self.cache)
 
     @torch.inference_mode()
     def execute(self, call, hidden):
@@ -489,18 +504,31 @@ class CodaGraphs:
         batch, entry = call.metadata, call.entry
         call.inputs_ready = False
         if entry is None:
-            return (
-                self.model.coda_prepared(hidden, batch, self.cache)
-                if self.cache is not None
-                else self.model.coda(hidden)
-            )
+            return self._eager(hidden, batch)
         entry.graph.replay()
         output = entry.output[: len(hidden)].clone()
         self.last_event = torch.cuda.Event()
         self.last_event.record(torch.cuda.current_stream(hidden.device))
         if self.cache is not None:
             for allocation, depth, position in batch.rows:
-                for layer in self.model.coda_kv_layers:
+                for layer in self.kv_layers:
                     allocation.written[self.cache._plane(depth)][layer].add(position)
         self.replays += 1
         return output
+
+
+class PreludeGraphs(CodaGraphs):
+    """Decode-token input stage of a boundary-KV model: tokens in, carried state out.
+
+    Prompt prefill stays eager; its row count follows the prompt, not the batch.
+    """
+
+    def __init__(self, model, execution, cache):
+        super().__init__(model, execution, cache)
+        self.kv_layers = model.prelude_kv_layers
+
+    def _run(self, entry):
+        return self.model.prelude_prepared(entry.hidden, entry.metadata, _DeviceCache(self.cache))
+
+    def _eager(self, tokens, batch):
+        return self.model.prelude_prepared(tokens, batch, self.cache)

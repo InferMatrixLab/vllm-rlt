@@ -483,8 +483,9 @@ class DoryForCausalLM(nn.Module):
     # No Ouro-style learned exit gate: the reviewed implementation always runs
     # the configured loop count, so requesting a shallower depth is unsupported.
     fixed_loop_count = True
-    # Sliding-window masking currently needs host-planned KV metadata.
-    supports_cuda_graphs = False
+    # Fixed loops need no exit signal, so ordinary asynchronous scheduling can
+    # submit a request's next loop without reading the previous one back.
+    supports_async_scheduling = True
     # Selection must reject a backend that would silently attend full history.
     requires_sliding_window = True
 
