@@ -38,6 +38,17 @@ class AttentionBackend:
     def __call__(self, *args, **kwargs):
         return self.kernel(*args, **kwargs)
 
+    def attend_metadata(self, q, keys, values, batch):
+        """Borrow validated host metadata when supported; retain the legacy tensor API.
+
+        Metadata-aware kernels can reuse host planning across layers without
+        reading device tables or lengths back to the host.
+        """
+        method = getattr(self.kernel, "attend_metadata", None)
+        if method is not None:
+            return method(q, keys, values, batch)
+        return self(q, keys, values, batch.block_tables, batch.context_lengths)
+
     def prefill(self, *args, **kwargs):
         return self.kernel.prefill(*args, **kwargs)
 
@@ -78,11 +89,17 @@ def backend_capabilities(implementation) -> BackendCapabilities:
 
 
 def validate_backend_name(backend: str) -> None:
-    if backend not in {"auto", "torch", "triton", *FLASH_BACKENDS}:
+    if backend not in {"auto", "torch", "triton", "ascend_eager", *FLASH_BACKENDS}:
         raise ValueError("unknown attention backend")
 
 
 def _create_explicit(backend, device, dtype, head_dim, block_size):
+    if backend == "ascend_eager":
+        if device.type != "npu" or dtype != torch.bfloat16:
+            raise ValueError("ascend_eager requires an NPU and BF16")
+        from vllm_rlt.kernels.ascend_eager import AscendEagerAttention
+
+        return AttentionBackend(AscendEagerAttention(), _TORCH_CAPABILITIES, {"backend": backend})
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")

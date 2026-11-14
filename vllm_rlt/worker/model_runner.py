@@ -1158,6 +1158,9 @@ class ModelRunner:
         raise RuntimeError("readback buffers exhausted; retire completed submissions")
 
     def _synchronize_submission(self, stream, prepared):
+        if self.device.type == "npu":
+            torch.npu.synchronize(self.device)
+            return
         if self.device.type != "cuda":
             return
         (stream or torch.cuda.current_stream(self.device)).synchronize()
@@ -1260,6 +1263,10 @@ class ModelRunner:
                     for span in batch.spans:
                         self.events[span.request.request_id] = compute_done
                     self.submissions.complete(compute_done)
+            if self.device.type == "npu":
+                # No CUDA completion events protect NPU metadata snapshots.
+                # Drain before pools/host inputs can be recycled or KV freed.
+                torch.npu.synchronize(self.device)
             if split_prefill:
                 self.split_prefill_submissions += 1
             return Submission(
@@ -1396,6 +1403,9 @@ class ModelRunner:
         self.rng.drop(request_id)
 
     def synchronize(self):
+        if self.device.type == "npu":
+            torch.npu.synchronize(self.device)
+            return
         for stream in (
             self.core_stream,
             self.boundary_stream,

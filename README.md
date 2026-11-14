@@ -134,7 +134,7 @@ No PyPI publication is implied.
 
 | Checkpoint | Implementation | Documented validation scope | Guide |
 | --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | Existing runtime and benchmark coverage under their recorded configurations | [Runtime](docs/runtime.md), [accuracy](docs/accuracy.md) |
+| Ouro-1.4B | Native Ouro | Ascend BF16, fixed-four-loop synchronous full-prefill support; HF-eager-aligned attention with batched prefill/decode; chunked prefill unresolved | [Runtime](docs/runtime.md), [Ascend recipe](docs/recipes/ouro_ascend.md#5-attention-batching-and-device-side-kv-writes) |
 | Ouro-2.6B | Shared Ouro | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
 | Ouro-1.4B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
 | Ouro-2.6B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |

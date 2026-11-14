@@ -155,3 +155,73 @@ def test_depth_batches_stage_metadata_twice_and_preserve_shared_views(monkeypatc
         assert len({batch.cu_seqlens_q.data_ptr() for batch in batches}) == 1
         assert batches[0].cu_seqlens_q.tolist() == [0, 2, 3]
         assert batches[0].max_seqlen_q == 2
+
+
+def test_prepared_attention_keeps_the_legacy_kernel_signature():
+    cache = KVCacheManager(1, 1, 4, 4, 2, 1)
+    assert cache.allocate("a", 3)
+    batch = cache._prepare_batch(["a"] * 3, [0] * 3, [0, 1, 2])
+    keys = torch.zeros(3, 1, 4)
+    values = torch.arange(12, dtype=torch.float32).reshape(3, 1, 4)
+    query = torch.zeros(3, 2, 4)
+    cache._write_prepared(0, batch, keys, values)
+    kernel = cache.attention.kernel
+    expected = kernel(
+        query,
+        cache.key_cache[:, 0],
+        cache.value_cache[:, 0],
+        batch.block_tables,
+        batch.context_lengths,
+    )
+    seen = []
+
+    def legacy(*args):
+        seen.append(args)
+        return kernel(*args)
+
+    cache.attention.kernel = legacy
+    actual = cache._attend_prepared(0, batch, query)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert len(seen) == 1 and len(seen[0]) == 5
+    assert seen[0][0] is query
+    assert seen[0][3] is batch.block_tables
+    assert seen[0][4] is batch.context_lengths
+    cache.free("a")
+
+
+def test_metadata_attention_borrows_only_a_live_validated_descriptor():
+    cache = KVCacheManager(1, 1, 4, 4, 2, 1)
+    assert cache.allocate("a", 3)
+    batch = cache._prepare_batch(["a"] * 3, [0] * 3, [0, 1, 2])
+    keys = torch.zeros(3, 1, 4)
+    values = torch.arange(12, dtype=torch.float32).reshape(3, 1, 4)
+    query = torch.zeros(3, 2, 4)
+    cache._write_prepared(0, batch, keys, values)
+    legacy = cache.attention.kernel
+    expected = legacy(
+        query,
+        cache.key_cache[:, 0],
+        cache.value_cache[:, 0],
+        batch.block_tables,
+        batch.context_lengths,
+    )
+    seen = []
+
+    class MetadataKernel:
+        def __call__(self, *args):
+            pytest.fail("metadata-aware kernels must not read device metadata back")
+
+        def attend_metadata(self, q, k, v, descriptor):
+            seen.append(descriptor)
+            return legacy(q, k, v, descriptor.block_tables, descriptor.context_lengths)
+
+    cache.attention.kernel = MetadataKernel()
+    actual = cache._attend_prepared(0, batch, query)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert len(seen) == 1 and seen[0] is batch
+    cache.free("a")
+    assert cache.allocate("a", 3)
+    with pytest.raises((ValueError, RuntimeError)):
+        cache._attend_prepared(0, batch, query)
+    assert len(seen) == 1
+    cache.free("a")
