@@ -86,10 +86,13 @@ def _packed_tile(
     base = block[:, None] * param_block + layer * param_layer
     if IS_NVFP4:
         scale = tl.load(First + base + param, mask=mask, other=0.0).to(tl.float32)
+        # One global scale per page and layer: load it once per token.
+        tokens = tl.max(mask.to(tl.int32), axis=1) > 0
         global_scale = tl.load(
-            Global + block[:, None] * global_block + layer * global_layer, mask=mask, other=1.0
+            Global + block * global_block + layer * global_layer, mask=tokens, other=1.0
         )
-        value = _e2m1(code) * tl.div_rn(scale, global_scale)
+        ratio = tl.div_rn(scale, global_scale[:, None])
+        value = _e2m1(code) * ratio
     else:
         minimum = tl.load(First + base + param, mask=mask, other=0.0).to(tl.float32)
         scale = tl.load(Second + base + param, mask=mask, other=0.0).to(tl.float32)
