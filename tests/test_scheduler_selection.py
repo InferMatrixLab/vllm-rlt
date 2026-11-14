@@ -11,9 +11,10 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import RequestPhase
+from vllm_rlt.request import Request, RequestStatus
 
 
 def model():
@@ -38,19 +39,64 @@ def params(max_tokens=5):
     return SamplingParams(max_tokens=max_tokens, ignore_eos=True)
 
 
-@pytest.mark.parametrize("wavefront", [False, True])
-def test_batch_selection_is_never_preempted_by_a_later_item(monkeypatch, wavefront):
+def test_enqueue_work_requires_registered_active_request_and_unique_pending_work():
+    e = engine()
+    e.add_request("r", [1, 2], params())
+    request = e.scheduler.requests["r"]
+    with pytest.raises(ValueError, match="registered request"):
+        e.scheduler.enqueue_work(Request("r", [1, 2], params()), WorkKey.PROMPT_ATOMIC)
+    with pytest.raises(ValueError, match="only active requests"):
+        e.scheduler.enqueue_work(request, WorkKey.PROMPT_ATOMIC)
+
+    e.scheduler._admit()
+    with pytest.raises(ValueError, match="already has pending work"):
+        e.scheduler.enqueue_work(request, WorkKey.DECODE_RECURRENT)
+    e.close()
+
+
+def test_pending_work_index_tracks_enqueue_selection_and_removal():
+    e = engine()
+    e.add_request("r", [1, 2], params())
+    e.scheduler._admit()
+    request = e.scheduler.requests["r"]
+    assert e.scheduler.pending_work(request) is WorkKey.PROMPT_ATOMIC
+    assert e.scheduler.pending_works == {"r": WorkKey.PROMPT_ATOMIC}
+
+    batch = e.scheduler.take_works((WorkKey.PROMPT_ATOMIC,))
+    assert batch is not None
+    assert e.scheduler.pending_work(request) is None
+    assert not e.scheduler.pending_works
+
+    e.scheduler.enqueue_work(request, WorkKey.DECODE_CODA)
+    assert e.scheduler.remove_pending_work(request) is WorkKey.DECODE_CODA
+    assert not e.scheduler.pending_works
+    assert all("r" not in queue for queue in e.scheduler.work_queues.values())
+    e.close()
+
+
+def test_batch_selection_is_never_preempted_by_a_later_item(monkeypatch):
     """Selecting A must stop B's capacity failure from evicting A."""
-    e = engine(wavefront_chunked_prefill=wavefront)
+    e = engine()
     for name in ("a", "b"):
         e.add_request(name, [1, 2], params())
     e.scheduler._admit()
     monkeypatch.setattr(e.cache_manager, "ensure_capacity", lambda rid, frontier: rid != "b")
-    phase = RequestPhase.PREFILLING_PRELUDE if wavefront else RequestPhase.PREFILL
-    batch = e.scheduler._take(phase)
+    batch = e.scheduler.take_works((WorkKey.PROMPT_ATOMIC,))
     assert [scheduled_request.request.request_id for scheduled_request in batch.requests] == ["a"]
     assert e.preemption.preemptions == 0
-    assert e.scheduler.requests["a"].phase == phase
+    assert e.scheduler.requests["a"].status == RequestStatus.ACTIVE
+
+
+def test_batch_selection_reports_a_duplicate_request_in_one_queue():
+    e = engine(max_num_seqs=3)
+    for request_id in ("a", "b"):
+        e.add_request(request_id, [1, 2], params())
+    e.scheduler._admit()
+    e.scheduler.work_queues[WorkKey.PROMPT_ATOMIC].append("a")
+
+    with pytest.raises(RuntimeError, match="queued more than once"):
+        e.scheduler.take_works((WorkKey.PROMPT_ATOMIC,))
+    e.close()
 
 
 def test_wavefront_does_not_schedule_a_candidate_preempted_during_selection(monkeypatch):
@@ -65,13 +111,13 @@ def test_wavefront_does_not_schedule_a_candidate_preempted_during_selection(monk
         lambda rid, frontier: rid == "a" and not e.cache_manager.has_allocation("b"),
     )
 
-    batch = e.scheduler._take(RequestPhase.PREFILLING_PRELUDE)
+    batch = e.scheduler.take_works((WorkKey.PROMPT_PRELUDE,))
 
     assert {item.request.request_id for item in batch.requests} == {"a"}
     assert e.preemption.preemptions == 1
-    assert list(e.scheduler.queues[RequestPhase.WAITING]) == ["b"]
-    assert not e.scheduler.queues[RequestPhase.PREFILLING_PRELUDE]
-    assert e.scheduler.requests["b"].phase == RequestPhase.WAITING
+    assert list(e.scheduler.waiting) == ["b"]
+    assert not e.scheduler.work_queues[WorkKey.PROMPT_PRELUDE]
+    assert e.scheduler.requests["b"].status == RequestStatus.WAITING
     e.close()
 
 
@@ -82,7 +128,7 @@ def test_direct_take_does_not_inherit_an_earlier_batch_selection(monkeypatch):
         e.add_request(name, [1, 2], params())
     e.scheduler._admit()
     # A first batch selects both requests.
-    assert e.scheduler._take(RequestPhase.PREFILL) is not None
+    assert e.scheduler.take_works((WorkKey.PROMPT_ATOMIC,)) is not None
 
     seen = []
 
@@ -93,9 +139,9 @@ def test_direct_take_does_not_inherit_an_earlier_batch_selection(monkeypatch):
     # The Scheduler holds the callback it was given, so replace that reference.
     monkeypatch.setattr(e.scheduler, "preempt", spy)
     for name in ("a", "b"):
-        e.scheduler.enqueue(e.scheduler.requests[name], RequestPhase.PREFILL)
+        e.scheduler.enqueue_work(e.scheduler.requests[name], WorkKey.PROMPT_ATOMIC)
     monkeypatch.setattr(e.cache_manager, "ensure_capacity", lambda rid, frontier: rid != "b")
-    assert e.scheduler._take(RequestPhase.PREFILL) is not None
+    assert e.scheduler.take_works((WorkKey.PROMPT_ATOMIC,)) is not None
     # Only "a", selected in this batch, is excluded. The first batch's
     # selection is not still in force, and the set is handed over frozen.
     assert seen == [("b", frozenset({"a"}))]
@@ -106,10 +152,38 @@ def test_request_selected_in_an_earlier_batch_is_still_preemptable():
     e = engine(max_num_seqs=1)
     e.add_request("victim", [1, 2], params())
     e.step()
-    assert e.scheduler.requests["victim"].phase != RequestPhase.WAITING
+    assert e.scheduler.requests["victim"].status == RequestStatus.ACTIVE
     e.add_request("requester", [3, 4], params())
     assert e.scheduler.preempt(e.scheduler.requests["requester"])
     assert "victim" in e.preemption.snapshots
+
+
+def test_waiting_resident_victim_can_be_offloaded_without_changing_queue_position():
+    e = engine(max_num_seqs=1, policy="priority")
+    e.add_request("low", [1, 2], SamplingParams(max_tokens=3, priority=10))
+    e.scheduler._admit()
+    e.add_request("high", [3, 4], SamplingParams(max_tokens=1, priority=0))
+    low = e.scheduler.requests["low"]
+    high = e.scheduler.requests["high"]
+
+    assert e.scheduler.preempt(high, priority_only=True)
+    assert low.status == RequestStatus.WAITING
+    assert e.cache_manager.has_allocation("low")
+    waiting = list(e.scheduler.waiting)
+    assert e.preemption.snapshots["low"]["kv"] is None
+
+    assert e.scheduler.preempt(high, waiting_only=True)
+    assert list(e.scheduler.waiting) == waiting
+    assert not e.cache_manager.has_allocation("low")
+    assert e.preemption.snapshots["low"]["kv"] is not None
+    assert e.preemption.preemptions == 1
+
+    e.abort_request("high")
+    e.scheduler._admit()
+    assert low.status == RequestStatus.ACTIVE
+    assert e.scheduler.has_admission_slot(low)
+    assert e.preemption.resumptions == 1
+    e.close()
 
 
 def test_reused_request_id_is_not_protected_by_the_previous_request():
@@ -125,14 +199,14 @@ def test_reused_request_id_is_not_protected_by_the_previous_request():
     assert "r" in e.preemption.snapshots
 
 
-@pytest.mark.parametrize("boundary", [RequestPhase.PRELUDE, RequestPhase.CODA])
+@pytest.mark.parametrize("boundary", [WorkKey.DECODE_PRELUDE, WorkKey.DECODE_CODA])
 def test_refill_runs_boundary_restored_during_admission(boundary):
     """A sole resumed boundary must run in the admission step that restores it."""
     e = engine(max_num_seqs=1)
     e.add_request("resumed", [1, 2], params(max_tokens=3))
     request = e.scheduler.requests["resumed"]
     for _ in range(20):
-        if request.phase == boundary:
+        if e.scheduler.pending_work(request) == boundary:
             break
         e.step()
     else:
@@ -141,21 +215,21 @@ def test_refill_runs_boundary_restored_during_admission(boundary):
     generated_before = len(request.generated_token_ids)
     e.add_request("pressure", [3, 4], params(max_tokens=1))
     assert e.scheduler.preempt(e.scheduler.requests["pressure"])
-    assert e.preemption.snapshots["resumed"]["phase"] == boundary
-    assert request.phase == RequestPhase.WAITING
+    assert e.preemption.snapshots["resumed"]["work"] == boundary
+    assert request.status == RequestStatus.WAITING
     e.abort_request("pressure")
 
     outputs = e.step()
 
     assert e.preemption.resumptions == 1
-    assert e.last_schedule.phase == boundary
-    if boundary == RequestPhase.PRELUDE:
+    assert e.last_schedule.works == frozenset((boundary,))
+    if boundary == WorkKey.DECODE_PRELUDE:
         assert not outputs
-        assert request.phase == RequestPhase.RECURRENT
+        assert e.scheduler.pending_work(request) == WorkKey.DECODE_RECURRENT
         assert len(request.generated_token_ids) == generated_before
     else:
         assert [output.request_id for output in outputs] == ["resumed"]
-        assert request.phase == RequestPhase.PRELUDE
+        assert e.scheduler.pending_work(request) == WorkKey.DECODE_PRELUDE
         assert len(request.generated_token_ids) == generated_before + 1
 
 
@@ -169,7 +243,7 @@ def test_refill_restored_coda_waits_for_recurrent_batchmate():
     e.add_request("core", [1, 2], SamplingParams(max_tokens=2, ignore_eos=True))
     core = e.scheduler.requests["core"]
     for _ in range(20):
-        if core.phase == RequestPhase.RECURRENT:
+        if e.scheduler.pending_work(core) == WorkKey.DECODE_RECURRENT:
             break
         e.step()
     else:
@@ -182,23 +256,23 @@ def test_refill_restored_coda_waits_for_recurrent_batchmate():
     )
     e.step()
     restored = e.scheduler.requests["restored-coda"]
-    assert core.phase == RequestPhase.RECURRENT
-    assert restored.phase == RequestPhase.CODA
+    assert e.scheduler.pending_work(core) == WorkKey.DECODE_RECURRENT
+    assert e.scheduler.pending_work(restored) == WorkKey.DECODE_CODA
 
     e.add_request("pressure", [5, 6], params(max_tokens=1))
     assert e.scheduler.preempt(e.scheduler.requests["pressure"])
-    assert e.preemption.snapshots["restored-coda"]["phase"] == RequestPhase.CODA
+    assert e.preemption.snapshots["restored-coda"]["work"] == WorkKey.DECODE_CODA
     e.abort_request("pressure")
 
     e.step()
 
     assert e.preemption.resumptions == 1
-    assert e.last_schedule.phase == RequestPhase.RECURRENT
-    assert restored.phase == RequestPhase.CODA
+    assert e.last_schedule.works == frozenset((WorkKey.DECODE_RECURRENT,))
+    assert e.scheduler.pending_work(restored) == WorkKey.DECODE_CODA
 
     for _ in range(20):
         e.step()
-        if e.last_schedule.phase == RequestPhase.CODA:
+        if e.last_schedule.works == frozenset((WorkKey.DECODE_CODA,)):
             break
     else:
         pytest.fail("CODA requests did not form a batch")

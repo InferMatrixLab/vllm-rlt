@@ -27,11 +27,11 @@
 <text x="80" y="1113" font-family="Arial,Helvetica,sans-serif" font-size="19" fill="#728399" font-weight="400" text-anchor="start">physical addresses / rows</text>
 <rect x="390" y="270" width="1250" height="88" rx="14" fill="#eef6f3" stroke="#c2dbd1" stroke-width="2"/>
 <rect x="410" y="289" width="290" height="48" rx="14" fill="#e3f0ea" stroke="#cedbea" stroke-width="2"/>
-<text x="555.0" y="321" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#43856f" font-weight="700" text-anchor="middle">R2 · active phase</text>
+<text x="555.0" y="321" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#43856f" font-weight="700" text-anchor="middle">R2 · active request</text>
 <rect x="870" y="289" width="290" height="48" rx="14" fill="#e3f0ea" stroke="#cedbea" stroke-width="2"/>
 <text x="1015.0" y="321" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#43856f" font-weight="700" text-anchor="middle">R2 · WAITING</text>
 <rect x="1330" y="289" width="290" height="48" rx="14" fill="#e3f0ea" stroke="#cedbea" stroke-width="2"/>
-<text x="1475.0" y="321" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#43856f" font-weight="700" text-anchor="middle">R2 · saved phase</text>
+<text x="1475.0" y="321" font-family="Arial,Helvetica,sans-serif" font-size="22" fill="#43856f" font-weight="700" text-anchor="middle">R2 · saved WorkKey</text>
 <path d="M700 313H870" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
 <path d="M1160 313H1330" fill="none" stroke="#43856f" stroke-width="3" stroke-linejoin="round" marker-end="url(#a)"/>
 <rect x="390" y="415" width="1250" height="88" rx="14" fill="#eef6f3" stroke="#c2dbd1" stroke-width="2"/>

@@ -98,7 +98,9 @@ def drive(engine, requests, state):
             next_request = next(pending, None)
         state["max_waiting"] = max(
             state["max_waiting"],
-            sum(request.phase.value == "waiting" for request in engine.scheduler.requests.values()),
+            sum(
+                request.status.value == "waiting" for request in engine.scheduler.requests.values()
+            ),
         )
         if engine.has_unfinished_requests():
             for output in engine.step():

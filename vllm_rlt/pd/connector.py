@@ -8,7 +8,8 @@ from dataclasses import asdict, dataclass, field, replace
 
 import torch
 
-from vllm_rlt.request import Request, RequestPhase
+from vllm_rlt.core.execution import WorkKey
+from vllm_rlt.request import Request, RequestStatus
 
 from .transport import NixlConnector, kv_segments, partition_segments
 
@@ -185,12 +186,12 @@ class PDStageConnector:
             and self.transport.inflight_bytes < self.config.max_inflight_bytes
         )
 
-    def prefill_submitted(self, request, *, phase, start, progress, event, stream):
+    def prefill_submitted(self, request, *, work, start, progress, event, stream):
         transfer = self.transfers[request.request_id]
         if transfer.request is not request:
             raise RuntimeError("stale transfer generation")
-        if phase == RequestPhase.PREFILLING_PRELUDE or (
-            phase == RequestPhase.PREFILLING_RECURRENT
+        if work == WorkKey.PROMPT_PRELUDE or (
+            work == WorkKey.PROMPT_RECURRENT
             and self.engine.scheduler.config.wavefront_chunked_prefill
         ):
             # Overlap: the transfer ran during this compute step, either still on the
@@ -380,7 +381,7 @@ class PDStageConnector:
                     continue
                 if (
                     transfer.compute_done
-                    and not transfer.request.compute_released
+                    and self.engine.scheduler.has_admission_slot(transfer.request)
                     and self.engine.release_transfer_compute(
                         transfer.request, ready_event=transfer.last_event
                     )
@@ -404,7 +405,7 @@ class PDStageConnector:
             elif transfer.ready:
                 if transfer.request.request_id not in self.engine.scheduler.requests:
                     self._forget(transfer)
-                elif not transfer.active and transfer.request.phase != RequestPhase.RECEIVING:
+                elif not transfer.active and transfer.request.status != RequestStatus.RECEIVING:
                     transfer.active = True
                     self.notify(
                         "activated", tid=transfer.tid, seconds=time.monotonic() - transfer.started

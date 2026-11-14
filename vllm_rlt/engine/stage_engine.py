@@ -10,6 +10,7 @@ from vllm_rlt.config import (
     SchedulerConfig,
     resolve_cuda_graph_rows,
 )
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
@@ -18,7 +19,7 @@ from vllm_rlt.engine.connector import StageConnector
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.profiling import Profiler
-from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
+from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestStatus
 from vllm_rlt.sampling_params import SamplingParams
 from vllm_rlt.worker.executor import Executor
 from vllm_rlt.worker.model_runner import ModelRunner
@@ -277,6 +278,7 @@ class StageEngine:
         if scheduler_config.enable_preemption:
             self.scheduler.suspend_callback = self.preemption.suspend
             self.scheduler.resume_callback = self.preemption.resume
+            self.scheduler.has_preemption_snapshot = self.preemption.has_snapshot
 
     @property
     def connector(self):
@@ -402,7 +404,7 @@ class StageEngine:
 
     def has_request(self, request_id):
         request = self.scheduler.requests.get(request_id)
-        return request is not None and request.phase != RequestPhase.FINISHED
+        return request is not None and request.status != RequestStatus.FINISHED
 
     def stats(self):
         return dict(
@@ -433,7 +435,7 @@ class StageEngine:
 
     def abort_request(self, request_id: str) -> RequestOutput:
         request = self.scheduler.requests[request_id]
-        if request.phase == RequestPhase.FINISHED:
+        if request.status == RequestStatus.FINISHED:
             return RequestOutput.from_request(request)
         if self.async_speculative:
             request = self.scheduler.requests[request_id]
@@ -525,30 +527,27 @@ class StageEngine:
         transfer_waiters = {
             r.request_id
             for r in self.scheduler.requests.values()
-            if r.phase in (RequestPhase.RECEIVING, RequestPhase.TRANSFERRING)
-            or (
-                r.request_id in self._connector_blocked
-                and r.request_id in self.scheduler.queues[r.phase]
-            )
+            if r.status in (RequestStatus.RECEIVING, RequestStatus.TRANSFERRING)
+            or (r.request_id in self._connector_blocked and self.scheduler.pending_work(r))
         }
         return all(
             r.request_id in transfer_waiters
             # An admitted export may retain a compute slot while backpressured,
             # even before it reaches TRANSFERRING. Queued arrivals must yield too.
             # A WAITING request absent from its queue remains an invariant error.
-            or (transfer_waiters and r.request_id in self.scheduler.queues[RequestPhase.WAITING])
+            or (transfer_waiters and r.request_id in self.scheduler.waiting)
             for r in self.scheduler.requests.values()
         )
 
-    def _notify_connector_prefill(self, scheduled_request, phase, progress):
+    def _notify_connector_prefill(self, scheduled_request, work, progress):
         request = scheduled_request.request
         if self.connector is not None and self.connector.exports(request):
             self.connector.prefill_submitted(
                 request,
-                phase=phase,
+                work=work,
                 start=(
                     scheduled_request.token_start
-                    if phase == RequestPhase.PREFILL
+                    if work == WorkKey.PROMPT_ATOMIC
                     else progress.transfer_start
                     if progress.transfer_start is not None
                     else scheduled_request.chunk_start
@@ -587,8 +586,7 @@ class StageEngine:
         # Reservation owns transport resources, not a compute slot. Outgoing
         # requests compete with local arrivals in the scheduler's WAITING queue.
         if receiving:
-            self.scheduler.queues[RequestPhase.WAITING].remove(request_id)
-            request.phase = RequestPhase.RECEIVING
+            self.scheduler.mark_receiving(request)
         return request
 
     def suspend_transfer(self, request):
@@ -603,12 +601,13 @@ class StageEngine:
         """
         if self.scheduler.requests.get(request.request_id) is not request:
             return False
-        if request.phase != RequestPhase.TRANSFERRING:
+        if request.status != RequestStatus.TRANSFERRING:
             raise ValueError("request is not awaiting transfer completion")
         if not ready_event.query():
             return False
         self.model_runner.release(request.request_id)
         request.hidden_state = None
+        self.scheduler.release_admission_slot(request)
         request.compute_released = True
         return True
 
@@ -618,7 +617,7 @@ class StageEngine:
             return False
         rid = request.request_id
         if self.async_speculative:
-            if request.phase != RequestPhase.FINISHED:
+            if request.status != RequestStatus.FINISHED:
                 self._finish(request, FinishReason.ABORT)
             self._retire_speculative()
             if self.scheduler.requests.get(rid) is request:
@@ -639,8 +638,8 @@ class StageEngine:
         if self.scheduler.requests.get(request.request_id) is not request:
             return False
         if (
-            request.phase != RequestPhase.RECEIVING
-            or request.request_id in self.scheduler.queues[RequestPhase.WAITING]
+            request.status != RequestStatus.RECEIVING
+            or request.request_id in self.scheduler.waiting
         ):
             raise ValueError("request is not awaiting an import")
         count = len(request.prompt_token_ids)
@@ -653,16 +652,13 @@ class StageEngine:
         request.hidden_state = hidden
         # Keep RECEIVING until the scheduler grants a compute slot. The lease
         # protects the imported allocation while it waits alongside local work.
-        self.scheduler.queues[RequestPhase.WAITING].append(request.request_id)
+        self.scheduler.queue_for_admission(request)
         return True
 
-    def _rewind_split_prefill(self, request):
-        """Rewind an in-flight chunk; the caller rebuilds its queue membership."""
-        if request.phase not in (
-            RequestPhase.PREFILLING_PRELUDE,
-            RequestPhase.PREFILLING_RECURRENT,
-        ):
-            return
+    def _rewind_split_prefill(self, request, work):
+        """Discard the resident partial chunk and return the work to resume."""
+        if work not in (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT):
+            return work
         frontier = request.num_prefilled_tokens
         request.num_preluded_tokens = frontier
         request.prefill_window_origin = frontier
@@ -672,11 +668,11 @@ class StageEngine:
             self.model.config.total_ut_steps,
             start=frontier,
         )
-        request.phase = RequestPhase.PREFILLING_PRELUDE
+        return WorkKey.PROMPT_PRELUDE
 
     def _apply_update(self, update) -> list[RequestOutput]:
-        for scheduled_request, phase, progress in update.prefill:
-            self._notify_connector_prefill(scheduled_request, phase, progress)
+        for scheduled_request, work, progress in update.prefill:
+            self._notify_connector_prefill(scheduled_request, work, progress)
         if update.exited:
             self.model_runner.finalize_many(update.exited)
         if self.speculative_runner is not None:
@@ -702,11 +698,7 @@ class StageEngine:
         if self.async_speculative:
             # Logical finish is immediate; allocation ownership survives until
             # the final submitted round has stopped accessing the request.
-            request.phase = RequestPhase.FINISHED
-            request.finish_reason = reason
-            for queue in self.scheduler.queues.values():
-                while request.request_id in queue:
-                    queue.remove(request.request_id)
+            self.scheduler.mark_finished(request, reason)
             self._retiring_speculative[request.request_id] = request
             return
         if self.speculative_runner is not None:
@@ -742,7 +734,7 @@ class StageEngine:
             request = scheduled_request.request
             if (
                 self.scheduler.requests.get(request.request_id) is not request
-                or request.phase == RequestPhase.FINISHED
+                or request.status == RequestStatus.FINISHED
             ):
                 runner.discarded_rounds += 1
                 continue
@@ -763,7 +755,7 @@ class StageEngine:
         if (
             self.pipeline_speculative
             and self.scheduler.config.enable_preemption
-            and self.scheduler.queues[RequestPhase.WAITING]
+            and self.scheduler.waiting
         ):
             while self._pending_speculative:
                 outputs.extend(self._collect_speculative())
@@ -774,7 +766,7 @@ class StageEngine:
         batch = self._schedule()
         self.last_schedule = batch
         if batch is not None:
-            if batch.phase == RequestPhase.SPECULATIVE:
+            if batch.is_speculative:
                 ticket = self.executor.submit(batch)
                 self._pending_speculative.append(ticket)
                 self._apply_update(self.scheduler.update_after_submission(batch))
@@ -815,9 +807,10 @@ class StageEngine:
             # If the preceding core is still running, boundary work can overlap
             # the independent next core. Once it has completed, refill first:
             # splitting on a briefly pending coda readback fragments the batch.
-            prefer_recurrent=self._overlap_boundary
+            prefer_recurrent=self.scheduler.config.mode != "mixed"
+            and self._overlap_boundary
             and any(
-                t.batch.phase == RequestPhase.RECURRENT and not t.ready() for t in self._inflight
+                WorkKey.DECODE_RECURRENT in t.batch.works and not t.ready() for t in self._inflight
             )
         )
         self._overlap_boundary = False
@@ -829,7 +822,7 @@ class StageEngine:
             elif not self._waiting_for_connector():
                 raise RuntimeError("scheduler made no progress")
             return outputs
-        if batch.phase == RequestPhase.CODA:
+        if WorkKey.DECODE_CODA in batch.works:
             # Bound speculation to one output per request. Its next prelude and
             # core may run before delivery (including a possible EOS), but never
             # sample another token until that output's stop decision is known.
@@ -848,7 +841,7 @@ class StageEngine:
                 return outputs
         ticket = self.executor.submit(batch)
         self._inflight.append(ticket)
-        if batch.phase == RequestPhase.CODA:
+        if WorkKey.DECODE_CODA in batch.works:
             self._pending_coda.append(ticket)
             runner = self.model_runner
             self._overlap_boundary = (
@@ -857,11 +850,11 @@ class StageEngine:
             )
         signals = {}
         for row, scheduled_request in enumerate(batch.requests):
-            phase = batch.phase_for(scheduled_request)
+            work = scheduled_request.work
             request = scheduled_request.request
-            if phase == RequestPhase.PRELUDE:
+            if work == WorkKey.DECODE_PRELUDE:
                 self._pending_exit_signals.pop(request.request_id, None)
-            elif phase == RequestPhase.RECURRENT:
+            elif work == WorkKey.DECODE_RECURRENT:
                 # Submission is already enqueued. Only now may the preceding score
                 # block CPU delivery; max-depth/trace decisions require no readback.
                 previous = self._pending_exit_signals.pop(request.request_id, None)

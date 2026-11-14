@@ -15,9 +15,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import RequestPhase
 from vllm_rlt.serving.protocol import (
     CompletionRequest,
     IncrementalText,
@@ -46,7 +46,7 @@ class PauseAt:
     """Hold one engine step while a test exercises HTTP or worker lifecycle."""
 
     def __init__(self, stage, *, fail=False):
-        self.phase, self.fail = stage, fail
+        self.work, self.fail = stage, fail
         self.entered, self.release = threading.Event(), threading.Event()
         self.engine = None
 
@@ -55,7 +55,7 @@ class PauseAt:
         submit = engine.executor.submit
 
         def pause(batch):
-            if batch.phase == self.phase and not self.entered.is_set():
+            if self.work in batch.works and not self.entered.is_set():
                 self.entered.set()
                 assert self.release.wait(5)
                 if self.fail:
@@ -369,7 +369,7 @@ def test_http_output_matches_direct_and_stream_has_exact_token_events():
 @pytest.mark.parametrize("expired", [False, True])
 def test_shutdown_cleans_http_and_engine_state(caplog, expired):
     async def run():
-        pause, cleaned = PauseAt(RequestPhase.PREFILL), asyncio.Event()
+        pause, cleaned = PauseAt(WorkKey.PROMPT_ATOMIC), asyncio.Event()
         app = create_app(
             lambda: factory(hook=pause),
             model="test-model",
@@ -498,14 +498,14 @@ def test_owner_thread_dynamic_batching_cancellation_and_overload():
                 owner_threads.append(threading.get_ident())
                 trace.append(
                     (
-                        batch.phase,
+                        batch.works,
                         [
                             scheduled_request.request.request_id
                             for scheduled_request in batch.requests
                         ],
                     )
                 )
-                if batch.phase == RequestPhase.RECURRENT and not blocked.is_set():
+                if WorkKey.DECODE_RECURRENT in batch.works and not blocked.is_set():
                     blocked.set()
                     assert release.wait(5)
                 return submit(batch)
@@ -583,7 +583,7 @@ def test_slow_channel_does_not_block_other_requests():
 def test_request_failure_and_disconnect_cleanup(monkeypatch, failure, stream, max_tokens):
     from vllm_rlt.serving import worker as worker_module
 
-    pause = PauseAt(RequestPhase.RECURRENT, fail=failure == "engine")
+    pause = PauseAt(WorkKey.DECODE_RECURRENT, fail=failure == "engine")
 
     class BadTokenizer(TinyTokenizer):
         calls = 0
