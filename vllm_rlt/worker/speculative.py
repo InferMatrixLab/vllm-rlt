@@ -6,6 +6,7 @@ outputs; Scheduler applies returned tokens and KV commits; Engine coordinates cl
 
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from functools import lru_cache
 
 import torch
 
@@ -61,6 +62,30 @@ def rejection_sample(candidate, target, proposal, generator):
     if not bool(torch.isfinite(total) & (total > 0)):
         raise RuntimeError("invalid speculative residual probability mass")
     return int(Sampler.draw(residual / total, generator).item()), False
+
+
+@lru_cache(maxsize=64)
+def loop_waves(token_counts, draft_loops, target_loops):
+    """Return the mixed-depth rows of one loop-level round, one tuple per wave.
+
+    Offset o of a request enters at wave o * draft_loops, after its parent's draft
+    head chose its input, and runs one depth per wave up to target_loops. Rows are
+    (request, offset, depth), ordered by request and offset. ``drafts`` lists the
+    rows whose state after the wave feeds the draft head for the next offset.
+    The schedule depends only on token counts, never on token values.
+    """
+    waves = []
+    for wave in range(max((count - 1) * draft_loops + target_loops for count in token_counts)):
+        rows, drafts = [], []
+        for i, count in enumerate(token_counts):
+            first = max(0, -(-(wave - target_loops + 1) // draft_loops))
+            for offset in range(first, min(count, wave // draft_loops + 1)):
+                depth = wave - offset * draft_loops
+                if depth == draft_loops - 1 and offset + 1 < count:
+                    drafts.append(len(rows))
+                rows.append((i, offset, depth))
+        waves.append((tuple(rows), tuple(drafts)))
+    return tuple(waves)
 
 
 @dataclass
@@ -259,6 +284,8 @@ class SpeculativeRunner:
             ):
                 if self.config.mode == "pipeline":
                     submission = self._submit_pipeline(batch)
+                elif self.config.loop_level_pipelining:
+                    submission = self._submit_loop_round(batch, *self._prepare_loop_inputs(batch))
                 else:
                     inputs, steps, verification = self._prepare_inputs(batch)
                     submission = self._submit_round(batch, inputs, steps, verification)
@@ -454,6 +481,100 @@ class SpeculativeRunner:
         self.stats.rounds += len(scheduled_requests)
         self.stats.drafted_tokens += sum(len(rows) for rows, _ in drafted)
         self.stats.verified_rows += sum(span.token_count for span in scheduled_requests)
+        return SpeculativeSubmission(self, batch, logits, drafted, proposals, event)
+
+    def _prepare_loop_inputs(self, batch):
+        """Plan every wave of a loop-level round and publish one snapshot per dtype.
+
+        Branch states live in one buffer whose rows follow verification order:
+        contiguous by request, then by offset. Each wave gathers its rows, runs
+        one mixed-depth recurrent call and scatters the states back.
+        """
+        for buffer in self.input_buffers.values():
+            buffer.reset()
+        requests = batch.requests
+        counts = tuple(span.token_count for span in requests)
+        starts = [0]
+        for count in counts:
+            starts.append(starts[-1] + count)
+        int64 = self.input_buffers[torch.int64]
+        tokens = int64.append([span.request.input_token_id for span in requests])
+        firsts = int64.append(starts[:-1])
+        planned = []
+        for rows, drafts in loop_waves(counts, self.config.draft_loops, self.config.target_loops):
+            layouts = self.metadata.build(
+                [requests[i].request.request_id for i, _, _ in rows],
+                [[depth for _, _, depth in rows]],
+                [requests[i].token_start + offset for i, offset, _ in rows],
+            )
+            metadata = stage_metadata(
+                layouts, lambda values, dtype: self.input_buffers[dtype].append(values)
+            )
+            flat = [starts[i] + offset for i, offset, _ in rows]
+            draft = None
+            if drafts:
+                draft = (
+                    [rows[row][0] for row in drafts],
+                    int64.append(drafts),
+                    int64.append([flat[row] + 1 for row in drafts]),
+                )
+            planned.append((int64.append(flat), metadata, draft))
+        uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
+
+        def bind(tensor):
+            return uploaded[tensor.dtype].as_strided(
+                tensor.shape, tensor.stride(), tensor.storage_offset()
+            )
+
+        waves = [
+            (
+                bind(flat),
+                tuple(self.metadata.bind(kv, uploaded) for kv in metadata),
+                None if draft is None else (draft[0], bind(draft[1]), bind(draft[2])),
+            )
+            for flat, metadata, draft in planned
+        ]
+        return bind(tokens), bind(firsts), starts[-1], waves
+
+    def _submit_loop_round(self, batch, tokens, firsts, total_rows, waves):
+        """Advance all positions one depth per wave; children start at draft depth.
+
+        A child starts draft_loops waves after its parent, so the parent's KV at
+        each depth is written before the child attends to it. Only draft-ready rows
+        run the head inside the loop; target logits come from one head call after
+        the last wave. Draft IDs stay on the device, as in the block round.
+        """
+        scheduled_requests = batch.requests
+        proposals = [[] for _ in scheduled_requests]
+        drafted = []
+        hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=tokens)).hidden
+        states = hidden.new_empty((total_rows, hidden.shape[-1]))
+        states.index_copy_(0, firsts, hidden)
+        for flat, metadata, draft in waves:
+            hidden = self._recurrent(states.index_select(0, flat), metadata)
+            states.index_copy_(0, flat, hidden)
+            if draft is None:
+                continue
+            owners, rows, children = draft
+            logits = self._coda(hidden.index_select(0, rows))
+            inputs = logits.argmax(-1)
+            for row, i in enumerate(owners):
+                request = scheduled_requests[i].request
+                if request.sampling_params.temperature != 0:
+                    q = Sampler.probabilities(logits[row], request.sampling_params)
+                    proposals[i].append(q)
+                    inputs[row] = Sampler.draw(q, self._acquire_generator(request, logits[row]))
+            drafted.append((owners, inputs))
+            child = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=inputs)).hidden
+            states.index_copy_(0, children, child)
+        logits = self._coda(states)
+        event = None
+        if self.device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+        self.stats.rounds += len(scheduled_requests)
+        self.stats.drafted_tokens += sum(len(rows) for rows, _ in drafted)
+        self.stats.verified_rows += total_rows
         return SpeculativeSubmission(self, batch, logits, drafted, proposals, event)
 
     @torch.inference_mode()
