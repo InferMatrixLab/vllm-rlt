@@ -846,6 +846,17 @@ class KVCacheManager:
             for name, storage in pool.items():
                 storage[index] = getattr(packed, name).view(len(page_ids), *storage.shape[2:])
             return
+        if self.kv_quantization == "nvfp4" and self.device.type == "cuda":
+            # One global scale per page and layer, computed for the whole batch at once.
+            from vllm_rlt.kernels.kv_quantization.nvfp4_batch import pack_batch
+
+            payload, scale, global_scale = pack_batch(items, kind=kind)
+            page_index = torch.tensor(page_ids, dtype=torch.long, device=self.device)
+            layer_index = torch.tensor(layer_ids, dtype=torch.long, device=self.device)
+            pool["payload"][page_index, layer_index] = payload
+            pool["scale"][page_index, layer_index] = scale
+            pool["global_scale"][page_index, layer_index] = global_scale
+            return
         for item, page, layer in zip(items, page_ids, layer_ids):
             packed = pack_kv(item, kind=kind, format=self.kv_quantization, group_size=group)
             for name, storage in pool.items():
