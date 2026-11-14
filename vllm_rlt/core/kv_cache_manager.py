@@ -33,6 +33,7 @@ from vllm_rlt.attention import (
 )
 from vllm_rlt.kernels.kv_quantization import KV_CODECS, pack_kv, unpack_kv
 from vllm_rlt.kernels.kv_quantization._common import KVKind
+from vllm_rlt.kernels.paged_attention import TritonPagedAttention
 from vllm_rlt.request import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
@@ -933,18 +934,44 @@ class KVCacheManager:
             remapped.append(
                 [index.setdefault(b, len(index)) if j < needed else 0 for j, b in enumerate(table)]
             )
+        # Per remapped page: its staging slot, or -(block + 1) once packed.
+        sources = [
+            -(block + 1) if self._packed_page[block] else self._staging_of[block]
+            for block in index
+        ]
         plan = (
             self._page_plan(list(index)),
             torch.tensor(remapped, dtype=torch.int32, device=self.device).reshape(
                 batch.block_tables.shape
             ),
+            torch.tensor(sources or [0], dtype=torch.int32, device=self.device),
         )
         self._attention_plans[batch] = (self._epoch, plan)
         return plan
 
     def _attend_quantized(self, layer: int, batch: KVMetadata, q: torch.Tensor) -> torch.Tensor:
-        """Reference path: decode the batch's pages to BF16, then run the backend."""
-        plan, tables = self._attention_plan(batch)
+        """Decode reads packed pages in place; prefill decodes pages to BF16 first."""
+        plan, tables, sources = self._attention_plan(batch)
+        kernel = getattr(self.attention, "kernel", self.attention)
+        if batch.cu_seqlens_q is None and isinstance(kernel, TritonPagedAttention):
+            # Same result as decode-then-attend, without writing BF16 pages.
+            from vllm_rlt.kernels.kv_quantization.triton_attention_packed import (
+                packed_paged_attention,
+            )
+
+            return packed_paged_attention(
+                q,
+                self.key_cache[:, layer],
+                self.value_cache[:, layer],
+                self._packed_pools["key"],
+                self._packed_pools["value"],
+                layer,
+                tables,
+                sources,
+                batch.context_lengths,
+                format=self.kv_quantization,
+                group_size=self.kv_quantization_group_size,
+            )
         keys, values = self._gather_pages(layer, plan)
         if batch.cu_seqlens_q is not None:
             return self.attention.prefill(
