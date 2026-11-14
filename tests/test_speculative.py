@@ -44,6 +44,57 @@ def drain(e):
     pytest.fail("speculative scheduler did not drain")
 
 
+@pytest.mark.parametrize("k", [1, 3])
+def test_packed_verification_matches_native_greedy(k, monkeypatch):
+    """Packed verification rows, boundaries and tables reproduce native greedy decoding.
+
+    On GPU only FA4 routes verification through packed queries; here a reference
+    packed prefill expands each sequence into bottom-right aligned single rows.
+    """
+    from vllm_rlt.attention import BackendCapabilities
+    from vllm_rlt.core.kv_cache_manager import KVCacheManager
+    from vllm_rlt.kernels.paged_attention import TorchPagedAttention, torch_paged_attention
+    from vllm_rlt.worker.metadata import MetadataBuilder
+
+    def reference_prefill(self, q, key_cache, value_cache, tables, lengths, cu_seqlens, _):
+        rows, row_lengths = [], []
+        for seq, (start, end) in enumerate(zip(cu_seqlens.tolist(), cu_seqlens[1:].tolist())):
+            for row in range(start, end):
+                rows.append(seq)
+                row_lengths.append(int(lengths[seq]) - (end - 1 - row))
+        return torch_paged_attention(
+            q, key_cache, value_cache, tables[rows], torch.tensor(row_lengths, dtype=torch.int32)
+        )
+
+    m = model()
+    prompts = [[2], [3, 4, 5, 6, 7], [9, 3], [5, 6, 7]]
+    params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in [1, 13, 8, 11]]
+    expected = LLM(m).generate(prompts, params)
+    monkeypatch.setattr(
+        KVCacheManager,
+        "attention_capabilities",
+        property(lambda self: BackendCapabilities(packed_prefill=True, packed_matches_decode=True)),
+    )
+    monkeypatch.setattr(TorchPagedAttention, "prefill", reference_prefill, raising=False)
+    packed_rows = []
+    select = MetadataBuilder.select_rows
+
+    def counted(layout, rows, *, packed=False):
+        selected = select(layout, rows, packed=packed)
+        if packed and selected is not None:
+            assert selected.attention.cu_seqlens_q is not None
+            packed_rows.append(len(selected.rows))
+        return selected
+
+    monkeypatch.setattr(MetadataBuilder, "select_rows", staticmethod(counted))
+    llm = LLM(m, speculative_config=SpeculativeConfig(k), cache_config=CacheConfig(256, 2))
+    assert llm.engine.speculative_runner._packed(True)
+    actual = llm.generate(prompts, params)
+    assert packed_rows
+    assert [o.token_ids for o in actual] == [o.token_ids for o in expected]
+    assert llm.engine.cache_manager.num_used_blocks == 0
+
+
 @pytest.mark.parametrize(
     "generation,packed,matches_decode,expected",
     # Triton packs prompt prefill, but its packed kernel is not bitwise equal to
