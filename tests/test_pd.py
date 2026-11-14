@@ -494,6 +494,7 @@ def test_control_channel_detects_a_worker_exit_and_reaps_every_peer():
     engine = PDEngine.__new__(PDEngine)
     engine._profile_session = None
     engine.failure = None
+    engine.terminate_workers_on_failure = True
     engine.peers = {}
     for role in ("prefill", "decode"):
         client = StageClient(
@@ -559,6 +560,8 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
 
     engine = object.__new__(LLMEngine)
     engine.async_speculative = False
+    engine._update_version = None
+    engine._update_failed = False
     engine.pipeline_speculative = False
     engine.speculative_runner = None
     engine.profiling = Profiler("cpu")

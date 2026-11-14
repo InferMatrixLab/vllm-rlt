@@ -276,6 +276,12 @@ class KVCacheManager:
             found.append(blocks)
         return tuple(found)
 
+    def reset_prefix_cache(self):
+        self._pending_prefixes.clear()
+        for blocks in self._prefixes.values():
+            self._drop_refs(blocks)
+        self._prefixes.clear()
+
     def allocate(self, request_id: str, max_tokens: int, *, initial_tokens=None, prefix=()) -> bool:
         """Reserve a logical capacity; acquire physical pages for the current frontier."""
         if not isinstance(request_id, str) or not request_id:
