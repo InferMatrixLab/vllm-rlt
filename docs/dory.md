@@ -152,6 +152,28 @@ What a draft shares with the target, and what it does not:
 Sliding-window attention takes one query row per token, so verification uses
 per-row attention rather than a packed call.
 
+**Round metadata.** A block round prepares its metadata on the host before any
+GPU work. One `MetadataBuilder.build` covers every row of the round (each
+request's committed token plus its `K` candidates, grouped by request in
+position order) at every target depth. Each operation stages a selection of
+that layout (`MetadataBuilder.select_rows`):
+
+- draft offset `j`: the requests still drafting at `j`, at depths `0..d-1`
+  (depth 0 also serves the prelude);
+- draft CODA: the subset that emits a candidate at `j`, at depth 0. The same
+  `coda_rows` index both the CODA hidden rows and their KV metadata;
+- verification: every row at depths `d..T-1`, packed when the attention backend
+  declares `packed_matches_decode` and the model allows packed queries;
+- target CODA: every row at depth 0.
+
+Selections keep the caller's row order and take positions and write addresses
+from the source layout; attention tables are re-planned for the rows selected.
+All selections go into one upload per dtype, and `_prepare_inputs` returns them
+as a `PreparedRound`. Its tensors are views into the runner's input buffers and
+stay valid until the next round is prepared, which happens only after the
+current round has been read back. The pipeline mode uses one build per
+submission and selects its prelude and CODA rows from it the same way.
+
 ## Validation status
 
 `tests/test_dory.py` and `tests/test_dory_gpu.py` hold the regression suites;
