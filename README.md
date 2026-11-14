@@ -105,7 +105,9 @@ in mixed prefill/decode batches.
 ## Getting Started
 
 Requires **Python 3.10+** and **PyTorch 2.5+**. For GPU inference, use Linux and
-an NVIDIA GPU with a compatible CUDA-enabled PyTorch installation.
+an NVIDIA GPU with a compatible CUDA-enabled PyTorch installation. AMD Instinct
+GPUs are supported through ROCm; see the [ROCm guide](docs/rocm.md) for the
+wheel index, feature matrix and validation results.
 
 ```bash
 # Activate your Python environment first.

@@ -135,6 +135,8 @@ def test_kernel_initialization_and_cpu_fallback_do_not_initialize_cuda(missing_e
 @pytest.fixture(autouse=True)
 def require_native_extension_for_gpu_tests(request):
     if request.node.get_closest_marker("gpu"):
+        if torch.version.hip is not None:
+            pytest.skip("native CUDA SiLU-and-Mul is not built on ROCm")
         from vllm_rlt.kernels._extension import load_extension
 
         load_extension()
