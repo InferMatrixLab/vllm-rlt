@@ -78,5 +78,12 @@ def test_packed_attention_matches_decode_then_attend(format, group, block, heads
             group_size=group,
         )
         assert torch.equal(actual[0], torch.zeros_like(actual[0]))
-        # Tile reductions may be ordered differently: allow one BF16 ulp.
-        torch.testing.assert_close(actual, expected, atol=0, rtol=2**-7)
+        if format == "int4":
+            # Same arithmetic and same tile layout as the reference: exact.
+            assert torch.equal(actual, expected)
+        else:
+            # The one-byte E4M3 scale makes Triton lay the tile out as
+            # [1, 16] where the reference gets [1, 8], so the FP32 score dot
+            # product associates differently. Decoded values are identical;
+            # allow the single ulp that reduction order can move.
+            torch.testing.assert_close(actual, expected, atol=0, rtol=2**-7)
