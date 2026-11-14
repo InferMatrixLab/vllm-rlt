@@ -68,6 +68,7 @@ class EngineWorker:
         # Owner-thread state:
         self.engine = None
         self.tokenizer = None
+        self.max_model_len = 0
         self.decoders = {}
 
     def start(self):
@@ -137,6 +138,10 @@ class EngineWorker:
 
     def _load(self):
         self.engine, self.tokenizer = self.factory()
+        model_config = getattr(self.engine, "model_config", None)
+        if model_config is None:
+            model_config = self.engine.model.config
+        self.max_model_len = model_config.max_position_embeddings
 
     def _tick(self, pending, cancellations):
         failures = []
@@ -150,8 +155,13 @@ class EngineWorker:
                 continue
             try:
                 tokens = self.tokenizer.encode(channel.spec.prompt)
+                params = channel.spec.resolve_params(
+                    len(tokens),
+                    self.max_model_len,
+                    max_output_tokens=self.limits.max_output_tokens,
+                )
                 options = {"trace_id": channel.spec.trace_id} if channel.spec.trace_id else {}
-                self.engine.add_request(request_id, tokens, channel.spec.params, **options)
+                self.engine.add_request(request_id, tokens, params, **options)
                 self.decoders[request_id] = (IncrementalText(self.tokenizer), 0)
             except ValueError as exc:
                 failures.append((request_id, ServingError.invalid_request(str(exc))))
@@ -203,6 +213,7 @@ class EngineWorker:
         self.decoders.clear()
         self.engine = None
         self.tokenizer = None
+        self.max_model_len = 0
 
     async def _run(self):
         running = False
