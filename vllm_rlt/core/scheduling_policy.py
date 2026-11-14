@@ -23,17 +23,25 @@ class SchedulingPolicy:
     def __init__(self, config: SchedulerConfig):
         self.config = config
         self.prefill_batches_since_recurrent = 0
+        # Prefill batches allowed before the next decode step.
+        self.prefill_allowance = config.max_prefill_batches_before_decode
 
     @property
     def decode_due(self) -> bool:
-        return self.prefill_batches_since_recurrent >= self.config.max_prefill_batches_before_decode
+        return self.prefill_batches_since_recurrent >= self.prefill_allowance
 
-    def record_batch(self, phase: RequestPhase) -> None:
+    def record_batch(self, phase: RequestPhase, *, loop_count: int | None = None) -> None:
         """Count nonempty scheduled batches, not attempts or GPU completions."""
         if phase in self.PREFILL_PHASES:
             self.prefill_batches_since_recurrent += 1
         elif phase in (RequestPhase.RECURRENT, RequestPhase.SPECULATIVE):
             self.prefill_batches_since_recurrent = 0
+            # Unfused, each loop is its own decode step followed by a prefill turn.
+            # Fusing L loops into one submission would otherwise cut prompt work to
+            # 1/L of its share and delay admission (TTFT) under load.
+            loops = loop_count if phase != RequestPhase.SPECULATIVE and loop_count else 1
+            share = loops if self.config.prefill_share_per_loop else 1
+            self.prefill_allowance = self.config.max_prefill_batches_before_decode * max(1, share)
 
 
 class PromptOnlyPolicy(SchedulingPolicy):

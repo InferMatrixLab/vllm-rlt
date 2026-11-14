@@ -162,11 +162,15 @@ def test_model_execution_consumes_selected_and_staged_graphs(monkeypatch):
         pytest.fail("graph selection, capture and input staging belong to preparation")
 
     def checked_execute(scheduled, prepared):
+        # Graph selection and capture belong to preparation. Input staging of a
+        # fused later loop necessarily follows its producer loop inside execution;
+        # the first loop's inputs are still staged in preparation.
         with monkeypatch.context() as patch:
             patch.setattr(runner.graphs, "select", reject)
-            patch.setattr(runner.graphs, "prepare_inputs", reject)
-            patch.setattr(cuda_graph, "_copy_graph_inputs", reject)
             patch.setattr(cuda_graph, "_capture", reject)
+            if prepared.batch.loop_count <= 1:
+                patch.setattr(runner.graphs, "prepare_inputs", reject)
+                patch.setattr(cuda_graph, "_copy_graph_inputs", reject)
             return execute(scheduled, prepared)
 
     monkeypatch.setattr(runner, "_execute", checked_execute)
