@@ -75,6 +75,17 @@ layer id rather than their physical sublayer index.
   `test_engine_stops_on_the_configured_eos_token`.
 - CUDA execution on the Triton backend, including sliding-window masking; `auto`
   selects Triton because the Flash adapters do not implement masking.
+- CUDA Graphs (`ExecutionConfig(cuda_graphs=True)`) for decode: the input
+  stage, every recurrent loop and the output stage each replay one graph per
+  batch size. The window is a constant of the captured attention kernel; page
+  tables and context lengths stay graph inputs. Prompt prefill runs eager,
+  because its row count follows the prompt rather than the batch.
+- Ordinary asynchronous scheduling (`ExecutionConfig(async_scheduling=True)`),
+  with or without graphs. Dory's loop count is fixed, so no exit score is read
+  back and any exit mode is accepted; the sampled token stays on the device for
+  the next input stage and only its readback is deferred. The two switches are
+  independent: sync eager, sync Graph, async eager and async Graph are tested
+  separately.
 - The official tokenizer, including the Hub's `tokenizer.json` and chat
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
@@ -83,8 +94,7 @@ layer id rather than their physical sublayer index.
 
 These fail fast rather than degrade silently:
 
-- WCPB, mixed or staged prefill; asynchronous execution; PD.
-- CUDA Graphs (the sliding-window path needs host-planned KV metadata).
+- WCPB, mixed or staged prefill; packed prefill metadata (`prefill_uva`); PD.
 - Prefix caching.
 - Self-speculation.
 - Per-request loop counts other than the configured full depth: Dory has no
@@ -99,9 +109,9 @@ off until 2E covers it.
 Sliding-window masking exists in the Torch reference backend and in the Triton
 decode kernel (`window=` on `KVCacheManager.attend`). Backend selection requires
 the `sliding_window` capability, so a Flash-backed Dory engine fails at
-construction instead of attending full history. Masking with device-owned
-metadata (Graphs, async) and storage reclamation of out-of-window pages stay
-with PR 1's follow-ups (2D) and 2B.
+construction instead of attending full history. Masking accepts host-planned,
+graph-private and device-owned metadata; storage reclamation of out-of-window
+pages stays with 2B.
 
 ## Validation status
 
@@ -151,14 +161,59 @@ the oracle is an independent implementation of the pinned upstream math, which
 is weaker than comparing two runtimes. It is recorded here rather than implied
 to be complete.
 
+### Execution modes
+
+`tests/test_dory_gpu.py` adds 36 cases on a small FP32 model. For each of sync
+eager, sync Graph, async eager and async Graph, with 1, 2 and 3 concurrent
+requests of different prompt lengths, the generated tokens equal the dense
+oracle's, and the Graph modes must replay the input-stage, recurrent and
+output-stage graphs. Cancellation (before the first step, after prefill, in the
+middle of decode) and a failed submission are checked in every mode: the KV
+allocation returns to zero and a following request still matches the oracle.
+
+Real checkpoint, one GH200 (torch 2.14.0+cu130, triton 3.8.0), BF16, two loops,
+greedy, 64 generated tokens per request, prompts cut from tokenized Python
+source, `max_num_batched_tokens=2048`. Each workload runs twice in one process
+and the second pass is reported. Decode throughput in tokens/s, counted after
+the last request's first token:
+
+| Requests x prompt | sync eager | sync Graph | async eager | async Graph | Peak GiB |
+| --- | --- | --- | --- | --- | --- |
+| 128 x 468 | 688 | 2274 | 752 | 2356 | 44.8 |
+| 64 x 937 | 384 | 1341 | 358 | 1843 | 26.4 |
+| 32 x 1875 | 198 | 775 | 217 | 1054 | 26.4 |
+| 16 x 3750 | 122 | 512 | 135 | 572 | 26.4 |
+| 8 x 7500 | 64.6 | 288 | 69.2 | 318 | 26.1 |
+| 4 x 15000 | 35.1 | 152 | 31.8 | 166 | 25.9 |
+| 2 x 32256 | 15.8 | 77.6 | 18.0 | 85.2 | 25.9 |
+| 1 x 32256 | 9.4 | 41.2 | 8.5 | 44.8 | 16.9 |
+
+Graphs raise decode throughput 3.3x to 5.3x and cut the median inter-token
+latency from 107-182 ms to 22-56 ms; no graph call fell back to eager. Async
+alone is within run-to-run noise of sync in eager mode (0.9x to 1.1x) and adds
+4% to 37% on top of Graphs. Time to first token is prompt prefill, which stays
+eager and does not change with the mode: 7.2-7.9 s for 128 x 468, 25.6-25.8 s
+for 4 x 15000, 48.7-49.7 s for 2 x 32256. These are single runs on a shared
+host.
+
+Token agreement on the real checkpoint: in FP32 the four modes generate
+identical tokens for every request (32 x 937 and 64 x 468, the second with the
+async Graph run batching its decode waves differently from the sync runs). In
+BF16 the four modes are identical up to 16 requests and at every prompt length
+measured there; from 32 requests on, sync eager, sync Graph and async eager
+still agree while async Graph differs, because it merges the two prefill
+cohorts into one decode wave and BF16 greedy tokens depend on batch
+composition. FP32 is therefore the exact check; BF16 agreement is not promised
+across batch shapes.
+
 ### Not yet performed
 
 - A runtime-to-runtime comparison against vLLM once a Dory-capable build is
   available.
-- Long-context behaviour: the qualified prompt is 5 tokens plus 4 generated, far
-  below the artifact's 256K configuration limit, which is not a qualified
-  deployment length.
-- Windowed Flash-backed kernels and windowed masking with device-owned metadata
-  (Graphs, async) — 2D's combination work.
-- Performance measurement and memory accounting in devices terms. No throughput
-  or memory claim is made here.
+- Long-context behaviour beyond 32K tokens: the longest measured prompt is
+  32,256 tokens, far below the artifact's 256K configuration limit, which is
+  not a qualified deployment length.
+- Windowed Flash-backed kernels.
+- Graph-captured prefill, open-loop arrival traces and sampled decoding on the
+  real checkpoint in Graph or async mode. The measurements above are
+  closed-loop, greedy, and their time to first token is eager prefill.

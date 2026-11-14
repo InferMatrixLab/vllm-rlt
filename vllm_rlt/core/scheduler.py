@@ -1256,8 +1256,14 @@ class Scheduler:
 
     def needs_exit_signal(self, request: Request) -> bool:
         """Whether the next submitted loop needs its predecessor's readback."""
-        maximum = request.sampling_params.max_loops or self.total_ut_steps
-        return self.exit_mode != "trace" and request.loops_done + 1 < maximum
+        params = request.sampling_params
+        maximum = params.max_loops or self.total_ut_steps
+        # No score can end a request whose minimum depth is its maximum.
+        return (
+            self.exit_mode != "trace"
+            and request.loops_done + 1 < maximum
+            and params.min_loops < maximum
+        )
 
     def _record_token(self, request: Request, token: int, depth: int) -> bool:
         request.generated_token_ids.append(token)

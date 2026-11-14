@@ -177,3 +177,114 @@ def test_plan_cache_profiles_dory_on_cuda():
         * config.head_dim
         * 4
     )
+
+
+EXECUTION_MODES = {
+    "sync_eager": dict(),
+    "sync_graph": dict(cuda_graphs=True),
+    "async_eager": dict(async_scheduling=True),
+    "async_graph": dict(async_scheduling=True, cuda_graphs=True),
+}
+# Prompts shorter than, equal to and longer than the tiny window of four.
+PROMPTS = {"a": [4, 7, 3], "b": [9, 2, 6, 5], "c": [8, 3, 3, 11, 5, 2, 7, 13, 6]}
+
+
+def reference_pair():
+    reference = DoryForCausalLM(tiny_dory_config()).eval()
+    torch.manual_seed(42)
+    model = make_gpu_model()
+    reference.load_state_dict({name: value.cpu() for name, value in model.state_dict().items()})
+    return reference, model
+
+
+def make_engine(model, mode, *, max_num_seqs=3):
+    return LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=512, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=max_num_seqs, max_num_batched_tokens=16),
+        execution_config=ExecutionConfig(**EXECUTION_MODES[mode]),
+    )
+
+
+def drain(engine, *, abort=None, after=0):
+    finished, steps = {}, 0
+    while engine.has_unfinished_requests():
+        if abort is not None and steps == after:
+            engine.abort_request(abort)
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output
+        steps += 1
+    return finished
+
+
+@pytest.mark.parametrize("mode", EXECUTION_MODES)
+@pytest.mark.parametrize("max_num_seqs", [1, 2, 3])
+def test_dory_execution_modes_match_cpu_oracle(mode, max_num_seqs):
+    """Graph replay and asynchronous submission are separate switches; each
+    combination serves the same greedy tokens as the dense oracle."""
+    reference, model = reference_pair()
+    engine = make_engine(model, mode, max_num_seqs=max_num_seqs)
+    params = SamplingParams(max_tokens=6, min_loops=2, max_loops=2, ignore_eos=True)
+    for request_id, prompt in PROMPTS.items():
+        engine.add_request(request_id, prompt, params)
+    finished = drain(engine)
+    assert set(finished) == set(PROMPTS)
+    for request_id, prompt in PROMPTS.items():
+        assert finished[request_id].token_ids == greedy_reference(reference, prompt, 6)
+        assert finished[request_id].exit_depths == [2] * 6
+    assert engine.cache_manager.num_used_blocks == 0
+    runner = engine.model_runner
+    if "graph" in mode:
+        # Every decode stage replays a graph; prompt prefill stays eager.
+        for graphs in (runner.prelude_graphs, runner.graphs, runner.coda_graphs):
+            assert graphs.replays > 0
+    else:
+        assert runner.graphs is None and runner.coda_graphs is None
+        assert runner.prelude_graphs is None
+
+
+@pytest.mark.parametrize("mode", EXECUTION_MODES)
+@pytest.mark.parametrize("after", [0, 1, 3, 6, 9])
+def test_dory_cancellation_releases_kv_in_every_execution_mode(mode, after):
+    reference, model = reference_pair()
+    engine = make_engine(model, mode)
+    params = SamplingParams(max_tokens=6, min_loops=2, max_loops=2, ignore_eos=True)
+    for request_id, prompt in PROMPTS.items():
+        engine.add_request(request_id, prompt, params)
+    finished = drain(engine, abort="b", after=after)
+    assert set(finished) >= {"a", "c"}
+    for request_id in ("a", "c"):
+        assert finished[request_id].token_ids == greedy_reference(reference, PROMPTS[request_id], 6)
+    assert engine.cache_manager.num_used_blocks == 0
+    # The cancelled ID is reusable and serves the full answer afterwards.
+    engine.add_request("b", PROMPTS["b"], params)
+    assert drain(engine)["b"].token_ids == greedy_reference(reference, PROMPTS["b"], 6)
+    assert engine.cache_manager.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("mode", EXECUTION_MODES)
+def test_dory_failed_submission_releases_kv_in_every_execution_mode(mode, monkeypatch):
+    reference, model = reference_pair()
+    engine = make_engine(model, mode)
+    params = SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True)
+    for request_id, prompt in PROMPTS.items():
+        engine.add_request(request_id, prompt, params)
+    for _ in range(4):
+        engine.step()
+    submit = engine.executor.submit
+
+    def failing(batch):
+        raise RuntimeError("injected submission failure")
+
+    monkeypatch.setattr(engine.executor, "submit", failing)
+    with pytest.raises(RuntimeError, match="injected"):
+        engine.step()
+    monkeypatch.setattr(engine.executor, "submit", submit)
+    for request_id in list(engine.scheduler.requests):
+        engine.abort_request(request_id)
+    assert engine.cache_manager.num_used_blocks == 0
+    engine.add_request("a", PROMPTS["a"], params)
+    assert drain(engine)["a"].token_ids == greedy_reference(reference, PROMPTS["a"], 4)
+    assert engine.cache_manager.num_used_blocks == 0
