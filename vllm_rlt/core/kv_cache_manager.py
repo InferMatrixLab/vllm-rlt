@@ -8,7 +8,7 @@ prompt blocks can be shared through the prefix cache.
 
 import hashlib
 import struct
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -276,6 +276,37 @@ class KVCacheManager:
             found.append(blocks)
         return tuple(found)
 
+    def prefix_admission_bounds(
+        self, tokens: Sequence[int], *, release_requests: Sequence[str] = ()
+    ) -> tuple[int, int]:
+        """Return possible reuse and a lower bound for exclusive prefix claims.
+
+        Pending publications are counted even if their events or written ranges
+        are not ready. The claim bound only covers the contiguous prefix already
+        published, projected after releasing the specified allocations.
+        """
+        if not self.enable_prefix_caching:
+            return 0, 0
+        released = self._released_block_counts(release_requests)
+        pending_keys = set()
+        for request_id, allocation, pending_tokens, length, _ in self._pending_prefixes:
+            if self._allocations.get(request_id) is not allocation:
+                continue
+            publishable = min(length, len(pending_tokens) - 1)
+            pending_keys.update(self._prefix_keys(pending_tokens[:publishable]))
+        pages = claims = 0
+        published_prefix = True
+        for key in self._prefix_keys(tokens[:-1]):
+            blocks = self._prefixes.get(key)
+            if blocks is None and key not in pending_keys:
+                break
+            if blocks is not None and published_prefix:
+                claims += sum(self._refs[block] - released[block] == 1 for block in blocks)
+            if blocks is None:
+                published_prefix = False
+            pages += 1
+        return pages * self.storage_depths, claims
+
     def allocate(self, request_id: str, max_tokens: int, *, initial_tokens=None, prefix=()) -> bool:
         """Reserve a logical capacity; acquire physical pages for the current frontier."""
         if not isinstance(request_id, str) or not request_id:
@@ -398,6 +429,32 @@ class KVCacheManager:
     def allocated_blocks(self, request_id: str) -> int:
         """How many physical blocks this request holds, counting every plane."""
         return len(self._get_allocation(request_id).block_tables[0]) * self.storage_depths
+
+    def _released_block_counts(self, request_ids: Sequence[str]) -> Counter:
+        allocations = (self._get_allocation(request_id) for request_id in set(request_ids))
+        return Counter(
+            block
+            for allocation in allocations
+            if not allocation.transfer_leases
+            for table in allocation.block_tables
+            for block in table
+        )
+
+    def reclaimable_blocks(self, request_ids: Sequence[str]) -> int:
+        """Count additional available blocks if these allocations are released.
+
+        Shared pages count only once, and cached pages become available once the
+        last non-cache reference is released. Transfer-leased allocations remain
+        pinned and contribute nothing until the lease is released.
+        """
+        released = self._released_block_counts(request_ids)
+        cached = {
+            block for blocks in self._prefixes.values() for block in blocks if block in released
+        }
+        return sum(
+            self._refs[block] == count or (self._refs[block] == count + 1 and block in cached)
+            for block, count in released.items()
+        )
 
     def get_block_table(self, request_id: str, depth: int) -> tuple[int, ...]:
         self._validate_depth(depth)

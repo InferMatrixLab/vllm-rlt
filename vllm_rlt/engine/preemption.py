@@ -20,6 +20,14 @@ class PreemptionManager:
         """Discard saved state; normal request cleanup releases any resident KV."""
         self.snapshots.pop(request_id, None)
 
+    def resume_required_blocks(self, request) -> int | None:
+        """Return restore allocation size, or None when no snapshot exists."""
+        state = self.snapshots.get(request.request_id)
+        if state is None:
+            return None
+        kv = state["kv"]
+        return 0 if kv is None else kv.pages * self.engine.cache_manager.storage_depths
+
     def suspend(self, victim, *, offload_kv=True):
         """Release a runner slot, optionally reclaiming KV capacity as well.
 

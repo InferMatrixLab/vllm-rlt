@@ -12,6 +12,60 @@ def make_cache(**kwargs):
     return KVCacheManager(**parameters)
 
 
+def test_reclaimable_blocks_account_for_shared_prefix_references():
+    cache = make_cache(num_blocks=20, max_loops=2, enable_prefix_caching=True)
+    assert cache.allocate("first", 5)
+    cache.mark_imported_prefix("first", 5)
+    cache.publish_prefix("first", [1, 2, 3, 4, 5], 5)
+    prefix = cache.lookup_prefix([1, 2, 3, 4, 6])
+    assert cache.allocate("second", 5, prefix=prefix)
+    free_before = cache.num_free_blocks
+
+    assert cache.prefix_admission_bounds([1, 2, 3, 4, 6]) == (4, 0)
+    assert cache.prefix_admission_bounds([1, 2, 3, 4, 6], release_requests=["first", "second"]) == (
+        4,
+        4,
+    )
+    assert cache.reclaimable_blocks(["first"]) == 2
+    assert cache.reclaimable_blocks(["first", "second"]) == 8
+    assert cache.num_free_blocks == free_before
+
+    cache.pin_transfer("first", "transfer")
+    assert cache.reclaimable_blocks(["first", "second"]) == 2
+    cache.unpin_transfer("first", "transfer")
+    cache.free("first")
+    assert cache.num_free_blocks == free_before + 2
+    assert cache.reclaimable_blocks(["second"]) == 6
+    cache.free("second")
+    assert cache.num_free_blocks == free_before + 8
+    assert cache.prefix_admission_bounds([1, 2, 3, 4, 6]) == (4, 4)
+
+
+def test_prefix_admission_bounds_include_pending_publications_without_polling():
+    class PendingEvent:
+        def __init__(self):
+            self.queries = 0
+
+        def query(self):
+            self.queries += 1
+            return False
+
+    cache = make_cache(num_blocks=20, max_loops=2, enable_prefix_caching=True)
+    assert cache.allocate("first", 5)
+    cache.mark_imported_prefix("first", 5)
+    event = PendingEvent()
+    cache.publish_prefix("first", [1, 2, 3, 4, 5], 5, event=event)
+
+    assert cache.prefix_admission_bounds([1, 2, 3, 4, 6]) == (4, 0)
+    assert cache.prefix_admission_bounds([1, 9, 3, 4, 6]) == (0, 0)
+    assert event.queries == 0
+    assert not cache.lookup_prefix([1, 2, 3, 4, 6])
+    assert event.queries == 1
+    assert cache.prefix_admission_bounds([1, 2, 3, 4, 6]) == (4, 0)
+    cache.free("first")
+    assert cache.prefix_admission_bounds([1, 2, 3, 4, 6]) == (0, 0)
+
+
 def test_admission_is_atomic_and_counts_all_depths():
     cache = make_cache(num_blocks=12)
     assert cache.required_blocks(3) == 6

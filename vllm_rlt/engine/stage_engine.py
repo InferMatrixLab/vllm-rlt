@@ -277,6 +277,7 @@ class StageEngine:
         if scheduler_config.enable_preemption:
             self.scheduler.suspend_callback = self.preemption.suspend
             self.scheduler.resume_callback = self.preemption.resume
+            self.scheduler.resume_blocks_callback = self.preemption.resume_required_blocks
 
     @property
     def connector(self):
