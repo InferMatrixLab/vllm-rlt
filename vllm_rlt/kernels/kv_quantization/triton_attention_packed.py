@@ -10,9 +10,16 @@ span pages, so each token selects its source with masked loads.
 
 Decode uses the same FP32 operations as ``triton_decode`` (no FMA contraction)
 and rounds to the cache dtype; the softmax reuses the reference tiling, split
-layout and merge. Results usually equal decode-then-``paged_attention`` bit for
-bit, but the compiler may order a tile reduction differently, so rare outputs
-differ by one BF16 ulp.
+layout and merge. INT4 results equal decode-then-``paged_attention`` bit for
+bit. NVFP4 does too except for rare single outputs (1 in 20480 at head_dim 128,
+none at 8 or 65), because its E4M3 scale is one byte where the BF16 key tile is
+two: Triton fills a 16-byte vector from the scale load and gives the tile
+``sizePerThread`` [1, 16] instead of the reference kernel's [1, 8], so the FP32
+score dot product associates as a different tree. The decoded values themselves
+are identical; only that reduction order differs. ``tl.max_contiguous`` on the
+scale index does not change the choice, and an explicit two-level sum in the
+reference's tree did not either, so this is left as a documented caveat rather
+than paid for with a layout-forcing workaround.
 """
 
 import torch
