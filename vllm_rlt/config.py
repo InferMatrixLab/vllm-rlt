@@ -20,6 +20,14 @@ class CacheConfig:
     incremental_allocation: bool = False
     # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
+    # "int4" or "nvfp4": pages leaving the latest kv_quantization_window tokens
+    # move from a small BF16 staging pool to packed storage.
+    kv_quantization: str | None = None
+    # None selects the codec default (INT4 G=64, NVFP4 G=16); must divide block_size.
+    kv_quantization_group_size: int | None = None
+    kv_quantization_window: int = 64
+    # None sizes the staging pool for max_num_seqs requests at the batch token limit.
+    kv_quantization_staging_blocks: int | None = None
 
     def __post_init__(self):
         for name in ("enable_prefix_caching", "incremental_allocation"):
@@ -45,6 +53,10 @@ class CacheConfig:
                 raise ValueError("specify num_blocks or kv_cache_memory_bytes, not both")
         if type(self.memory_reserve_bytes) is not int or self.memory_reserve_bytes < 0:
             raise ValueError("memory_reserve_bytes must be a nonnegative integer")
+        if self.kv_quantization not in (None, "int4", "nvfp4"):
+            raise ValueError("kv_quantization must be None, 'int4', or 'nvfp4'")
+        if self.kv_quantization_staging_blocks is not None:
+            _positive("kv_quantization_staging_blocks", self.kv_quantization_staging_blocks)
 
 
 @dataclass(frozen=True)
