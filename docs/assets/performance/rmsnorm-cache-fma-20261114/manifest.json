@@ -1,0 +1,340 @@
+{
+  "head": "824cd3846316b5287f609ee5748b6433c1d802bb",
+  "old_commit": "50a7ce199ab37632249516f7112d82f02880aa48",
+  "vllm_source_commit": "2b678ac739166bd0356883048673bbd1c34a3b0e",
+  "tested_runtime_and_tests_diff": "empty before tests; checked empty again during manifest generation",
+  "workspace_note": "The shared repository was clean at initial measurement; another agent later began documentation-only integration. This does not alter the locked runtime/test hashes.",
+  "python": "3.12.3",
+  "python_executable": "/home/zjy/code/david/b_workspace/.b_rdma/bin/python",
+  "torch": "2.13.0+cu130",
+  "torch_cuda_runtime": "13.0",
+  "driver": "610.43.02",
+  "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Sun_Jul_12_11:24:59_PDT_2026\nCuda compilation tools, release 13.4, V13.4.46\nBuild cuda_13.4.r13.4/compiler.38501229_0",
+  "gpu": "NVIDIA B300 SXM6 AC",
+  "physical_gpu_index": 7,
+  "logical_gpu_index": 0,
+  "gpu_uuid": "GPU-40e00845-d89c-1393-2c32-a2dca3ee9442",
+  "sm_count": 148,
+  "compute_capability": "10.3",
+  "device_selection_note": "Physical GPU 3 became occupied before test start; all arms were newly measured on idle GPU 7.",
+  "compiled_arches": [
+    "sm_80",
+    "sm_103"
+  ],
+  "tested_arch": "sm_103",
+  "build_flags": "-O3; TORCH_CUDA_ARCH_LIST=8.0;10.3; MAX_JOBS=2",
+  "test_suite": {
+    "passed": 384,
+    "log": "gpu-tests.log",
+    "gpu_monitor": "process list checked before and immediately after; no continuous polling during the suite"
+  },
+  "timing": {
+    "seed": 42,
+    "warmup": 10,
+    "repetitions": 7,
+    "graph_unroll": 32,
+    "replays": 50,
+    "unprofiled": true,
+    "clock_locked": false,
+    "output": "all four experimental arms share a single preallocated output; vLLM residual added separately"
+  },
+  "correctness": {
+    "key": 54,
+    "matrix": 444,
+    "original_subset": 420,
+    "extended_seed3039": 342,
+    "tolerances": {
+      "float32": 2e-06,
+      "float16": 0.002,
+      "bfloat16": 0.01
+    },
+    "details": "summary.json; do not suppress recorded failures"
+  },
+  "guarded_stages": {
+    "extended-gpu-monitor.jsonl": {
+      "samples": 3,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "key-gpu-monitor.jsonl": {
+      "samples": 15,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "matrix-gpu-monitor.jsonl": {
+      "samples": 54,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "ncu-fixed-4096-1024-gpu-monitor.jsonl": {
+      "samples": 4,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "ncu-fixed-8192-4-gpu-monitor.jsonl": {
+      "samples": 4,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "ncu-fma-4096-1024-gpu-monitor.jsonl": {
+      "samples": 4,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "ncu-fma-8192-4-gpu-monitor.jsonl": {
+      "samples": 4,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "profile-full-gpu-monitor.jsonl": {
+      "samples": 4,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "profile-ops-gpu-monitor.jsonl": {
+      "samples": 4,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "verify-fixed-gpu-monitor.jsonl": {
+      "samples": 3,
+      "external": [],
+      "before": true,
+      "after": true
+    },
+    "verify-old-gpu-monitor.jsonl": {
+      "samples": 3,
+      "external": [],
+      "before": true,
+      "after": true
+    }
+  },
+  "trace_limit": "Full trace requested shapes, memory and stack; no allocation events with this preallocated-output window.",
+  "discarded_captures": "First profiler script shadowed Python profile module and double-captured within one process; prior-module-shadow-* retained but excluded. Both modes recaptured with renamed script.",
+  "preflight_failures": "PYTHONPATH omission and missing GPU- prefix normalization failed before timing; error logs retained.",
+  "new_model_end_to_end_tests": false,
+  "runtime_changes_or_commits": false,
+  "sha256": {
+    "production_source": {
+      "path": "csrc/normalization/rms_norm.cu",
+      "sha256": "b5e81d259f1d65c4e5abc9fb9b3ed9b8dc6c8130b84bbe842d62cf607d1d3260"
+    },
+    "production_binary": {
+      "path": "vllm_rlt/_C.cpython-312-x86_64-linux-gnu.so",
+      "sha256": "fac48ddb73f7f284e887b880ed0604d25362c9a3404adb280e368683c1ce09aa"
+    },
+    "test_normalization": {
+      "path": "tests/test_normalization.py",
+      "sha256": "5981df44b1aa352d519f8acf2482b0841106abd8524e8e8f29e9abd4f8494861"
+    },
+    "test_ouro": {
+      "path": "tests/test_ouro.py",
+      "sha256": "1dbd8ac91158f37e0681835039a6ea9f99b1aec95c5acd1b880579a3fc2f4473"
+    },
+    "test_activation": {
+      "path": "tests/test_activation.py",
+      "sha256": "26871b0692530a3e742304da1d7eb19715d3c22bd0badfbf1469748f5226bace"
+    },
+    "test_native_build": {
+      "path": "tests/test_native_build.py",
+      "sha256": "0642377f098b1a8e327175ca63a0a55cd776c77075a47d132f0d7d9d9f7a6534"
+    },
+    "old_binary": {
+      "path": "artifacts/rmsnorm-cache-count-20261110/before.so",
+      "sha256": "3c132ba489156b36876fdb971e68305583df76bf839ed2f8770ae828a0d5af04"
+    },
+    "vllm_binary": {
+      "path": "artifacts/rmsnorm-generic-20261109/vllm-source-build/build/vllm_rms_review.so",
+      "sha256": "f71fed3f96c641f4c8188b3e088787a1ffa64bd6febe865ed9056b575eb0bd5e"
+    },
+    "CONTRACT.md": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/CONTRACT.md",
+      "sha256": "02d8a5d3b74d9cad7df5b18e0fb3ad16c3e66f2a5fad67061afff4e22db92630"
+    },
+    "REPORT.md": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/REPORT.md",
+      "sha256": "c26d624668ca529dbee87312217fd39a34165fb0190320e9b1b494dbcd829352"
+    },
+    "fma.patch": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/fma.patch",
+      "sha256": "6ef0f9ca5895392d1130bbf3c22c236930ed2ec4a8f3f1cb56073fe568481f31"
+    },
+    "variant-hashes.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/variant-hashes.json",
+      "sha256": "d3d25a42d02b9dc5f019059242df15373a90a4cec5b627f02f8887932db2e574"
+    },
+    "benchmark.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/benchmark.py",
+      "sha256": "56f638d63fbe8cc9f6fb6661f796ec39f226e11198c27236ee2c75c9764abcf0"
+    },
+    "gpu_guard.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/gpu_guard.py",
+      "sha256": "3bf4c88949148dff9c9d4433d1c08622d0e1b11b468f305937da64e537d30800"
+    },
+    "verify_wrapper.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/verify_wrapper.py",
+      "sha256": "affcf6a153119b9bca29c8f3b8a20d32a9de6bb69ca368cb3c79caf9edd48ce5"
+    },
+    "make_variants.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/make_variants.py",
+      "sha256": "05d64b33a8d6b810dbd1c4bc89871c8171fd987d9e9775e73350e09b6e46449e"
+    },
+    "build_one.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/build_one.py",
+      "sha256": "dc5864be1317f4d14badeed686b6f3ff78ae77f1a96742b99e5778ce2351e46e"
+    },
+    "run_ncu.sh": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/run_ncu.sh",
+      "sha256": "3c222349b338439489b42e7e59e0e45889891afd221ac96c06104064579bdf08"
+    },
+    "ncu_target.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/ncu_target.py",
+      "sha256": "7ca3b02866ce15903cea3dd35af177ddf8ff109afcda69dfae59ed3bb058de7b"
+    },
+    "capture_traces.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/capture_traces.py",
+      "sha256": "1f9a158dbbf20abf65c63ceb73ee0853a3684c0874dc09ebf4f5cd36e5531bd4"
+    },
+    "extract_sass.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/extract_sass.py",
+      "sha256": "6b5c1b9eb27f5ee1df14f67536e80f0479360435541b87043f60758e54e80886"
+    },
+    "summarize.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/summarize.py",
+      "sha256": "5cbaaf2cf3e6fbcbc7e54f2cbc81c9f5aece9150c719c0abd3381b38fa6c5de8"
+    },
+    "make_manifest.py": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/make_manifest.py",
+      "sha256": "c01aa9bd7de0ba84368ca3928ba1ee513e19406787202ef7cd2185c0f183caff"
+    },
+    "gpu-tests.log": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/gpu-tests.log",
+      "sha256": "043907083247614cd81f44b305750cdd85bf545f029b240ebab3a6fd1c7dfe33"
+    },
+    "key-raw.jsonl": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/key-raw.jsonl",
+      "sha256": "1a6a73f1137e6794d74ae4a50d8f0d3f6fa986d59836b706ae44aed8367d6601"
+    },
+    "matrix-raw.jsonl": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/matrix-raw.jsonl",
+      "sha256": "1bccb8acef8c0c6ea48d108aa90807e9b35642649c47abcf6885956f77c7665d"
+    },
+    "extended-raw.jsonl": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/extended-raw.jsonl",
+      "sha256": "62b90471944dd7c347a551866a3d85cdc17b94ce5bcbc58eedcbeeb1aaf07602"
+    },
+    "key-metadata.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/key-metadata.json",
+      "sha256": "88246c009352aff45da97c1ad97e48a58e72cfc42688326ad220dac2ca3bd959"
+    },
+    "matrix-metadata.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/matrix-metadata.json",
+      "sha256": "a23e6256847ac469619d8fabac897ef6e1bff89cb4fa46bcf051ea3251113daa"
+    },
+    "extended-metadata.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/extended-metadata.json",
+      "sha256": "4b3adb0e0bccb5c4c701f2a389748b1708bd8fe1670405ba7bddd73d0ecf8454"
+    },
+    "verify-old.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/verify-old.json",
+      "sha256": "b5a14864b3bdada7c2cc1fe0ea0af42dbd292c93f0da5f2674b6a4961cc112ac"
+    },
+    "verify-fixed.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/verify-fixed.json",
+      "sha256": "b5a14864b3bdada7c2cc1fe0ea0af42dbd292c93f0da5f2674b6a4961cc112ac"
+    },
+    "summary.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/summary.json",
+      "sha256": "c39a00eb474ec6956ab60e75a33104f413533c254ac93ba0a78aa22accb0ade0"
+    },
+    "ncu-summary.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/ncu-summary.json",
+      "sha256": "d2a3096e8b625bd048083f2730d0f7e3632b639a79419a5e92baab78698a5037"
+    },
+    "sass-summary.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/sass-summary.json",
+      "sha256": "e94d51d8f6608887e1f983882b4303ac2fc8bb280e0681a8992df06d634f5c77"
+    },
+    "sass-equality.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/sass-equality.json",
+      "sha256": "73b9b9933732913934357ab5e7d01eea0d8e4bd449111acab95f819d4562e178"
+    },
+    "profile-ops-summary.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/profile-ops-summary.json",
+      "sha256": "0cdbb7c68593386e4e736873d14003e9d9b71aca6d6c478601731979ed2bf19f"
+    },
+    "profile-full-summary.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/profile-full-summary.json",
+      "sha256": "91c546aeeae76016f79e3c99c500a79a5f9a166843274d3d06102b1b03b7c048"
+    },
+    "profile-ops.trace.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/profile-ops.trace.json",
+      "sha256": "e0c30ff2b006016bb0e4183a87aba75aea3611b332b51959699ec712834584a8"
+    },
+    "profile-full.trace.json": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/profile-full.trace.json",
+      "sha256": "b67527609b20ae8098e16a89cf20e52924c69c1f2af0ac9167714c073b893b7d"
+    },
+    "rms_cache_old.cu": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/rms_cache_old.cu",
+      "sha256": "0eacd62a421597b1ba90c91529203f072482ff45ed4afb94fef75df5e925f5da"
+    },
+    "rms_cache_old_source.cu": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/rms_cache_old_source.cu",
+      "sha256": "542310f69b2453adb48fc4f98087ff28f3a2aa233d32dd0b7cb8007a4c640397"
+    },
+    "build-rms_cache_old/rms_cache_old.so": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/build-rms_cache_old/rms_cache_old.so",
+      "sha256": "8358bb3c31edabdab4520a4759a023a1402f881c94302eacb66b80187692a057"
+    },
+    "rms_cache_fixed.cu": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/rms_cache_fixed.cu",
+      "sha256": "9e3b44fd2d90dfe0804e2c4a5c5e88ae5ca761bdeee7e980c1cb0bd7b9a74f22"
+    },
+    "rms_cache_fixed_source.cu": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/rms_cache_fixed_source.cu",
+      "sha256": "b5e81d259f1d65c4e5abc9fb9b3ed9b8dc6c8130b84bbe842d62cf607d1d3260"
+    },
+    "build-rms_cache_fixed/rms_cache_fixed.so": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/build-rms_cache_fixed/rms_cache_fixed.so",
+      "sha256": "7791972a73dc4c9f8e1a5f49e2faf2285f7e8f424969496cb98f8aae52d16660"
+    },
+    "rms_cache_fma.cu": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/rms_cache_fma.cu",
+      "sha256": "2bde31663becefc2e56ed9f385140ca8554fde1cad96431014232238df4ab80e"
+    },
+    "rms_cache_fma_source.cu": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/rms_cache_fma_source.cu",
+      "sha256": "e5ca8ea7c9ef46bcbce27098e70094e477a2b53a5f4db7b4574a053c75a41165"
+    },
+    "build-rms_cache_fma/rms_cache_fma.so": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/build-rms_cache_fma/rms_cache_fma.so",
+      "sha256": "9c5811b4554fe5171f4161fab57d957d49d4a33b3da495cec3bf0b2c13f64752"
+    },
+    "ncu-fixed-4096-1024.csv": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/ncu-fixed-4096-1024.csv",
+      "sha256": "8fa3cfefa4bcc9fc2e392b43107dae8379733226d135c0619acf70a5f90f0270"
+    },
+    "ncu-fixed-8192-4.csv": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/ncu-fixed-8192-4.csv",
+      "sha256": "661ef07c40dc84b65a3452f415c3fd7586e3e0d81d35cca6adb55d832b9e49a0"
+    },
+    "ncu-fma-4096-1024.csv": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/ncu-fma-4096-1024.csv",
+      "sha256": "d76d38e1ce5a30c55a8da4854fdf5a9f387a2c8248e6579aef00f80b64c4984d"
+    },
+    "ncu-fma-8192-4.csv": {
+      "path": "artifacts/rmsnorm-cache-fma-20261114/ncu-fma-8192-4.csv",
+      "sha256": "67acea79578b61520f4d63d5f3198e56a3107bfe47184c335fbed3347be5f053"
+    }
+  }
+}
