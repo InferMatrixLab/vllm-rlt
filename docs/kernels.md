@@ -13,9 +13,13 @@ fallbacks. It neither compiles code nor creates a CUDA context.
 | `csrc/ops.h` | Native operator declarations |
 | `csrc/torch_bindings.cpp` | Operator schemas and CUDA dispatch registration |
 | `csrc/activation/silu_and_mul.cu` | SiLU-and-Mul CUDA validation, launch and computation |
+| `csrc/normalization/rms_norm.cu` | RMSNorm and RMSNorm-then-residual CUDA kernels |
+| `vllm_rlt/kernels/normalization.py` | RMSNorm Python entry and Torch reference |
 | `setup.py` | Optional build of `vllm_rlt._C` |
 | `tests/test_activation.py` | Reference, CUDA numerics, layouts, tails and graph replay |
+| `tests/test_normalization.py` | RMSNorm numerics, strides, alignment and graph replay |
 | `benchmarks/kernels/silu_and_mul.py` | Matched Torch/native/vLLM accuracy and latency comparison |
+| `benchmarks/kernels/rms_norm.py` | RMSNorm and residual accuracy and latency comparison |
 
 Add future kernels to the same extension and group sources by operation family.
 No backend registry or base class is required. Put future kernel performance
@@ -95,6 +99,64 @@ are disabled, consistent with Ouro's inference-only model. `torch.compile` has
 no fake kernel registration. Tests cover the operator and Ouro MLP, including
 CUDA Graph capture/replay.
 
+## RMSNorm and residual contract
+
+`rms_norm(hidden, weight, epsilon, residual=None)` returns a new tensor. Its
+reference computes the mean square and inverse square root in FP32, multiplies
+the input by that scale and by `weight` in FP32, then converts the weighted
+result to the output dtype. When supplied, the residual is added after this
+conversion, with a separate rounding to the output dtype. In Ouro, this fuses the existing `residual + RMSNorm(hidden)`
+order; it does not implement `RMSNorm(residual + hidden)`. The weight is a
+one-dimensional tensor of shape `[hidden_size]` and is shared across rows.
+
+With the extension installed, the native inference path supports CUDA FP32,
+FP16 and BF16 tensors of rank 1 through 4, matching one-dimensional contiguous
+weights, and matching residuals. The last input and residual dimensions must
+have stride 1. Outer dimensions may be strided, including views into a larger
+row; input, weight and residual addresses may have independent offsets. The
+output is contiguous and none of the inputs is modified. Empty tensors return
+without a kernel launch. CPU tensors, autograd, mixed dtypes and other layouts
+use the Torch reference. Nanbeige and Huginn continue to use their existing
+Torch RMSNorm path.
+
+The general CUDA kernel assigns one block per row. It sums squares in FP32,
+uses a warp reduction for widths up to 256 and a block reduction otherwise,
+then writes the scaled and weighted values, optionally with a residual. The
+aligned body loads and stores 16 bytes at a time. Normalization and weight
+multiplication use FP32 pairs; FP16/BF16 residual addition uses dtype-specific
+paired arithmetic. Unaligned output heads and tails use scalar accesses; independently
+shifted input, weight and residual vectors are reconstructed from safe aligned
+reads, with scalar reads at view boundaries. Small rows retain their input
+vectors in registers across the reduction; wider rows stream them again to bound
+register usage. No hidden width has a dedicated specialization. FP32 pairs use paired
+arithmetic on SM100 and newer, with scalar FP32 operations on earlier
+architectures. These launch choices are implementation details and are not
+claimed optimal for every GPU.
+
+Launch selection uses the workload and the current device's actual SM count.
+Widths up to 256 use 32 threads; other widths start with 256. If there are fewer
+rows than SMs and a 256-thread block would need more than four 16-byte vectors
+per thread, use 512 threads when supported. After selecting the thread count,
+cache one, two or four vectors per thread, or reread input when more are needed.
+Cache capacity counts only complete body vectors: use `floor(H / elements)`
+as the upper bound across row prefixes, then round up by the thread count.
+Scalar heads and tails are stored separately and do not increase this capacity.
+When there are at least two rows per SM, also reread instead of retaining more
+than two vectors per thread. Vector counts account for dtype: a 16-byte vector
+holds eight FP16/BF16 values or four FP32 values. These are general heuristics,
+not a per-model or GPU-model tuning table; measured tradeoffs remain device-dependent.
+
+The native reduction can use a different floating-point summation order from
+PyTorch, so its result need not be bitwise equal. All supported inputs use the
+same generic kernel family; there is no model-specific reduction path or
+PyTorch-version/GPU-architecture compatibility gate. The Torch fallback and
+shared RMSNorm layer use the same FP32 normalization and weight multiplication
+contract. Compared with the previous layer, this removes the low-precision
+rounding before weight multiplication and can change model outputs and adaptive
+exit decisions. Model-level quality and throughput must be revalidated; previous
+compatibility-path measurements do not describe this implementation. CUDA Graph
+replay is supported; a fake kernel for `torch.compile` is not registered.
+
 ## Build and reference checks
 
 The extension builds automatically when the build environment has CUDA-enabled
@@ -109,7 +171,7 @@ python -m pip install "torch>=2.5" setuptools wheel ninja
 python -m pip install --no-build-isolation -e .
 python -m pytest tests/test_activation.py -q
 CUDA_VISIBLE_DEVICES=<allocated_gpu> python -m pytest \
-  tests/test_activation.py --run-gpu -q
+  tests/test_activation.py tests/test_normalization.py --run-gpu -q
 ```
 
 `pip` invokes setuptools, whose PyTorch `CUDAExtension`/`BuildExtension` compiles
@@ -167,3 +229,27 @@ commit. The report retains library hashes, the local diff and raw measurements.
 Optional ops-only/full profiles are captured separately after timing; full
 capture enables shapes, memory and stacks. Large traces stay under ignored
 `artifacts/`.
+
+For RMSNorm, compare the Torch reference and the native kernel without vLLM:
+
+```bash
+CUDA_VISIBLE_DEVICES=<allocated_gpu> python -m benchmarks.kernels.rms_norm \
+  --output artifacts/rmsnorm/results.json \
+  --profile-dir artifacts/rmsnorm/profiles
+```
+
+An optional source-built vLLM comparison can be supplied with
+`--vllm-library <so> --vllm-namespace <namespace> --vllm-source-commit <sha>`.
+The benchmark reports error against the FP32 Torch reference and an FP64 diagnostic reference
+that converts the weighted result before adding the residual. The native paths
+may use different reduction orders from PyTorch. Near a low-precision rounding
+midpoint, a small reduction difference can become one output-dtype step before
+residual addition; cancellation can then expose a larger relative difference.
+Casting an FP64 tensor to a low-precision dtype can itself involve intermediate
+FP32 rounding, so midpoint diagnostics must inspect the value before that cast.
+
+The [previous B300 Graph timeline](assets/performance/ouro-rmsnorm-graph-b300.png)
+records the removed compatibility implementation, not the current kernel. It is
+retained as historical data and must not be used as current performance evidence.
+
+The [cache-capacity and scalar-FMA comparison](assets/performance/rmsnorm-cache-fma-20261114/README.md) validates the complete-vector cache correction at `824cd38`. It retains the cache correction and evaluates scalar FMA as an experimental alternative; scalar FMA is not enabled in the production kernel. The [resource-based RMSNorm validation](assets/performance/rmsnorm-policy-20261110/README.md) records snapshot `50a7ce1`, before that cache correction. The [earlier generic implementation report](assets/performance/rmsnorm-20261110/README.md) records the pre-policy snapshot and the limits of the ten-question model-quality smoke test; neither earlier report measures the current cache correction.

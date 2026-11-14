@@ -1,0 +1,80 @@
+{
+  "cases": [
+    {
+      "shape": [
+        299,
+        4095
+      ],
+      "rows": 299,
+      "sm": 148,
+      "input_stride": [
+        8208,
+        1
+      ],
+      "residual_stride": [
+        12336,
+        1
+      ],
+      "input_offset_mod16": 4,
+      "weight_offset_mod16": 12,
+      "residual_offset_mod16": 8,
+      "max_abs_add_False": 1.9073486328125e-06,
+      "max_abs_add_True": 1.9073486328125e-06
+    },
+    {
+      "shape": [
+        151,
+        2,
+        4095
+      ],
+      "rows": 302,
+      "sm": 148,
+      "input_stride": [
+        16416,
+        4104,
+        1
+      ],
+      "residual_stride": [
+        24672,
+        4112,
+        1
+      ],
+      "input_offset_mod16": 4,
+      "weight_offset_mod16": 12,
+      "residual_offset_mod16": 8,
+      "max_abs_add_False": 1.9073486328125e-06,
+      "max_abs_add_True": 1.9073486328125e-06,
+      "profiled_kernel": "void vllm_rlt::(anonymous namespace)::rms_norm_kernel<float, 256, true, false, 0>(float*, float const*, float const*, float const*, vllm_rlt::(anonymous namespace)::RowLayout, float)"
+    },
+    {
+      "shape": [
+        75,
+        2,
+        2,
+        4095
+      ],
+      "rows": 300,
+      "sm": 148,
+      "input_stride": [
+        32832,
+        8208,
+        4104,
+        1
+      ],
+      "residual_stride": [
+        49344,
+        8224,
+        4112,
+        1
+      ],
+      "input_offset_mod16": 4,
+      "weight_offset_mod16": 12,
+      "residual_offset_mod16": 8,
+      "max_abs_add_False": 2.86102294921875e-06,
+      "max_abs_add_True": 2.86102294921875e-06
+    }
+  ],
+  "seed": 7021,
+  "tolerance": 2e-06,
+  "complete": true
+}

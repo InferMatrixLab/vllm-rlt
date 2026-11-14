@@ -1,0 +1,5 @@
+UTC: 2026-11-10 03:58:42.865272+00:00
+Command: ../.b_rdma/bin/pre-commit run --files csrc/normalization/rms_norm.cu tests/test_normalization.py docs/kernels.md
+Result: Ruff lint PASS; Ruff format PASS; CPU regression tests PASS; exit 0. Hook output did not expose counts.
+CUDA source SHA256: 542310f69b2453adb48fc4f98087ff28f3a2aa233d32dd0b7cb8007a4c640397
+Review checkout: copied these three files only after checking they matched pre-change PR HEAD; git index remains empty.

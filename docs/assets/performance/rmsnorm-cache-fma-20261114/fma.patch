@@ -1,0 +1,12 @@
+--- fixed
++++ fma
+@@ -155,7 +155,8 @@
+   for (int j = 0; j < pairs; ++j) {
+     Pair p = reinterpret_cast<const Pair*>(&x)[j];
+     float2 f = A::pair(p);
+-    accum = add2(accum, mul2(f, f));
++    accum.x = __fmaf_rn(f.x, f.x, accum.x);
++    accum.y = __fmaf_rn(f.y, f.y, accum.y);
+   }
+   return accum;
+ }

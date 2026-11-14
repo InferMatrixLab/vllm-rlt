@@ -202,10 +202,16 @@ class OuroDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = OuroAttention(config, layer_idx)
         self.mlp = OuroMLP(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm_2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_native=True)
+        self.input_layernorm_2 = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, use_native=True
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, use_native=True
+        )
+        self.post_attention_layernorm_2 = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, use_native=True
+        )
 
     def forward(
         self,
@@ -215,9 +221,9 @@ class OuroDecoderLayer(nn.Module):
         cache: "KVCacheManager",
     ) -> torch.Tensor:
         attention = self.self_attn(self.input_layernorm(hidden), position_embeddings, batch, cache)
-        hidden = hidden + self.input_layernorm_2(attention)
-        return hidden + self.post_attention_layernorm_2(
-            self.mlp(self.post_attention_layernorm(hidden))
+        hidden = self.input_layernorm_2(attention, residual=hidden)
+        return self.post_attention_layernorm_2(
+            self.mlp(self.post_attention_layernorm(hidden)), residual=hidden
         )
 
 
@@ -228,7 +234,7 @@ class OuroModel(nn.Module):
         self.layers = nn.ModuleList(
             OuroDecoderLayer(config, layer) for layer in range(config.num_hidden_layers)
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_native=True)
         self.rotary_emb = RotaryEmbedding(head_dim=config.head_dim, rope_theta=config.rope_theta)
         self.early_exit_gate = nn.Linear(config.hidden_size, 1, bias=True)
 
