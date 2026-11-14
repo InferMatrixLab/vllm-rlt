@@ -205,6 +205,31 @@ def test_kv_layers_are_compacted_away_from_mlp_sublayers():
         config.kv_layer_index(1)
 
 
+def test_engine_stops_on_the_configured_eos_token():
+    """The enabled baseline path must honour EOS ids (2 and 11 for the artifact)."""
+    torch.manual_seed(9)
+    probe = DoryForCausalLM(tiny_dory_config()).eval()
+    tokens = [4, 7, 3]
+    eos = int(dense_dory_reference(probe, torch.tensor(tokens))["logits"][-1].argmax())
+    model = DoryForCausalLM(tiny_dory_config(eos_token_id=(eos,))).eval()
+    model.load_state_dict(probe.state_dict())
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=256, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+    )
+    engine.add_request("request", tokens, SamplingParams(max_tokens=4, min_loops=2, max_loops=2))
+    finished = {}
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output
+    result = finished["request"]
+    assert result.finish_reason == "stop"
+    assert result.token_ids == [eos]
+    assert engine.cache_manager.num_used_blocks == 0
+
+
 def test_engine_sizes_kv_for_attention_layers_only(model):
     engine = LLMEngine(
         model,
