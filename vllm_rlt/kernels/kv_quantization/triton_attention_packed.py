@@ -35,14 +35,13 @@ def _mul_rn(a, b, EXACT: tl.constexpr):
 
 @triton.jit
 def _e2m1(code):
-    # Same arithmetic as triton_decode: m -> 0, .5, 1, 1.5, 2, 3, 4, 6; bit 3 is
-    # the sign, multiplied in so code 0b1000 decodes to -0.
+    # Build the FP32 bits of E2M1 directly: magnitude m = 2..7 is exponent
+    # (m >> 1) - 1 with mantissa bit m & 1, i.e. (m + 252) << 22; m = 1 is 0.5
+    # (252 << 22); m = 0 is zero. Bit 3 becomes the FP32 sign, so 0b1000 is -0.
     m = code & 7
-    exponent = m >> 1
-    mantissa = (m & 1).to(tl.float32)
-    normal = (1.0 + 0.5 * mantissa) * tl.exp2((exponent - 1).to(tl.float32))
-    magnitude = tl.where(exponent == 0, 0.5 * mantissa, normal)
-    return magnitude * tl.where((code & 8) != 0, -1.0, 1.0)
+    magnitude = tl.where(m >= 2, m + 252, tl.where(m == 1, 252, 0)) << 22
+    bits = magnitude | ((code & 8) << 28)
+    return bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
