@@ -928,8 +928,10 @@ class KVCacheManager:
         lengths = batch.context_lengths.tolist()
         index: dict[int, int] = {}
         remapped = []
+        reads = 0
         for table, length in zip(tables, lengths):
             needed = (length + self.block_size - 1) // self.block_size
+            reads += needed
             # Entries past a row's context are never read; point them at page 0.
             remapped.append(
                 [index.setdefault(b, len(index)) if j < needed else 0 for j, b in enumerate(table)]
@@ -944,15 +946,19 @@ class KVCacheManager:
                 batch.block_tables.shape
             ),
             torch.tensor(sources or [0], dtype=torch.int32, device=self.device),
+            # The fused kernel decodes a page once per row that reads it, so it
+            # only pays off when rows rarely share pages (decode, not the rows
+            # of a prompt chunk, which all read the same prefix).
+            reads < 2 * len(index),
         )
         self._attention_plans[batch] = (self._epoch, plan)
         return plan
 
     def _attend_quantized(self, layer: int, batch: KVMetadata, q: torch.Tensor) -> torch.Tensor:
-        """Decode reads packed pages in place; prefill decodes pages to BF16 first."""
-        plan, tables, sources = self._attention_plan(batch)
+        """Decode rows read packed pages in place; rows sharing pages decode them to BF16 first."""
+        plan, tables, sources, fused = self._attention_plan(batch)
         kernel = getattr(self.attention, "kernel", self.attention)
-        if batch.cu_seqlens_q is None and isinstance(kernel, TritonPagedAttention):
+        if fused and batch.cu_seqlens_q is None and isinstance(kernel, TritonPagedAttention):
             # Same result as decode-then-attend, without writing BF16 pages.
             from vllm_rlt.kernels.kv_quantization.triton_attention_packed import (
                 packed_paged_attention,
