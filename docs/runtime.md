@@ -138,7 +138,9 @@ for the selection order, shared budget and per-request progress.
 `SchedulerConfig(wavefront_chunked_prefill=True)` opts into WCPB and requires
 LAST_EXITED KV. It can run with
 refill or mixed scheduling. When combined with speculation, use refill mode;
-speculation cannot use preemption.
+asynchronous block speculation rejects preemption. Synchronous block and
+pipeline modes have different support constraints; do not infer that every
+combination is validated.
 
 The scheduler stages up to `total_ut_steps` chunks per request, then batches one
 ready chunk for each prompt depth. For four depths and chunk size two, recurrent

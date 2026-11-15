@@ -16,7 +16,7 @@ from vllm_rlt.worker.buffers import (
     prefill_stage_rows,
     stage_metadata,
 )
-from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
+from vllm_rlt.worker.cuda_graph import CodaGraphs, PreludeGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
 from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
@@ -187,6 +187,11 @@ class ModelRunner:
         self.coda_graphs = (
             CodaGraphs(model, self.execution_config, cache_manager)
             if self.graphs is not None and getattr(model, "requires_boundary_kv", False)
+            else None
+        )
+        self.prelude_graphs = (
+            PreludeGraphs(model, self.execution_config, cache_manager)
+            if self.coda_graphs is not None and hasattr(model, "prelude_kv_layers")
             else None
         )
         self.input_buffers: dict[torch.dtype, StagedInputTensor] = {
@@ -1012,6 +1017,7 @@ class ModelRunner:
                 tokens=prepared.token_ids,
                 prelude_coda_kv_metadata=kv_metadata,
                 generators=self._prepare_generators(requests) if kv_metadata else None,
+                graphs=self.prelude_graphs if kv_metadata else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
         hidden = self._load_hidden(batch, prepared, workspace, size)
@@ -1303,7 +1309,7 @@ class ModelRunner:
         copies = []
         for request in requests:
             depth = request.loops_done - 1
-            if not cache.token_written(request.request_id, request.position, depth):
+            if not cache.exit_written(request.request_id, request.position, depth):
                 raise RuntimeError("cannot finalize before every layer has written KV")
             if depth + 1 < cache.max_loops:
                 copies.append(request)

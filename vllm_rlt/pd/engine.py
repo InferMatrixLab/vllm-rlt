@@ -76,6 +76,10 @@ class PDEngine:
         )
         if self.model_config.model_type == "huginn_raven":
             raise ValueError("PD does not support Huginn")
+        if getattr(model, "requires_boundary_kv", False):
+            raise ValueError(
+                f"PD does not support {self.model_config.model_type} boundary-KV models"
+            )
         self.config = pd_config or PDConfig()
         self.exit_config = exit_config or ExitConfig(
             "ouro" if speculative_config else "ouro_delayed"

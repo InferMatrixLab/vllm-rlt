@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerics, tails, layouts and stream contracts for SiLU-and-Mul."""
 
+import json
 import math
 import subprocess
 import sys
 import textwrap
+from itertools import product
 
 import pytest
 import torch
@@ -160,7 +162,115 @@ def test_silu_and_mul_cuda_vectors_tails_and_storage_offsets(dtype, shape, offse
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_silu_and_mul_cuda_special_values_and_underflow(dtype):
+def test_silu_and_mul_cuda_all_alignment_pairs_match_aligned_path(dtype):
+    # The two inputs can have different offsets. Cover every 16-byte alignment
+    # pair in the scalar fallback, including zero and short input lengths.
+    elements = 16 // torch.empty((), dtype=dtype).element_size()
+    counts = [*range(2 * elements + 2), 17 * elements - 1, 17 * elements + 1]
+    integer = torch.int32 if dtype == torch.float32 else torch.int16
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    for count in counts:
+        for gate_offset in range(elements):
+            for up_offset in range(elements):
+                gate = torch.randn(
+                    count + gate_offset, device="cuda", dtype=dtype, generator=generator
+                )[gate_offset:]
+                up = torch.randn(
+                    count + up_offset, device="cuda", dtype=dtype, generator=generator
+                )[up_offset:]
+                expected = silu_and_mul(gate.clone(), up.clone())
+                actual = silu_and_mul(gate, up)
+                assert torch.equal(actual.view(integer), expected.view(integer)), (
+                    dtype,
+                    count,
+                    gate_offset,
+                    up_offset,
+                )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("delta", range(-1, 8))
+def test_silu_and_mul_cuda_threshold_and_vector_offsets_match_aligned_path(dtype, delta):
+    # Short-offset tests now take the scalar fallback. Exercise all independent
+    # input alignments above the threshold and each possible scalar tail.
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    elements = 16 // torch.empty((), dtype=dtype).element_size()
+    count = sms * 160 * 256 * elements + delta
+    integer = torch.int32 if dtype == torch.float32 else torch.int16
+    generator = torch.Generator(device="cuda").manual_seed(43)
+    gate_storage = torch.randn(
+        count + elements - 1, device="cuda", dtype=dtype, generator=generator
+    )
+    up_storage = torch.randn(count + elements - 1, device="cuda", dtype=dtype, generator=generator)
+    offsets = product(range(elements), repeat=2) if delta == 1 else [(1, 3), (elements - 1, 1)]
+    for go, uo in offsets:
+        gate = gate_storage[go : go + count]
+        up = up_storage[uo : uo + count]
+        expected = silu_and_mul(gate.clone(), up.clone())
+        actual = silu_and_mul(gate, up)
+        assert torch.equal(actual.view(integer), expected.view(integer)), (dtype, count, go, uo)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_silu_and_mul_cuda_uses_device_scaled_threshold(dtype, tmp_path):
+    # Both paths can have the same capped grid, so also inspect the kernel mode.
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    elements = 16 // torch.empty((), dtype=dtype).element_size()
+    threshold = sms * 160 * 256 * elements
+    cases = [(threshold - 1, 1, 3), (threshold, 1, 3), (threshold, 0, 0)]
+    tensors = [
+        (
+            torch.randn(count + go, device="cuda", dtype=dtype)[go:],
+            torch.randn(count + uo, device="cuda", dtype=dtype)[uo:],
+        )
+        for count, go, uo in cases
+    ]
+    for gate, up in tensors:
+        silu_and_mul(gate, up)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        for gate, up in tensors:
+            silu_and_mul(gate, up)
+        torch.cuda.synchronize()
+    trace = tmp_path / "silu-dispatch.json"
+    prof.export_chrome_trace(str(trace))
+    events = json.loads(trace.read_text())["traceEvents"]
+    kernels = sorted(
+        (
+            event
+            for event in events
+            if event.get("cat") == "kernel" and "silu_and_mul_kernel" in event.get("name", "")
+        ),
+        key=lambda event: event["ts"],
+    )
+    assert len(kernels) == len(cases)
+
+    def blocks_for(work):
+        cap = 16384 if dtype == torch.float32 and work >= 16384 * 256 else 4096
+        return min(math.ceil(work / 256), cap)
+
+    scalar_blocks = blocks_for(threshold - 1)
+    vector_blocks = blocks_for(threshold // elements)
+    assert [event["args"]["grid"][0] for event in kernels] == [
+        scalar_blocks,
+        vector_blocks,
+        vector_blocks,
+    ]
+    assert all(event["args"]["block"] == [256, 1, 1] for event in kernels)
+    assert all(
+        f"AccessMode){mode}>" in event["name"]
+        for event, mode in zip(kernels, (2, 1, 0), strict=True)
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offsets", [(0, 0), (1, 3)])
+def test_silu_and_mul_cuda_special_values_and_underflow(dtype, offsets):
     info = torch.finfo(dtype)
     values = [
         float("nan"),
@@ -184,6 +294,13 @@ def test_silu_and_mul_cuda_special_values_and_underflow(dtype):
         indexing="ij",
     )
     gate, up = gate.contiguous(), up.contiguous()
+    if offsets != (0, 0):
+        count = gate.numel()
+        shifted_gate = torch.empty(count + offsets[0], device="cuda", dtype=dtype)[offsets[0] :]
+        shifted_up = torch.empty(count + offsets[1], device="cuda", dtype=dtype)[offsets[1] :]
+        shifted_gate.copy_(gate.flatten())
+        shifted_up.copy_(up.flatten())
+        gate, up = shifted_gate.view(gate.shape), shifted_up.view(up.shape)
     torch.testing.assert_close(
         silu_and_mul(gate, up), silu_and_mul_reference(gate, up), equal_nan=True
     )
@@ -210,11 +327,17 @@ def test_silu_and_mul_cuda_rejects_autograd_but_allows_inference():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype):
+@pytest.mark.parametrize("offsets", [(0, 0), (1, 3)])
+@pytest.mark.parametrize("large", [False, True])
+def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype, offsets, large):
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    elements = 16 // torch.empty((), dtype=dtype).element_size()
+    threshold = sms * 160 * 256 * elements
+    count = threshold + 1 if large else min(4097, threshold - 1)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        gate = torch.randn(4097, device="cuda", dtype=dtype)
-        up = torch.randn_like(gate)
+        gate = torch.randn(count + offsets[0], device="cuda", dtype=dtype)[offsets[0] :]
+        up = torch.randn(count + offsets[1], device="cuda", dtype=dtype)[offsets[1] :]
         for _ in range(3):
             silu_and_mul(gate, up)
     stream.synchronize()
@@ -228,6 +351,25 @@ def test_silu_and_mul_cuda_current_stream_and_graph_replay(dtype):
 
 
 @pytest.mark.gpu
+def test_silu_and_mul_first_misaligned_call_during_graph_capture():
+    # The device-property lookup used by dispatch must also work on first use.
+    script = textwrap.dedent("""
+        import torch
+        from vllm_rlt.kernels.activation import silu_and_mul, silu_and_mul_reference
+        n = 4097
+        gate = torch.randn(n + 1, device='cuda', dtype=torch.bfloat16)[1:]
+        up = torch.randn(n + 3, device='cuda', dtype=torch.bfloat16)[3:]
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = silu_and_mul(gate, up)
+        graph.replay()
+        torch.testing.assert_close(output, silu_and_mul_reference(gate, up), rtol=0, atol=0)
+    """)
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, timeout=60)
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("count", [(1 << 24) - 1, 1 << 24, (1 << 24) + 1])
 def test_silu_and_mul_cuda_fp32_streaming_grid_boundary(count):
     # Four FP32 elements/vector: this boundary fills 16384 blocks of 256 threads.
@@ -238,9 +380,10 @@ def test_silu_and_mul_cuda_fp32_streaming_grid_boundary(count):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("offset", [0, 1])
-def test_silu_and_mul_cuda_low_precision_storage_patterns(dtype, offset):
-    # Exercise all gate bit patterns with both vector/tail and scalar-only access.
+@pytest.mark.parametrize("offsets", [(0, 0), (1, 0), (1, 3), (7, 5)])
+def test_silu_and_mul_cuda_low_precision_storage_patterns(dtype, offsets):
+    # Exercise all gate bit patterns through aligned and independently shifted
+    # vector loads, including subnormal products at the scalar tail.
     values = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16).view(dtype)
     info = torch.finfo(dtype)
     subnormal = info.tiny / (1024 if dtype == torch.float16 else 128)
@@ -265,16 +408,23 @@ def test_silu_and_mul_cuda_low_precision_storage_patterns(dtype, offset):
         device="cuda",
         dtype=dtype,
     )
-    gate = torch.empty(values.numel() * factors.numel() + 1 + offset, device="cuda", dtype=dtype)[
-        offset:
-    ]
-    up = torch.empty_like(gate)
-    gate[:-1].copy_(values.repeat(factors.numel()))
-    up[:-1].copy_(factors.repeat_interleave(values.numel()))
-    # The aligned path ends with one scalar multiplication yielding a subnormal.
+    pattern_count = values.numel() * factors.numel()
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    threshold = sms * 160 * 256 * (16 // values.element_size())
+    count = max(pattern_count + 1, threshold + 1) if offsets != (0, 0) else pattern_count + 1
+    gate = torch.empty(count + offsets[0], device="cuda", dtype=dtype)[offsets[0] :]
+    up = torch.empty(count + offsets[1], device="cuda", dtype=dtype)[offsets[1] :]
+    gate.zero_()
+    up.zero_()
+    gate[:pattern_count].copy_(values.repeat(factors.numel()))
+    up[:pattern_count].copy_(factors.repeat_interleave(values.numel()))
+    # A scalar tail multiplication produces a subnormal.
     gate[-1], up[-1] = 1.0, subnormal
     actual = silu_and_mul(gate, up)
-    expected = silu_and_mul_reference(gate, up)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    expected = silu_and_mul_reference(gate[:pattern_count], up[:pattern_count])
+    actual_patterns = actual[:pattern_count]
+    torch.testing.assert_close(actual_patterns, expected, rtol=0, atol=0, equal_nan=True)
     valid = ~torch.isnan(expected)
-    assert torch.equal(actual[valid].view(torch.int16), expected[valid].view(torch.int16))
+    assert torch.equal(actual_patterns[valid].view(torch.int16), expected[valid].view(torch.int16))
+    expected_tail = silu_and_mul_reference(gate[-1:], up[-1:])
+    torch.testing.assert_close(actual[-1:], expected_tail, rtol=0, atol=0)

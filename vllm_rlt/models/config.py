@@ -5,6 +5,7 @@ from pathlib import Path
 
 from torch import nn
 
+from .dory import DoryConfig
 from .huginn import HuginnConfig
 from .nanbeige import NanbeigeConfig
 from .ouro import OuroConfig
@@ -13,6 +14,7 @@ _CONFIG_TYPES = {
     "ouro": OuroConfig,
     "nanbeige": NanbeigeConfig,
     "huginn_raven": HuginnConfig,
+    "dory": DoryConfig,
 }
 
 
@@ -24,7 +26,7 @@ class ModelConfig:
     limits remain properties of the concrete config rather than duplicated fields.
     """
 
-    model_specific_config: OuroConfig | NanbeigeConfig | HuginnConfig
+    model_specific_config: OuroConfig | NanbeigeConfig | HuginnConfig | DoryConfig
 
     def __post_init__(self):
         if type(self.model_specific_config) not in _CONFIG_TYPES.values():
