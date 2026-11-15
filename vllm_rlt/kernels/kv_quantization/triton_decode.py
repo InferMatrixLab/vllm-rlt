@@ -15,6 +15,40 @@ _TILE = 1024
 
 
 @triton.jit
+def _e2m1(code):
+    # E2M1 magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6 as FP32 bits: m = 2..7 is
+    # (m + 252) << 22, m = 1 is 252 << 22. Bit 3 is the sign, so 0b1000 is -0.
+    m = code & 7
+    magnitude = tl.where(m >= 2, m + 252, tl.where(m == 1, 252, 0)) << 22
+    return (magnitude | ((code & 8) << 28)).to(tl.float32, bitcast=True)
+
+
+def _pool_args(pool, format):
+    """(payload, first, second, global) tensors plus their [block, layer] strides.
+
+    INT4 reads minimum and scale as first and second; NVFP4 reads its E4M3
+    scale as first and its per-page FP32 global scale as global.
+    """
+    payload = pool["payload"]
+    if format == "nvfp4":
+        first = second = pool["scale"]
+        global_scale = pool["global_scale"]
+        global_strides = global_scale.stride()[:2]
+    elif format == "int4":
+        first, second = pool["minimum"], pool["scale"]
+        global_scale, global_strides = second, (0, 0)
+    else:
+        raise ValueError(f"unknown KV format: {format!r}")
+    for tensor in (payload, first, second):
+        if not tensor.is_contiguous():
+            raise ValueError("packed KV pools must be contiguous")
+    if first.stride() != second.stride():
+        raise ValueError("INT4 minimum and scale pools must share a layout")
+    tensors = (payload, first, second, global_scale)
+    return tensors, (*payload.stride()[:2], *first.stride()[:2], *global_strides)
+
+
+@triton.jit
 def _decode_pages(
     Out,
     Rows,
@@ -22,6 +56,7 @@ def _decode_pages(
     Payload,
     First,
     Second,
+    Global,
     out_page,
     pool_block,
     pool_layer,
@@ -30,7 +65,6 @@ def _decode_pages(
     global_block,
     global_layer,
     layer,
-    TOKENS: tl.constexpr,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     GROUP: tl.constexpr,
@@ -57,17 +91,9 @@ def _decode_pages(
         param = (token * HEADS + head) * groups + dim // GROUP
     base = block * param_block + layer * param_layer
     if IS_NVFP4:
-        # E2M1: magnitude code m -> 0, .5, 1, 1.5, 2, 3, 4, 6; bit 3 is the sign.
-        m = code & 7
-        exponent = m >> 1
-        mantissa = (m & 1).to(tl.float32)
-        normal = (1.0 + 0.5 * mantissa) * tl.exp2((exponent - 1).to(tl.float32))
-        magnitude = tl.where(exponent == 0, 0.5 * mantissa, normal)
-        # Multiply rather than negate so code 0b1000 decodes to -0 like copysign.
-        value = magnitude * tl.where((code & 8) != 0, -1.0, 1.0)
         scale = tl.load(First + base + param, mask=valid, other=0.0).to(tl.float32)
-        global_scale = tl.load(Second + block * global_block + layer * global_layer)
-        value = value * tl.div_rn(scale, global_scale)
+        global_scale = tl.load(Global + block * global_block + layer * global_layer)
+        value = _e2m1(code) * tl.div_rn(scale, global_scale)
     else:
         scale = tl.load(Second + base + param, mask=valid, other=0.0).to(tl.float32)
         minimum = tl.load(First + base + param, mask=valid, other=0.0).to(tl.float32)
@@ -96,34 +122,18 @@ def decode_pages_into(
     if not count:
         return
     _, tokens, heads, dim = out.shape
-    payload = pool["payload"]
-    if format == "nvfp4":
-        first, second, global_scale = pool["scale"], pool["scale"], pool["global_scale"]
-        global_strides = global_scale.stride()[:2]
-    elif format == "int4":
-        first, second, global_scale = pool["minimum"], pool["scale"], None
-        global_strides = (0, 0)
-    else:
-        raise ValueError(f"unknown KV format: {format!r}")
-    for tensor in (out, payload, first, second):
-        if not tensor.is_contiguous():
-            raise ValueError("decode_pages_into requires contiguous tensors")
+    if not out.is_contiguous():
+        raise ValueError("decode_pages_into requires a contiguous output")
+    tensors, strides = _pool_args(pool, format)
     grid = (count, tokens, triton.cdiv(heads * dim, _TILE))
     _decode_pages[grid](
         out,
         rows,
         blocks,
-        payload,
-        first,
-        second if global_scale is None else global_scale,
+        *tensors,
         out.stride(0),
-        payload.stride(0),
-        payload.stride(1),
-        first.stride(0),
-        first.stride(1),
-        *global_strides,
+        *strides,
         layer,
-        TOKENS=tokens,
         HEADS=heads,
         DIM=dim,
         GROUP=group_size,

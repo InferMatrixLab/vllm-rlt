@@ -26,6 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
+from vllm_rlt.kernels.kv_quantization.triton_decode import _e2m1, _pool_args
 from vllm_rlt.kernels.triton_attention import NUM_SPLITS, _paged_attention_merge_kernel
 
 
@@ -38,17 +39,6 @@ def _mul_rn(a, b, EXACT: tl.constexpr):
             "mul.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1
         )
     return a * b
-
-
-@triton.jit
-def _e2m1(code):
-    # Build the FP32 bits of E2M1 directly: magnitude m = 2..7 is exponent
-    # (m >> 1) - 1 with mantissa bit m & 1, i.e. (m + 252) << 22; m = 1 is 0.5
-    # (252 << 22); m = 0 is zero. Bit 3 becomes the FP32 sign, so 0b1000 is -0.
-    m = code & 7
-    magnitude = tl.where(m >= 2, m + 252, tl.where(m == 1, 252, 0)) << 22
-    bits = magnitude | ((code & 8) << 28)
-    return bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -239,28 +229,6 @@ def _packed_attention_kernel(
     tl.store(PART_M + part, maximum)
     tl.store(PART_L + part, normalizer)
     tl.store(PART_O + part * BLOCK_D + dims, accumulator)
-
-
-def _pool_args(pool, format):
-    """(payload, first, second, global) tensors plus their block/layer strides."""
-    payload = pool["payload"]
-    if format == "nvfp4":
-        first = second = pool["scale"]
-        global_scale = pool["global_scale"]
-        global_strides = global_scale.stride()[:2]
-    elif format == "int4":
-        first, second = pool["minimum"], pool["scale"]
-        global_scale, global_strides = second, (0, 0)
-    else:
-        raise ValueError(f"unknown KV format: {format!r}")
-    for tensor in (payload, first, second):
-        if not tensor.is_contiguous():
-            raise ValueError("packed KV pools must be contiguous")
-    if first.stride() != second.stride():
-        raise ValueError("INT4 minimum and scale pools must share a layout")
-    tensors = (payload, first, second, global_scale)
-    strides = (*payload.stride()[:2], *first.stride()[:2], *global_strides)
-    return tensors, strides
 
 
 def packed_paged_attention(
