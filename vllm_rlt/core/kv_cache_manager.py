@@ -936,8 +936,7 @@ class KVCacheManager:
             )
         # Per remapped page: its staging slot, or -(block + 1) once packed.
         sources = [
-            -(block + 1) if self._packed_page[block] else self._staging_of[block]
-            for block in index
+            -(block + 1) if self._packed_page[block] else self._staging_of[block] for block in index
         ]
         plan = (
             self._page_plan(list(index)),

@@ -8,18 +8,12 @@ the BF16 cache or packed; ``SOURCES`` says which, per page of the remapped
 table: a staging slot (>= 0) or ``-(block + 1)`` for a packed block. Tiles may
 span pages, so each token selects its source with masked loads.
 
-Decode uses the same FP32 operations as ``triton_decode`` (no FMA contraction)
-and rounds to the cache dtype; the softmax reuses the reference tiling, split
-layout and merge. INT4 results equal decode-then-``paged_attention`` bit for
-bit. NVFP4 does too except for rare single outputs (1 in 20480 at head_dim 128,
-none at 8 or 65), because its E4M3 scale is one byte where the BF16 key tile is
-two: Triton fills a 16-byte vector from the scale load and gives the tile
-``sizePerThread`` [1, 16] instead of the reference kernel's [1, 8], so the FP32
-score dot product associates as a different tree. The decoded values themselves
-are identical; only that reduction order differs. ``tl.max_contiguous`` on the
-scale index does not change the choice, and an explicit two-level sum in the
-reference's tree did not either, so this is left as a documented caveat rather
-than paid for with a layout-forcing workaround.
+Decode uses the same FP32 operations as ``triton_decode`` and rounds to the
+cache dtype; the softmax reuses the reference tiling, split layout and merge.
+INT4 matches decode-then-``paged_attention`` bit for bit. NVFP4 decodes the
+same values, but its one-byte E4M3 scale makes Triton lay the tile out as
+[1, 16] instead of [1, 8], so the FP32 score sum can differ by one ulp in rare
+outputs (head_dim 128).
 """
 
 import torch
@@ -203,14 +197,52 @@ def _packed_attention_kernel(
         )
         if tl.max(tl.max(packed.to(tl.int32), axis=1), axis=0) > 0:
             decoded_keys = _packed_tile(
-                KPayload, KFirst, KSecond, KGlobal, block, offsets, dims, packed, kv_head,
-                layer, kp_block, kp_layer, kq_block, kq_layer, kg_block, kg_layer,
-                KV_HEADS, HEAD_DIM, GROUP, True, IS_NVFP4, EXACT,
+                KPayload,
+                KFirst,
+                KSecond,
+                KGlobal,
+                block,
+                offsets,
+                dims,
+                packed,
+                kv_head,
+                layer,
+                kp_block,
+                kp_layer,
+                kq_block,
+                kq_layer,
+                kg_block,
+                kg_layer,
+                KV_HEADS,
+                HEAD_DIM,
+                GROUP,
+                True,
+                IS_NVFP4,
+                EXACT,
             )
             decoded_values = _packed_tile(
-                VPayload, VFirst, VSecond, VGlobal, block, offsets, dims, packed, kv_head,
-                layer, vp_block, vp_layer, vq_block, vq_layer, vg_block, vg_layer,
-                KV_HEADS, HEAD_DIM, GROUP, False, IS_NVFP4, EXACT,
+                VPayload,
+                VFirst,
+                VSecond,
+                VGlobal,
+                block,
+                offsets,
+                dims,
+                packed,
+                kv_head,
+                layer,
+                vp_block,
+                vp_layer,
+                vq_block,
+                vq_layer,
+                vg_block,
+                vg_layer,
+                KV_HEADS,
+                HEAD_DIM,
+                GROUP,
+                False,
+                IS_NVFP4,
+                EXACT,
             )
             # Round like the decoded BF16 pages the reference attends over.
             keys = tl.where(packed, decoded_keys.to(keys.dtype), keys)
