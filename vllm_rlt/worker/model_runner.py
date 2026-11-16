@@ -173,6 +173,7 @@ class ModelRunner:
         self.rng = rng if rng is not None else RngRegistry()
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
+        use_async_state = self.execution_config.async_scheduling and self.device.type == "cuda"
         scheduler = scheduler_config or SchedulerConfig()
         self.graphs = (
             RecurrentGraphs(
@@ -334,18 +335,19 @@ class ModelRunner:
                     )
                     for _ in range(2)
                 ]
-            self.states = torch.empty(
-                (scheduler.max_num_seqs, model.config.hidden_size),
-                device=self.device,
-                dtype=parameter.dtype,
-            )
+            if not use_async_state:
+                self.states = torch.empty(
+                    (scheduler.max_num_seqs, model.config.hidden_size),
+                    device=self.device,
+                    dtype=parameter.dtype,
+                )
             # Buffers allocated after stream creation must be visible there too.
             for stream in (self.core_stream, self.boundary_stream):
                 if stream is not None:
                     stream.wait_stream(torch.cuda.current_stream(self.device))
 
         self.async_state = None
-        if self.execution_config.async_scheduling and self.device.type == "cuda":
+        if use_async_state:
             from vllm_rlt.worker.async_state import AsyncState
 
             rows = scheduler.max_num_batched_tokens
