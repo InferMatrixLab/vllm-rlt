@@ -670,3 +670,16 @@ def test_exit_written_ignores_boundary_layers(model):
     # The output stage has not run, so "every layer" is still false.
     assert not cache.token_written("request", 0, model.config.total_ut_steps - 1)
     cache.free("request")
+
+
+def test_dory_packed_prefill_requires_a_qualified_backend(model):
+    with pytest.raises(ValueError, match="packed_sliding_window"):
+        LLMEngine(model, execution_config=ExecutionConfig(dory_packed_prefill=True))
+
+
+def test_dory_packed_prefill_rejects_graphs(model):
+    with pytest.raises(ValueError, match="packed prefill requires synchronous eager"):
+        LLMEngine(
+            model,
+            execution_config=ExecutionConfig(dory_packed_prefill=True, cuda_graphs=True),
+        )

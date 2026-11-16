@@ -288,3 +288,114 @@ def test_dory_failed_submission_releases_kv_in_every_execution_mode(mode, monkey
     engine.add_request("a", PROMPTS["a"], params)
     assert drain(engine)["a"].token_ids == greedy_reference(reference, PROMPTS["a"], 4)
     assert engine.cache_manager.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("window", [0, 32])
+def test_dory_packed_attention_matches_per_row_reference(window):
+    if torch.cuda.get_device_capability() != (12, 0) or torch.version.hip:
+        pytest.skip("Dory packed prefill requires NVIDIA SM 12.0")
+    from vllm_rlt.kernels.triton_attention import paged_attention, paged_prefill_attention
+
+    # The first chunk is far enough into its history to skip a full SWA tile.
+    # The two sequences have distinct pages and different causal offsets.
+    torch.manual_seed(123)
+    q = torch.randn((42, 16, 256), device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn((10, 16, 4, 256), device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    tables = torch.tensor(
+        [[8, 2, 3, 0, 1, 4, 5, 6, 7], [9, -1, -1, -1, -1, -1, -1, -1, -1]],
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    lengths = torch.tensor([132, 15], device=DEVICE, dtype=torch.int32)
+    offsets = torch.tensor([0, 35, 42], device=DEVICE, dtype=torch.int32)
+    row_tables = torch.cat((tables[:1].expand(35, -1), tables[1:].expand(7, -1)))
+    row_lengths = torch.tensor([*range(98, 133), *range(9, 16)], device=DEVICE, dtype=torch.int32)
+    expected = paged_attention(q, k, v, row_tables, row_lengths, window=window)
+    actual = paged_prefill_attention(
+        q, k, v, tables, lengths, offsets, 35, window=window, compensate=True
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize("multi_stream", [True, False])
+def test_dory_packed_prefill_preserves_short_prompt_logits(monkeypatch, multi_stream):
+    if torch.cuda.get_device_capability() != (12, 0) or torch.version.hip:
+        pytest.skip("Dory packed prefill requires NVIDIA SM 12.0")
+    model = make_gpu_model(head_dim=256, max_position_embeddings=256, sliding_window=32).to(
+        dtype=torch.bfloat16
+    )
+    prompt = [4, 7, 9, 3, 12, 5, 23]
+    scheduler = SchedulerConfig(
+        max_num_seqs=2,
+        max_num_batched_tokens=128,
+        prefill_chunk_size=64,
+    )
+
+    def run(*, enable):
+        engine = LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=64),
+            scheduler_config=scheduler,
+            attention_backend="triton",
+            execution_config=ExecutionConfig(dory_packed_prefill=enable, multi_stream=multi_stream),
+        )
+        packed_layers = set()
+        short_logits = []
+        sampler = engine.model_runner.sampler
+        original_sample = sampler.sample
+        original_attention = engine.cache_manager._attend_prepared
+
+        def sample(logits, params, generator):
+            if params is short_options:
+                short_logits.append(logits.detach().cpu())
+            return original_sample(logits, params, generator)
+
+        def attention(layer, metadata, q, *, window=None):
+            if metadata.cu_seqlens_q is not None:
+                assert all(rid == "long" for rid, _ in metadata.allocations)
+                packed_layers.add((layer, window is not None))
+            return original_attention(layer, metadata, q, window=window)
+
+        short_options = SamplingParams(max_tokens=3, ignore_eos=True)
+        with monkeypatch.context() as mp:
+            mp.setattr(sampler, "sample", sample)
+            mp.setattr(engine.cache_manager, "_attend_prepared", attention)
+            engine.add_request(
+                "long", (prompt * 19)[:129], SamplingParams(max_tokens=3, ignore_eos=True)
+            )
+            engine.add_request("short", (prompt * 10)[:64], short_options)
+            try:
+                while engine.has_unfinished_requests():
+                    engine.step()
+                assert engine.cache_manager.num_used_blocks == 0
+            finally:
+                engine.close()
+        return torch.stack(short_logits), packed_layers
+
+    baseline, baseline_packed = run(enable=False)
+    actual, packed = run(enable=True)
+    assert not baseline_packed
+    assert {layer for layer, _ in packed} == set(range(model.config.num_kv_layers))
+    assert {window for _, window in packed} == {False, True}
+    assert torch.equal(baseline, actual)
+
+
+def test_dory_packed_prefill_keeps_small_value_residual():
+    if torch.cuda.get_device_capability() != (12, 0) or torch.version.hip:
+        pytest.skip("Dory packed prefill requires NVIDIA SM 12.0")
+    from vllm_rlt.kernels.triton_attention import paged_attention, paged_prefill_attention
+
+    q = torch.zeros((1, 1, 256), device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.zeros((1, 16, 1, 256), device=DEVICE, dtype=torch.bfloat16)
+    k, v = kv.clone(), kv.clone()
+    q[0, 0, 0], k[0, 1, 0, 0] = 16, -0.5
+    # Rounding exp(-0.5) to BF16 before multiplying would zero the numerator.
+    v[0, 0, 0, 0], v[0, 1, 0, 0] = -0.60546875, 1
+    table = torch.tensor([[0]], device=DEVICE, dtype=torch.int32)
+    length = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+    offset = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+    expected = paged_attention(q, k, v, table, length)
+    actual = paged_prefill_attention(q, k, v, table, length, offset, 1, compensate=True)
+    assert expected[0, 0, 0] > 0.0006
+    torch.testing.assert_close(actual, expected, atol=5e-6, rtol=0)

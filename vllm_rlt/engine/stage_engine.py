@@ -17,6 +17,7 @@ from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.engine.connector import StageConnector
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
+from vllm_rlt.models.dory import DoryForCausalLM
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
@@ -74,6 +75,22 @@ class StageEngine:
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
+        if self.execution_config.dory_packed_prefill:
+            if not isinstance(model, DoryForCausalLM):
+                raise ValueError("Dory packed prefill requires a Dory model")
+            if (
+                self.execution_config.async_scheduling
+                or self.execution_config.cuda_graphs
+                or staged_prefill
+                or scheduler_config.enable_preemption
+                or speculative_config is not None
+                or self.stage_config.role != "prefill_decode"
+                or cache_config.layout != "last_exited"
+            ):
+                raise ValueError(
+                    "Dory packed prefill requires synchronous eager single-stage execution "
+                    "with per_loop KV and ordinary prefill, without speculation or preemption"
+                )
         if getattr(model, "requires_boundary_kv", False):
             if staged_prefill:
                 raise ValueError(
@@ -187,7 +204,9 @@ class StageEngine:
             config.head_dim,
             cache_config.block_size,
             required_capabilities=BackendCapabilities(
-                packed_prefill=self.execution_config.prefill_uva,
+                packed_prefill=self.execution_config.prefill_uva
+                or self.execution_config.dory_packed_prefill,
+                packed_sliding_window=self.execution_config.dory_packed_prefill,
                 cuda_graphs=self.execution_config.cuda_graphs,
                 async_scheduling=(
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling

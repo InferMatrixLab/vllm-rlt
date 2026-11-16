@@ -230,6 +230,8 @@ def _paged_prefill_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRECISION: tl.constexpr,
+    WINDOW: tl.constexpr,
+    COMPENSATE: tl.constexpr,
     max_q_blocks,
 ):
     pid = tl.program_id(0)
@@ -261,7 +263,8 @@ def _paged_prefill_kernel(
     accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
     # Bottom-right causal alignment: the last query row sees every key.
     end = tl.minimum(kv_len, prefix + (q_block + 1) * BLOCK_M)
-    for start in range(0, end, BLOCK_N):
+    first = tl.maximum(0, prefix + q_block * BLOCK_M - WINDOW + 1) if WINDOW else 0
+    for start in range(first // BLOCK_N * BLOCK_N, end, BLOCK_N):
         keys_pos = start + tl.arange(0, BLOCK_N)
         key_valid = keys_pos < end
         blocks = tl.load(
@@ -279,6 +282,8 @@ def _paged_prefill_kernel(
         )
         scores = tl.dot(query, tl.trans(keys), input_precision=PRECISION) * SCALE
         visible = key_valid[None, :] & (keys_pos[None, :] <= positions[:, None])
+        if WINDOW:
+            visible = visible & (keys_pos[None, :] >= positions[:, None] - WINDOW + 1)
         scores = tl.where(visible, scores, -float("inf"))
         next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
         # Rows with no visible key in this tile keep -inf; avoid inf - inf.
@@ -294,9 +299,13 @@ def _paged_prefill_kernel(
             mask=key_valid[:, None] & dim_valid[None, :],
             other=0.0,
         )
-        accumulator = accumulator * correction[:, None] + tl.dot(
-            weights.to(values.dtype), values, input_precision=PRECISION
-        )
+        rounded = weights.to(values.dtype)
+        partial = tl.dot(rounded, values, input_precision=PRECISION)
+        if COMPENSATE:
+            # Recover the leading bits lost when the FP32 weight is cast for MMA.
+            residual = (weights - rounded.to(tl.float32)).to(values.dtype)
+            partial = tl.dot(residual, values, partial, input_precision=PRECISION)
+        accumulator = accumulator * correction[:, None] + partial
         normalizer = normalizer * correction + tl.sum(weights, axis=1)
         maximum = next_maximum
     out = accumulator / tl.maximum(normalizer, 1.0e-30)[:, None]
@@ -311,7 +320,16 @@ def _paged_prefill_kernel(
 
 
 def paged_prefill_attention(
-    q, key_cache, value_cache, block_tables, context_lengths, cu_seqlens_q, max_seqlen_q
+    q,
+    key_cache,
+    value_cache,
+    block_tables,
+    context_lengths,
+    cu_seqlens_q,
+    max_seqlen_q,
+    *,
+    window=0,
+    compensate=False,
 ):
     """Packed causal prefill over paged K/V, bottom-right aligned per sequence.
 
@@ -324,7 +342,10 @@ def paged_prefill_attention(
     sequences = block_tables.shape[0]
     if q.shape[0] == 0 or sequences == 0:
         return output
-    block_m, block_n = 64, 64
+    if type(window) is not int or window < 0:
+        raise ValueError("window must be a nonnegative integer")
+    # The compensated head-dim-256 variant must fit SM 12.0's shared memory limit.
+    block_m, block_n = (32, 64) if compensate else (64, 64)
     q_blocks = triton.cdiv(int(max_seqlen_q), block_m)
     for tensor in (key_cache, value_cache):
         if tensor.stride(3) != 1:
@@ -359,8 +380,10 @@ def paged_prefill_attention(
         BLOCK_N=block_n,
         # FP32 callers (reference checks) need exact products, not TF32.
         PRECISION="ieee" if q.dtype == torch.float32 else "tf32",
+        WINDOW=window,
+        COMPENSATE=compensate,
         max_q_blocks=q_blocks,
         num_warps=4,
-        num_stages=2,
+        num_stages=1 if compensate else 2,
     )
     return output

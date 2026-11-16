@@ -90,6 +90,32 @@ layer id rather than their physical sublayer index.
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
 
+## Opt-in packed Triton prefill
+
+Set `ExecutionConfig(dory_packed_prefill=True)` in Python or pass
+`--dory-packed-prefill` with the Triton attention backend in the CLI. This
+path requires Dory BF16, NVIDIA SM 12.0, `per_loop` KV, ordinary prefill,
+and synchronous eager single-stage execution. Speculation, preemption, CUDA
+graphs and asynchronous scheduling are outside its scope. RTX 5090 is the
+only GPU tested. Validate other SM 12.0 GPUs locally. Other GPU
+architectures require a separate kernel configuration and validation
+before the option can be enabled.
+
+A batch uses packed attention across PRELUDE, recurrence and the CODA
+writes for prompt history when every prompt is longer than 64 tokens.
+The CODA that samples the first token uses per-query attention. A batch containing
+a shorter prompt or a 64-token prompt uses per-query attention. The
+cutoff uses the full prompt length. Decode keeps the per-query path.
+
+Packed full and sliding-window attention use the same causal ranges as
+per-query attention. The matrix products and softmax reductions use a
+different order and intermediate rounding. The value product compensates
+for the BF16 rounding of softmax weights. Remaining differences can
+propagate through Dory's recurrent layers and change a greedy choice.
+For reproducible comparisons, use per-query attention and hold the
+batch shape fixed. Changes in arrival timing can change the batch shape
+even with per-query attention.
+
 ## Rejected today
 
 These fail fast rather than degrade silently:

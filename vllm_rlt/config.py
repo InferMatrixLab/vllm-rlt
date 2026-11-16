@@ -151,10 +151,12 @@ class ExecutionConfig:
     # Select packed prefill metadata staging (and require packed attention).
     # The historical name is retained; use_uva controls its transfer mechanism.
     prefill_uva: bool = False
+    dory_packed_prefill: bool = False
 
     def __post_init__(self):
         for name in (
             "prefill_uva",
+            "dory_packed_prefill",
             "use_uva",
             "async_scheduling",
             "multi_stream",

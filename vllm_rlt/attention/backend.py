@@ -25,6 +25,7 @@ class BackendCapabilities:
     device_context_lengths: bool = False
     # Mask keys outside a per-layer sliding window (not storage reclamation).
     sliding_window: bool = False
+    packed_sliding_window: bool = False
 
 
 @dataclass
@@ -124,7 +125,18 @@ def create_backend(
     for candidate in candidates:
         try:
             implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
-            if candidate == "triton" and required_capabilities.packed_prefill:
+            if candidate == "triton" and required_capabilities.packed_sliding_window:
+                if (
+                    dtype != torch.bfloat16
+                    or torch.version.hip
+                    or torch.cuda.get_device_capability(device) != (12, 0)
+                ):
+                    raise ValueError("packed_sliding_window requires NVIDIA SM 12.0 and BF16")
+                implementation.kernel = TritonPagedAttention(packed_sliding_window=True)
+                implementation.capabilities = replace(
+                    implementation.capabilities, packed_prefill=True, packed_sliding_window=True
+                )
+            elif candidate == "triton" and required_capabilities.packed_prefill:
                 # Packed BF16 prefill has different arithmetic from per-row decode.
                 # Opt in for prefill_uva without changing existing split/mixed or
                 # Huginn boundary attention when that option is disabled.
@@ -139,6 +151,7 @@ def create_backend(
                     "async_scheduling",
                     "device_context_lengths",
                     "sliding_window",
+                    "packed_sliding_window",
                 )
                 if getattr(required_capabilities, name)
                 and not getattr(implementation.capabilities, name)

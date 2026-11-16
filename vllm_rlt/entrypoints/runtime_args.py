@@ -30,6 +30,11 @@ def add_runtime_args(parser):
         help="Use packed prefill metadata staging (requires packed attention)",
     )
     parser.add_argument(
+        "--dory-packed-prefill",
+        action="store_true",
+        help="Enable packed Triton prefill for Dory BF16 on NVIDIA SM 12.0",
+    )
+    parser.add_argument(
         "--no-uva",
         dest="use_uva",
         action="store_false",
@@ -119,6 +124,7 @@ def runtime_configs(args):
         ),
         execution_config=ExecutionConfig(
             prefill_uva=args.prefill_uva,
+            dory_packed_prefill=args.dory_packed_prefill,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,
