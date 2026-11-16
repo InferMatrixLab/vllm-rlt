@@ -31,13 +31,14 @@ def add_runtime_args(parser):
         help="Force packed prefill metadata staging (requires packed attention); "
         "default resolves automatically (on for CUDA with last_exited KV)",
     )
-    parser.add_argument(
+    packed_prefill_mode = parser.add_mutually_exclusive_group()
+    packed_prefill_mode.add_argument(
         "--no-packed-prefill",
         action="store_false",
         dest="packed_prefill",
         help="Keep per-row prefill even when packed attention is available",
     )
-    parser.add_argument(
+    packed_prefill_mode.add_argument(
         "--dory-packed-prefill",
         action="store_true",
         help="Enable packed Triton prefill for Dory BF16 on NVIDIA SM 12.0",

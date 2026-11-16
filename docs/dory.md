@@ -92,9 +92,12 @@ layer id rather than their physical sublayer index.
 
 ## Opt-in packed Triton prefill
 
-Set `ExecutionConfig(dory_packed_prefill=True)` in Python or pass
-`--dory-packed-prefill` with the Triton attention backend in the CLI. This
-path requires Dory BF16, NVIDIA SM 12.0, `per_loop` KV, ordinary prefill,
+In Python, set `attention_backend="triton"` and
+`execution_config=ExecutionConfig(dory_packed_prefill=True)`. On the CLI, pass
+`--attention-backend triton --dory-packed-prefill`. The `--dory-packed-prefill`
+and `--no-packed-prefill` flags are mutually exclusive.
+
+This path requires Dory BF16, NVIDIA SM 12.0, `per_loop` KV, ordinary prefill,
 and synchronous eager single-stage execution. Speculation, preemption, CUDA
 graphs and asynchronous scheduling are outside its scope. RTX 5090 is the
 only GPU tested. Validate other SM 12.0 GPUs locally. Other GPU
