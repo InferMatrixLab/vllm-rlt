@@ -4,8 +4,10 @@ import math
 
 import torch
 
+from vllm_rlt.config import cuda_graph_rows
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.worker.buffers import execution_buffer_bytes
+from vllm_rlt.worker.cuda_graph import speculative_capture_sizes
 
 
 def budget_blocks(available_bytes, bytes_per_block):
@@ -17,13 +19,49 @@ def budget_blocks(available_bytes, bytes_per_block):
     return blocks
 
 
+def graph_memory_reserve(model, scheduler, execution, speculative=None):
+    """Headroom per pool plus retained speculative coda logits across all entries.
+
+    This is a conservative planning allowance, not an allocator upper bound.
+    Explicit KV capacities bypass automatic planning as before.
+    """
+    if not execution.cuda_graphs:
+        return 0
+    pools = 1 + bool(getattr(model, "requires_boundary_kv", False))
+    retained_logits = 0
+    if speculative is not None:
+        pools += 2
+        rows = min(
+            cuda_graph_rows(execution),
+            scheduler.max_num_seqs * (speculative.num_speculative_tokens + 1),
+            scheduler.max_num_batched_tokens,
+        )
+        entries = min(rows, execution.cuda_graph_max_graphs)
+        # Each entry retains a separate full-vocabulary output, even though the
+        # graph allocator pool can reuse intermediate storage between replays.
+        retained_rows = (
+            sum(speculative_capture_sizes(execution, scheduler, speculative))
+            if execution.async_scheduling
+            else entries * rows
+        )
+        retained_logits = (
+            retained_rows * model.config.vocab_size * next(model.parameters()).element_size()
+        )
+    return pools * execution.cuda_graph_memory_reserve_bytes + retained_logits
+
+
 @torch.inference_mode()
-def plan_cache(model, cache, scheduler, execution, backend, *, staged_prefill=None):
+def plan_cache(
+    model, cache, scheduler, execution, backend, *, speculative=None, staged_prefill=None
+):
     parameter = next(model.parameters())
     config, device = model.config, parameter.device
+    # Models whose physical stack mixes KV-owning and KV-free sublayers (Dory)
+    # expose the compact count; everything else keeps the layer count.
+    kv_layers = getattr(config, "num_kv_layers", config.num_hidden_layers)
     per_block = (
         2
-        * config.num_hidden_layers
+        * kv_layers
         * cache.block_size
         * config.num_key_value_heads
         * config.head_dim
@@ -56,7 +94,7 @@ def plan_cache(model, cache, scheduler, execution, backend, *, staged_prefill=No
         for start in range(0, count, config.max_position_embeddings)
     ]
     probe = KVCacheManager(
-        num_layers=config.num_hidden_layers,
+        num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         max_loops=config.total_ut_steps,
@@ -118,7 +156,7 @@ def plan_cache(model, cache, scheduler, execution, backend, *, staged_prefill=No
     )
     budget = min(free_before, int(total * cache.gpu_memory_utilization) - reserved)
     concurrent_peak = peak * (2 if execution.async_scheduling and execution.multi_stream else 1)
-    graph_reserve = execution.cuda_graph_memory_reserve_bytes if execution.cuda_graphs else 0
+    graph_reserve = graph_memory_reserve(model, scheduler, execution, speculative)
     budget -= (
         concurrent_peak
         + context_scratch

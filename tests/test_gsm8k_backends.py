@@ -1,5 +1,7 @@
 """CPU tests for native generation stopping and cleanup."""
 
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,21 @@ ADAPTIVE_EXIT = {
     "max_loops": 4,
     "async_scheduling": False,
 }
+
+
+def test_backend_helpers_import_without_registering_unrelated_lm_eval_models():
+    pytest.importorskip("lm_eval")
+    script = """
+import sys
+from pathlib import Path
+import lm_eval
+from benchmarks import gsm8k_backends as backends
+assert 'lm_eval.models' not in sys.modules
+expected = Path(lm_eval.__file__).parent / 'models' / 'utils.py'
+for helper in (backends.stop_sequences_criteria, backends.postprocess_generated_text):
+    assert Path(helper.__code__.co_filename) == expected
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, timeout=60)
 
 
 class Engine:

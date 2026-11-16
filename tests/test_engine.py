@@ -426,6 +426,7 @@ def test_packed_prefill_resolves_automatically_when_unset(monkeypatch):
     assert packed_prefill_eligible(None, device_type="cuda", **common)
     assert not packed_prefill_eligible(None, device_type="cpu", **common)
     assert not packed_prefill_eligible(None, device_type="cuda", **{**common, "layout": "shared"})
+    assert not packed_prefill_eligible(None, device_type="cuda", **common, sliding_window=True)
     # Huginn packs by default (GSM8K-87 paired gate: no regression); =0 keeps per-row prefill.
     assert packed_prefill_eligible(None, device_type="cuda", **{**common, "boundary_kv": True})
     monkeypatch.setenv("VLLM_RLT_HUGINN_PACKED_PREFILL", "0")

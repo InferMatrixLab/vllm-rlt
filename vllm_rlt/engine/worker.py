@@ -9,7 +9,7 @@ import os
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import asdict, is_dataclass
+from dataclasses import is_dataclass
 
 import torch
 
@@ -43,14 +43,21 @@ class StageWorker:
         self.channel = channel
         self.max_control_messages = max_control_messages
         dtype = getattr(torch, options["dtype"])
+        model_config = options["model_config"]
         if isinstance(model_source, torch.nn.Module):
             self.model = model_source.to(device=device, dtype=dtype)
         elif is_dataclass(model_source):
-            model_cls = MODEL_MAPPING[model_source.to_dict()["model_type"]]
-            self.model = model_cls(model_source).to(device=device, dtype=dtype)
+            model_cls = MODEL_MAPPING[model_config.model_type]
+            self.model = model_cls(model_config.model_specific_config).to(
+                device=device, dtype=dtype
+            )
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_source, revision=options["revision"], device=str(device), dtype=dtype
+                model_source,
+                revision=options["revision"],
+                device=str(device),
+                dtype=dtype,
+                model_config=model_config,
             )
         self.engine = StageEngine(self.model, stage_config=stage_config, **options["engine"])
         self.connector = (
@@ -66,8 +73,6 @@ class StageWorker:
         info = dict(
             stage_id=stage_config.stage_id,
             role=stage_config.role,
-            model=asdict(self.model.config),
-            model_type=self.model.config.to_dict()["model_type"],
             num_blocks=cache.num_blocks,
             block_size=cache.block_size,
             depths=cache.storage_depths,

@@ -245,7 +245,9 @@ def test_cuda_engine_resolves_auto_before_profiling(packages, monkeypatch, execu
     class ProfileReached(Exception):
         pass
 
-    def plan_cache(model, cache, scheduler, execution, selected, *, staged_prefill):
+    def plan_cache(
+        model, cache, scheduler, execution, selected, *, speculative=None, staged_prefill=None
+    ):
         assert selected == "triton"  # FA2 cannot use the configured 16-token pages.
         assert staged_prefill is False
         raise ProfileReached

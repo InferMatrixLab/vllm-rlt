@@ -1,8 +1,15 @@
+import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 from vllm_rlt.attention import BackendCapabilities, create_backend
-from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt.config import (
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    SchedulerConfig,
+    resolve_cuda_graph_rows,
+)
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
@@ -18,6 +25,8 @@ from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry
 from vllm_rlt.worker.speculative import SpeculativeRunner
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vllm_rlt.worker.async_speculative import AsyncSpeculativeRunner
@@ -41,19 +50,27 @@ def _huginn_packed_prefill_disabled() -> bool:
     return os.environ.get("VLLM_RLT_HUGINN_PACKED_PREFILL", "1") == "0"
 
 
-def packed_prefill_eligible(prefill_uva, *, device_type, layout, boundary_kv, staged_prefill):
+def packed_prefill_eligible(
+    prefill_uva, *, device_type, layout, boundary_kv, staged_prefill, sliding_window=False
+):
     """Whether an unset ``prefill_uva`` may resolve to packed prefill.
 
     Explicit settings win. Packed prefill needs CUDA packed attention and
     last_exited KV; staged prefill (wavefront chunking, mixed mode) keeps the
     per-row path, which its schedulers were written against. Boundary-KV models
-    (Huginn) pack unless VLLM_RLT_HUGINN_PACKED_PREFILL=0.
+    (Huginn) pack unless VLLM_RLT_HUGINN_PACKED_PREFILL=0. Sliding-window
+    attention keeps its single-query-row metadata.
     """
     if prefill_uva is not None:
         return bool(prefill_uva)
     if boundary_kv and _huginn_packed_prefill_disabled():
         return False
-    return device_type == "cuda" and layout == "last_exited" and not staged_prefill
+    return (
+        device_type == "cuda"
+        and layout == "last_exited"
+        and not staged_prefill
+        and not sliding_window
+    )
 
 
 class StageEngine:
@@ -80,29 +97,59 @@ class StageEngine:
         parameter = next(model.parameters())
         config = model.config
         if getattr(model, "requires_boundary_kv", False):
-            if cache_config.layout != "last_exited":
-                raise ValueError("Huginn requires last_exited KV")
+            required_layout = getattr(model, "kv_cache_layout", "last_exited")
+            if cache_config.layout != required_layout:
+                raise ValueError(f"boundary-KV models require {required_layout} KV")
             if cache_config.enable_prefix_caching:
-                raise ValueError("Huginn prefix caching is not yet supported")
+                raise ValueError("boundary-KV prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
-        self.execution_config = execution_config or ExecutionConfig()
+        self.execution_config = resolve_cuda_graph_rows(
+            execution_config or ExecutionConfig(), scheduler_config, speculative_config
+        )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
         if getattr(model, "requires_boundary_kv", False):
             if staged_prefill:
                 raise ValueError(
-                    "Huginn does not support staged prefill required by this scheduler"
+                    "boundary-KV models do not support staged prefill required by this scheduler"
                 )
-            if self.execution_config.async_scheduling:
-                raise ValueError("Huginn requires synchronous scheduling")
-            if self.execution_config.prefill_uva is True and _huginn_packed_prefill_disabled():
+            if self.execution_config.async_scheduling and not getattr(
+                model, "supports_async_scheduling", False
+            ):
+                raise ValueError("boundary-KV models require synchronous scheduling")
+            if self.execution_config.prefill_uva and getattr(
+                model, "requires_sliding_window", False
+            ):
+                raise ValueError("prefill_uva does not support sliding-window attention")
+            if (
+                self.execution_config.prefill_uva is True
+                and not getattr(model, "requires_sliding_window", False)
+                and _huginn_packed_prefill_disabled()
+            ):
                 raise ValueError(
                     "Huginn packed prefill is disabled by VLLM_RLT_HUGINN_PACKED_PREFILL=0"
                 )
             if speculative_config is not None:
-                raise ValueError("Huginn speculative decoding is not yet supported")
+                if not getattr(model, "supports_self_speculation", False):
+                    raise ValueError("boundary-KV speculative decoding is not yet supported")
+                # Qualified: synchronous eager rounds. Async rounds, Graph replay and
+                # resumable preemption of draft/target boundary state are separate work.
+                if (
+                    self.execution_config.async_scheduling
+                    or self.execution_config.cuda_graphs
+                    or scheduler_config.enable_preemption
+                ):
+                    raise ValueError(
+                        "boundary-KV speculative decoding requires synchronous eager "
+                        "execution without CUDA graphs or preemption"
+                    )
+        if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
+            raise ValueError("this model does not support CUDA graphs yet")
         self.speculative_config = speculative_config
+        self.pipeline_speculative = bool(
+            speculative_config and speculative_config.mode == "pipeline"
+        )
         self.async_speculative = bool(speculative_config and self.execution_config.async_scheduling)
         if speculative_config is not None:
             if cache_config.layout != "last_exited":
@@ -114,7 +161,9 @@ class StageEngine:
             if self.async_speculative and parameter.device.type != "cuda":
                 raise ValueError("async speculative decoding requires CUDA")
             if scheduler_config.mode != "refill" or (
-                self.async_speculative and scheduler_config.enable_preemption
+                self.async_speculative
+                and not self.pipeline_speculative
+                and scheduler_config.enable_preemption
             ):
                 raise ValueError(
                     "speculative decoding requires refill scheduling without preemption"
@@ -138,11 +187,33 @@ class StageEngine:
             )
         if self.execution_config.cuda_graphs and parameter.device.type != "cuda":
             raise ValueError("CUDA graphs require CUDA with Triton or FlashAttention")
+        if self.execution_config.cuda_graphs and speculative_config is not None:
+            rows = min(
+                scheduler_config.max_num_seqs * (speculative_config.num_speculative_tokens + 1),
+                scheduler_config.max_num_batched_tokens,
+            )
+            if rows > self.execution_config.cuda_graph_max_batch_size:
+                logger.warning(
+                    "CUDA Graph row limit %d cannot cover %d verification rows "
+                    "(max_num_seqs=%d, K=%d); larger batches run eager. "
+                    "Raise cuda_graph_max_batch_size, or leave it unset to cover them, "
+                    "and budget additional graph memory.",
+                    self.execution_config.cuda_graph_max_batch_size,
+                    rows,
+                    scheduler_config.max_num_seqs,
+                    speculative_config.num_speculative_tokens,
+                )
         if self.execution_config.async_scheduling:
-            if not self.async_speculative and self.exit_config.mode not in (
-                "ouro_delayed",
-                "random_lookahead",
-                "trace",
+            # A fixed-loop model has no exit decision to delay or look ahead to.
+            if (
+                not self.async_speculative
+                and not getattr(model, "fixed_loop_count", False)
+                and self.exit_config.mode
+                not in (
+                    "ouro_delayed",
+                    "random_lookahead",
+                    "trace",
+                )
             ):
                 raise ValueError(
                     "async scheduling requires ouro_delayed, random_lookahead or trace exit mode"
@@ -159,6 +230,7 @@ class StageEngine:
             layout=cache_config.layout,
             boundary_kv=getattr(model, "requires_boundary_kv", False),
             staged_prefill=staged_prefill,
+            sliding_window=getattr(model, "requires_sliding_window", False),
         )
 
         def backend(packed_prefill):
@@ -175,6 +247,7 @@ class StageEngine:
                         parameter.device.type == "cuda" and self.execution_config.async_scheduling
                     ),
                     device_context_lengths=self.async_speculative,
+                    sliding_window=getattr(model, "requires_sliding_window", False),
                 ),
             )
 
@@ -193,10 +266,11 @@ class StageEngine:
             scheduler_config,
             self.execution_config,
             attention.info["selected_backend"],
+            speculative=speculative_config,
             staged_prefill=staged_prefill,
         )
         self.cache_manager = KVCacheManager(
-            num_layers=config.num_hidden_layers,
+            num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_loops=config.total_ut_steps,
@@ -326,8 +400,12 @@ class StageEngine:
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
-        if self.async_speculative and params.temperature != 0:
-            raise ValueError("async speculative decoding currently requires greedy sampling")
+        if (
+            self.async_speculative
+            or (self.speculative_config and self.speculative_config.mode == "pipeline")
+        ) and params.temperature != 0:
+            mode = "async" if self.async_speculative else "pipeline"
+            raise ValueError(f"{mode} speculative decoding currently requires greedy sampling")
         if request_id in self._retiring_speculative:
             self._retire_speculative(wait=True, request_id=request_id)
         config = self.model.config
@@ -338,6 +416,13 @@ class StageEngine:
         max_loops = params.max_loops or config.total_ut_steps
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
+        if getattr(self.model, "fixed_loop_count", False) and (
+            max_loops != config.total_ut_steps or params.min_loops != config.total_ut_steps
+        ):
+            raise ValueError(
+                "this model always runs the configured loop count; min_loops and "
+                "max_loops must both equal it"
+            )
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
@@ -431,6 +516,8 @@ class StageEngine:
             self._finish(request, FinishReason.ABORT)
             return RequestOutput.from_request(request)
         self.preemption.discard_snapshot(request_id)
+        if self.speculative_runner is not None:
+            self.speculative_runner.release(request)
         self.model_runner.release(request_id)
         self._pending_exit_signals.pop(request_id, None)
         return RequestOutput.from_request(self.scheduler.abort(request_id))
@@ -698,6 +785,8 @@ class StageEngine:
                     queue.remove(request.request_id)
             self._retiring_speculative[request.request_id] = request
             return
+        if self.speculative_runner is not None:
+            self.speculative_runner.release(request)
         self.model_runner.release(request.request_id)
         self.cache_manager.poll_prefixes()
         self._pending_exit_signals.pop(request.request_id, None)
@@ -745,6 +834,15 @@ class StageEngine:
     def _step_async_speculative(self):
         self._retire_speculative()
         outputs = []
+        # Waiting admissions need a quiescent point before the scheduler can
+        # select a victim. Victim selection remains entirely in Scheduler.
+        if (
+            self.pipeline_speculative
+            and self.scheduler.config.enable_preemption
+            and self.scheduler.queues[RequestPhase.WAITING]
+        ):
+            while self._pending_speculative:
+                outputs.extend(self._collect_speculative())
         # Submit ahead before collecting, even when a small round already
         # completed. Two leased buffers provide a hard global queue bound.
         if len(self._pending_speculative) == 2:

@@ -21,6 +21,8 @@ class ExitSignal:
 class SpeculativeResult:
     token_ids: list[int]
     accepted_count: int
+    # Exclusive KV extent still needed by retained pipeline tokens.
+    kv_frontier: int | None = None
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -60,6 +60,8 @@ class DeviceKVMetadata:
     write_offsets: torch.Tensor
     block_tables: torch.Tensor
     context_lengths: torch.Tensor
+    # Inactive pipeline slots must not overwrite any live KV address.
+    write_mask: torch.Tensor | None = None
     # The device-owned path currently uses independent single-query rows.
     # These layout fields also let recurrent graphs stage the same contract.
     cu_seqlens_q: torch.Tensor | None = None
@@ -97,6 +99,7 @@ class MetadataBuilder:
         write_offsets,
         block_tables,
         context_lengths,
+        write_mask=None,
     ) -> DeviceKVMetadata:
         """Borrow stream-ordered metadata without reading device positions on CPU.
 
@@ -111,7 +114,14 @@ class MetadataBuilder:
             write_offsets=write_offsets,
             block_tables=block_tables,
             context_lengths=context_lengths,
+            write_mask=write_mask,
         )
+        if write_mask is not None and (
+            write_mask.shape != position_ids.shape
+            or write_mask.dtype != torch.bool
+            or write_mask.device != self.cache.device
+        ):
+            raise ValueError("write_mask must be bool [rows] on the cache device")
         self.cache._require_live_batch(batch)
         rows = len(position_ids)
         for name, tensor, dtype in (
@@ -217,6 +227,52 @@ class MetadataBuilder:
                 )
             )
         return tuple(layouts)
+
+    @staticmethod
+    def select_rows(layout, rows, *, packed=False):
+        """Select host rows of a built layout, in the given order, before staging.
+
+        ``rows`` indexes ``layout.rows``. Positions, write addresses and
+        allocation identities are taken from the layout, so the selection
+        describes exactly the rows a caller selects from the matching hidden
+        tensor. Attention values are re-planned for the selection: a subset may
+        need a narrower table, and packed queries need their own sequence
+        boundaries (selected rows of one request/depth must stay contiguous).
+        The result is a new layout; the source and its shared lists are not
+        modified. An empty selection returns ``None``.
+        """
+        if not rows:
+            return None
+        owner = layout.owner
+        if packed and (
+            owner.layout != "last_exited" or not owner.attention_capabilities.packed_prefill
+        ):
+            raise ValueError("packed queries require a compatible attention backend and KV layout")
+        selected = tuple(layout.rows[row] for row in rows)
+        positions = [layout.positions[row] for row in rows]
+        names = {id(allocation): name for name, allocation in layout.allocations}
+        allocations = {}
+        for allocation, _, _ in selected:
+            allocations.setdefault(names[id(allocation)], allocation)
+        attention = plan_attention_metadata(
+            AttentionRows(
+                block_tables=[a.block_tables[owner._plane(d)] for a, d, _ in selected],
+                positions=positions,
+                sequence_keys=[(id(a), d) for a, d, _ in selected] if packed else None,
+            ),
+            block_size=owner.block_size,
+            packed_prefill=packed,
+        )
+        return KVLayout(
+            owner=owner,
+            rows=selected,
+            allocations=tuple(allocations.items()),
+            positions=positions,
+            write_blocks=[layout.write_blocks[row] for row in rows],
+            write_offsets=[layout.write_offsets[row] for row in rows],
+            attention=attention,
+            writable=layout.writable,
+        )
 
     @staticmethod
     def bind(metadata, storage):
