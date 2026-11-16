@@ -404,7 +404,7 @@ def test_sync_rejection_retires_all_references_before_replacement(draft, accepte
         original = e.speculative_runner._coda
         calls = 0
 
-        def controlled(hidden):
+        def controlled(hidden, boundary=None):
             nonlocal calls
             logits = torch.full((len(hidden), 64), -100.0)
             if calls < 2:

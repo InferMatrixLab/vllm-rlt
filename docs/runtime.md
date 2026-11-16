@@ -76,6 +76,22 @@ OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli --toy --dtype float32 \
 
 For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --attention-backend triton`. Use `--single-stream` for the single-stream pipeline. `--num-blocks` overrides automatic sizing, or specify `--kv-cache-memory-bytes`; these two overrides are mutually exclusive. CPU auto mode keeps a 256-block default. `StageEngine.memory_plan` records the worker-local sizing decision; it is not an attribute of the public `LLM.engine` client.
 
+## Packed prefill
+
+`ExecutionConfig.packed_prefill` controls packed prefill attention and metadata
+staging. Its default, `None`, selects packed prefill when the selected backend
+supports it on CUDA with `last_exited` KV and ordinary, non-staged prefill.
+Mixed scheduling, wavefront chunked prefill and sliding-window attention keep
+their existing paths. These selection rules apply to all models.
+
+Set `packed_prefill=True` / `--packed-prefill` to require packed prefill, or
+`packed_prefill=False` / `--no-packed-prefill` to disable its staging path.
+Explicit requests still undergo device, model and backend compatibility checks.
+
+`ExecutionConfig.use_uva` independently controls how input buffers are read.
+`use_uva=False` / `--no-uva` copies them to the GPU and can be combined with
+packed prefill.
+
 ## Execution batches and mixed scheduling
 
 Stage composition, component ownership and Request handoff are described in the
