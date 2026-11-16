@@ -133,6 +133,73 @@ def test_native_per_loop_batched_queries_and_sliced_metadata():
         cache.layer_view(batch, 1)
 
 
+@pytest.mark.parametrize("loops", [1, 2, 4])
+@pytest.mark.parametrize("tail_pages", [0, 1, 3])
+def test_grouped_prefix_import_preserves_page_order_and_shared_ownership(loops, tail_pages):
+    cached_pages, block_size = 64, 2
+    recurrent = (2, 3, 4, 5)
+    # Every group has multiple layers; recurrent groups also have multiple
+    # planes. Distinct data per layer/plane detects any flattening mismatch.
+    windows = {layer: (4 if layer % 2 == 0 else None) for layer in range(8)}
+    pages_per_block = 4 + 4 * loops
+    pool_pages = max(cached_pages + 1, cached_pages + 2 * tail_pages)
+    cache = KVCacheManager(
+        num_layers=8,
+        num_kv_heads=1,
+        head_dim=2,
+        num_blocks=pool_pages * pages_per_block,
+        block_size=block_size,
+        max_loops=loops,
+        recurrent_layers=recurrent,
+        layer_windows=windows,
+        enable_prefix_caching=True,
+    )
+    tokens = list(range(cached_pages * block_size + 1))
+    assert cache.allocate("source", len(tokens))
+    expected_tables = {}
+    for layer in windows:
+        for depth in range(loops) if layer in recurrent else (0,):
+            values = torch.full((len(tokens), 1, 2), float(layer * loops + depth))
+            cache.write(
+                layer, ["source"] * len(tokens), [depth] * len(tokens), tokens, values, values + 100
+            )
+            expected_tables[layer, depth] = cache.layer_block_table("source", layer, depth)[
+                :cached_pages
+            ]
+    cache.publish_prefix("source", tokens, len(tokens))
+    prefix = cache.lookup_prefix(tokens)
+    assert len(prefix) == cached_pages
+    cache.free("source")
+
+    capacity = (cached_pages + tail_pages) * block_size
+    fresh_pages = set()
+    for request_id in ("hit", "sharer"):
+        assert cache.allocate(request_id, capacity, prefix=prefix)
+        for (layer, depth), expected in expected_tables.items():
+            table = cache.layer_block_table(request_id, layer, depth)
+            assert table[:cached_pages] == expected
+            assert len(table) == cached_pages + tail_pages
+            suffix = set(table[cached_pages:])
+            assert not suffix & fresh_pages
+            fresh_pages.update(suffix)
+            keys, values = cache.read(layer, request_id, depth)
+            expected_keys = torch.full_like(keys, float(layer * loops + depth))
+            torch.testing.assert_close(keys, expected_keys)
+            torch.testing.assert_close(values, expected_keys + 100)
+    assert cache.num_used_blocks == (cached_pages + 2 * tail_pages) * pages_per_block
+    if tail_pages:
+        # A failed third import must roll back its shared-page references.
+        assert not cache.allocate("blocked", capacity, prefix=prefix)
+        assert not cache.has_allocation("blocked")
+    cache.free("hit")
+    cache.free("sharer")
+    assert cache.num_used_blocks == 0
+    # Evict every cached page to prove no import left a reference behind.
+    assert cache.allocate("evict", pool_pages * block_size)
+    cache.free("evict")
+    assert cache.num_free_blocks == cache.num_blocks
+
+
 def test_native_atomic_growth_failure_free_and_early_exit_copy():
     model = DoryForCausalLM(tiny_dory_config()).eval()
     cache = native_cache(model, blocks=18)
@@ -225,11 +292,56 @@ def test_native_engine_generation_uses_grouped_storage(mode):
     assert cache.num_used_blocks == 0
 
 
-def test_native_engine_refuses_preemption_before_running():
+@pytest.mark.parametrize("mode", ["per_loop", "last_loop"])
+@pytest.mark.parametrize("loops", [1, 2, 4])
+def test_grouped_static_buffers_with_three_padded_rows_match_dense_reference(mode, loops):
+    torch.manual_seed(42)
+    model = DoryForCausalLM(
+        tiny_dory_config(recurrent_kv_cache_mode=mode, n_recurrent_loops=loops)
+    ).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=64, block_size=2, layout=model.kv_cache_layout),
+        scheduler_config=SchedulerConfig(max_num_seqs=3, max_num_batched_tokens=3),
+        execution_config=ExecutionConfig(static_buffers=True, pad_to_power_of_two=True),
+    )
+    prompts = {"a": [4], "b": [7], "c": [3]}
+    try:
+        cache = engine.cache_manager
+        assert cache.grouped
+        assert engine.model_runner.requestspaces
+        for request_id, prompt in prompts.items():
+            engine.add_request(
+                request_id,
+                prompt,
+                SamplingParams(max_tokens=3, min_loops=loops, max_loops=loops, ignore_eos=True),
+            )
+        completed = {}
+        while engine.has_unfinished_requests():
+            for output in engine.step():
+                if output.finished:
+                    completed[output.request_id] = output.token_ids
+        assert set(completed) == set(prompts)
+        for request_id, prompt in prompts.items():
+            tokens = list(prompt)
+            for _ in range(3):
+                logits = reference.dense_dory_reference(model, torch.tensor(tokens))["logits"]
+                tokens.append(int(logits[-1].argmax()))
+            assert completed[request_id] == tokens[len(prompt) :]
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+def test_native_engine_refuses_preemption_before_running(monkeypatch):
+    def unexpected_plan(*args, **kwargs):
+        pytest.fail("unsupported preemption must be rejected before cache planning")
+
+    monkeypatch.setattr("vllm_rlt.engine.stage_engine.plan_cache", unexpected_plan)
     model = DoryForCausalLM(tiny_dory_config()).eval()
     with pytest.raises(NotImplementedError, match="preemption snapshots"):
         LLMEngine(
             model,
-            cache_config=CacheConfig(num_blocks=8, block_size=2),
+            cache_config=CacheConfig(block_size=2),
             scheduler_config=SchedulerConfig(enable_preemption=True),
         )

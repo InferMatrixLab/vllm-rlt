@@ -111,9 +111,11 @@ def model():
     return DoryForCausalLM(tiny_dory_config()).eval()
 
 
-def make_cache(model, layout=None, block_size=2):
+def make_cache(model, layout=None, block_size=2, enable_prefix_caching=False, grouped=False):
     config = model.config
     return KVCacheManager(
+        layer_windows=model.kv_layer_windows if grouped else None,
+        enable_prefix_caching=enable_prefix_caching,
         num_layers=config.num_kv_layers,
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
@@ -690,3 +692,235 @@ def test_dory_packed_prefill_rejects_graphs(model):
             model,
             execution_config=ExecutionConfig(packed_prefill=True, cuda_graphs=True),
         )
+
+
+def prefill_rows(model, cache, request_id, tokens, start):
+    """Run positions ``start:`` one row at a time on an allocated request."""
+    config = model.config
+    logits = []
+    for position in range(start, len(tokens)):
+        boundary = cache._prepare_batch([request_id], [0], [position])
+        hidden = model.prelude_prepared(tokens[position : position + 1], boundary, cache)
+        for depth in range(config.total_ut_steps):
+            core = cache._prepare_batch([request_id], [depth], [position])
+            hidden, _ = model.recurrent_prepared(hidden, core, cache)
+        logits.append(model.coda_prepared(hidden, boundary, cache)[0])
+        cache.finalize_token(request_id, position, config.total_ut_steps - 1)
+    return torch.stack(logits)
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["legacy", "grouped"])
+@pytest.mark.parametrize("loops", [1, 2, 4])
+def test_prefix_hit_resumes_boundary_and_recurrent_kv(loops, grouped):
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=loops)).eval()
+    cache = make_cache(model, enable_prefix_caching=True, grouped=grouped)
+    # The cached prefix exceeds the four-token sliding attention window.
+    tokens = torch.tensor([4, 7, 3, 9, 5, 2, 8, 6, 3])
+    expected = dense_dory_reference(model, tokens)["logits"]
+
+    assert cache.allocate("cold", len(tokens))
+    torch.testing.assert_close(
+        prefill_rows(model, cache, "cold", tokens, 0), expected, atol=3e-6, rtol=3e-5
+    )
+    cache.publish_prefix("cold", tokens.tolist(), len(tokens))
+    # The last prompt token is always recomputed, so four whole pages publish.
+    assert len(cache._prefixes) == 4
+    cache.free("cold")
+
+    prefix = cache.lookup_prefix(tokens.tolist())
+    assert len(prefix) == 4
+    assert cache.allocate("hit", len(tokens), prefix=prefix)
+    written = cache._get_allocation("hit").written
+    for plane, layers in enumerate(written):
+        for layer, positions in enumerate(layers):
+            owns = plane == 0 or layer in model.recurrent_kv_layers
+            # Boundary KV is restored only where the cold run wrote it.
+            assert positions.prefix == (8 if owns else 0)
+    torch.testing.assert_close(
+        prefill_rows(model, cache, "hit", tokens, 8), expected[8:], atol=3e-6, rtol=3e-5
+    )
+    cache.free("hit")
+    assert cache.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["legacy", "grouped"])
+@pytest.mark.parametrize("missing", ["boundary_plane0", "recurrent_plane0", "recurrent_deep_plane"])
+def test_prefix_publication_requires_every_owned_plane(model, missing, grouped):
+    cache = make_cache(model, enable_prefix_caching=True, grouped=grouped)
+    tokens = torch.tensor([4, 7, 3, 9, 5])
+    assert cache.allocate("request", len(tokens))
+    prefill_rows(model, cache, "request", tokens, 0)
+    layers = cache._get_allocation("request").written
+    boundary = model.prelude_kv_layers[0]
+    recurrent = model.recurrent_kv_layers[0]
+    plane, layer = {
+        "boundary_plane0": (0, boundary),
+        "recurrent_plane0": (0, recurrent),
+        "recurrent_deep_plane": (cache.storage_depths - 1, recurrent),
+    }[missing]
+    # Mark page 1 (positions 2-3) incomplete in one plane: only page 0 may publish.
+    layers[plane][layer].prefix = 2
+    cache.publish_prefix("request", tokens.tolist(), len(tokens))
+    assert len(cache._prefixes) == 1
+
+
+def test_grouped_prefix_pages_outlive_the_publishing_request(model):
+    cache = make_cache(model, enable_prefix_caching=True, grouped=True)
+    tokens = torch.tensor([4, 7, 3, 9, 5])
+    expected = dense_dory_reference(model, tokens)["logits"]
+    assert cache.allocate("cold", len(tokens))
+    prefill_rows(model, cache, "cold", tokens, 0)
+    cache.publish_prefix("cold", tokens.tolist(), len(tokens))
+    published = {b for blocks in cache._prefixes.values() for b in blocks}
+    # Two token pages, each one physical page per (group, plane, layer).
+    assert len(published) == 2 * cache.pages_per_token_block
+    cache.free("cold")
+    # Allocate another request; the published pages must not be handed out.
+    assert cache.allocate("filler", len(tokens))
+    assert not published & set(
+        b
+        for layer in cache.layer_groups
+        for depth in range(cache.max_loops if cache.layer_group(layer)[1].recurrent else 1)
+        for b in cache.layer_block_table("filler", layer, depth)
+    )
+    cache.free("filler")
+    prefix = cache.lookup_prefix(tokens.tolist())
+    assert cache.allocate("hit", len(tokens), prefix=prefix)
+    for layer in cache.layer_groups:
+        assert cache.retained_range("hit", layer, 0) == (0, 4)
+    torch.testing.assert_close(
+        prefill_rows(model, cache, "hit", tokens, 4), expected[4:], atol=3e-6, rtol=3e-5
+    )
+    cache.free("hit")
+    assert cache.num_used_blocks == 0
+
+
+def test_grouped_prefix_caching_rejects_swa_reclamation(model):
+    config = model.config
+    with pytest.raises(NotImplementedError, match="SWA reclamation"):
+        KVCacheManager(
+            num_layers=config.num_kv_layers,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            num_blocks=256,
+            block_size=2,
+            max_loops=config.total_ut_steps,
+            device="cpu",
+            dtype=torch.float32,
+            backend="torch",
+            layout=config.kv_cache_layout,
+            recurrent_layers=model.recurrent_kv_layers,
+            layer_windows=model.kv_layer_windows,
+            enable_prefix_caching=True,
+            incremental_allocation=True,
+            reclaim_swa=True,
+        )
+
+
+def test_engine_rejects_prefix_caching_with_swa_reclamation_before_planning(model, monkeypatch):
+    def unexpected_plan(*args, **kwargs):
+        pytest.fail("prefix caching with SWA reclamation must be rejected before cache planning")
+
+    monkeypatch.setattr("vllm_rlt.engine.stage_engine.plan_cache", unexpected_plan)
+    with pytest.raises(NotImplementedError, match="prefix caching with SWA reclamation"):
+        LLMEngine(
+            model,
+            cache_config=CacheConfig(
+                block_size=2,
+                enable_prefix_caching=True,
+                incremental_allocation=True,
+                reclaim_swa=True,
+            ),
+        )
+
+
+def run_engine(engine, requests, params):
+    for request_id, prompt in requests:
+        engine.add_request(request_id, prompt, params)
+    finished = {}
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output.token_ids
+    return finished
+
+
+def greedy_reference(model, prompt, steps):
+    tokens = list(prompt)
+    for _ in range(steps):
+        logits = dense_dory_reference(model, torch.tensor(tokens))["logits"]
+        tokens.append(int(logits[-1].argmax()))
+    return tokens[len(prompt) :]
+
+
+@pytest.mark.parametrize("loops", [1, 2, 4])
+def test_engine_prefix_hits_match_cold_greedy_reference(loops):
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=loops)).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=512, block_size=2, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
+    )
+    steps = model.config.total_ut_steps
+    params = SamplingParams(max_tokens=3, min_loops=steps, max_loops=steps, ignore_eos=True)
+    shared = [4, 7, 3, 9, 5, 2, 8, 6]
+    prompts = {
+        "cold": shared + [3],
+        # Block-aligned: the last full page is still recomputed.
+        "aligned": shared + [3, 5],
+        "branch": shared + [10, 11, 12],
+        "same": shared + [3],
+    }
+    cache = engine.cache_manager
+    assert run_engine(engine, [("cold", prompts["cold"])], params) == {
+        "cold": greedy_reference(model, prompts["cold"], 3)
+    }
+    assert cache.prefix_hits == 0
+    # Run the remaining requests concurrently over the shared published prefix.
+    finished = run_engine(
+        engine, [(rid, prompts[rid]) for rid in ("aligned", "branch", "same")], params
+    )
+    for rid in ("aligned", "branch", "same"):
+        assert finished[rid] == greedy_reference(model, prompts[rid], 3), rid
+    assert cache.prefix_hits >= 3 * len(shared)
+    assert cache.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("loops", [1, 2, 4])
+def test_evicted_prefix_falls_back_to_cold_prefill(loops):
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=loops)).eval()
+    steps = model.config.total_ut_steps
+    # Grouped KV stores one layer per physical page: boundary layers own one
+    # plane, recurrent layers own ``steps``. A configured block is
+    # ``num_kv_layers`` physical pages. Each request reserves eleven tokens,
+    # spanning six token pages; those plus four cached pages exceed the pool's eight.
+    recurrent = set(model.recurrent_kv_layers)
+    pages_per_token_page = sum(
+        steps if layer in recurrent else 1 for layer in model.kv_layer_windows
+    )
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(
+            num_blocks=8 * pages_per_token_page // model.config.num_kv_layers,
+            block_size=2,
+            enable_prefix_caching=True,
+        ),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+    )
+    cache = engine.cache_manager
+    params = SamplingParams(max_tokens=3, min_loops=steps, max_loops=steps, ignore_eos=True)
+    prompt = [4, 7, 3, 9, 5, 2, 8, 6, 3]
+    other = [10, 11, 12, 13, 14, 15, 16, 17, 18]
+    expected = greedy_reference(model, prompt, 3)
+
+    assert run_engine(engine, [("cold", prompt)], params) == {"cold": expected}
+    assert len(cache.lookup_prefix(prompt)) == 4
+    run_engine(engine, [("other", other)], params)
+    assert cache.lookup_prefix(prompt) == ()
+    hits = cache.prefix_hits
+    assert run_engine(engine, [("again", prompt)], params) == {"again": expected}
+    assert cache.prefix_hits == hits
+    assert cache.num_used_blocks == 0

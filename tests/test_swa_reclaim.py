@@ -167,6 +167,12 @@ def test_reclaim_waits_for_group_reader_reuses_pages_and_rebuilds_or_rejects_vie
             assert len(waits) == 2
             assert cache.retained_range("request", 0, 0) == (2, 5)
             assert cache.retained_range("request", 1, 0) == (0, 5)
+            for layer in (*model.prelude_kv_layers, *model.coda_kv_layers):
+                with pytest.raises(
+                    ValueError, match="boundary attention layers only own depth zero"
+                ):
+                    cache.retained_range("request", layer, 1)
+            assert cache.token_written("request", position, 1)
             with pytest.raises(RuntimeError, match="resident"):
                 cache.layer_view(old, 0)
             with pytest.raises(ValueError, match="window must match the layer policy"):
@@ -224,6 +230,86 @@ def test_window_one_page_one_finalization_and_swa_occupancy_plateau(monkeypatch)
     assert max(full for _, full in occupancy) >= 2 * len(prompt)
     assert any(swa == 0 and full > 0 for swa, full in occupancy)
     assert cache.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("layout", ["last_exited", "shared"])
+def test_long_reclaimed_history_is_not_copied_on_growth_or_retirement(monkeypatch, layout):
+    history_tokens, extra_tokens, loops = 4096, 8, 2
+    planes = loops if layout == "last_exited" else 1
+    cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        num_blocks=history_tokens * planes,
+        block_size=1,
+        max_loops=loops,
+        layout=layout,
+        layer_windows={0: 1},
+        incremental_allocation=True,
+        reclaim_swa=True,
+        max_submission_tokens=history_tokens,
+    )
+    assert cache.allocate("request", history_tokens + extra_tokens, initial_tokens=history_tokens)
+    snapshots = tuple(cache.layer_block_table("request", 0, depth) for depth in range(planes))
+    # Exercise real coverage and consumption bookkeeping without benchmarking attention.
+    monkeypatch.setattr(cache.attention, "windowed", lambda query, *args: query)
+    values = torch.zeros(history_tokens, 1, 2)
+    for depth in range(loops):
+        batch = cache._prepare_batch(
+            ["request"] * history_tokens, [depth] * history_tokens, list(range(history_tokens))
+        )
+        cache._write_prepared(0, batch, values, values)
+        cache._attend_prepared(0, batch, values, window=1)
+    cache.finish_submission()
+    assert cache.num_used_blocks == 0
+    assert all(isinstance(snapshot, tuple) and min(snapshot) >= 0 for snapshot in snapshots)
+
+    class NoHistoryCopy(list):
+        # A one-page append or retirement must not traverse thousands of dead slots.
+        def __iter__(self):
+            raise AssertionError("allocator scanned the full historical page table")
+
+        def __add__(self, other):
+            raise AssertionError("allocator copied the full historical page table")
+
+    allocation = cache._get_allocation("request")
+    tables = tuple(NoHistoryCopy(table) for table in allocation.group_tables[0])
+    allocation.group_tables = (tables,)
+    assert cache.allocated_blocks("request") == 0
+    epochs = tuple(allocation.group_epochs[0])
+    for position in range(history_tokens, history_tokens + extra_tokens):
+        assert cache.ensure_capacity("request", position + 1)
+        assert cache.num_used_blocks == planes
+        assert cache.allocated_blocks("request") == planes
+        for depth in range(loops):
+            batch = cache._prepare_batch(["request"], [depth], [position])
+            cache._write_prepared(0, batch, values[:1], values[:1])
+            cache._attend_prepared(0, batch, values[:1], window=1)
+
+        class Completion:
+            def synchronize(self):
+                # Residency and references remain intact until the final reader completes.
+                assert cache.num_used_blocks == planes
+                assert all(table[position] is not None for table in tables)
+
+        cache.finish_submission(Completion())
+        assert cache.num_used_blocks == 0
+        assert cache.allocated_blocks("request") == 0
+        assert all(table[position] is None for table in tables)
+        assert all(current is saved for current, saved in zip(allocation.group_tables[0], tables))
+    assert allocation.group_epochs[0] == [epoch + 2 * extra_tokens for epoch in epochs]
+    # Public inspection still returns immutable snapshots independent of internal mutation.
+    allocation.group_tables = (tuple(table[:] for table in tables),)
+    for depth in range(planes):
+        assert cache.layer_block_table("request", 0, depth) == (-1,) * (
+            history_tokens + extra_tokens
+        )
+        assert cache.retained_range("request", 0, depth) == (
+            history_tokens + extra_tokens,
+            history_tokens + extra_tokens,
+        )
+    cache.free("request")
+    assert cache.num_free_blocks == cache.num_blocks
 
 
 @pytest.mark.parametrize("mode", ["per_loop", "last_loop"])
@@ -284,7 +370,7 @@ def test_reclaim_multi_request_abort_and_reuse(monkeypatch, mode):
     first_b_pages, reused_while_b_active = set(), set()
     stale = None
     aborted = stale_checked = False
-    for step in range(128):
+    for _ in range(128):
         if not engine.has_unfinished_requests():
             break
         for output in engine.step():
@@ -349,7 +435,6 @@ def test_reclaim_multi_request_abort_and_reuse(monkeypatch, mode):
     assert not engine.has_unfinished_requests(), "small-pool admission/growth did not complete"
     assert aborted and stale_checked and reused_while_b_active
     assert set(completed) == {"long", "reused"}
-    # Device snapshots stay on-device until the whole cancel/reuse scenario ends.
     for request, index, context, actual in observed:
         assert index == len(context) - len(request.prompt_token_ids)
         expected = dense_dory_reference(reference, torch.tensor(context))["logits"][-1]
@@ -366,8 +451,3 @@ def test_reclaim_multi_request_abort_and_reuse(monkeypatch, mode):
             tokens.append(int(logits[-1].argmax()))
         assert completed[rid].token_ids == tokens[len(prompts[rid]) :]
     assert cache.num_used_blocks == 0 and cache.num_free_blocks == cache.num_blocks
-    print(
-        f"{mode}: steps={step + 1}, live_cross_request_reused_pages="
-        f"{sorted(reused_while_b_active)}, stale_rejected={stale_checked}, "
-        f"logits_checked={len(observed)}, cleanup=0"
-    )

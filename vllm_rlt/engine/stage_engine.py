@@ -69,7 +69,11 @@ class StageEngine:
             required_layout = getattr(model, "kv_cache_layout", "last_exited")
             if cache_config.layout != required_layout:
                 raise ValueError(f"boundary-KV models require {required_layout} KV")
-            if cache_config.enable_prefix_caching:
+            # Only models that verified hit/miss parity opt in: the cache must
+            # cover boundary KV at depth 0 and recurrent KV at every depth.
+            if cache_config.enable_prefix_caching and not getattr(
+                model, "supports_boundary_prefix_caching", False
+            ):
                 raise ValueError("boundary-KV prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = resolve_cuda_graph_rows(
@@ -262,6 +266,27 @@ class StageEngine:
             self.execution_config = replace(
                 self.execution_config, packed_prefill=prefer_packed and supported
             )
+        layer_windows = getattr(model, "kv_layer_windows", None)
+        if layer_windows is not None and (
+            self.execution_config.cuda_graphs
+            or self.execution_config.async_scheduling
+            or self.execution_config.packed_prefill
+            or speculative_config is not None
+            or cache_config.kv_cache_dtype != "auto"
+        ):
+            # Graph, async, packed, speculative and FP8 paths require all-layer
+            # block tables until they support grouped pages.
+            if cache_config.reclaim_swa:
+                raise ValueError(
+                    "SWA reclamation requires synchronous eager execution without "
+                    "packed prefill, speculation or FP8 KV"
+                )
+            layer_windows = None
+        if layer_windows is not None:
+            if scheduler_config.enable_preemption:
+                raise NotImplementedError("grouped KV does not support preemption snapshots")
+            if cache_config.enable_prefix_caching and cache_config.reclaim_swa:
+                raise NotImplementedError("prefix caching with SWA reclamation is not qualified")
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -271,12 +296,8 @@ class StageEngine:
             speculative=speculative_config,
             staged_prefill=staged_prefill,
             fp8_scale=fp8_scale,
+            layer_windows=layer_windows,
         )
-        if (
-            getattr(model, "kv_layer_windows", None) is not None
-            and scheduler_config.enable_preemption
-        ):
-            raise NotImplementedError("grouped KV does not support preemption snapshots")
         self.cache_manager = KVCacheManager(
             num_layers=kv_layers,
             num_kv_heads=config.num_key_value_heads,
@@ -295,7 +316,7 @@ class StageEngine:
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
             kv_cache_dtype=cache_config.kv_cache_dtype,
             fp8_scale=fp8_scale,
-            layer_windows=getattr(model, "kv_layer_windows", None),
+            layer_windows=layer_windows,
             reclaim_swa=cache_config.reclaim_swa,
             max_submission_tokens=min(
                 scheduler_config.prefill_chunk_size, scheduler_config.max_num_batched_tokens
