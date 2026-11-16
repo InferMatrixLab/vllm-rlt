@@ -120,14 +120,19 @@ def main():
     parser.add_argument("--pd-max-receiving-requests", type=int, default=32)
     parser.add_argument("--pd-max-draining-requests", type=int, default=8)
     parser.add_argument("--nixl-backend", default="UCX")
-    parser.add_argument("--pd-transfer-chunk-bytes", type=int, default=64 * 1024**2)
-    parser.add_argument("--pd-max-inflight-bytes", type=int, default=256 * 1024**2)
+    parser.add_argument(
+        "--pd-transfer-chunk-bytes", type=int, default=PDConfig.transfer_chunk_bytes
+    )
+    parser.add_argument("--pd-max-inflight-bytes", type=int, default=PDConfig.max_inflight_bytes)
     parser.add_argument("--pd-max-transfer-descriptors", type=int, default=256)
     parser.add_argument("--pd-startup-timeout", type=float, default=300)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    for name, default in asdict(ServingLimits()).items():
-        parser.add_argument("--" + name.replace("_", "-"), type=type(default), default=default)
+    parser.add_argument("--max-output-tokens", type=int)
+    defaults = asdict(ServingLimits())
+    for name, default in defaults.items():
+        if name != "max_output_tokens":
+            parser.add_argument("--" + name.replace("_", "-"), type=type(default), default=default)
     add_runtime_args(parser)
     parser.add_argument("--no-async-scheduling", action="store_false", dest="async_scheduling")
     parser.set_defaults(
@@ -135,7 +140,7 @@ def main():
     )
 
     args = parser.parse_args()
-    limits = ServingLimits(**{name: getattr(args, name) for name in asdict(ServingLimits())})
+    limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
     logging.basicConfig(level=logging.INFO)
     web.run_app(
         create_app(
