@@ -304,6 +304,9 @@ class StageEngine:
 
     def _init_wise(self, wise_config, speculative_config, config, parameter):
         """WISE working-set decode (vllm_rlt.wise) on this engine's cache."""
+        # Its kernels attend the full support; a window mask would be dropped.
+        if getattr(self.model, "requires_sliding_window", False):
+            raise ValueError("WISE decode does not implement sliding-window attention")
         from vllm_rlt.wise import WiseState
 
         backend = self.cache_manager.backend

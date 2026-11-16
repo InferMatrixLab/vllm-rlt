@@ -670,3 +670,9 @@ def test_exit_written_ignores_boundary_layers(model):
     # The output stage has not run, so "every layer" is still false.
     assert not cache.token_written("request", 0, model.config.total_ut_steps - 1)
     cache.free("request")
+
+
+def test_wise_decode_rejects_the_sliding_window_model():
+    # Checked before the WISE kernels load, so it needs neither CUDA nor Triton.
+    with pytest.raises(ValueError, match="sliding-window"):
+        LLMEngine(DoryForCausalLM(tiny_dory_config()).eval(), wise_config=object())
