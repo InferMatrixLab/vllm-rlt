@@ -319,7 +319,10 @@ def test_dory_packed_attention_matches_per_row_reference(window):
 
 
 @pytest.mark.parametrize("multi_stream", [True, False])
-def test_dory_packed_prefill_preserves_short_prompt_logits(monkeypatch, multi_stream):
+@pytest.mark.parametrize(("long_tokens", "max_num_seqs"), [(65, 1), (129, 2)])
+def test_dory_packed_prefill_preserves_short_prompt_logits(
+    monkeypatch, multi_stream, long_tokens, max_num_seqs
+):
     if torch.cuda.get_device_capability() != (12, 0) or torch.version.hip:
         pytest.skip("Dory packed prefill requires NVIDIA SM 12.0")
     model = make_gpu_model(head_dim=256, max_position_embeddings=256, sliding_window=32).to(
@@ -327,7 +330,7 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(monkeypatch, multi_st
     )
     prompt = [4, 7, 9, 3, 12, 5, 23]
     scheduler = SchedulerConfig(
-        max_num_seqs=2,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=128,
         prefill_chunk_size=64,
     )
@@ -361,11 +364,14 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(monkeypatch, multi_st
         with monkeypatch.context() as mp:
             mp.setattr(sampler, "sample", sample)
             mp.setattr(engine.cache_manager, "_attend_prepared", attention)
-            engine.add_request(
-                "long", (prompt * 19)[:129], SamplingParams(max_tokens=3, ignore_eos=True)
-            )
-            engine.add_request("short", (prompt * 10)[:64], short_options)
             try:
+                assert engine.execution_config.packed_prefill is False
+                engine.add_request(
+                    "long",
+                    (prompt * 19)[:long_tokens],
+                    SamplingParams(max_tokens=3, ignore_eos=True),
+                )
+                engine.add_request("short", (prompt * 10)[:64], short_options)
                 while engine.has_unfinished_requests():
                     engine.step()
                 assert engine.cache_manager.num_used_blocks == 0

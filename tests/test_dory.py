@@ -683,3 +683,8 @@ def test_dory_packed_prefill_rejects_graphs(model):
             model,
             execution_config=ExecutionConfig(dory_packed_prefill=True, cuda_graphs=True),
         )
+
+
+def test_generic_packed_prefill_rejects_dory_sliding_windows(model):
+    with pytest.raises(ValueError, match="packed_prefill does not support sliding-window"):
+        LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=True))

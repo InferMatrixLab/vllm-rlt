@@ -120,7 +120,7 @@ even with per-query attention.
 
 These fail fast rather than degrade silently:
 
-- WCPB, mixed or staged prefill; packed prefill metadata (`prefill_uva`); PD.
+- WCPB, mixed or staged prefill; packed prefill metadata (`packed_prefill`); PD.
 - Prefix caching.
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
   preemption or `last_loop` KV, and sampled token-pipeline speculation. The
