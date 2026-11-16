@@ -428,6 +428,31 @@ def test_missing_tokenizer_prompts_before_download(monkeypatch, answer):
     prompt.assert_called_once()
 
 
+@pytest.mark.parametrize("failure", ["value", "strict"])
+def test_tokenizer_falls_back_when_transformers_rejects_the_config(monkeypatch, failure):
+    """Dory's ``layer_types`` include ``mlp``, which transformers refuses."""
+    from vllm_rlt.models import load_tokenizer
+
+    if failure == "value":
+        error = ValueError("layer_types entries must be in (...) but got ['mlp']")
+    else:
+        from huggingface_hub.errors import StrictDataclassClassValidationError
+
+        error = StrictDataclassClassValidationError(
+            validator="validate_layer_type", cause=ValueError("unexpected 'mlp'")
+        )
+    tokenizer = object()
+    load = Mock(side_effect=[error, tokenizer])
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", load)
+    assert load_tokenizer("org/dory", revision="tag") is tokenizer
+    assert load.call_count == 2
+    assert "config" not in load.call_args_list[0].kwargs
+    assert load.call_args_list[1].kwargs["local_files_only"] is True
+    from transformers import PretrainedConfig
+
+    assert isinstance(load.call_args_list[1].kwargs["config"], PretrainedConfig)
+
+
 def test_local_checkpoint_never_prompts(monkeypatch, checkpoint):
     prompt = Mock(side_effect=AssertionError("local loading must not ask"))
     monkeypatch.setattr("builtins.input", prompt)

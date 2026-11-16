@@ -29,7 +29,9 @@ def _write_kv(
     TILE: tl.constexpr,
 ):
     row = tl.program_id(0)
-    enabled = row < tl.load(Active)
+    enabled = True
+    if Active is not None:
+        enabled = row < tl.load(Active)
     if WriteMask is not None:
         enabled = enabled & tl.load(WriteMask + row)
     if enabled:

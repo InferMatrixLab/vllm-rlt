@@ -1,5 +1,7 @@
 """CPU/GPU input preparation, reusable metadata and forward boundaries."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -14,7 +16,7 @@ from vllm_rlt.worker.metadata import KVMetadata
 
 
 @pytest.mark.parametrize(
-    "device,layout,backend,uva",
+    "device,layout,backend,packed_prefill",
     [
         ("cpu", "shared", "torch", False),
         ("cpu", "last_exited", "torch", False),
@@ -26,7 +28,7 @@ from vllm_rlt.worker.metadata import KVMetadata
     ],
 )
 def test_loop_preparation_reuses_growing_storage_and_only_saves_final_hidden(
-    monkeypatch, device, layout, backend, uva
+    monkeypatch, device, layout, backend, packed_prefill
 ):
     torch.manual_seed(123)
     config = (
@@ -41,7 +43,7 @@ def test_loop_preparation_reuses_growing_storage_and_only_saves_final_hidden(
         model,
         cache_config=CacheConfig(128, 16 if backend == "flash_attn_4" else 2, layout=layout),
         execution_config=ExecutionConfig(
-            static_buffers=True, pad_to_power_of_two=True, prefill_uva=uva
+            static_buffers=True, pad_to_power_of_two=True, packed_prefill=packed_prefill
         ),
         exit_config=ExitConfig("ouro"),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
@@ -119,7 +121,7 @@ def test_loop_preparation_reuses_growing_storage_and_only_saves_final_hidden(
         assert gates and not any(gates)
         assert outputs[0] == outputs[1] == outputs[2] == outputs[4]
         assert outputs[3] == outputs[5]
-        if uva:
+        if packed_prefill:
             previous = {}
             reused = grew = False
             for _, tensor, slot, count in snapshots:
@@ -621,3 +623,44 @@ def test_forward_consumes_prepared_inputs(
         assert operations == {Operation.PRELUDE, Operation.RECURRENT, Operation.CODA}
     finally:
         e.close()
+
+
+@pytest.mark.parametrize(
+    "selection,packed",
+    [
+        ((0, 1, 2, 3, 4, 5, 6), False),  # every row
+        ((1, 3, 6), False),  # one offset across unequal requests
+        ((3, 6), False),  # partial CODA subset, last request skipped
+        ((5, 3, 0), False),  # caller order is preserved
+        ((), False),  # empty subset
+        ((0, 1, 2, 3, 4, 5, 6), True),  # packed verification rows
+        ((1, 2, 4, 5), True),  # packed subset rebuilds sequence boundaries
+    ],
+)
+def test_selected_rows_match_a_layout_built_for_those_rows(monkeypatch, selection, packed):
+    cache = KVCacheManager(1, 1, 8, 32, 4, 4, layout="last_exited")
+    monkeypatch.setattr(
+        type(cache),
+        "attention_capabilities",
+        property(lambda self: replace(self.attention.capabilities, packed_prefill=True)),
+    )
+    for name, length in (("a", 9), ("b", 6), ("c", 11)):
+        assert cache.allocate(name, length)
+    # Rows grouped by request in position order, as speculative rounds lay them out.
+    ids = ["a", "a", "a", "b", "b", "c", "c"]
+    positions = [6, 7, 8, 4, 5, 9, 10]
+    builder = cache.metadata_builder
+    source = builder.build(ids, [[depth] * len(ids) for depth in range(4)], positions)
+    for depth in range(4):
+        selected = builder.select_rows(source[depth], selection, packed=packed)
+        if not selection:
+            assert selected is None
+            continue
+        expected = builder.build(
+            [ids[row] for row in selection],
+            [[depth] * len(selection)],
+            [positions[row] for row in selection],
+            packed=packed,
+        )[0]
+        assert selected == expected
+    assert source[0].positions == positions  # the source's shared lists are untouched

@@ -568,6 +568,18 @@ class KVCacheManager:
         plane = allocation.written[self._plane(depth)]
         return all(position in plane[layer] for layer in range(self.num_layers))
 
+    def exit_written(self, request_id: str, position: int, depth: int) -> bool:
+        """Whether every recurrent layer has written KV for ``position`` at ``depth``.
+
+        Boundary layers keep their history at depth 0 and the output stage runs
+        after the exit, so they take no part in finalizing a token.
+        """
+        allocation = self._get_allocation(request_id)
+        self._validate_depth(depth)
+        self._validate_position(allocation, position)
+        plane = allocation.written[self._plane(depth)]
+        return all(position in plane[layer] for layer in self.recurrent_layers)
+
     def mark_finalized(self, request_id: str, position: int, exit_depth: int) -> None:
         """Mark the token written at every depth deeper than ``exit_depth``.
 
@@ -839,19 +851,28 @@ class KVCacheManager:
         depths: Sequence[int],
         positions: Sequence[int] | torch.Tensor,
         q: torch.Tensor,
+        *,
+        window: int | None = None,
     ) -> torch.Tensor:
         """Apply causal GQA at each row's own position and recurrence depth."""
         self._validate_layer(layer)
         batch = self._prepare_batch(request_ids, depths, positions, for_write=False)
-        return self._attend_prepared(layer, batch, q)
+        return self._attend_prepared(layer, batch, q, window=window)
 
     @torch.no_grad()
     def _attend_prepared(
-        self, layer: int, batch: KVMetadata | DeviceKVMetadata, q: torch.Tensor
+        self,
+        layer: int,
+        batch: KVMetadata | DeviceKVMetadata,
+        q: torch.Tensor,
+        *,
+        window: int | None = None,
     ) -> torch.Tensor:
         self._validate_layer(layer)
         self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
+        if window is not None:
+            return self._attend_windowed(layer, batch, q, window)
         if isinstance(batch, DeviceKVMetadata):
             keys, values, tables = self._layer_kv(layer, batch.block_tables)
             return self.attention(q, keys, values, tables, batch.context_lengths)
@@ -872,6 +893,34 @@ class KVCacheManager:
                 batch.max_seqlen_q,
             )
         return self.attention(q, keys, values, tables, batch.context_lengths)
+
+    @torch.no_grad()
+    def _attend_windowed(
+        self, layer: int, batch: KVMetadata, q: torch.Tensor, window: int
+    ) -> torch.Tensor:
+        """Mask keys outside ``window`` without reclaiming their storage.
+
+        Only kernels that advertise ``sliding_window`` are used; there is no
+        silent fallback to full attention, which would change the model.
+        """
+        if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+            raise ValueError("window must be a positive integer")
+        if not self.attention_capabilities.sliding_window:
+            raise NotImplementedError(
+                f"the {self.backend} attention backend does not implement sliding-window masking"
+            )
+        if batch.cu_seqlens_q is not None:
+            raise NotImplementedError("sliding-window attention needs one query row per token")
+        # Device-owned positions are ordered by the runner's stream; the host
+        # frontier lags them, as for unwindowed attention.
+        if not isinstance(batch, DeviceKVMetadata):
+            if not batch.rows:
+                return torch.empty_like(q)
+            self._require_packed_layer(layer, batch.rows)
+            for allocation, depth, position in batch.rows:
+                self._require_prefix(allocation, layer, depth, position + 1)
+        keys, values, tables = self._layer_kv(layer, batch.block_tables)
+        return self.attention.windowed(q, keys, values, tables, batch.context_lengths, window)
 
     @torch.no_grad()
     def finalize_token(self, request_id: str, position: int, exit_depth: int) -> None:

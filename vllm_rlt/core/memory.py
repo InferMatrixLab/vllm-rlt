@@ -56,9 +56,12 @@ def plan_cache(
 ):
     parameter = next(model.parameters())
     config, device = model.config, parameter.device
+    # Models whose physical stack mixes KV-owning and KV-free sublayers (Dory)
+    # expose the compact count; everything else keeps the layer count.
+    kv_layers = getattr(config, "num_kv_layers", config.num_hidden_layers)
     per_block = (
         2
-        * config.num_hidden_layers
+        * kv_layers
         * cache.block_size
         * config.num_key_value_heads
         * config.head_dim
@@ -91,7 +94,7 @@ def plan_cache(
         for start in range(0, count, config.max_position_embeddings)
     ]
     probe = KVCacheManager(
-        num_layers=config.num_hidden_layers,
+        num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         max_loops=config.total_ut_steps,
