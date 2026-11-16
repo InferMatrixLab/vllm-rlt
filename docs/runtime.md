@@ -82,7 +82,9 @@ For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --att
 staging. Its default, `None`, selects packed prefill when the selected backend
 supports it on CUDA with `last_exited` KV and ordinary, non-staged prefill.
 Mixed scheduling, wavefront chunked prefill and sliding-window attention keep
-their existing paths. These selection rules apply to all models.
+their existing paths, and so does an engine that reserves LoopCD
+(`ExecutionConfig(loopcd=True)`): LoopCD admission rejects guided requests when
+packed prefill is on. These selection rules apply to all models.
 
 Set `packed_prefill=True` / `--packed-prefill` to require packed prefill, or
 `packed_prefill=False` / `--no-packed-prefill` to disable its staging path.

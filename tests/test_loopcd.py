@@ -283,6 +283,31 @@ def test_unsupported_admission_rejected_before_request_allocation(case):
     assert not engine.scheduler.requests
 
 
+def test_reserved_loopcd_keeps_unset_packed_prefill_off():
+    from vllm_rlt.config import CacheConfig as Cache
+    from vllm_rlt.config import ExitConfig
+    from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
+    from vllm_rlt.worker.loopcd import validate
+
+    common = dict(device_type="cuda", layout="last_exited", staged_prefill=False)
+    assert packed_prefill_eligible(None, **common)
+    # Unset packing resolves to per-row prefill when the engine reserves LoopCD.
+    assert not packed_prefill_eligible(None, **common, loopcd=True)
+    # An explicit request still wins; guided admission then rejects it.
+    assert packed_prefill_eligible(True, **common, loopcd=True)
+    model = model_for()
+    for packed, rejected in ((None, False), (False, False), (True, True)):
+        execution = ExecutionConfig(loopcd=True, packed_prefill=packed)
+        check = lambda: validate(  # noqa: E731
+            model, params_for(), execution, Cache(), SchedulerConfig(), ExitConfig(), None
+        )
+        if rejected:
+            with pytest.raises(ValueError, match="LoopCD requires atomic synchronous"):
+                check()
+        else:
+            check()
+
+
 @pytest.mark.parametrize("feature", ["async", "prefix", "shared", "split"])
 def test_shallow_prefill_capability_checked_before_allocation(feature):
     with pytest.raises(ValueError, match="prefill_depth override"):

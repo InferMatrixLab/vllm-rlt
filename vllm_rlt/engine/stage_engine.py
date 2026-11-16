@@ -195,6 +195,7 @@ class StageEngine:
             layout=cache_config.layout,
             staged_prefill=staged_prefill,
             sliding_window=getattr(model, "requires_sliding_window", False),
+            loopcd=self.execution_config.loopcd,
         )
         attention = create_backend(
             attention_backend,
