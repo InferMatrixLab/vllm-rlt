@@ -66,13 +66,15 @@ def test_packed_prefill_and_wcpb_match_default():
             cache_config=CacheConfig(num_blocks=64, block_size=16),
             scheduler_config=scheduler
             or SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=64, prefill_chunk_size=8),
-            execution_config=execution or ExecutionConfig(),
+            # packed_prefill=None would pack Triton prefill automatically, so the
+            # per-row baseline opts out explicitly.
+            execution_config=execution or ExecutionConfig(packed_prefill=False),
             exit_config=ExitConfig("ouro"),
         ) as llm:
             return [o.token_ids for o in llm.generate(prompts, params)]
 
     baseline = run()
-    assert run(execution=ExecutionConfig(prefill_uva=True, use_uva=True)) == baseline
+    assert run(execution=ExecutionConfig(packed_prefill=True, use_uva=True)) == baseline
     assert (
         run(
             scheduler=SchedulerConfig(

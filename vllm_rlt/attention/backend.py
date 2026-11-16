@@ -57,10 +57,8 @@ class AttentionBackend:
 
 
 _TORCH_CAPABILITIES = BackendCapabilities(sliding_window=True)
-# Triton's packed prefill opts in through required_capabilities (prefill_uva);
-# it is not the default because FA4 owns packed prefill on CUDA.
 _TRITON_CAPABILITIES = BackendCapabilities(
-    cuda_graphs=True, async_scheduling=True, device_context_lengths=True
+    cuda_graphs=True, async_scheduling=True, device_context_lengths=True, sliding_window=True
 )
 _FLASH_CAPABILITIES = {
     2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
@@ -110,6 +108,7 @@ def create_backend(
     block_size: int,
     *,
     required_capabilities: BackendCapabilities = BackendCapabilities(),
+    prefer_packed_prefill: bool = False,
 ) -> AttentionBackend:
     """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
 
@@ -118,7 +117,9 @@ def create_backend(
     implementation. Only compatibility and import failures permit auto to try the
     next candidate; kernel execution errors never trigger a runtime fallback.
     Execution requirements filter candidates before memory profiling or
-    device-buffer allocation.
+    device-buffer allocation. Preferred packed prefill enables it where available
+    without filtering or reordering candidates; required packed prefill still
+    rejects unsupported ones.
     """
     validate_backend_name(backend)
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
@@ -132,9 +133,11 @@ def create_backend(
     for candidate in candidates:
         try:
             implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
-            if candidate == "triton" and required_capabilities.packed_prefill:
+            if candidate == "triton" and (
+                required_capabilities.packed_prefill or prefer_packed_prefill
+            ):
                 # Packed BF16 prefill has different arithmetic from per-row decode.
-                # Opt in for prefill_uva without changing existing split/mixed or
+                # Opt in for packed_prefill without changing existing split/mixed or
                 # Huginn boundary attention when that option is disabled.
                 implementation.capabilities = replace(
                     implementation.capabilities, packed_prefill=True

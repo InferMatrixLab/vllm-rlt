@@ -60,7 +60,7 @@ device selector because PyTorch exposes ROCm devices through `torch.cuda`.
 | CUDA Graph replay | Yes | Triton backend, static buffers |
 | Multi-stream execution | Yes | `multi_stream` |
 | UVA host metadata | Yes (probed) | `hipHostGetDevicePointer` must equal the host address |
-| Packed prefill / `prefill_uva` | Opt-in | FP32 greedy matches per-row exactly; BF16 attention differs by <=0.0156 and greedy can diverge, so it stays out of `all` until an accuracy check |
+| Packed prefill / `packed_prefill` | Opt-in | FP32 greedy matches per-row exactly; BF16 attention differs by <=0.0156 and greedy can diverge, so it stays out of `all` until an accuracy check |
 | Wavefront chunked prefill | Yes | `--wavefront-chunked-prefill` |
 | Prefix cache | Yes | `enable_prefix_caching=True` |
 | Priority scheduling | Yes | `priority=0` is highest; high-priority latency 7.80s → 2.22s |
@@ -231,7 +231,7 @@ opt-in and is not a default.
 
 ### Not done on ROCm
 
-- **Packed prefill (`prefill_uva`)**: root cause located as BF16 accumulation,
+- **Packed prefill (`packed_prefill`)**: root cause located as BF16 accumulation,
   not metadata: FP32 greedy output matches per-row exactly, while BF16
   per-call attention differs by <=0.0156 and can flip greedy tokens. It stays
   opt-in until an accuracy evaluation, and is excluded from `all`.

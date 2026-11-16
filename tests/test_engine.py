@@ -415,3 +415,31 @@ def test_finish_reason_preserves_public_string_values(reason):
     output = RequestOutput.from_request(request)
     assert output.finished and type(output.finish_reason) is str
     assert output.finish_reason == reason.value
+
+
+def test_packed_prefill_resolves_automatically_when_unset():
+    from vllm_rlt.config import ExecutionConfig
+    from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
+
+    common = dict(layout="last_exited", staged_prefill=False)
+    # Unset: on for CUDA, last_exited, ordinary prefill without sliding windows.
+    assert packed_prefill_eligible(None, device_type="cuda", **common)
+    assert not packed_prefill_eligible(None, device_type="cpu", **common)
+    assert not packed_prefill_eligible(None, device_type="cuda", **{**common, "layout": "shared"})
+    assert not packed_prefill_eligible(None, device_type="cuda", **common, sliding_window=True)
+    assert not packed_prefill_eligible(
+        None, device_type="cuda", **{**common, "staged_prefill": True}
+    )
+    # Explicit settings win regardless of eligibility.
+    assert not packed_prefill_eligible(False, device_type="cuda", **common)
+    assert packed_prefill_eligible(True, device_type="cuda", **common)
+    assert ExecutionConfig().packed_prefill is None
+    with pytest.raises(ValueError, match="packed_prefill"):
+        ExecutionConfig(packed_prefill=1)
+    # A CPU engine resolves the unset value to the per-row path and records the decision.
+    engine = LLMEngine(tiny_model())
+    assert engine.execution_config.packed_prefill is False
+    with pytest.raises(ValueError, match="packed_prefill requires CUDA"):
+        LLMEngine(tiny_model(), execution_config=ExecutionConfig(packed_prefill=True))
+    engine = LLMEngine(tiny_model(), execution_config=ExecutionConfig(packed_prefill=False))
+    assert engine.execution_config.packed_prefill is False

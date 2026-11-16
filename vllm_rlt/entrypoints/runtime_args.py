@@ -25,9 +25,17 @@ def add_runtime_args(parser):
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
     parser.add_argument("--enable-preemption", action="store_true")
     parser.add_argument(
-        "--prefill-uva",
+        "--packed-prefill",
         action="store_true",
-        help="Use packed prefill metadata staging (requires packed attention)",
+        default=None,
+        help="Force packed prefill metadata staging (requires packed attention); "
+        "default resolves automatically (on for CUDA with last_exited KV)",
+    )
+    parser.add_argument(
+        "--no-packed-prefill",
+        action="store_false",
+        dest="packed_prefill",
+        help="Keep per-row prefill even when packed attention is available",
     )
     parser.add_argument(
         "--no-uva",
@@ -118,7 +126,7 @@ def runtime_configs(args):
             else None,
         ),
         execution_config=ExecutionConfig(
-            prefill_uva=args.prefill_uva,
+            packed_prefill=args.packed_prefill,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,
