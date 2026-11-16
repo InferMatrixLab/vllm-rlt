@@ -17,6 +17,7 @@ from vllm_rlt import (
 )
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import DoryForCausalLM
+from vllm_rlt.request import Operation
 from vllm_rlt.worker.sampler import Sampler
 
 DEPTH_PAIRS = [(1, 2), (1, 4), (2, 4)]
@@ -61,6 +62,58 @@ def greedy_reference(model, prompt, count):
         logits = dense_dory_reference(model, torch.tensor(tokens))["logits"]
         tokens.append(int(logits[-1].argmax()))
     return tokens
+
+
+def test_round_layouts_align_partial_coda_rows_and_upload_once(monkeypatch):
+    model = dory(4)
+    e = engine(model, 3, 2, scheduler_config=SchedulerConfig(max_num_seqs=2))
+    runner = e.speculative_runner
+    prepare = runner._prepare_inputs
+    uploads = dict.fromkeys(runner.input_buffers, 0)
+    subsets = set()
+    for dtype, buffer in runner.input_buffers.items():
+        upload = buffer.upload
+
+        def counted(dtype=dtype, upload=upload):
+            uploads[dtype] += 1
+            return upload()
+
+        monkeypatch.setattr(buffer, "upload", counted)
+
+    def checked(batch):
+        before = uploads.copy()
+        prepared = prepare(batch)
+        assert all(uploads[dtype] == before[dtype] + 1 for dtype in uploads)
+        for step in prepared.steps:
+            recurrent = prepared.layouts[step.views[Operation.RECURRENT][0]]
+            assert prepared.layouts[step.views[Operation.PRELUDE][0]] is recurrent
+            indices = step.views[Operation.CODA]
+            if not step.coda_rows:
+                subsets.add("empty")
+                assert not indices
+                continue
+            coda = prepared.layouts[indices[0]]
+            assert coda.rows == tuple(recurrent.rows[row] for row in step.coda_rows)
+            if len(step.coda_rows) == len(step.requests):
+                subsets.add("full")
+                assert coda is recurrent
+            else:
+                subsets.add("partial")
+        target = prepared.layouts[prepared.target[Operation.CODA][0]]
+        assert len(target.rows) == sum(span.token_count for span in batch.requests)
+        return prepared
+
+    monkeypatch.setattr(runner, "_prepare_inputs", checked)
+    try:
+        for name, prompt, count in (("a", [4, 7], 3), ("b", [9, 2, 3], 5)):
+            e.add_request(name, prompt, params(model, count))
+        actual = drain(e)
+        assert actual["a"].token_ids == greedy_reference(model, [4, 7], 3)[-3:]
+        assert actual["b"].token_ids == greedy_reference(model, [9, 2, 3], 5)[-5:]
+        assert subsets == {"empty", "full", "partial"}
+        assert e.cache_manager.num_used_blocks == 0
+    finally:
+        e.close()
 
 
 def serial_cache(model, tokens):

@@ -169,10 +169,18 @@ that layout (`MetadataBuilder.select_rows`):
 Selections keep the caller's row order and take positions and write addresses
 from the source layout; attention tables are re-planned for the rows selected.
 All selections go into one upload per dtype, and `_prepare_inputs` returns them
-as a `PreparedRound`. Its tensors are views into the runner's input buffers and
-stay valid until the next round is prepared, which happens only after the
-current round has been read back. The pipeline mode uses one build per
-submission and selects its prelude and CODA rows from it the same way.
+as a `PreparedRound`. Only `PreparedRound.layouts` stores bound KV metadata.
+Each draft step's `views` maps PRELUDE, RECURRENT and CODA to indices in that
+store; `target` uses the same index contract for verification and target CODA.
+There are no separately owned CODA or verification metadata fields. Repeated
+row/depth/packed selections reuse the same layout index, including a full-row
+draft CODA and its PRELUDE/recurrent depth-0 view. Empty selections have no
+indices. `coda_rows` still selects the matching hidden rows.
+
+Layout tensors borrow the runner's typed upload snapshots until the submission's
+final consumer completes. The pipeline mode uses the same preparation-local
+layout store and operation indices for its new-token, recurrent and endpoint
+views; all views are bound before execution.
 
 ## Validation status
 
