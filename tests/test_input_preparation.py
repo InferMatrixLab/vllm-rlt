@@ -16,7 +16,7 @@ from vllm_rlt.worker.metadata import KVMetadata
 
 
 @pytest.mark.parametrize(
-    "device,layout,backend,uva",
+    "device,layout,backend,packed_prefill",
     [
         ("cpu", "shared", "torch", False),
         ("cpu", "last_exited", "torch", False),
@@ -28,7 +28,7 @@ from vllm_rlt.worker.metadata import KVMetadata
     ],
 )
 def test_loop_preparation_reuses_growing_storage_and_only_saves_final_hidden(
-    monkeypatch, device, layout, backend, uva
+    monkeypatch, device, layout, backend, packed_prefill
 ):
     torch.manual_seed(123)
     config = (
@@ -43,7 +43,7 @@ def test_loop_preparation_reuses_growing_storage_and_only_saves_final_hidden(
         model,
         cache_config=CacheConfig(128, 16 if backend == "flash_attn_4" else 2, layout=layout),
         execution_config=ExecutionConfig(
-            static_buffers=True, pad_to_power_of_two=True, prefill_uva=uva
+            static_buffers=True, pad_to_power_of_two=True, packed_prefill=packed_prefill
         ),
         exit_config=ExitConfig("ouro"),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
@@ -121,7 +121,7 @@ def test_loop_preparation_reuses_growing_storage_and_only_saves_final_hidden(
         assert gates and not any(gates)
         assert outputs[0] == outputs[1] == outputs[2] == outputs[4]
         assert outputs[3] == outputs[5]
-        if uva:
+        if packed_prefill:
             previous = {}
             reused = grew = False
             for _, tensor, slot, count in snapshots:

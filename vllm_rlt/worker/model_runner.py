@@ -721,7 +721,7 @@ class ModelRunner:
             and batch.loop_count
             and self.cache_manager.layout != "shared"
             and self.cache_manager.attention_capabilities.packed_prefill
-            and self.execution_config.prefill_uva
+            and self.execution_config.packed_prefill
         )
 
     def _prepare_loop_inputs(self, batch, packed_metadata=None):
