@@ -101,6 +101,31 @@ def test_windowed_attention_reads_fp8_scales():
         assert not torch.allclose(got, cache.attend(layer, *rows, q))
 
 
+def test_graph_and_triton_window_paths_forward_fp8_scales(monkeypatch):
+    import vllm_rlt.kernels.paged_attention as paged
+    from vllm_rlt.worker.cuda_graph import _DeviceCache
+
+    cache = make_cache()
+    assert cache.allocate("r", 11)
+    fill(cache, "r", 11)
+    q = torch.randn(3, 2, 8)
+    rows = (["r"] * 3, [0, 2, 3], [10, 4, 7])
+    batch = cache._prepare_batch(*rows, for_write=False)
+    for layer in range(cache.num_layers):
+        # Graph replay's window branch reads the same scales as eager attention.
+        got = _DeviceCache(cache)._attend_prepared(layer, batch, q, window=3)
+        torch.testing.assert_close(got, cache.attend(layer, *rows, q, window=3))
+
+    calls = []
+    monkeypatch.setattr(paged, "triton_paged_attention", lambda *a, **k: calls.append((a, k)))
+    scale = cache.key_scale[:, 0]
+    paged.TritonPagedAttention().windowed(
+        q, None, None, None, None, 3, key_scale=scale, value_scale=scale
+    )
+    ((args, kwargs),) = calls
+    assert args[5] is scale and args[6] is scale and kwargs == {"window": 3}
+
+
 def test_torch_kernel_scales_multiply_each_token_vector():
     codes, scale = quantize_fp8(torch.randn(5, 4, 2, 8))  # [block, token, head, dim]
     tables = torch.tensor([[3, 1, 4]], dtype=torch.int32)
@@ -341,6 +366,21 @@ def test_triton_fp8_attention_matches_torch_reference():
     q = torch.randn(6, 8, 128, device="cuda", dtype=torch.bfloat16)
     got = paged_attention(q, codes, codes, tables, lengths, scale, scale)
     want = torch_paged_attention(q, codes, codes, tables, lengths, scale, scale)
+    torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.gpu
+def test_triton_fp8_windowed_attention_matches_torch_reference():
+    from vllm_rlt.kernels.paged_attention import torch_paged_attention_windowed
+    from vllm_rlt.kernels.triton_attention import paged_attention
+
+    torch.manual_seed(5)
+    codes, scale = quantize_fp8(torch.randn(40, 16, 4, 128, device="cuda"))
+    tables = torch.randint(0, 40, (6, 9), device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([1, 17, 50, 100, 144, 3], device="cuda", dtype=torch.int32)
+    q = torch.randn(6, 8, 128, device="cuda", dtype=torch.bfloat16)
+    got = paged_attention(q, codes, codes, tables, lengths, scale, scale, window=24)
+    want = torch_paged_attention_windowed(q, codes, codes, tables, lengths, 24, scale, scale)
     torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
 
 
