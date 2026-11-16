@@ -19,6 +19,17 @@ def budget_blocks(available_bytes, bytes_per_block):
     return blocks
 
 
+def kv_capacity(*, free_bytes, cap_bytes, reserved_bytes, per_block, overheads, useful_blocks):
+    """Blocks that fit after measured free memory, the cap and every overhead.
+
+    ``overheads`` are non-KV bytes that must remain available. Returns the block
+    count and the KV budget in bytes before block rounding.
+    """
+    budget = min(free_bytes, cap_bytes - reserved_bytes) - sum(overheads.values())
+    blocks = min(budget_blocks(budget, per_block), useful_blocks)
+    return blocks, int(budget)
+
+
 def graph_memory_reserve(model, scheduler, execution, speculative=None):
     """Headroom per pool plus retained speculative coda logits across all entries.
 
@@ -154,17 +165,15 @@ def plan_cache(
     metadata = 3 * (
         (1 << (wide_capacity - 1).bit_length()) * 8 + (1 << (narrow_capacity - 1).bit_length()) * 4
     )
-    budget = min(free_before, int(total * cache.gpu_memory_utilization) - reserved)
-    concurrent_peak = peak * (2 if execution.async_scheduling and execution.multi_stream else 1)
-    graph_reserve = graph_memory_reserve(model, scheduler, execution, speculative)
-    budget -= (
-        concurrent_peak
-        + context_scratch
-        + buffers
-        + metadata
-        + cache.memory_reserve_bytes
-        + graph_reserve
-    )
+    concurrent_factor = 2 if execution.async_scheduling and execution.multi_stream else 1
+    overheads = {
+        "concurrent_peak_bytes": peak * concurrent_factor,
+        "context_scratch_bytes": context_scratch,
+        "static_buffer_bytes": buffers,
+        "metadata_bytes": metadata,
+        "memory_reserve_bytes": cache.memory_reserve_bytes,
+        "cuda_graph_reserve_bytes": graph_memory_reserve(model, scheduler, execution, speculative),
+    }
     # More blocks than all concurrent full-context requests can use only waste
     # memory, particularly for tiny-model GPU tests with very small pages.
     useful_blocks = (
@@ -172,15 +181,24 @@ def plan_cache(
         * (config.total_ut_steps if cache.layout == "last_exited" else 1)
         * scheduler.max_num_seqs
     )
-    blocks = min(budget_blocks(budget, per_block), useful_blocks)
+    blocks, budget = kv_capacity(
+        free_bytes=free_before,
+        cap_bytes=int(total * cache.gpu_memory_utilization),
+        reserved_bytes=reserved,
+        per_block=per_block,
+        overheads=overheads,
+        useful_blocks=useful_blocks,
+    )
     return blocks, dict(
         source="cuda_profile",
         bytes_per_block=per_block,
         profile_peak_bytes=peak,
-        concurrent_peak_bytes=concurrent_peak,
+        concurrent_peak_bytes=overheads["concurrent_peak_bytes"],
         max_useful_blocks=useful_blocks,
-        cuda_graph_reserve_bytes=graph_reserve,
+        cuda_graph_reserve_bytes=overheads["cuda_graph_reserve_bytes"],
         static_buffer_bytes=buffers,
         context_scratch_bytes=context_scratch,
-        kv_budget_bytes=int(budget),
+        metadata_bytes=metadata,
+        kv_budget_bytes=budget,
+        kv_committed_bytes=blocks * per_block,
     )
