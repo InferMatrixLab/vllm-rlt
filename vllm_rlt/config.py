@@ -18,13 +18,13 @@ class CacheConfig:
     memory_reserve_bytes: int = 256 * 1024 * 1024
     enable_prefix_caching: bool = False
     incremental_allocation: bool = False
-    # Ordinary fixed-loop grouped KV only; return expired SWA pages to the pool.
-    reclaim_swa: bool = False
     # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
     # "auto" stores KV in the model dtype; "fp8_e4m3" stores float8 e4m3 codes with
     # scales chosen by the engine for the selected attention backend.
     kv_cache_dtype: str = "auto"
+    # Ordinary fixed-loop grouped KV only; return expired SWA pages to the pool.
+    reclaim_swa: bool = False
 
     def __post_init__(self):
         for name in ("enable_prefix_caching", "incremental_allocation", "reclaim_swa"):

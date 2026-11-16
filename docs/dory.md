@@ -52,8 +52,9 @@ to one cache layout:
 Boundary stages always write depth 0, so input and output KV are never
 replicated per loop. In `last_loop` mode a token's current-step KV is overwritten
 by the next loop, so results depend on the chunk schedule; the qualified
-schedule is one token per step. `per_loop` gives the same result for
-token-at-a-time and all-positions-at-once execution.
+schedule is one token per step. `per_loop` preserves the same mathematical
+computation for token-at-a-time and all-positions-at-once execution; floating-point
+rounding can still vary with chunk and batch shapes.
 
 Only the 36 attention sublayers own KV. The cache pool is sized by that compact
 count (`DoryConfig.num_kv_layers`), not by all 72 physical sublayers, and
@@ -63,10 +64,10 @@ layer id rather than their physical sublayer index.
 
 ## Grouped storage and optional SWA reclamation
 
-Dory uses one pool of attention-layer pages, grouped by window policy and
-boundary/recurrent plane domain. `reclaim_swa` defaults to `False`. To return
-expired sliding-window pages to the pool, enable it together with incremental
-allocation on an already loaded model:
+Dory's ordinary synchronous eager execution uses one pool of attention-layer
+pages, grouped by window policy and boundary/recurrent plane domain.
+`reclaim_swa` defaults to `False`. To return expired sliding-window pages to the
+pool, enable it together with incremental allocation on an already loaded model:
 
 ```python
 from vllm_rlt import CacheConfig
@@ -94,6 +95,11 @@ Reclamation supports ordinary synchronous fixed-loop `ouro` execution. Each
 all layers in their group have consumed the range and the submission completes.
 Full-attention history remains resident.
 
+CUDA Graphs and asynchronous scheduling borrow device-owned KV metadata;
+self-speculation needs suffix truncation after a rejection. Grouped pages do not
+provide these operations yet. For all three modes, the engine uses all-layer
+blocks, including for prefix caching, and rejects `reclaim_swa`.
+
 Native SWA attention stages only the needed page-aligned read span. Logical token
 positions, write addresses and public layer maps remain absolute; the backend's
 read-table context lengths are local to that span. Native attention calls must
@@ -112,12 +118,12 @@ logical-page map, with `-1` for reclaimed pages. Here `cache` is
 reclaimed full prefix is rejected; these queries do not retain page references
 or expose mutable allocator state.
 
-Grouped prefix publish, lookup and import remain unsupported. A future prefix
-consumer must retain pages through the same manager before publishing them or
-allowing their request owner to reclaim them. Reclamation drops the owner's
-references; a page becomes reusable only when its final reference reaches zero.
-The inspection methods are not a pin API, and no public grouped retain/pin
-interface is provided yet.
+Grouped prefix caching publishes one entry per token page holding every
+owned (group, plane, layer) page, ordered as the allocator splits a claim.
+The entry takes its own reference, so the publishing request can finish or
+release its pages without freeing the cached ones. Publication stops at the
+first token page with any owned page missing. Prefix caching together with
+`reclaim_swa` is rejected until hit-path reclamation is qualified.
 
 ## Supported today
 
@@ -147,6 +153,16 @@ interface is provided yet.
 - The official tokenizer, including the Hub's `tokenizer.json` and chat
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
+- Prefix caching (`enable_prefix_caching=True`) in `per_loop` mode. A
+  published page carries boundary KV from plane 0 and recurrent KV from every
+  plane; boundary layers never write deeper planes, so they are not required
+  there. A hit restores exactly that coverage and the scheduler resumes prefill
+  from the cached offset. `last_loop` keeps one shared plane and stays rejected.
+  Prefix keys hash tokens only. That is sound because the loop count is fixed
+  when the model loads and the layout is fixed by `CacheConfig`, and each
+  engine owns its own KV manager, so pages from different loop counts or
+  layouts never share a cache. A cache shared across loop counts would have to
+  add both to the key. Evicted prefixes fall back to a full cold prefill.
 
 ## Packed Triton prefill
 
@@ -193,21 +209,25 @@ even with per-query attention.
 These fail fast rather than degrade silently:
 
 - WCPB, mixed or staged prefill, and PD.
-- Prefix caching.
-- Preemption and native-cache snapshot/restore.
+- Prefix caching in `last_loop` mode.
+- Preemption and snapshot/restore with grouped KV.
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
-  preemption or `last_loop` KV, and sampled token-pipeline speculation. The
-  synchronous eager form is supported; see below.
+  preemption, `reclaim_swa` or `last_loop` KV, and sampled token-pipeline
+  speculation. The synchronous eager form is supported; see below.
 - Per-request loop counts other than the configured full depth: Dory has no
   trained exit gate, so the runtime refuses to invent one, including via
   `min_loops` with `exit_threshold=0`.
+
+For ordinary decoding, the all-layer fallback used with CUDA Graphs or
+asynchronous scheduling accepts `enable_preemption`. Dory preemption in these
+modes has not been qualified on GPU.
 
 Sliding-window masking exists in the Torch reference backend and in the Triton
 decode kernel (`window=` on `KVCacheManager.attend`). Backend selection requires
 the `sliding_window` capability, so a Flash-backed Dory engine fails at
 construction instead of attending full history. Masking accepts host-planned,
-graph-private and device-owned metadata; storage reclamation of out-of-window
-pages stays with 2B. Optional physical SWA page reclamation is available on the grouped Torch path described above.
+graph-private and device-owned metadata. Physical reclamation of out-of-window
+pages is the optional grouped path described above.
 
 ## Synchronous self-speculation
 
@@ -281,19 +301,76 @@ views; all views are bound before execution.
 `tests/test_dory.py` and `tests/test_dory_gpu.py` hold the regression suites;
 `tests/test_dory_real_checkpoint.py` holds the pinned-weight run. Measured
 results are below, including what they do not cover.
+
 ### CPU suite
 
-`tests/test_dory.py` (44 cases) covers configuration validation, strict loading
+`tests/test_dory.py` covers configuration validation, strict loading
 with single-file and sharded checkpoints, stage/KV contracts, sliding-window
 masking, KV layer compaction, engine scheduling, EOS stopping, and numerical
 agreement with an independent dense oracle (`tests/reference/dory.py`) for both
-KV modes — including greedy generation against that oracle. The full CPU run is
-945 passed with only the pre-existing failures of the reviewed baseline
-(`test_ouro` packed prefill, one `test_pd`, eleven `test_serving`).
+KV modes — including greedy generation against that oracle. The full CPU run on
+2026-11-16 passed 1109 tests with no failures; GPU-marked tests were skipped.
+
+### Prefix reuse
+
+Prefix reuse is checked at loops 1, 2 and 4: cold and cache-hit prefill
+logits match the oracle, cached prefixes longer than the sliding window,
+block-aligned prompts, diverging suffixes, concurrent sharers and a
+re-request after its prefix was evicted all reproduce the cold greedy tokens,
+and publication refuses pages missing any owned plane. Prefix pages stay
+pinned for the life of the cache entry. Prefix tests run on both the legacy
+all-layer blocks and grouped storage. On a small FP32 model, prefix hits and
+diverging branches match the oracle in sync eager, sync Graph, async eager and
+async Graph modes.
+
+Real checkpoint, one L20, two loops, 16 greedy tokens, `prefill_chunk_size=256`,
+prompts cut from the model card. Each cell compares prefix caching on and off in
+a fresh engine; time to first token in seconds:
+
+| Prompt tokens | Request | TTFT off | TTFT on | Tokens equal (BF16) |
+| --- | --- | --- | --- | --- |
+| 1100 | repeat | 15.3 | 0.30 | yes |
+| 1100 | branch | 15.2 | 0.60 | yes |
+| 4096 | repeat | 60.4 | 0.41 | yes |
+| 4096 | branch | 60.3 | 0.78 | yes |
+
+An evicted prefix falls back to a cold prefill with equal tokens, and a control
+without eviction hits 1088 tokens. In BF16, one of four concurrent sharers and a
+seeded sampled (temperature 0.8) repeat differed from the uncached run; in FP32
+all of them match. A hit resumes prefill at the cached offset, which changes
+the chunk split, and with caching off, changing `prefill_chunk_size` alone
+already changes BF16 greedy tokens. FP32 tokens matched in these checks; BF16
+agreement is not promised across chunk splits. These are single runs on a
+shared host.
+
+The same checks were repeated on one RTX PRO 5000 Blackwell (torch 2.13+cu130,
+Torch backend), BF16, at loops 1, 2 and 4:
+
+| Loops | Prompt tokens | TTFT off | TTFT on (repeat) |
+| --- | --- | --- | --- |
+| 1 | 1100 | 6.6 | 0.13 |
+| 1 | 4096 | 27.9 | 0.20 |
+| 2 | 1100 | 9.3 | 0.18 |
+| 2 | 4096 | 40.9 | 0.29 |
+| 4 | 1100 | 16.4 | 0.31 |
+| 4 | 4096 | 69.9 | 0.49 |
+
+Repeat tokens were equal everywhere; eviction and its 1088-token control
+behaved as on the L20. At two loops and 1100 tokens in FP32, all eight
+concurrent requests, the seeded sampled repeat, every `prefill_chunk_size`
+from 16 to 256 and the cache hit produced identical tokens.
+
+With the Triton backend at two loops and 1100 tokens, sync eager, sync Graph,
+async eager and async Graph each produced the uncached tokens for the cold,
+repeat and branch requests, with the hit cutting time to first token from
+0.54-0.79 s to 0.06-0.10 s. Through the OpenAI-compatible HTTP server (1516
+prompt tokens), every request succeeded and hits cut time to first token from
+1.5-7 s to 0.09-0.35 s; the branch and one concurrent response differed in
+BF16 text, which is the chunk-split effect above.
 
 ### CUDA
 
-`tests/test_dory_gpu.py` (66 cases) checks the Triton backend against the Torch
+`tests/test_dory_gpu.py` checks the Triton backend against the Torch
 reference: windowed decode for `head_dim` 8/128/256, windows 1/3/16/64 and
 lengths 1/7/63/64/65; unwindowed decode unchanged; both KV modes against the
 dense oracle; a greedy engine run whose tokens match the oracle; and
@@ -326,7 +403,7 @@ to be complete.
 
 ### Execution modes
 
-`tests/test_dory_gpu.py` adds 36 cases on a small FP32 model. For each of sync
+`tests/test_dory_gpu.py` checks a small FP32 model. For each of sync
 eager, sync Graph, async eager and async Graph, with 1, 2 and 3 concurrent
 requests of different prompt lengths, the generated tokens equal the dense
 oracle's, and the Graph modes must replay the input-stage, recurrent and
@@ -366,12 +443,12 @@ BF16 the four modes are identical up to 16 requests and at every prompt length
 measured there; from 32 requests on, sync eager, sync Graph and async eager
 still agree while async Graph differs, because it merges the two prefill
 cohorts into one decode wave and BF16 greedy tokens depend on batch
-composition. FP32 is therefore the exact check; BF16 agreement is not promised
-across batch shapes.
+composition. FP32 tokens matched in these measured workloads; BF16 agreement is
+not promised across batch shapes.
 
 ### Self-speculation
 
-`tests/test_dory_speculative.py` (54 CPU cases) checks block and token-pipeline
+`tests/test_dory_speculative.py` checks block and token-pipeline
 speculation for the depth pairs 1→2, 1→4 and 2→4 against the dense oracle:
 greedy tokens for ragged batches, a forced rejection at every draft position,
 all-accepted rounds with the bonus token, EOS inside an accepted prefix, output
@@ -400,9 +477,9 @@ same eight BF16 requests without speculation in waves of four or one instead of
 eight also leaves only 2–4 of 8 requests token-identical, while the FP32
 baseline is identical across wave sizes (32/32). Speculation changes the batch
 shapes of the same per-row arithmetic, BF16 rounding then differs, and greedy
-near-ties flip; every later token of that request diverges. FP32 is therefore
-the exact check, and BF16 output is a valid greedy continuation up to rounding,
-not a bit-reproduction of the baseline.
+near-ties flip; later tokens of that request can then diverge. FP32 tokens matched
+in these measured workloads; BF16 does not reproduce the baseline token for token
+across these batch shapes.
 
 Acceptance (accepted / drafted, BF16): 1→2 0.78–0.93, 2→4 0.90–0.98, 1→4
 0.72–0.93.

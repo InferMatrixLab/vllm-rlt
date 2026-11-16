@@ -10,7 +10,13 @@ import torch
 
 from tests.reference.dory import dense_dory_reference
 from tests.test_dory import tiny_dory_config
-from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import (
+    CacheConfig,
+    ExecutionConfig,
+    SamplingParams,
+    SchedulerConfig,
+    SpeculativeConfig,
+)
 from vllm_rlt.attention import create_backend
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
@@ -169,13 +175,10 @@ def test_plan_cache_profiles_dory_on_cuda():
     # The probe ran the real staged path, including windowed boundary attention.
     assert plan["source"] == "cuda_profile"
     config = model.config
+    # Grouped storage budgets one physical attention-layer page per block.
+    assert plan["block_unit"] == "physical_layer_page"
     assert plan["bytes_per_block"] == (
-        2
-        * config.num_kv_layers
-        * cache.block_size
-        * config.num_key_value_heads
-        * config.head_dim
-        * 4
+        2 * cache.block_size * config.num_key_value_heads * config.head_dim * 4
     )
 
 
@@ -510,3 +513,168 @@ def test_dory_packed_prefill_keeps_small_value_residual():
     actual = paged_prefill_attention(q, k, v, table, length, offset, 1, compensate=True)
     assert expected[0, 0, 0] > 0.0006
     torch.testing.assert_close(actual, expected, atol=5e-6, rtol=0)
+
+
+@pytest.mark.parametrize("mode", EXECUTION_MODES)
+def test_dory_prefix_hits_match_cpu_oracle_in_every_execution_mode(mode):
+    """Prefix reuse composes with Graph replay and async submission: a cache hit
+    and a diverging branch serve the same greedy tokens as the dense oracle."""
+    reference, model = reference_pair()
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=512, block_size=2, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(max_num_seqs=3, max_num_batched_tokens=16),
+        execution_config=ExecutionConfig(**EXECUTION_MODES[mode]),
+    )
+    params = SamplingParams(max_tokens=6, min_loops=2, max_loops=2, ignore_eos=True)
+    prompt = PROMPTS["c"]
+    branch = prompt[:6] + [4, 9, 1]
+    cache = engine.cache_manager
+    try:
+        assert cache.grouped is (mode == "sync_eager")
+        expected = greedy_reference(reference, prompt, 6)
+        engine.add_request("cold", prompt, params)
+        assert drain(engine)["cold"].token_ids == expected
+        assert cache.prefix_hits == 0
+        graphs = (
+            (
+                engine.model_runner.prelude_graphs,
+                engine.model_runner.graphs,
+                engine.model_runner.coda_graphs,
+            )
+            if "graph" in mode
+            else ()
+        )
+        replays = [graph.replays for graph in graphs]
+
+        engine.add_request("hit", prompt, params)
+        engine.add_request("branch", branch, params)
+        actual = drain(engine)
+        assert actual["hit"].token_ids == expected
+        assert actual["branch"].token_ids == greedy_reference(reference, branch, 6)
+        assert cache.prefix_hits == 14  # Eight shared tokens for hit, six for branch.
+        assert all(graph.replays > before for graph, before in zip(graphs, replays))
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("speculative_mode", ["block", "pipeline"])
+def test_dory_speculative_prefix_hits_match_cpu_oracle(speculative_mode):
+    reference, model = reference_pair()
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=512, block_size=2, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=16),
+        speculative_config=SpeculativeConfig(
+            2, draft_loops=1, target_loops=2, mode=speculative_mode
+        ),
+    )
+    prompt = PROMPTS["c"]
+    branch = prompt[:6] + [4, 9, 1]
+    params = SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True)
+    try:
+        cache = engine.cache_manager
+        assert not cache.grouped
+        expected = greedy_reference(reference, prompt, 4)
+        engine.add_request("cold", prompt, params)
+        assert drain(engine)["cold"].token_ids == expected
+        assert cache.prefix_hits == 0
+        rounds = engine.speculative_runner.stats.rounds
+
+        engine.add_request("hit", prompt, params)
+        engine.add_request("branch", branch, params)
+        actual = drain(engine)
+        assert actual["hit"].token_ids == expected
+        assert actual["branch"].token_ids == greedy_reference(reference, branch, 4)
+        assert cache.prefix_hits == 14
+        assert engine.speculative_runner.stats.rounds > rounds
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+def test_grouped_static_buffers_keep_three_decode_rows_aligned():
+    reference, model = reference_pair()
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=64, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=3, max_num_batched_tokens=3),
+        execution_config=ExecutionConfig(static_buffers=True, pad_to_power_of_two=True),
+    )
+    prompts = {"a": [4], "b": [7], "c": [3]}
+    params = SamplingParams(max_tokens=3, min_loops=2, max_loops=2, ignore_eos=True)
+    try:
+        assert engine.cache_manager.grouped
+        assert engine.model_runner.requestspaces
+        for request_id, prompt in prompts.items():
+            engine.add_request(request_id, prompt, params)
+        actual = drain(engine)
+        assert set(actual) == set(prompts)
+        for request_id, prompt in prompts.items():
+            assert actual[request_id].token_ids == greedy_reference(reference, prompt, 3)
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("kv_mode", ["per_loop", "last_loop"])
+def test_grouped_swa_reclamation_uses_cuda_completion_and_reuses_pages(kv_mode, monkeypatch):
+    model = make_gpu_model(recurrent_kv_cache_mode=kv_mode)
+    reference = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode=kv_mode)).eval()
+    reference.load_state_dict({name: value.cpu() for name, value in model.state_dict().items()})
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(
+            num_blocks=8,
+            block_size=2,
+            layout=model.kv_cache_layout,
+            incremental_allocation=True,
+            reclaim_swa=True,
+        ),
+        # One token per chunk preserves last_loop's token-then-loop ordering.
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=1, prefill_chunk_size=1
+        ),
+    )
+    prompt = [4, 7, 9, 3, 12, 5, 6, 8, 11, 13, 14, 15]
+    cache = engine.cache_manager
+    retired, reused = set(), set()
+    finish = cache.finish_submission
+
+    def resident_pages():
+        return {
+            page
+            for layer in model.kv_layer_windows
+            for depth in (
+                range(cache.storage_depths) if layer in model.recurrent_kv_layers else (0,)
+            )
+            for page in cache.layer_block_table("request", layer, depth)
+            if page >= 0
+        }
+
+    def observe_completion(event=None):
+        assert isinstance(event, torch.cuda.Event)
+        before = resident_pages()
+        reused.update(before & retired)
+        finish(event)
+        retired.update(before - resident_pages())
+
+    monkeypatch.setattr(cache, "finish_submission", observe_completion)
+    try:
+        assert cache.grouped and cache.reclaim_swa
+        engine.add_request(
+            "request",
+            prompt,
+            SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True),
+        )
+        actual = drain(engine)["request"]
+        assert actual.token_ids == greedy_reference(reference, prompt, 4)
+        assert retired and reused
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()

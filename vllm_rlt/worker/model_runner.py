@@ -1068,10 +1068,11 @@ class ModelRunner:
         kv = prepared.kv
         if kv is not None:
             metadata = (kv,) + metadata
+        # Grouped views omit padding even when the hidden workspace includes it.
         forward = ForwardBatch(
             Operation.RECURRENT,
             hidden=hidden[: batch.num_rows]
-            if graphs is not None or batch.loop_count > 1
+            if graphs is not None or batch.loop_count > 1 or self.cache_manager.grouped
             else hidden,
             metadata=metadata,
             graphs=graphs,

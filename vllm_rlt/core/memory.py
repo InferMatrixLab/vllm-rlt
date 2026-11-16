@@ -135,13 +135,16 @@ def plan_cache(
     speculative=None,
     staged_prefill=None,
     fp8_scale=None,
+    layer_windows=...,
 ):
     parameter = next(model.parameters())
     config, device = model.config, parameter.device
     # Models whose physical stack mixes KV-owning and KV-free sublayers (Dory)
     # expose the compact count; everything else keeps the layer count.
     kv_layers = getattr(config, "num_kv_layers", config.num_hidden_layers)
-    layer_windows = getattr(model, "kv_layer_windows", None)
+    # Omitted uses the model policy; explicit None forces all-layer blocks.
+    if layer_windows is ...:
+        layer_windows = getattr(model, "kv_layer_windows", None)
     native = layer_windows is not None
     unit = "physical_layer_page" if native else "all_layer_block"
     recurrent = set(getattr(model, "recurrent_kv_layers", range(kv_layers)))

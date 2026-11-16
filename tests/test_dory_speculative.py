@@ -64,6 +64,56 @@ def greedy_reference(model, prompt, count):
     return tokens
 
 
+@pytest.mark.parametrize("mode", ["block", "pipeline"])
+def test_prefix_hits_keep_speculative_outputs_on_all_layer_kv(mode):
+    model, count = dory(2), 5
+    prompt = [4, 7, 3, 9, 5, 2, 8, 6, 3]
+    branch = prompt[:6] + [10, 11, 12]
+    sampling = params(model, count)
+    expected = greedy_reference(model, prompt, count)[len(prompt) :]
+    e = engine(
+        model,
+        2,
+        1,
+        mode,
+        cache_config=CacheConfig(num_blocks=256, block_size=2, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
+    )
+    try:
+        cache = e.cache_manager
+        assert not cache.grouped
+        assert e.memory_plan["block_unit"] == "all_layer_block"
+        e.add_request("cold", prompt, sampling)
+        assert drain(e)["cold"].token_ids == expected
+        assert cache.prefix_hits == 0
+
+        rounds = e.speculative_runner.stats.rounds
+        e.add_request("hit", prompt, sampling)
+        e.add_request("branch", branch, sampling)
+        actual = drain(e)
+        assert actual["hit"].token_ids == expected
+        assert actual["branch"].token_ids == greedy_reference(model, branch, count)[len(branch) :]
+        assert cache.prefix_hits == 14  # Eight shared tokens for hit, six for branch.
+        assert e.speculative_runner.stats.rounds > rounds
+        assert cache.num_used_blocks == 0
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("mode", ["block", "pipeline"])
+def test_speculation_rejects_swa_reclamation(mode):
+    with pytest.raises(ValueError, match="without speculation"):
+        engine(
+            dory(2),
+            2,
+            1,
+            mode,
+            cache_config=CacheConfig(
+                num_blocks=256, block_size=2, incremental_allocation=True, reclaim_swa=True
+            ),
+        )
+
+
 def test_round_layouts_align_partial_coda_rows_and_upload_once(monkeypatch):
     model = dory(4)
     e = engine(model, 3, 2, scheduler_config=SchedulerConfig(max_num_seqs=2))
