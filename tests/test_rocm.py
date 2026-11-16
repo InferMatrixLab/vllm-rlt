@@ -26,6 +26,14 @@ def test_auto_prefers_triton_on_rocm(rocm):
     assert "FlashAttention is NVIDIA-only" in selected.info["selection_reason"]
 
 
+def test_packed_prefill_stays_opt_in_on_rocm(rocm):
+    from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
+
+    common = dict(device_type="cuda", layout="last_exited", staged_prefill=False)
+    assert not packed_prefill_eligible(None, **common)
+    assert packed_prefill_eligible(True, **common)
+
+
 def test_explicit_flash_rejected_on_rocm(rocm):
     with pytest.raises(ValueError, match="NVIDIA CUDA"):
         create_backend("flash_attn", torch.device("cuda"), torch.bfloat16, 128, 16)

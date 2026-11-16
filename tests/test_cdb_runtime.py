@@ -652,9 +652,10 @@ def test_cuda_dynamic_async_respects_buffers_and_matches_sync(layout, multi_stre
     execution = ExecutionConfig(async_scheduling=True, multi_stream=multi_stream)
     actual = LLM(base, execution_config=execution, **common)
     resolved = resolve_cuda_graph_rows(execution, common["scheduler_config"])
-    # packed_prefill=None resolves at construction: Triton packs last_exited prefill.
+    # packed_prefill=None resolves at construction: Triton packs last_exited
+    # prefill, except on ROCm where packing stays opt-in.
     assert actual.engine.execution_config == replace(
-        resolved, packed_prefill=layout == "last_exited"
+        resolved, packed_prefill=layout == "last_exited" and not torch.version.hip
     )
     assert actual.engine.model_runner.requestspaces == {}
     assert actual.engine.model_runner.states is actual.engine.model_runner.async_state.hidden
