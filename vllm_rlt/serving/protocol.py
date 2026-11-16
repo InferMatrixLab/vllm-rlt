@@ -3,7 +3,7 @@
 import codecs
 import json
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 
 from vllm_rlt.models import special_token_ids
 from vllm_rlt.sampling_params import SamplingParams
@@ -17,11 +17,14 @@ class ServingLimits:
     request_timeout: float = 300.0
     write_timeout: float = 10.0
     shutdown_timeout: float = 30.0
+    max_output_tokens: int | None = None
 
     def __post_init__(self):
         for field in fields(self):
             value = getattr(self, field.name)
-            if field.type is int and type(value) is not int:
+            if field.type == (int | None) and value is None:
+                continue
+            if field.type in (int, int | None) and type(value) is not int:
                 raise ValueError(f"{field.name} must be a positive integer")
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{field.name} must be finite and positive")
@@ -56,6 +59,23 @@ class CompletionRequest:
     stream: bool = False
     include_usage: bool = False
     trace_id: str | None = None
+    use_remaining_context: bool = False
+
+    def resolve_params(
+        self, prompt_length: int, max_model_len: int, *, max_output_tokens: int | None = None
+    ) -> SamplingParams:
+        """Resolve the HTTP output limit once the final prompt length is known."""
+        if self.use_remaining_context:
+            remaining = max_model_len - prompt_length
+            if remaining <= 0:
+                raise ValueError("tokenized prompt leaves no room for generation in model context")
+            budget = remaining if max_output_tokens is None else min(remaining, max_output_tokens)
+            return replace(self.params, max_tokens=budget)
+        if max_output_tokens is not None and self.params.max_tokens > max_output_tokens:
+            raise ValueError(
+                f"max_tokens exceeds the server output limit ({max_output_tokens} tokens)"
+            )
+        return self.params
 
     @classmethod
     def parse(cls, body, model):
@@ -112,6 +132,9 @@ class CompletionRequest:
             if type(include_usage) is not bool:
                 raise ValueError("include_usage must be a boolean")
         params = {key: body[key] for key in params_keys & body.keys()}
+        use_remaining_context = params.get("max_tokens") is None
+        if use_remaining_context:
+            params.pop("max_tokens", None)
         for key in ("temperature", "top_p", "exit_threshold"):
             if key in params and (
                 type(params[key]) not in (int, float) or not math.isfinite(params[key])
@@ -122,7 +145,14 @@ class CompletionRequest:
         trace_id = body.get("trace_id")
         if "trace_id" in body and (not isinstance(trace_id, str) or not trace_id):
             raise ValueError("trace_id must be a nonempty string")
-        return cls(body["prompt"], SamplingParams(**params), stream, include_usage, trace_id)
+        return cls(
+            body["prompt"],
+            SamplingParams(**params),
+            stream,
+            include_usage,
+            trace_id,
+            use_remaining_context=use_remaining_context,
+        )
 
 
 class IncrementalText:

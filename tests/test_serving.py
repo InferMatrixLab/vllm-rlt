@@ -15,7 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
-from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.engine.llm_engine import LLMEngine, StageClient
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import RequestPhase
 from vllm_rlt.serving.protocol import (
@@ -65,10 +65,10 @@ class PauseAt:
         engine.executor.submit = pause
 
 
-def factory(*, seqs=8, blocks=256, hook=None):
+def factory(*, seqs=8, blocks=256, context=128, hook=None):
     torch.manual_seed(123)
     engine = LLMEngine(
-        OuroForCausalLM(tiny_ouro_config()),
+        OuroForCausalLM(tiny_ouro_config(max_position_embeddings=context)),
         cache_config=CacheConfig(num_blocks=blocks, block_size=2),
         scheduler_config=SchedulerConfig(max_num_seqs=seqs, max_num_batched_tokens=3),
     )
@@ -119,8 +119,10 @@ def body(**kwargs):
         {"logprobs": 1},
         {"stop": "end"},
         {"max_tokens": 0},
-        {"max_tokens": None},
         {"max_tokens": True},
+        {"max_tokens": -1},
+        {"max_tokens": 1.5},
+        {"max_tokens": "4"},
         {"temperature": "0"},
         {"temperature": float("nan")},
         {"top_p": True},
@@ -152,6 +154,124 @@ def test_neutral_client_fields_and_extensions():
         "test-model",
     )
     assert spec.include_usage and spec.params.max_loops == 3 and spec.params.top_k == 9
+
+
+def test_automatic_max_tokens_uses_remaining_context_and_server_cap():
+    request = CompletionRequest.parse(body(max_tokens=None, top_k=3), "test-model")
+    assert request.resolve_params(1024, 4096).max_tokens == 3072
+    capped = request.resolve_params(1024, 4096, max_output_tokens=64)
+    assert capped.max_tokens == 64 and capped.top_k == 3
+    assert SamplingParams().max_tokens == 16
+
+
+def test_http_max_tokens_is_resolved_after_encoding():
+    class BosTokenizer(TinyTokenizer):
+        def encode(self, text):
+            return [0, *super().encode(text)]
+
+    def load():
+        # Eight executable positions occupy four pages at each of four depths.
+        engine, _ = factory(context=9, blocks=16)
+        return engine, BosTokenizer()
+
+    async def run():
+        async with client_for(load) as (client, worker):
+            await until(lambda: worker.ready)
+            omitted = body()
+            del omitted["max_tokens"]
+            for payload, expected in [(omitted, 5), (body(max_tokens=None), 5), (body(), 4)]:
+                response = await client.post("/v1/completions", json=payload)
+                result = await response.json()
+                assert response.status == 200, result
+                assert result["choices"][0]["finish_reason"] == "length"
+                assert result["usage"] == {
+                    "prompt_tokens": 4,
+                    "completion_tokens": expected,
+                    "total_tokens": 4 + expected,
+                }
+            response = await client.post(
+                "/v1/completions", json=body(prompt="abcdefgh", max_tokens=None)
+            )
+            assert response.status == 400
+            assert "context" in (await response.json())["error"]["message"]
+            await until(lambda: not worker.channels)
+            assert worker.ready and not worker.decoders
+            assert worker.engine.cache_manager.num_used_blocks == 0
+
+    asyncio.run(run())
+
+
+def test_http_explicit_max_tokens_preserves_engine_context_boundary():
+    async def run():
+        async with client_for(lambda: factory(context=9, blocks=20)) as (client, worker):
+            await until(lambda: worker.ready)
+            for prompt, limit in [("abc", 7), ("abcdefghi", 1)]:
+                response = await client.post(
+                    "/v1/completions", json=body(prompt=prompt, max_tokens=limit)
+                )
+                result = await response.json()
+                assert response.status == 200, result
+                assert result["choices"][0]["finish_reason"] == "length"
+                assert result["usage"]["completion_tokens"] == limit
+            response = await client.post("/v1/completions", json=body(max_tokens=8))
+            assert response.status == 400
+            assert "context" in (await response.json())["error"]["message"]
+            await until(lambda: not worker.channels)
+            assert worker.ready and worker.engine.cache_manager.num_used_blocks == 0
+
+    asyncio.run(run())
+
+
+def test_http_automatic_max_tokens_preserves_kv_admission():
+    async def run():
+        async with client_for(lambda: factory(context=9, blocks=15)) as (client, worker):
+            await until(lambda: worker.ready)
+            response = await client.post("/v1/completions", json=body(max_tokens=None))
+            assert response.status == 400
+            assert "requires 16 KV blocks" in (await response.json())["error"]["message"]
+            response = await client.post("/v1/completions", json=body(max_tokens=1))
+            assert response.status == 200
+            assert (await response.json())["usage"]["completion_tokens"] == 1
+            await until(lambda: not worker.channels)
+            assert worker.ready and not worker.decoders
+            assert worker.engine.cache_manager.num_used_blocks == 0
+
+    asyncio.run(run())
+
+
+def test_http_output_cap_bounds_automatic_and_explicit_max_tokens():
+    async def run():
+        async with client_for(max_output_tokens=3) as (client, worker):
+            await until(lambda: worker.ready)
+            response = await client.post("/v1/completions", json=body(max_tokens=None))
+            assert response.status == 200
+            assert (await response.json())["usage"]["completion_tokens"] == 3
+            response = await client.post("/v1/completions", json=body(max_tokens=4))
+            assert response.status == 400
+            assert "server" in (await response.json())["error"]["message"]
+
+    asyncio.run(run())
+
+
+def test_http_automatic_max_tokens_with_stage_client():
+    def load():
+        return StageClient(
+            tiny_ouro_config(max_position_embeddings=7),
+            dtype="float32",
+            cache_config=CacheConfig(16, 2),
+        ), TinyTokenizer()
+
+    async def run():
+        async with client_for(load) as (client, worker):
+            await until(lambda: worker.ready or worker.failure)
+            assert worker.ready, worker.failure
+            response = await client.post("/v1/completions", json=body(max_tokens=None))
+            result = await response.json()
+            assert response.status == 200, result
+            assert result["usage"]["completion_tokens"] == 4
+            assert result["choices"][0]["finish_reason"] == "length"
+
+    asyncio.run(run())
 
 
 def test_byte_decoder_unicode_special_tokens_and_final_flush(monkeypatch):
@@ -471,16 +591,21 @@ def test_eos_usage_and_non_usage_stream():
     async def run():
         async with client_for(load) as (client, worker):
             await until(lambda: worker.ready)
-            response = await client.post("/v1/completions", json=body(ignore_eos=False))
+            response = await client.post(
+                "/v1/completions", json=body(ignore_eos=False, max_tokens=None)
+            )
             result = await response.json()
+            assert response.status == 200, result
             assert result["choices"][0]["text"] == ""
             assert result["choices"][0]["finish_reason"] == "stop"
             assert result["usage"]["completion_tokens"] == 1
             response = await client.post(
-                "/v1/completions", json=body(stream=True, ignore_eos=False)
+                "/v1/completions", json=body(stream=True, ignore_eos=False, max_tokens=None)
             )
+            assert response.status == 200
             frames = (await response.text()).strip().split("\n\n")
             assert len(frames) == 2 and "usage" not in json.loads(frames[0][6:])
+            assert json.loads(frames[0][6:])["choices"][0]["finish_reason"] == "stop"
 
     asyncio.run(run())
 
@@ -789,7 +914,9 @@ def test_speculative_http_and_stream_deliver_entire_committed_suffix(asynchronou
 
     def load():
         torch.manual_seed(123)
-        m = OuroForCausalLM(tiny_ouro_config(head_dim=64 if asynchronous else 8)).to(
+        m = OuroForCausalLM(
+            tiny_ouro_config(head_dim=64 if asynchronous else 8, max_position_embeddings=15)
+        ).to(
             device="cuda" if asynchronous else "cpu",
             dtype=torch.bfloat16 if asynchronous else torch.float32,
         )
@@ -821,19 +948,25 @@ def test_speculative_http_and_stream_deliver_entire_committed_suffix(asynchronou
     async def run():
         async with client_for(load, output_buffer=2) as (client, worker):
             await until(lambda: worker.ready)
-            response = await client.post("/v1/completions", json=body(max_tokens=12))
+            omitted = body()
+            del omitted["max_tokens"]
+            response = await client.post("/v1/completions", json=omitted)
             result = await response.json()
             assert response.status == 200
             assert result["choices"][0]["text"] == expected
+            assert result["choices"][0]["finish_reason"] == "length"
             assert result["usage"]["completion_tokens"] == 12
             response = await client.post(
                 "/v1/completions",
-                json=body(max_tokens=12, stream=True, stream_options={"include_usage": True}),
+                json=body(max_tokens=None, stream=True, stream_options={"include_usage": True}),
             )
             wire = await response.text()
             frames = [json.loads(f.removeprefix("data: ")) for f in wire.strip().split("\n\n")[:-1]]
             assert "".join(f["choices"][0]["text"] for f in frames if f["choices"]) == expected
+            assert frames[-2]["choices"][0]["finish_reason"] == "length"
             assert frames[-1]["usage"]["completion_tokens"] == 12
+            await until(lambda: not worker.channels)
+            assert worker.engine.cache_manager.num_used_blocks == 0
             assert worker.engine.speculative_runner.stats.accepted_tokens > 0
             if graphs:
                 assert worker.engine.speculative_runner.graphs.replays > 0

@@ -152,6 +152,13 @@ class ModelRuntime:
         """
         if batch.graphs is None:
             return batch
+        if batch.operation == Operation.PRELUDE:
+            # Graph buffers hold the query rows only; padding has no KV address.
+            kv = batch.prelude_coda_kv_metadata
+            tokens = batch.tokens[: len(kv.position_ids)]
+            call = batch.graphs.select(tokens, kv)
+            batch.graphs.prepare_inputs(call, tokens)
+            return replace(batch, tokens=tokens, graph_calls=(call,))
         if batch.operation == Operation.CODA:
             calls = (batch.graphs.select(batch.hidden, batch.prelude_coda_kv_metadata),)
         else:
@@ -183,6 +190,8 @@ class ModelRuntime:
             if batch.operation == Operation.PRELUDE:
                 if batch.tokens is None:
                     raise ValueError("PRELUDE requires token IDs")
+                if batch.graphs is not None:
+                    return ForwardResult(batch.graphs.execute(batch.graph_calls[0], batch.tokens))
                 if batch.prelude_coda_kv_metadata is not None:
                     hidden = self.model.prelude_prepared(
                         batch.tokens[: len(batch.prelude_coda_kv_metadata.position_ids)],
