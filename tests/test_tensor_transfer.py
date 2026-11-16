@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from vllm_rlt import ExecutionConfig
-from vllm_rlt.entrypoints.runtime_args import add_runtime_args
+from vllm_rlt.entrypoints.runtime_args import add_runtime_args, runtime_configs
 from vllm_rlt.worker.tensors import (
     StagedWriteTensor,
     TensorTransfer,
@@ -379,15 +379,22 @@ def test_staged_inputs_preserve_slices_and_inflight_snapshots(device, use_uva):
     assert allocations[3] is allocations[5]
 
 
-def test_uva_configuration_and_capability(monkeypatch):
+@pytest.mark.parametrize(
+    "flags,packed_prefill",
+    [([], None), (["--packed-prefill"], True), (["--no-packed-prefill"], False)],
+)
+def test_uva_configuration_and_capability(monkeypatch, flags, packed_prefill):
     assert ExecutionConfig().use_uva
     with pytest.raises(ValueError, match="use_uva"):
         ExecutionConfig(use_uva=1)
     parser = argparse.ArgumentParser()
     add_runtime_args(parser)
+    parser.set_defaults(num_blocks=None, block_size=16)
     assert parser.parse_args([]).use_uva
-    args = parser.parse_args(["--no-uva", "--prefill-uva"])
-    assert not args.use_uva and args.prefill_uva
+    args = parser.parse_args(["--no-uva", *flags])
+    assert not args.use_uva and args.packed_prefill is packed_prefill
+    execution = runtime_configs(args)["execution_config"]
+    assert not execution.use_uva and execution.packed_prefill is packed_prefill
     monkeypatch.setattr(torch.version, "hip", None)
     assert use_uva_on("cuda")
     assert not use_uva_on("cuda", False)

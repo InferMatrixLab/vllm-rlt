@@ -129,6 +129,10 @@ No PyPI publication is implied.
 - [Native CUDA build](docs/launching.md#automatic-native-cuda-build)
 - [Migration from v0.1.0](CHANGELOG.md)
 
+Packed prefill uses `ExecutionConfig.packed_prefill` and the
+`--packed-prefill` / `--no-packed-prefill` flags. Input transfer is controlled
+independently by `use_uva`; see the [selection rules](docs/runtime.md#packed-prefill).
+
 ## Model Support
 
 

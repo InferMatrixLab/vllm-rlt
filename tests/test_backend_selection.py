@@ -186,6 +186,30 @@ def test_triton_packed_prefill_is_per_selection_opt_in(packages, monkeypatch, re
     assert not later.capabilities.packed_prefill
 
 
+@pytest.mark.parametrize(
+    "missing,expected,packed",
+    [
+        ((), "flash_attn_4", True),
+        (("flash_attn.cute",), "flash_attn_3", False),
+        (
+            ("flash_attn.cute", "flash_attn_3.flash_attn_interface", "flash_attn"),
+            "triton",
+            True,
+        ),
+    ],
+)
+def test_preferred_packed_prefill_preserves_backend_priority(
+    packages, monkeypatch, missing, expected, packed
+):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    packages.difference_update(missing)
+    args = ("auto", torch.device("cuda"), torch.bfloat16, 128, 256)
+    baseline = create_backend(*args)
+    preferred = create_backend(*args, prefer_packed_prefill=True)
+    assert preferred.info["selected_backend"] == baseline.info["selected_backend"] == expected
+    assert preferred.capabilities.packed_prefill is packed
+
+
 def test_packed_prefill_requires_declared_support(packages, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
     packages.remove("flash_attn.cute")
