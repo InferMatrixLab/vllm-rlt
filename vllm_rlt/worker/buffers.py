@@ -37,7 +37,7 @@ def execution_buffer_bytes(
     total = reserved_bytes(config, scheduler, execution, element_size)
     if execution.static_buffers:
         # Existing prefill/eager workspaces remain separate from async buffer sets.
-        total += 4 * rows * (hidden + 4 * width + 36) + scheduler.max_num_seqs * hidden
+        total += 4 * rows * (hidden + 4 * width + 36)
     if execution.async_scheduling:
         planes = config.total_ut_steps if cache.layout == "last_exited" else 1
         # Four routing buffer sets, including capacity for an H2D descriptor fallback.
@@ -48,6 +48,8 @@ def execution_buffer_bytes(
         total += (
             (4 * min(rows, scheduler.max_num_seqs) + 2 * scheduler.max_num_seqs) * planes * 8 * 8
         )
+    elif execution.static_buffers:
+        total += scheduler.max_num_seqs * hidden
     # Split prefill holds the staged chunk's hidden rows across batch boundaries.
     stage_rows = prefill_stage_rows(config, scheduler, staged_prefill=staged_prefill)
     total += scheduler.max_num_seqs * stage_rows * hidden

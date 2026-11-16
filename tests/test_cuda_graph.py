@@ -487,3 +487,48 @@ def test_bucketed_kv_graph_combines_active_rows_and_pipeline_write_mask():
                 expected_v[block, 0, offset] = v[row]
         assert torch.equal(keys, expected_k)
         assert torch.equal(values, expected_v)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_triton_graph_fuses_unmasked_key_and_value_writes(dtype):
+    from types import SimpleNamespace
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from vllm_rlt.worker.cuda_graph import _DeviceCache
+
+    class NoIndexPut(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert func != torch.ops.aten.index_put_.default, "separate indexed KV write"
+            return func(*args, **(kwargs or {}))
+
+    keys = torch.full((5, 2, 4, 3, 9), -1, dtype=dtype, device="cuda")
+    values = torch.full_like(keys, -2)
+    proxy = _DeviceCache(SimpleNamespace(key_cache=keys, value_cache=values, backend="triton"))
+    batch = SimpleNamespace(
+        active_rows=None,
+        write_mask=None,
+        write_blocks=torch.tensor([3, 0, 1], device="cuda"),
+        write_offsets=torch.tensor([2, 1, 3], device="cuda"),
+    )
+    k = torch.arange(81, dtype=dtype, device="cuda").reshape(3, 9, 3).transpose(1, 2)
+    v = k + 100
+    with NoIndexPut():
+        proxy._write_prepared(1, batch, k, v)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        proxy._write_prepared(1, batch, k, v)
+
+    keys.fill_(-1)
+    values.fill_(-2)
+    batch.write_blocks.copy_(torch.tensor([1, 4, 1], device="cuda"))
+    batch.write_offsets.copy_(torch.tensor([1, 0, 2], device="cuda"))
+    k.add_(10)
+    v.sub_(10)
+    expected_keys, expected_values = keys.clone(), values.clone()
+    expected_keys[batch.write_blocks, 1, batch.write_offsets] = k
+    expected_values[batch.write_blocks, 1, batch.write_offsets] = v
+    graph.replay()
+    assert torch.equal(keys, expected_keys)
+    assert torch.equal(values, expected_values)

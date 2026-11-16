@@ -488,6 +488,9 @@ class DoryForCausalLM(nn.Module):
     supports_async_scheduling = True
     # Selection must reject a backend that would silently attend full history.
     requires_sliding_window = True
+    # Synchronous self-speculation with per-loop KV: a draft's loops are the
+    # target's first loops, and boundary KV is committed by the target pass.
+    supports_self_speculation = True
 
     def __init__(self, config: DoryConfig) -> None:
         super().__init__()

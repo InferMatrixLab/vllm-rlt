@@ -40,7 +40,7 @@ def validate(model, params, execution, cache, scheduler, exit_config, speculativ
     if (
         requires_staged_prefill(scheduler)
         or execution.async_scheduling
-        or execution.prefill_uva
+        or execution.packed_prefill
         or cache.layout != "last_exited"
         or cache.enable_prefix_caching
         or scheduler.enable_preemption

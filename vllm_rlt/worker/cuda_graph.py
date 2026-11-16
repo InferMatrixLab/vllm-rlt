@@ -107,7 +107,9 @@ class _DeviceCache:
 
     def _write_prepared(self, layer, batch, k, v):
         cache = self.cache
-        if batch.active_rows is not None:
+        if batch.active_rows is not None or (
+            batch.write_mask is None and cache.backend == "triton"
+        ):
             from vllm_rlt.kernels.graph_kv import write_graph_kv
 
             write_graph_kv(cache.key_cache[:, layer], cache.value_cache[:, layer], batch, k, v)

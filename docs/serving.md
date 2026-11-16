@@ -68,7 +68,7 @@ curl http://127.0.0.1:8000/v1/completions \
 
 | Field | Default / supported behavior |
 | --- | --- |
-| `max_tokens` | 16; positive integer |
+| `max_tokens` | Omitted or null uses the remaining model context after tokenization. An explicit positive integer is subject to the engine's context check and any server cap. |
 | `temperature`, `top_p`, `top_k` | 0, 1, -1; passed to `SamplingParams` |
 | `seed`, `ignore_eos` | 0, false; request-local RNG and EOS policy |
 | `min_loops`, `max_loops`, `exit_threshold` | 2, model depth, 1; Ouro extensions |
@@ -81,9 +81,16 @@ curl http://127.0.0.1:8000/v1/completions \
 Unsupported fields/behaviors, invalid values, empty tokenized prompts, impossible
 KV reservations and context overflow return 400. An unknown model returns 404.
 Missing or invalid model identifiers return 400. Omit fields to use defaults;
-explicit null is accepted only for `max_loops`, `stream_options` and the four
+explicit null is accepted only for `max_tokens`, `max_loops`, `stream_options` and the four
 null-only fields above. Structured errors use the same value for `error.type`
 and `error.code`; admission messages include diagnostic context/KV limits.
+The HTTP default uses the model context length minus the number of encoded
+prompt tokens, including special tokens. For example, 1024 prompt tokens in
+a 4096-token context allow up to 3072 output tokens before any server cap.
+For an explicit limit, the engine counts the prompt and `max_tokens - 1` decode
+positions against its context limit. The final sampled token needs no forward pass.
+EOS can stop generation earlier. Send `"max_tokens": 16` to retain the previous
+HTTP default. The offline Python and CLI default is 16.
 There is no chat endpoint, prompt-list batching, token-ID prompt API, stop-string
 matching, beam search or multi-completion support. Independent HTTP requests
 share continuous engine batching. Prompt prefill always runs full depth;
@@ -127,6 +134,9 @@ recurrent loop; the same progress guard applies to refill and no-refill modes.
   request channels, including waiting requests and completed responses still
   being consumed. Saturation returns 429 with `Retry-After: 1`.
 - `--max-body-bytes` (1 MiB) bounds each request body; excess returns 413.
+- `--max-output-tokens` optionally caps generated tokens per request for both
+  serving entrypoints. It lowers automatic budgets and rejects explicit limits
+  above the cap with HTTP 400. The default uses the model context alone.
 - `--output-buffer` (32) bounds queued token events per request. Overflow aborts
   that request without blocking the engine or other clients.
 - `--request-timeout` (300 seconds) covers body reading through response

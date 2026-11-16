@@ -15,6 +15,7 @@ from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.engine.connector import StageConnector
+from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.profiling import Profiler
@@ -94,15 +95,24 @@ class StageEngine:
                 raise ValueError(
                     "boundary-KV models do not support staged prefill required by this scheduler"
                 )
-            if self.execution_config.prefill_uva or (
-                self.execution_config.async_scheduling
-                and not getattr(model, "supports_async_scheduling", False)
+            if self.execution_config.async_scheduling and not getattr(
+                model, "supports_async_scheduling", False
             ):
-                raise ValueError(
-                    "boundary-KV models require synchronous scheduling without prefill UVA"
-                )
+                raise ValueError("boundary-KV models require synchronous scheduling")
             if speculative_config is not None:
-                raise ValueError("boundary-KV speculative decoding is not yet supported")
+                if not getattr(model, "supports_self_speculation", False):
+                    raise ValueError("boundary-KV speculative decoding is not yet supported")
+                # Qualified: synchronous eager rounds. Async rounds, Graph replay and
+                # resumable preemption of draft/target boundary state are separate work.
+                if (
+                    self.execution_config.async_scheduling
+                    or self.execution_config.cuda_graphs
+                    or scheduler_config.enable_preemption
+                ):
+                    raise ValueError(
+                        "boundary-KV speculative decoding requires synchronous eager "
+                        "execution without CUDA graphs or preemption"
+                    )
         if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
             raise ValueError("this model does not support CUDA graphs yet")
         self.speculative_config = speculative_config
@@ -177,12 +187,15 @@ class StageEngine:
                 raise ValueError(
                     "async scheduling requires ouro_delayed, random_lookahead or trace exit mode"
                 )
-        if self.execution_config.prefill_uva and (
-            parameter.device.type != "cuda" or cache_config.layout != "last_exited"
-        ):
-            raise ValueError("prefill_uva requires CUDA packed prefill with last_exited KV")
         if staged_prefill and cache_config.layout != "last_exited":
             raise ValueError("staged prefill requires last_exited KV planes")
+        auto_packed = packed_prefill_eligible(
+            self.execution_config.packed_prefill,
+            device_type=parameter.device.type,
+            layout=cache_config.layout,
+            staged_prefill=staged_prefill,
+            sliding_window=getattr(model, "requires_sliding_window", False),
+        )
         attention = create_backend(
             attention_backend,
             parameter.device,
@@ -190,7 +203,7 @@ class StageEngine:
             config.head_dim,
             cache_config.block_size,
             required_capabilities=BackendCapabilities(
-                packed_prefill=self.execution_config.prefill_uva,
+                packed_prefill=bool(self.execution_config.packed_prefill),
                 cuda_graphs=self.execution_config.cuda_graphs,
                 async_scheduling=(
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
@@ -198,7 +211,13 @@ class StageEngine:
                 device_context_lengths=self.async_speculative,
                 sliding_window=getattr(model, "requires_sliding_window", False),
             ),
+            prefer_packed_prefill=auto_packed,
         )
+        if self.execution_config.packed_prefill is None:
+            self.execution_config = replace(
+                self.execution_config,
+                packed_prefill=auto_packed and attention.capabilities.packed_prefill,
+            )
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,

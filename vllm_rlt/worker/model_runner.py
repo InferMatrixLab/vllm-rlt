@@ -189,6 +189,7 @@ class ModelRunner:
             decode_submitted_rows=0,
         )
         self.prefill_depth = self.execution_config.prefill_depth or model.config.total_ut_steps
+        use_async_state = self.execution_config.async_scheduling and self.device.type == "cuda"
         scheduler = scheduler_config or SchedulerConfig()
         self.graphs = (
             RecurrentGraphs(
@@ -358,18 +359,19 @@ class ModelRunner:
                     )
                     for _ in range(2)
                 ]
-            self.states = torch.empty(
-                (scheduler.max_num_seqs, model.config.hidden_size),
-                device=self.device,
-                dtype=parameter.dtype,
-            )
+            if not use_async_state:
+                self.states = torch.empty(
+                    (scheduler.max_num_seqs, model.config.hidden_size),
+                    device=self.device,
+                    dtype=parameter.dtype,
+                )
             # Buffers allocated after stream creation must be visible there too.
             for stream in (self.core_stream, self.boundary_stream):
                 if stream is not None:
                     stream.wait_stream(torch.cuda.current_stream(self.device))
 
         self.async_state = None
-        if self.execution_config.async_scheduling and self.device.type == "cuda":
+        if use_async_state:
             from vllm_rlt.worker.async_state import AsyncState
 
             rows = scheduler.max_num_batched_tokens
@@ -879,7 +881,7 @@ class ModelRunner:
             and batch.loop_count
             and self.cache_manager.layout != "shared"
             and self.cache_manager.attention_capabilities.packed_prefill
-            and self.execution_config.prefill_uva
+            and self.execution_config.packed_prefill
         )
 
     def _prepare_loop_inputs(self, batch, packed_metadata=None):

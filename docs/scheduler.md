@@ -294,12 +294,12 @@ own capacity checks. With no selected work, no batch is returned.
 | Restore | If allocation succeeds, copy KV and optional hidden/token tensors to device, synchronize the current CUDA stream, delete the CPU snapshot and enqueue the saved phase. If allocation fails, retain the snapshot and defer. |
 | Abort a suspended request | Discard its snapshot, release runner resources/RNG and abort it through the scheduler. |
 
-Deferred IDs are put back at the front in their existing order. Fresh admission
-has `max_admission_bypasses` accounting to prevent unlimited bypass of blocked
-requests. Successful restoration takes an early continuation: it does not use
-the common bypass-counter update. Blocked restoration also takes an early
-continuation rather than checking the fresh-allocation bypass limit. These are
-current branch behaviors, not a guarantee of starvation-free restoration.
+Deferred IDs are put back at the front in their existing order. Both fresh
+admission and restoration count as bypasses of earlier blocked requests. A
+failed fresh admission or blocked restoration stops the scan when its own
+counter reaches `max_admission_bypasses`; a successful admission or restoration
+increments the deferred counters and stops when any of them reaches the limit.
+This bounds repeated bypasses; it is not a general starvation-freedom guarantee.
 
 #### Implemented recovery versus possible extensions
 
