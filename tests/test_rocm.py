@@ -1,5 +1,8 @@
 """ROCm platform behavior that does not require AMD hardware."""
 
+import sys
+from types import ModuleType
+
 import pytest
 import torch
 
@@ -20,18 +23,21 @@ def test_platform_flags(rocm):
     assert not supports_flash_attention()
 
 
-def test_auto_prefers_triton_on_rocm(rocm):
+def test_auto_prefers_triton_on_rocm(rocm, monkeypatch):
+    name = "vllm_rlt.kernels.triton_attention"
+    monkeypatch.setitem(sys.modules, name, ModuleType(name))
     selected = create_backend("auto", torch.device("cuda"), torch.bfloat16, 128, 16)
     assert selected.info["selected_backend"] == "triton"
     assert "FlashAttention is NVIDIA-only" in selected.info["selection_reason"]
 
 
 def test_packed_prefill_stays_opt_in_on_rocm(rocm):
+    from vllm_rlt.config import ExecutionConfig
     from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
 
     common = dict(device_type="cuda", layout="last_exited", staged_prefill=False)
-    assert not packed_prefill_eligible(None, **common)
-    assert packed_prefill_eligible(True, **common)
+    assert not packed_prefill_eligible(ExecutionConfig(), **common)
+    assert packed_prefill_eligible(ExecutionConfig(packed_prefill=True), **common)
 
 
 def test_explicit_flash_rejected_on_rocm(rocm):

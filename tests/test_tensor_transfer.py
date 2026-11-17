@@ -403,3 +403,18 @@ def test_uva_configuration_and_capability(monkeypatch, flags, packed_prefill):
     monkeypatch.delenv("VLLM_RLT_UVA")
     assert use_uva_on("cuda") is torch.cuda.is_available()
     assert not use_uva_on("cuda", False)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ("--no-packed-prefill", "--packed-prefill"),
+        ("--packed-prefill", "--no-packed-prefill"),
+    ],
+)
+def test_packed_prefill_flags_are_mutually_exclusive(flags):
+    parser = argparse.ArgumentParser()
+    add_runtime_args(parser)
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(flags)
+    assert error.value.code == 2
