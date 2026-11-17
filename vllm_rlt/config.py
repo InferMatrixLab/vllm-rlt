@@ -152,7 +152,8 @@ class ExecutionConfig:
     # use_uva independently controls its transfer mechanism.
     # None resolves at engine construction: on when the attention backend packs
     # prefill (Triton opts in, FlashAttention-4 natively) with last_exited KV and
-    # ordinary (non-staged) prefill without sliding-window attention; off otherwise.
+    # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
+    # support and compatible synchronous eager execution; off otherwise.
     packed_prefill: bool | None = None
 
     def __post_init__(self):
