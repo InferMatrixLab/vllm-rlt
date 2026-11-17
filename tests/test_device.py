@@ -9,7 +9,7 @@ import torch
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.memory import plan_cache
-from vllm_rlt.device import resolve_device
+from vllm_rlt.device import resolve_device, stream_module
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.profiling import ProfileConfig
 
@@ -20,6 +20,8 @@ def test_cpu_device_resolution_does_not_import_optional_backend(monkeypatch):
     )
     assert resolve_device("cpu") == torch.device("cpu")
     assert resolve_device("cuda:2") == torch.device("cuda:2")
+    assert stream_module("cpu") is None
+    assert stream_module("cuda:2") is torch.cuda
 
 
 def npu_model_stub(**overrides):
@@ -34,15 +36,14 @@ def npu_model_stub(**overrides):
 @pytest.mark.parametrize(
     "options",
     [
-        dict(execution_config=ExecutionConfig(async_scheduling=True)),
         dict(execution_config=ExecutionConfig(cuda_graphs=True)),
         dict(cache_config=CacheConfig(num_blocks=32, enable_prefix_caching=True)),
         dict(scheduler_config=SchedulerConfig(enable_preemption=True)),
-        dict(exit_config=ExitConfig(mode="ouro_delayed")),
+        dict(exit_config=ExitConfig(mode="random_lookahead")),
     ],
 )
 def test_npu_unsupported_execution_rejected_before_allocation(options):
-    with pytest.raises(ValueError, match="NPU Ouro requires synchronous"):
+    with pytest.raises(ValueError, match="NPU Ouro requires local execution"):
         StageEngine(npu_model_stub(), **options)
 
 
@@ -65,3 +66,8 @@ def test_npu_requires_explicit_torch_before_allocation(backend):
 def test_builtin_profiler_does_not_mislabel_npu_as_cpu_only(tmp_path):
     with pytest.raises(ValueError, match="torch_npu.profiler"):
         ProfileConfig(str(tmp_path)).resolve_activities("npu:0")
+
+
+def test_npu_async_requires_explicit_delayed_exit_policy():
+    with pytest.raises(ValueError, match="async scheduling requires ouro_delayed"):
+        StageEngine(npu_model_stub(), execution_config=ExecutionConfig(async_scheduling=True))

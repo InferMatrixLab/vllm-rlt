@@ -11,3 +11,14 @@ def resolve_device(device) -> torch.device:
         # them. Do this in each spawned worker, without importing it on CPU/CUDA.
         importlib.import_module("torch_npu")
     return torch.device(device)
+
+
+def stream_module(device):
+    """Resolve stream/event operations from the owning tensor device."""
+    device = resolve_device(device)
+    if device.type == "cuda":
+        return torch.cuda
+    if device.type == "npu":
+        importlib.import_module("torch_npu")
+        return torch.npu
+    return None

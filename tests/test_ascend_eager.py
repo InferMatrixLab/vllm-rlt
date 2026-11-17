@@ -188,6 +188,8 @@ def test_bf16_probability_rounding_is_part_of_the_eager_contract(device_name):
 
 
 class _PreparedBatch:
+    sequence_ranges = None
+
     """Only the host metadata the two batched attention paths consume."""
 
     def __init__(self, rows, tables, write_blocks, write_offsets):
@@ -199,7 +201,7 @@ class _PreparedBatch:
 
 def _batched_fixture(kind):
     layers, blocks, block_size, kv_heads, head_dim = 3, 24, 4, 2, 8
-    head_groups, table_width = 2, 4
+    head_groups = 2
     dtype = torch.bfloat16  # the Ascend eager contract is BF16 end to end
     torch.manual_seed(913)
     pool_k = torch.randn(blocks, layers, block_size, kv_heads, head_dim, dtype=dtype)
@@ -273,7 +275,11 @@ def test_batched_attention_paths_match_per_group_eager(kind, expected_prefill, e
         q.device,
     )
     expected = kernel._forward(
-        q, keys, values, batch.block_tables, groups,
+        q,
+        keys,
+        values,
+        batch.block_tables,
+        groups,
         flat_rows=_flat_kv_rows(keys, values),
     )
     actual = kernel.attend_metadata(q, keys, values, batch)

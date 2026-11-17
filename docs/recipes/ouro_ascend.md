@@ -3,6 +3,9 @@
 Run Ouro on one Ascend NPU with BF16, synchronous greedy decoding and four
 recurrent loops. Use the explicit `ascend_eager` attention backend.
 
+Sections 1–5 describe the synchronous path and its historical measurements.
+Section 6 covers the optional asynchronous engine plan.
+
 ## 1. Prepare the environment and model
 
 Use a compatible Torch, Torch-NPU and CANN environment with the project's
@@ -67,8 +70,8 @@ They do not establish model quality or performance; use the
 [accuracy guide](../accuracy.md) and [serving benchmark guide](../serving.md)
 for those evaluations.
 
-Async scheduling, graphs, speculation, PD, preemption, prefix caching and
-adaptive exit are currently unsupported on this path.
+Graphs, speculation, PD, preemption, prefix caching and adaptive exit are
+unsupported on this path. See section 6 for fixed-depth asynchronous execution.
 
 ## 5. Attention batching and device-side KV writes
 
@@ -207,3 +210,99 @@ not qualify this change.
 - Only the full-prefill synchronous path is qualified. Async scheduling,
   graphs, speculation, PD, preemption, prefix caching and adaptive exit
   remain unsupported here.
+
+
+## 6. Fixed-depth asynchronous engine plan
+
+This opt-in path reduces host submissions and KV gathering without replacing
+model operators or replaying graphs. It reuses stable batch allocation/range
+plans, combines fixed-depth decode submissions, and consumes owned KV in
+`[batch, kv_head, token, head_dim]` layout. Submitted-write coverage is distinct
+from device completion: stream events still protect readers, cancellation,
+request-ID reuse and release. Generic cache access exports live KV into paged
+storage and can temporarily require both representations.
+
+Use `CacheConfig(contiguous_kv=True)` and
+`ExecutionConfig(async_scheduling=True, multi_stream=False, use_uva=False,
+coalesce_fixed_prelude=True, native_eager_plan=True)`, with
+`attention_backend="ascend_eager"`, `ExitConfig("ouro_delayed")` and greedy
+`SamplingParams(min_loops=4, max_loops=4, exit_threshold=1.0, temperature=0.0)`.
+Allocate explicit KV blocks and enough prefill tokens for complete prompts.
+Graphs, static buffers, padding, prefix sharing, incremental allocation,
+speculation, PD and preemption are unsupported in this configuration. Arbitrary
+chunked/mixed-length prefill and adaptive-depth quality are not qualified.
+
+A checkpoint CLI smoke command is:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 TASK_QUEUE_ENABLE=2 OMP_NUM_THREADS=1 \
+python -m vllm_rlt.entrypoints.cli \
+  --model /work/models/Ouro-1.4B --device npu --dtype bfloat16 \
+  --attention-backend ascend_eager --prompt "Explain why the sky is blue." \
+  --max-tokens 4 --min-loops 4 --max-loops 4 --exit-mode ouro_delayed \
+  --async-scheduling --single-stream --no-uva --contiguous-kv \
+  --coalesce-fixed-prelude --native-eager-plan --num-blocks 256 \
+  --prefill-chunk-size 4096 --max-num-batched-tokens 4096
+```
+
+`worker/ascend.py` owns the NPU runtime, token/hidden batch reuse and batched
+sampling. CUDA/ROCm retain the shared runner, runtime, sampler, workspace and
+model implementation. The optional native executor in that module and
+`worker/csrc/ascend_eager_plan.cpp` dispatches individual eager ATen operations
+with the Python GIL released: Q/K/V and gate/up projections stay separate, with
+explicit RMSNorm, RoPE, matmul and softmax. Each call borrows live weights and
+returns owned outputs; unsupported module schemas, hooks/custom forwards or
+paged storage use Python. Changes to Ouro arithmetic require revalidating this
+executor too. The older experimental paged KV read cache has been removed.
+
+Native dispatch requires a C++17 compiler, Ninja, PyTorch headers and a writable
+cache on first enabled startup. `VLLM_RLT_NATIVE_BUILD_DIR` selects that cache;
+`MAX_JOBS=1` limits build parallelism. Its identity includes source, Torch version,
+C++ ABI and Python SOABI. Disable `native_eager_plan` to avoid compilation.
+CPU/CUDA/ROCm do not import or build this extension. The FP32 CPU generation of
+RoPE constants is an explicit NPU-only numerical correction to match HF;
+CUDA/ROCm retain their original device arithmetic.
+
+The November 17 refinement integrates upstream `c338aaa`, preserving its sliding
+windows, automatic `packed_prefill` policy and CUDA state-pool changes. Runtime
+source manifests, frozen inputs, pinned HF source, raw request records and
+reproduction scripts are in `/work/vllm-rlt-engine-20261117` inside `kelei-rlt`
+on `ssh npu`. Fixed and natural-input quality checks are separate from timing;
+they do not establish a task-accuracy score or W1–W7 qualification.
+
+### Refinement validation
+
+One NPU per case, CANN 9.0.0, Torch/Torch-NPU 2.10, Transformers 4.54.1,
+Ouro-1.4B BF16, UT4, greedy output, no graphs, one execution stream. All arms
+set `TASK_QUEUE_ENABLE=2` and OMP/MKL threads to one before import. Each has a
+complete shape-matched warmup, then 60 seconds of closed-loop admission and full
+drain. Rates include drain, exclude startup/compilation/warmup, and are medians of
+three unprofiled runs. Orders alternate native/HF, HF/native, native/HF on the
+same card and CPU affinity. These are engine-actor timings, not HTTP latency.
+
+| Prompt / output / client C | Resident batch | Token budget / chunk / blocks | HF tok/s | Native tok/s | vs HF |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 128 / 32 / 8 | 8 | 1024 / 1024 / 336 | 50.732 | 80.625 | +58.92% |
+| 128 / 32 / 64 | 64 | 8192 / 1024 / 2576 | 348.660 | 512.346 | +46.95% |
+| 4096 / 32 / 8 | 4 | 16384 / 4096 / 4144 | 13.636 | 17.210 | +26.21% |
+
+Blocks hold 16 tokens. Inputs are frozen complete equal-length prompts; timing
+forces 32 output tokens with EOS ignored. Native exceeds HF in all nine paired
+case/repeat comparisons. All 18 runs have zero failed requests; all 3,588 native
+request outputs (114,816 tokens) match the independent HF oracle, with no native
+fallbacks. This is not a chunked-prefill, saturation or W1–W7 campaign.
+
+Throughput does not imply faster first output. Pooled TTFT p50 is 222.4 vs
+157.5 ms at S8 and 634.5 vs 595.5 ms at S64 (native vs HF). L8 includes queuing
+at eight clients/four resident requests: 11.68 vs 13.54 s. Raw request records,
+variability, latency percentiles and peak allocations are in `slim-summary.json`
+and `slim-results` in the experiment bundle.
+
+The refinement passes 1,117 CPU regression tests (800 device tests skipped),
+81 targeted Ascend tests, three additional real-checkpoint regressions and three
+HTTP/SSE/disconnect regressions (Torch sync, Ascend sync and Ascend async).
+Separate fixed-input quality checks pass 192/192 sequences; 16 untruncated natural
+inputs also match HF under normal EOS with a 32-token cap (all reach the cap).
+Ruff and source/wheel packaging checks pass. CUDA `ict-90` and ROCm `DCU-02`
+were unreachable: unchanged shared implementations and CPU compatibility tests
+are evidence of isolation, not CUDA/ROCm hardware qualification.

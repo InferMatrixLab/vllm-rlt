@@ -15,14 +15,19 @@ import pytest
 pytestmark = pytest.mark.npu
 
 
-@pytest.mark.parametrize("backend", ["torch", "ascend_eager"])
-def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend):
+@pytest.mark.parametrize(
+    ("backend", "asynchronous"),
+    [("torch", False), ("ascend_eager", False), ("ascend_eager", True)],
+    ids=["torch-sync", "ascend-sync", "ascend-async"],
+)
+def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, asynchronous):
     import aiohttp
 
     source = os.environ.get("VLLM_RLT_OURO_CHECKPOINT")
     if not source:
         pytest.skip("set VLLM_RLT_OURO_CHECKPOINT to the pinned local Ouro-1.4B checkpoint")
-    folder = Path(os.environ.get("VLLM_RLT_ASCEND_RESULTS", tmp_path)) / backend
+    mode = backend + ("-async" if asynchronous else "-sync")
+    folder = Path(os.environ.get("VLLM_RLT_ASCEND_RESULTS", tmp_path)) / mode
     folder.mkdir(parents=True, exist_ok=True)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -50,6 +55,8 @@ def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend):
         "--port",
         str(port),
     ]
+    if asynchronous:
+        command.extend(["--async-scheduling", "--exit-mode", "ouro_delayed", "--single-stream"])
     with (folder / "service.log").open("w") as log:
         process = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True

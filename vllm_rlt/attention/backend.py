@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS, FlashPagedAttention
-from vllm_rlt.kernels.paged_attention import TritonPagedAttention, torch_paged_attention
+from vllm_rlt.kernels.paged_attention import TorchPagedAttention, TritonPagedAttention
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,11 @@ class BackendCapabilities:
     packed_matches_decode: bool = False
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
+    # Mask keys outside a per-layer sliding window (not storage reclamation).
+    sliding_window: bool = False
+    sequence_ranges: bool = False
+    # Consume private, owned KV pairs in [batch, kv_head, token, head_dim] layout.
+    owned_contiguous_kv: bool = False
 
 
 @dataclass
@@ -50,15 +55,26 @@ class AttentionBackend:
     def prefill(self, *args, **kwargs):
         return self.kernel.prefill(*args, **kwargs)
 
+    def windowed(self, *args, **kwargs):
+        """Sliding-window attention; kernels without masking refuse the call."""
+        method = getattr(self.kernel, "windowed", None)
+        if method is None:
+            selected = self.info.get("selected_backend", "this attention backend")
+            raise NotImplementedError(f"{selected} does not implement sliding-window masking")
+        return method(*args, **kwargs)
+
     @property
     def generation(self):
         # Retain the existing Flash adapter's diagnostic attribute.
         return getattr(self.kernel, "generation", None)
 
 
-_TORCH_CAPABILITIES = BackendCapabilities()
+_TORCH_CAPABILITIES = BackendCapabilities(sliding_window=True)
+_ASCEND_CAPABILITIES = BackendCapabilities(
+    async_scheduling=True, sequence_ranges=True, owned_contiguous_kv=True
+)
 _TRITON_CAPABILITIES = BackendCapabilities(
-    cuda_graphs=True, async_scheduling=True, device_context_lengths=True
+    cuda_graphs=True, async_scheduling=True, device_context_lengths=True, sliding_window=True
 )
 _FLASH_CAPABILITIES = {
     2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
@@ -89,7 +105,7 @@ def _create_explicit(backend, device, dtype, head_dim, block_size):
             raise ValueError("ascend_eager requires an NPU and BF16")
         from vllm_rlt.kernels.ascend_eager import AscendEagerAttention
 
-        return AttentionBackend(AscendEagerAttention(), _TORCH_CAPABILITIES, {"backend": backend})
+        return AttentionBackend(AscendEagerAttention(), _ASCEND_CAPABILITIES, {"backend": backend})
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
@@ -103,7 +119,7 @@ def _create_explicit(backend, device, dtype, head_dim, block_size):
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))
-    return AttentionBackend(torch_paged_attention, _TORCH_CAPABILITIES, {"backend": "torch"})
+    return AttentionBackend(TorchPagedAttention(), _TORCH_CAPABILITIES, {"backend": "torch"})
 
 
 def create_backend(
@@ -114,6 +130,7 @@ def create_backend(
     block_size: int,
     *,
     required_capabilities: BackendCapabilities = BackendCapabilities(),
+    prefer_packed_prefill: bool = False,
 ) -> AttentionBackend:
     """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
 
@@ -121,6 +138,8 @@ def create_backend(
     Only compatibility and import failures permit auto to try the next candidate;
     kernel execution errors never trigger a runtime fallback. Execution requirements
     filter candidates before memory profiling or device-buffer allocation.
+    Preferred packed prefill enables it where available without filtering or
+    reordering candidates; required packed prefill still rejects unsupported ones.
     """
     validate_backend_name(backend)
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
@@ -131,9 +150,11 @@ def create_backend(
     for candidate in candidates:
         try:
             implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
-            if candidate == "triton" and required_capabilities.packed_prefill:
+            if candidate == "triton" and (
+                required_capabilities.packed_prefill or prefer_packed_prefill
+            ):
                 # Packed BF16 prefill has different arithmetic from per-row decode.
-                # Opt in for prefill_uva without changing existing split/mixed or
+                # Opt in for packed_prefill without changing existing split/mixed or
                 # Huginn boundary attention when that option is disabled.
                 implementation.capabilities = replace(
                     implementation.capabilities, packed_prefill=True
@@ -145,6 +166,9 @@ def create_backend(
                     "cuda_graphs",
                     "async_scheduling",
                     "device_context_lengths",
+                    "sequence_ranges",
+                    "owned_contiguous_kv",
+                    "sliding_window",
                 )
                 if getattr(required_capabilities, name)
                 and not getattr(implementation.capabilities, name)

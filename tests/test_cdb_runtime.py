@@ -293,6 +293,59 @@ def test_padding_does_not_touch_free_blocks():
     drain(engine)
 
 
+def test_async_memory_plan_counts_static_workspaces_without_a_second_state_pool():
+    from vllm_rlt.worker.buffers import execution_buffer_bytes
+
+    config = tiny_ouro_config()
+    scheduler = SchedulerConfig(max_num_seqs=7, max_num_batched_tokens=3)
+    cache = CacheConfig()
+
+    def planned_bytes(asynchronous, static_buffers):
+        execution = ExecutionConfig(async_scheduling=asynchronous, static_buffers=static_buffers)
+        return execution_buffer_bytes(config, scheduler, cache, execution, 2)
+
+    sync_static_bytes = planned_bytes(False, True) - planned_bytes(False, False)
+    async_static_bytes = planned_bytes(True, True) - planned_bytes(True, False)
+    state_pool_bytes = scheduler.max_num_seqs * config.hidden_size * 2
+    assert sync_static_bytes - async_static_bytes == state_pool_bytes
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_cuda_static_buffers_allocate_one_state_pool(monkeypatch, asynchronous):
+    base = model().to(device="cuda", dtype=torch.bfloat16)
+    parameter = next(base.parameters())
+    scheduler = SchedulerConfig(max_num_seqs=7, max_num_batched_tokens=3)
+    shape = (scheduler.max_num_seqs, base.config.hidden_size)
+    allocations = 0
+    original_empty = torch.empty
+
+    def track_empty(*args, **kwargs):
+        nonlocal allocations
+        tensor = original_empty(*args, **kwargs)
+        if tensor.device == parameter.device and tensor.dtype == parameter.dtype:
+            allocations += tensor.shape == shape
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", track_empty)
+    engine = LLMEngine(
+        base,
+        cache_config=CacheConfig(64, 2),
+        attention_backend="triton",
+        exit_config=ExitConfig("ouro_delayed"),
+        execution_config=ExecutionConfig(async_scheduling=asynchronous, static_buffers=True),
+        scheduler_config=scheduler,
+    )
+    try:
+        runner = engine.model_runner
+        assert runner.states.shape == shape
+        if asynchronous:
+            assert runner.states is runner.async_state.hidden
+        assert allocations == 1
+    finally:
+        engine.close()
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("layout", ["last_exited", "shared"])
 @pytest.mark.parametrize("exit_mode", ["random_lookahead", "ouro_delayed"])
@@ -597,7 +650,15 @@ def test_cuda_dynamic_async_respects_buffers_and_matches_sync(layout, multi_stre
     expected = LLM(base, **common).generate(prompts, params)
     execution = ExecutionConfig(async_scheduling=True, multi_stream=multi_stream)
     actual = LLM(base, execution_config=execution, **common)
-    assert actual.engine.execution_config == execution
+    # Automatic fields resolve at engine construction; other switches must survive.
+    assert (
+        replace(
+            actual.engine.execution_config,
+            cuda_graph_max_batch_size=execution.cuda_graph_max_batch_size,
+            packed_prefill=execution.packed_prefill,
+        )
+        == execution
+    )
     assert actual.engine.model_runner.requestspaces == {}
     assert actual.engine.model_runner.states is actual.engine.model_runner.async_state.hidden
     result = actual.generate(prompts, params)

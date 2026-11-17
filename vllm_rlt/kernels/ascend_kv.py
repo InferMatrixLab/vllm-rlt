@@ -32,9 +32,9 @@ class AscendKVWriter:
                 raise ValueError("KV write address count does not match the prepared rows")
             layers = keys.shape[1]
             if self._layer_ids is None or self._layer_ids.shape[0] != layers:
-                self._layer_ids = torch.arange(
-                    layers, device=keys.device, dtype=torch.int32
-                )[:, None]
+                self._layer_ids = torch.arange(layers, device=keys.device, dtype=torch.int32)[
+                    :, None
+                ]
             layer_ids = self._layer_ids.expand(layers, rows)
             self._indices = torch.stack(
                 (blocks.expand(layers, -1), layer_ids, offsets.expand(layers, -1)), dim=-1

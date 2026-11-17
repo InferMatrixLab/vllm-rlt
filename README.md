@@ -129,17 +129,22 @@ No PyPI publication is implied.
 - [Native CUDA build](docs/launching.md#automatic-native-cuda-build)
 - [Migration from v0.1.0](CHANGELOG.md)
 
+Packed prefill uses `ExecutionConfig.packed_prefill` and the
+`--packed-prefill` / `--no-packed-prefill` flags. Input transfer is controlled
+independently by `use_uva`; see the [selection rules](docs/runtime.md#packed-prefill).
+
 ## Model Support
 
 
 | Checkpoint | Implementation | Documented validation scope | Guide |
 | --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | Ascend BF16, fixed-four-loop synchronous full-prefill support; HF-eager-aligned attention with batched prefill/decode; chunked prefill unresolved | [Runtime](docs/runtime.md), [Ascend recipe](docs/recipes/ouro_ascend.md#5-attention-batching-and-device-side-kv-writes) |
+| Ouro-1.4B | Native Ouro | Ascend BF16 full prefill; opt-in fixed-depth async scheduling, owned KV and native host dispatch using unchanged eager operators; arbitrary chunked prefill unresolved | [Runtime](docs/runtime.md), [Ascend recipe](docs/recipes/ouro_ascend.md#6-fixed-depth-asynchronous-engine-plan) |
 | Ouro-2.6B | Shared Ouro | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
 | Ouro-1.4B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
 | Ouro-2.6B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
 | Nanbeige4.2-3B | Native Nanbeige | Fixed two-loop inference | [Runtime](docs/runtime.md) |
 | Huginn-0125 | Native Huginn | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/runtime.md) |
+| NVIDIA-Nemotron-Labs-Dory1.0-4B | Native Dory | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified | [Dory baseline](docs/dory.md) |
 
 Shared implementation does not qualify every checkpoint/feature combination;
 see the linked guides for validation scope and limitations. See
@@ -152,6 +157,14 @@ inference and CUDA Graphs for the recurrent core and decode coda.
 Huginn does **not** currently support WCPB/mixed staged prefill, asynchronous
 execution, self-speculation, or PD. Feature availability is not equivalent to
 validation of every model/backend/workload combination.
+
+Dory runs the native normalized-GPT stack with attention-bearing input and
+output stages, so its boundary stages own their own KV. Synchronous
+fixed-loop execution is supported for both `per_loop` and `last_loop` KV
+modes. Sliding-window masking exists only in the Torch reference attention
+backend, and WCPB, CUDA Graphs, asynchronous execution, self-speculation,
+prefix reuse and PD are rejected. See the
+[Dory baseline notes](docs/dory.md) for the exact qualified scope.
 
 ## Documentation
 
@@ -175,8 +188,9 @@ as isolated runtime speedups.
 
 <a id="roadmap"></a>
 
-For ongoing design work, see the [architecture RFC](https://github.com/InferMatrixLab/vllm-rlt/issues/32)
-and [model roadmap](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
+For the current architecture and ownership boundaries, see the
+[unified architecture guide](docs/unified_execution.md). Ongoing model and feature
+work is tracked in the [model roadmap](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
 Roadmap proposals are not released capabilities.
 
 ## Contributing

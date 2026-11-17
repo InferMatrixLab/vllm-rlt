@@ -20,15 +20,23 @@ class CacheConfig:
     incremental_allocation: bool = False
     # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
+    # Experimental private, uniform eager cohorts. Generic accesses materialize paged KV.
+    contiguous_kv: bool = False
 
     def __post_init__(self):
-        for name in ("enable_prefix_caching", "incremental_allocation"):
+        for name in ("enable_prefix_caching", "incremental_allocation", "contiguous_kv"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if not 0 <= self.watermark_ratio < 1:
             raise ValueError("watermark_ratio must be in [0, 1)")
         if self.enable_prefix_caching and self.layout != "last_exited":
             raise ValueError("prefix caching requires last_exited KV")
+        if self.contiguous_kv and (
+            self.layout != "last_exited"
+            or self.enable_prefix_caching
+            or self.incremental_allocation
+        ):
+            raise ValueError("contiguous KV requires private, fully reserved last_exited storage")
         if self.num_blocks is not None:
             _positive("num_blocks", self.num_blocks)
         _positive("block_size", self.block_size)
@@ -149,18 +157,28 @@ class ExecutionConfig:
     # Shared switch for mapped pinned-memory reads; unsupported devices copy instead.
     use_uva: bool = True
     # Select packed prefill metadata staging (and require packed attention).
-    # The historical name is retained; use_uva controls its transfer mechanism.
-    prefill_uva: bool = False
+    # use_uva independently controls its transfer mechanism.
+    # None resolves at engine construction: on when the attention backend packs
+    # prefill (Triton opts in, FlashAttention-4 natively) with last_exited KV and
+    # ordinary (non-staged) prefill without sliding-window attention; off otherwise.
+    packed_prefill: bool | None = None
+    # Run embedding and the fixed full recurrent depth in one decode submission.
+    coalesce_fixed_prelude: bool = False
+    # Execute the same eager ATen layer operations through a native host plan.
+    native_eager_plan: bool = False
 
     def __post_init__(self):
+        if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
+            raise ValueError("packed_prefill must be a boolean or None")
         for name in (
-            "prefill_uva",
             "use_uva",
             "async_scheduling",
             "multi_stream",
             "static_buffers",
             "pad_to_power_of_two",
             "cuda_graphs",
+            "coalesce_fixed_prelude",
+            "native_eager_plan",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")

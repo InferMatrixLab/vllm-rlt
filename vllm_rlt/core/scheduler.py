@@ -140,6 +140,8 @@ class Scheduler:
         total_ut_steps: int | None = None,
         eos_token_id=(),
         exit_mode: str = "ouro",
+        coalesce_fixed_decode: bool = False,
+        coalesce_fixed_prelude: bool = False,
     ):
         self.config = config
         self.cache_manager = cache_manager
@@ -154,6 +156,8 @@ class Scheduler:
         else:
             self.eos_token_ids = (eos_token_id,)
         self.exit_mode = exit_mode
+        self.coalesce_fixed_decode = coalesce_fixed_decode
+        self.coalesce_fixed_prelude = coalesce_fixed_prelude
         self.requests: dict[str, Request] = {}
         self.queues: dict[RequestPhase, deque[str]] = {s: deque() for s in RequestPhase}
         # Bound by Engine when preemption is enabled. These callbacks can copy
@@ -475,8 +479,9 @@ class Scheduler:
         """Admit waiting requests: order -> slot -> restore/allocate -> defer/enter.
 
         A blocked long request may let a short one pass. Each successful fresh
-        admission increments earlier blocked requests' bypass counts; reaching
-        the limit stops further bypasses so active requests can drain.
+        admission or resumption increments earlier blocked requests' bypass
+        counts; fresh admission and blocked resumption stop the scan at the
+        limit so active requests can drain.
         """
         if not self.queues[RequestPhase.WAITING]:
             return
@@ -515,25 +520,27 @@ class Scheduler:
                 self._enter_prefill(request)
             else:
                 resume_result = self._try_resume(request)
-                if resume_result == ResumeResult.RESTORED:
-                    active_count += 1
-                    continue
                 if resume_result == ResumeResult.BLOCKED:
-                    deferred.append(request_id)
-                    continue
-
-                plan = self._plan_admission(request, active_count)
-                admitted = self._commit_admission(request, plan)
-                while not admitted and self.preempt(request, waiting_only=True):
-                    # Recompute prefix claims and growth reservations after
-                    # releasing a resident allocation; the previous plan is stale.
-                    plan = self._plan_admission(request, active_count)
-                    admitted = self._commit_admission(request, plan)
-                if not admitted:
                     deferred.append(request_id)
                     if request.admission_bypasses >= self.config.max_admission_bypasses:
                         break
                     continue
+
+                # RESTORED skips fresh allocation but shares the accounting
+                # below, just like an admitted fresh request.
+                if resume_result == ResumeResult.NOT_PREEMPTED:
+                    plan = self._plan_admission(request, active_count)
+                    admitted = self._commit_admission(request, plan)
+                    while not admitted and self.preempt(request, waiting_only=True):
+                        # Recompute prefix claims and growth reservations after
+                        # releasing a resident allocation; the previous plan is stale.
+                        plan = self._plan_admission(request, active_count)
+                        admitted = self._commit_admission(request, plan)
+                    if not admitted:
+                        deferred.append(request_id)
+                        if request.admission_bypasses >= self.config.max_admission_bypasses:
+                            break
+                        continue
 
             active_count += 1
             for blocked_id in deferred:
@@ -799,6 +806,19 @@ class Scheduler:
         if RequestPhase.SPECULATIVE in phases or RequestPhase.CODA in phases:
             return 0
         if RequestPhase.PRELUDE in phases:
+            if (
+                phases == {RequestPhase.PRELUDE}
+                and self.coalesce_fixed_prelude
+                and self.speculative_config is None
+                and self.exit_mode != "trace"
+                and all(
+                    item.request.sampling_params.min_loops == self.total_ut_steps
+                    and (item.request.sampling_params.max_loops or self.total_ut_steps)
+                    == self.total_ut_steps
+                    for item in scheduled_requests
+                )
+            ):
+                return self.total_ut_steps
             return 0
         if self.wavefront_chunked_prefill:
             return 1 if RequestPhase.PREFILLING_RECURRENT in phases else 0
@@ -816,6 +836,25 @@ class Scheduler:
                 return 1
             return min(self._max_contiguous_prefill_loops(item) for item in scheduled_requests)
         if RequestPhase.RECURRENT in phases:
+            # Fixed-depth requests have no intervening host exit decision.
+            # Trace and adaptive policies retain their per-loop boundaries.
+            depths = {item.depth for item in scheduled_requests}
+            if (
+                self.coalesce_fixed_decode
+                and self.exit_mode != "trace"
+                and len(depths) == 1
+                and all(
+                    item.request.sampling_params.exit_threshold == 1.0
+                    for item in scheduled_requests
+                )
+            ):
+                depth = next(iter(depths)) or 0
+                room = min(
+                    (item.request.sampling_params.max_loops or self.total_ut_steps) - depth
+                    for item in scheduled_requests
+                )
+                if room > 0:
+                    return room
             return 1
         raise ValueError(f"cannot derive recurrent boundary for phases: {phases}")
 
@@ -1256,8 +1295,14 @@ class Scheduler:
 
     def needs_exit_signal(self, request: Request) -> bool:
         """Whether the next submitted loop needs its predecessor's readback."""
-        maximum = request.sampling_params.max_loops or self.total_ut_steps
-        return self.exit_mode != "trace" and request.loops_done + 1 < maximum
+        params = request.sampling_params
+        maximum = params.max_loops or self.total_ut_steps
+        # No score can end a request whose minimum depth is its maximum.
+        return (
+            self.exit_mode != "trace"
+            and request.loops_done + 1 < maximum
+            and params.min_loops < maximum
+        )
 
     def _record_token(self, request: Request, token: int, depth: int) -> bool:
         request.generated_token_ids.append(token)
@@ -1305,12 +1350,15 @@ class Scheduler:
             ):
                 continue
             if phase == RequestPhase.PRELUDE:
-                request.loops_done = 0
+                request.loops_done = loop_count if self.coalesce_fixed_prelude else 0
                 request.remaining_probability = 1.0
                 request.pending_exit_depth = None
-                self.enqueue(request, RequestPhase.RECURRENT)
+                complete = self.coalesce_fixed_prelude and loop_count == self.total_ut_steps
+                if complete:
+                    update.exited.append(request)
+                self.enqueue(request, RequestPhase.CODA if complete else RequestPhase.RECURRENT)
             elif phase == RequestPhase.RECURRENT:
-                request.loops_done += 1
+                request.loops_done += max(1, loop_count) if self.coalesce_fixed_decode else 1
                 if self.exit_mode == "trace":
                     should_exit = self._trace_exit(request)
                 else:
@@ -1422,10 +1470,13 @@ class Scheduler:
             ):
                 continue
             if phase == RequestPhase.PRELUDE:
-                request.loops_done = 0
+                request.loops_done = loop_count if self.coalesce_fixed_prelude else 0
                 request.remaining_probability = 1.0
                 request.pending_exit_depth = None
-                self.enqueue(request, RequestPhase.RECURRENT)
+                complete = self.coalesce_fixed_prelude and loop_count == self.total_ut_steps
+                if complete:
+                    update.exited.append(request)
+                self.enqueue(request, RequestPhase.CODA if complete else RequestPhase.RECURRENT)
             elif phase == RequestPhase.CODA:
                 request.num_output_placeholders += 1
                 if request.num_scheduled_outputs < request.sampling_params.max_tokens:
@@ -1445,7 +1496,7 @@ class Scheduler:
                     and request.sampling_params.exit_threshold < 1
                     and self.needs_exit_signal(request)
                 )
-                request.loops_done += 1
+                request.loops_done += max(1, loop_count) if self.coalesce_fixed_decode else 1
                 should_exit = (
                     self._trace_exit(request)
                     if self.exit_mode == "trace"
