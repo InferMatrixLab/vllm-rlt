@@ -18,8 +18,10 @@ from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.engine.connector import StageConnector
+from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
+from vllm_rlt.kernels.paged_attention import PackedWindowShape
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
@@ -82,17 +84,40 @@ class StageEngine:
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
+        sliding_window = getattr(model, "requires_sliding_window", False)
+        prefer_packed = packed_prefill_eligible(
+            self.execution_config,
+            device_type=parameter.device.type,
+            layout=cache_config.layout,
+            staged_prefill=staged_prefill,
+            sliding_window=sliding_window,
+            stage_role=self.stage_config.role,
+            speculative=speculative_config is not None,
+            preemption=scheduler_config.enable_preemption,
+        )
         if getattr(model, "requires_boundary_kv", False):
             if staged_prefill:
                 raise ValueError(
                     "boundary-KV models do not support staged prefill required by this scheduler"
                 )
-            if self.execution_config.async_scheduling or self.execution_config.prefill_uva:
-                raise ValueError(
-                    "boundary-KV models require synchronous scheduling without prefill UVA"
-                )
+            if self.execution_config.async_scheduling and not getattr(
+                model, "supports_async_scheduling", False
+            ):
+                raise ValueError("boundary-KV models require synchronous scheduling")
             if speculative_config is not None:
-                raise ValueError("boundary-KV speculative decoding is not yet supported")
+                if not getattr(model, "supports_self_speculation", False):
+                    raise ValueError("boundary-KV speculative decoding is not yet supported")
+                # Qualified: synchronous eager rounds. Async rounds, Graph replay and
+                # resumable preemption of draft/target boundary state are separate work.
+                if (
+                    self.execution_config.async_scheduling
+                    or self.execution_config.cuda_graphs
+                    or scheduler_config.enable_preemption
+                ):
+                    raise ValueError(
+                        "boundary-KV speculative decoding requires synchronous eager "
+                        "execution without CUDA graphs or preemption"
+                    )
         if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
             raise ValueError("this model does not support CUDA graphs yet")
         self.speculative_config = speculative_config
@@ -153,20 +178,32 @@ class StageEngine:
                     speculative_config.num_speculative_tokens,
                 )
         if self.execution_config.async_scheduling:
-            if not self.async_speculative and self.exit_config.mode not in (
-                "ouro_delayed",
-                "random_lookahead",
-                "trace",
+            # A fixed-loop model has no exit decision to delay or look ahead to.
+            if (
+                not self.async_speculative
+                and not getattr(model, "fixed_loop_count", False)
+                and self.exit_config.mode
+                not in (
+                    "ouro_delayed",
+                    "random_lookahead",
+                    "trace",
+                )
             ):
                 raise ValueError(
                     "async scheduling requires ouro_delayed, random_lookahead or trace exit mode"
                 )
-        if self.execution_config.prefill_uva and (
-            parameter.device.type != "cuda" or cache_config.layout != "last_exited"
-        ):
-            raise ValueError("prefill_uva requires CUDA packed prefill with last_exited KV")
         if staged_prefill and cache_config.layout != "last_exited":
             raise ValueError("staged prefill requires last_exited KV planes")
+        require_packed = self.execution_config.packed_prefill is True
+        kv_layers = getattr(config, "num_kv_layers", config.num_hidden_layers)
+        window = getattr(config, "sliding_window", None)
+        packed_window_shape = (
+            PackedWindowShape(
+                config.num_attention_heads, config.num_key_value_heads, kv_layers, window
+            )
+            if prefer_packed and sliding_window
+            else None
+        )
         attention = create_backend(
             attention_backend,
             parameter.device,
@@ -174,15 +211,25 @@ class StageEngine:
             config.head_dim,
             cache_config.block_size,
             required_capabilities=BackendCapabilities(
-                packed_prefill=self.execution_config.prefill_uva,
+                packed_prefill=require_packed,
+                packed_sliding_window=require_packed and sliding_window,
                 cuda_graphs=self.execution_config.cuda_graphs,
                 async_scheduling=(
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
-                sliding_window=getattr(model, "requires_sliding_window", False),
+                sliding_window=sliding_window,
             ),
+            prefer_packed_prefill=prefer_packed and not sliding_window,
+            packed_window_shape=packed_window_shape,
         )
+        if self.execution_config.packed_prefill is None:
+            supported = attention.capabilities.packed_prefill and (
+                not sliding_window or attention.capabilities.packed_sliding_window
+            )
+            self.execution_config = replace(
+                self.execution_config, packed_prefill=prefer_packed and supported
+            )
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -193,7 +240,7 @@ class StageEngine:
             staged_prefill=staged_prefill,
         )
         self.cache_manager = KVCacheManager(
-            num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
+            num_layers=kv_layers,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_loops=config.total_ut_steps,
@@ -328,8 +375,8 @@ class StageEngine:
         pipeline = bool(self.speculative_config and self.speculative_config.mode == "pipeline")
         if self.async_speculative or pipeline:
             mode = "async" if self.async_speculative else "pipeline"
-            if params.temperature != 0:
-                raise ValueError(f"{mode} speculative decoding currently requires greedy sampling")
+            if pipeline and params.temperature != 0:
+                raise ValueError("pipeline speculative decoding currently requires greedy sampling")
             if params.logprobs is not None:
                 raise ValueError(f"{mode} speculative decoding does not yet support logprobs")
         if request_id in self._retiring_speculative:
@@ -807,8 +854,8 @@ class StageEngine:
         if not ticket.ready():
             runner.readback_waits += 1
         result = ticket.collect()
-        for scheduled_request, state, round_id in zip(
-            ticket.batch.requests, ticket.states, ticket.rounds
+        for row, (scheduled_request, state, round_id) in enumerate(
+            zip(ticket.batch.requests, ticket.states, ticket.rounds)
         ):
             request = scheduled_request.request
             if (
@@ -819,6 +866,12 @@ class StageEngine:
                 continue
             if state.delivered != round_id:
                 raise RuntimeError("out-of-order speculative round delivery")
+            # Stale rows were skipped above, so only live requests can fail the round. The
+            # check precedes _update (and the scheduler's EOS truncation): failure is atomic.
+            if result.speculative[row].numerical_error:
+                raise RuntimeError(
+                    f"invalid speculative sampling distribution for request {request.request_id!r}"
+                )
             state.delivered += 1
         outputs = self._update(ticket.batch, result)
         ticket.retire()

@@ -159,7 +159,7 @@ def test_lossless_preemption_preserves_looped_history():
 @pytest.mark.gpu
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("use_uva", [False, True])
-def test_fa4_prefill_uva_prefix_growth_and_bank_reuse(graph, use_uva):
+def test_fa4_packed_prefill_prefix_growth_and_bank_reuse(graph, use_uva):
     from vllm_rlt import ExecutionConfig, ExitConfig
 
     torch.manual_seed(21)
@@ -181,7 +181,7 @@ def test_fa4_prefill_uva_prefix_growth_and_bank_reuse(graph, use_uva):
                 exit_config=ExitConfig("trace", depths_by_request={"t": [4, 1, 2, 3, 4, 2, 1, 3]}),
                 execution_config=ExecutionConfig(
                     async_scheduling=True,
-                    prefill_uva=enabled,
+                    packed_prefill=enabled,
                     use_uva=use_uva,
                     static_buffers=graph,
                     pad_to_power_of_two=graph,
@@ -237,7 +237,7 @@ def test_priority_preempts_at_safe_boundary():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("use_uva", [False, True])
-def test_prefill_uva_metadata_matches_reference_and_waits_for_consumer(use_uva):
+def test_packed_prefill_metadata_matches_reference_and_waits_for_consumer(use_uva):
     from vllm_rlt.worker.buffers import PackedMetadataBuffer
 
     c = KVCacheManager(

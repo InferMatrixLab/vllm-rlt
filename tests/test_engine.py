@@ -415,3 +415,76 @@ def test_finish_reason_preserves_public_string_values(reason):
     output = RequestOutput.from_request(request)
     assert output.finished and type(output.finish_reason) is str
     assert output.finish_reason == reason.value
+
+
+def test_packed_prefill_resolves_automatically_when_unset():
+    from vllm_rlt.config import ExecutionConfig
+    from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
+
+    common = dict(layout="last_exited", staged_prefill=False)
+    # Unset: prefer packing for compatible CUDA execution, including windows.
+    assert packed_prefill_eligible(ExecutionConfig(), device_type="cuda", **common)
+    assert not packed_prefill_eligible(ExecutionConfig(), device_type="cpu", **common)
+    assert not packed_prefill_eligible(
+        ExecutionConfig(), device_type="cuda", **{**common, "layout": "shared"}
+    )
+    assert packed_prefill_eligible(
+        ExecutionConfig(), device_type="cuda", **common, sliding_window=True
+    )
+    assert not packed_prefill_eligible(
+        ExecutionConfig(), device_type="cuda", **{**common, "staged_prefill": True}
+    )
+    # Explicit settings override the automatic choice.
+    assert not packed_prefill_eligible(
+        ExecutionConfig(packed_prefill=False), device_type="cuda", **common
+    )
+    assert packed_prefill_eligible(
+        ExecutionConfig(packed_prefill=True), device_type="cuda", **common
+    )
+    assert packed_prefill_eligible(
+        ExecutionConfig(packed_prefill=True), device_type="cuda", **common, sliding_window=True
+    )
+    assert ExecutionConfig().packed_prefill is None
+    with pytest.raises(ValueError, match="packed_prefill"):
+        ExecutionConfig(packed_prefill=1)
+    # A CPU engine resolves the unset value to the per-row path and records the decision.
+    engine = LLMEngine(tiny_model())
+    assert engine.execution_config.packed_prefill is False
+    with pytest.raises(ValueError, match="packed_prefill requires CUDA"):
+        LLMEngine(tiny_model(), execution_config=ExecutionConfig(packed_prefill=True))
+    engine = LLMEngine(tiny_model(), execution_config=ExecutionConfig(packed_prefill=False))
+    assert engine.execution_config.packed_prefill is False
+
+
+@pytest.mark.parametrize("requested", [None, True, False])
+@pytest.mark.parametrize(
+    "execution, constraints, error",
+    [
+        ({}, {}, None),
+        ({}, {"device_type": "cpu"}, "requires CUDA"),
+        ({}, {"layout": "shared"}, "last_exited"),
+        ({"async_scheduling": True}, {}, "synchronous eager"),
+        ({"cuda_graphs": True}, {}, "synchronous eager"),
+        ({}, {"staged_prefill": True}, "ordinary prefill"),
+        ({}, {"speculative": True}, "without speculation"),
+        ({}, {"preemption": True}, "without speculation or preemption"),
+        ({}, {"stage_role": "prefill"}, "single-stage"),
+        ({}, {"stage_role": "decode"}, "single-stage"),
+    ],
+)
+def test_sliding_window_packed_prefill_tristate(requested, execution, constraints, error):
+    from vllm_rlt import ExecutionConfig
+    from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
+
+    options = dict(
+        device_type="cuda", layout="last_exited", staged_prefill=False, sliding_window=True
+    )
+    options.update(constraints)
+    config = ExecutionConfig(packed_prefill=requested, **execution)
+    if requested is True and error is not None:
+        with pytest.raises(ValueError, match=error):
+            packed_prefill_eligible(config, **options)
+    else:
+        assert packed_prefill_eligible(config, **options) is (
+            requested is not False and error is None
+        )

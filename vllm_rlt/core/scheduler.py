@@ -475,8 +475,9 @@ class Scheduler:
         """Admit waiting requests: order -> slot -> restore/allocate -> defer/enter.
 
         A blocked long request may let a short one pass. Each successful fresh
-        admission increments earlier blocked requests' bypass counts; reaching
-        the limit stops further bypasses so active requests can drain.
+        admission or resumption increments earlier blocked requests' bypass
+        counts; fresh admission and blocked resumption stop the scan at the
+        limit so active requests can drain.
         """
         if not self.queues[RequestPhase.WAITING]:
             return
@@ -515,25 +516,27 @@ class Scheduler:
                 self._enter_prefill(request)
             else:
                 resume_result = self._try_resume(request)
-                if resume_result == ResumeResult.RESTORED:
-                    active_count += 1
-                    continue
                 if resume_result == ResumeResult.BLOCKED:
-                    deferred.append(request_id)
-                    continue
-
-                plan = self._plan_admission(request, active_count)
-                admitted = self._commit_admission(request, plan)
-                while not admitted and self.preempt(request, waiting_only=True):
-                    # Recompute prefix claims and growth reservations after
-                    # releasing a resident allocation; the previous plan is stale.
-                    plan = self._plan_admission(request, active_count)
-                    admitted = self._commit_admission(request, plan)
-                if not admitted:
                     deferred.append(request_id)
                     if request.admission_bypasses >= self.config.max_admission_bypasses:
                         break
                     continue
+
+                # RESTORED skips fresh allocation but shares the accounting
+                # below, just like an admitted fresh request.
+                if resume_result == ResumeResult.NOT_PREEMPTED:
+                    plan = self._plan_admission(request, active_count)
+                    admitted = self._commit_admission(request, plan)
+                    while not admitted and self.preempt(request, waiting_only=True):
+                        # Recompute prefix claims and growth reservations after
+                        # releasing a resident allocation; the previous plan is stale.
+                        plan = self._plan_admission(request, active_count)
+                        admitted = self._commit_admission(request, plan)
+                    if not admitted:
+                        deferred.append(request_id)
+                        if request.admission_bypasses >= self.config.max_admission_bypasses:
+                            break
+                        continue
 
             active_count += 1
             for blocked_id in deferred:
@@ -1256,8 +1259,14 @@ class Scheduler:
 
     def needs_exit_signal(self, request: Request) -> bool:
         """Whether the next submitted loop needs its predecessor's readback."""
-        maximum = request.sampling_params.max_loops or self.total_ut_steps
-        return self.exit_mode != "trace" and request.loops_done + 1 < maximum
+        params = request.sampling_params
+        maximum = params.max_loops or self.total_ut_steps
+        # No score can end a request whose minimum depth is its maximum.
+        return (
+            self.exit_mode != "trace"
+            and request.loops_done + 1 < maximum
+            and params.min_loops < maximum
+        )
 
     def _record_token(self, request: Request, token: int, depth: int) -> bool:
         request.generated_token_ids.append(token)

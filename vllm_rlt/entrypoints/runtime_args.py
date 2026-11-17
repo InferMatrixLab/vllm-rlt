@@ -24,10 +24,19 @@ def add_runtime_args(parser):
     parser.add_argument("--kv-watermark", type=float, default=0.0)
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
     parser.add_argument("--enable-preemption", action="store_true")
-    parser.add_argument(
-        "--prefill-uva",
+    packed_prefill_mode = parser.add_mutually_exclusive_group()
+    packed_prefill_mode.add_argument(
+        "--packed-prefill",
         action="store_true",
-        help="Use packed prefill metadata staging (requires packed attention)",
+        default=None,
+        help="Require packed prefill on a compatible backend; fail if unsupported. "
+        "Defaults to automatic selection when execution and backend support it.",
+    )
+    packed_prefill_mode.add_argument(
+        "--no-packed-prefill",
+        action="store_false",
+        dest="packed_prefill",
+        help="Keep per-row prefill even when packed attention is available",
     )
     parser.add_argument(
         "--no-uva",
@@ -118,7 +127,7 @@ def runtime_configs(args):
             else None,
         ),
         execution_config=ExecutionConfig(
-            prefill_uva=args.prefill_uva,
+            packed_prefill=args.packed_prefill,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,

@@ -441,6 +441,18 @@ class KVCacheManager:
         plane = allocation.written[self._plane(depth)]
         return all(position in plane[layer] for layer in range(self.num_layers))
 
+    def exit_written(self, request_id: str, position: int, depth: int) -> bool:
+        """Whether every recurrent layer has written KV for ``position`` at ``depth``.
+
+        Boundary layers keep their history at depth 0 and the output stage runs
+        after the exit, so they take no part in finalizing a token.
+        """
+        allocation = self._get_allocation(request_id)
+        self._validate_depth(depth)
+        self._validate_position(allocation, position)
+        plane = allocation.written[self._plane(depth)]
+        return all(position in plane[layer] for layer in self.recurrent_layers)
+
     def mark_finalized(self, request_id: str, position: int, exit_depth: int) -> None:
         """Mark the token written at every depth deeper than ``exit_depth``.
 
@@ -732,8 +744,17 @@ class KVCacheManager:
         self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
         if window is not None:
-            return self._attend_windowed(layer, batch, q, window)
+            if batch.cu_seqlens_q is None:
+                return self._attend_windowed(layer, batch, q, window)
+            if not self.attention_capabilities.packed_sliding_window:
+                raise NotImplementedError("sliding-window attention needs one query row per token")
+            if type(window) is not int or window <= 0:
+                raise ValueError("window must be a positive integer")
         if isinstance(batch, DeviceKVMetadata):
+            if window is not None:
+                raise NotImplementedError(
+                    "packed sliding-window attention requires host-planned KV"
+                )
             return self.attention(
                 q,
                 self.key_cache[:, layer],
@@ -754,6 +775,7 @@ class KVCacheManager:
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
+                **({} if window is None else {"window": window}),
             )
         return self.attention(
             q,
@@ -778,14 +800,15 @@ class KVCacheManager:
             raise NotImplementedError(
                 f"the {self.backend} attention backend does not implement sliding-window masking"
             )
-        if isinstance(batch, DeviceKVMetadata):
-            raise NotImplementedError("sliding-window attention needs host-planned KV metadata")
         if batch.cu_seqlens_q is not None:
             raise NotImplementedError("sliding-window attention needs one query row per token")
-        if not batch.rows:
-            return torch.empty_like(q)
-        for allocation, depth, position in batch.rows:
-            self._require_prefix(allocation, layer, depth, position + 1)
+        # Device-owned positions are ordered by the runner's stream; the host
+        # frontier lags them, as for unwindowed attention.
+        if not isinstance(batch, DeviceKVMetadata):
+            if not batch.rows:
+                return torch.empty_like(q)
+            for allocation, depth, position in batch.rows:
+                self._require_prefix(allocation, layer, depth, position + 1)
         return self.attention.windowed(
             q,
             self.key_cache[:, layer],

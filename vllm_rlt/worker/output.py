@@ -24,6 +24,8 @@ class SpeculativeResult:
     log_probs: list = field(default_factory=list)
     # Exclusive KV extent still needed by retained pipeline tokens.
     kv_frontier: int | None = None
+    # Random speculation only: the round's stop point had an invalid distribution.
+    numerical_error: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)

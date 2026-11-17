@@ -149,12 +149,17 @@ class ExecutionConfig:
     # Shared switch for mapped pinned-memory reads; unsupported devices copy instead.
     use_uva: bool = True
     # Select packed prefill metadata staging (and require packed attention).
-    # The historical name is retained; use_uva controls its transfer mechanism.
-    prefill_uva: bool = False
+    # use_uva independently controls its transfer mechanism.
+    # None resolves at engine construction: on when the attention backend packs
+    # prefill (Triton opts in, FlashAttention-4 natively) with last_exited KV and
+    # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
+    # support and compatible synchronous eager execution; off otherwise.
+    packed_prefill: bool | None = None
 
     def __post_init__(self):
+        if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
+            raise ValueError("packed_prefill must be a boolean or None")
         for name in (
-            "prefill_uva",
             "use_uva",
             "async_scheduling",
             "multi_stream",

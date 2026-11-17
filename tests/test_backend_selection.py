@@ -24,7 +24,7 @@ def packages(monkeypatch):
         if name == "vllm_rlt.kernels.triton_attention":
             if "triton" not in installed:
                 raise ImportError("triton is not installed")
-            return SimpleNamespace()
+            return SimpleNamespace(select_packed_window_tile=lambda *args: None)
         if name in ("flash_attn", "flash_attn_3.flash_attn_interface", "flash_attn.cute"):
             if name not in installed:
                 raise ImportError(f"{name} is not installed")
@@ -186,6 +186,30 @@ def test_triton_packed_prefill_is_per_selection_opt_in(packages, monkeypatch, re
     assert not later.capabilities.packed_prefill
 
 
+@pytest.mark.parametrize(
+    "missing,expected,packed",
+    [
+        ((), "flash_attn_4", True),
+        (("flash_attn.cute",), "flash_attn_3", False),
+        (
+            ("flash_attn.cute", "flash_attn_3.flash_attn_interface", "flash_attn"),
+            "triton",
+            True,
+        ),
+    ],
+)
+def test_preferred_packed_prefill_preserves_backend_priority(
+    packages, monkeypatch, missing, expected, packed
+):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    packages.difference_update(missing)
+    args = ("auto", torch.device("cuda"), torch.bfloat16, 128, 256)
+    baseline = create_backend(*args)
+    preferred = create_backend(*args, prefer_packed_prefill=True)
+    assert preferred.info["selected_backend"] == baseline.info["selected_backend"] == expected
+    assert preferred.capabilities.packed_prefill is packed
+
+
 def test_packed_prefill_requires_declared_support(packages, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
     packages.remove("flash_attn.cute")
@@ -285,6 +309,62 @@ def test_explicit_triton_rejects_unsupported_nvidia_hardware(packages, monkeypat
         create_backend("triton", torch.device("cuda"), torch.float16, 128, 256)
 
 
+def test_triton_advertises_packed_window_only_after_selecting_a_tile(packages, monkeypatch):
+    from vllm_rlt.attention import backend as selection
+    from vllm_rlt.kernels.paged_attention import PackedWindowShape
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+    base_import = selection.importlib.import_module
+    shape = PackedWindowShape(16, 4, 36, 1024)
+    calls = []
+
+    def probe(device, dtype, head_dim, block_size, requested_shape):
+        calls.append((device, dtype, head_dim, block_size, requested_shape))
+        return (32, 32)
+
+    def import_module(name):
+        if name == "vllm_rlt.kernels.triton_attention":
+            return SimpleNamespace(select_packed_window_tile=probe)
+        return base_import(name)
+
+    monkeypatch.setattr(selection.importlib, "import_module", import_module)
+    args = (torch.device("cuda"), torch.bfloat16, 256, 16)
+    backend = create_backend(
+        "auto",
+        *args,
+        required_capabilities=BackendCapabilities(sliding_window=True),
+        packed_window_shape=shape,
+    )
+    assert backend.info["selected_backend"] == "triton"
+    assert backend.info["packed_prefill_tile"] == (32, 32)
+    assert backend.capabilities.packed_prefill and backend.capabilities.packed_sliding_window
+    assert not create_backend("triton", *args).capabilities.packed_sliding_window
+    assert calls == [(*args, shape)]
+
+
+@pytest.mark.parametrize("backend", ["triton", "auto"])
+def test_packed_window_falls_back_to_per_query_when_probe_has_no_tile(
+    packages, monkeypatch, backend
+):
+    from vllm_rlt.kernels.paged_attention import PackedWindowShape
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+    shape = PackedWindowShape(16, 4, 36, 1024)
+    selected = create_backend(
+        backend,
+        torch.device("cuda"),
+        torch.bfloat16,
+        256,
+        16,
+        required_capabilities=BackendCapabilities(sliding_window=True),
+        packed_window_shape=shape,
+    )
+    assert selected.info["selected_backend"] == "triton"
+    assert selected.info["packed_prefill_tile"] is None
+    assert not selected.capabilities.packed_prefill
+    assert not selected.capabilities.packed_sliding_window
+
+
 def test_auto_skips_broken_binary_import(packages, monkeypatch):
     from vllm_rlt.kernels import flash_attention
 
@@ -302,3 +382,170 @@ def test_auto_skips_broken_binary_import(packages, monkeypatch):
     assert "incompatible CUDA extension" in selected.info["selection_reason"]
     with pytest.raises(OSError, match="incompatible CUDA extension"):
         create_backend("flash_attn_2", torch.device("cuda"), torch.bfloat16, 128, 256)
+
+
+@pytest.mark.parametrize("requested", [None, True, False])
+@pytest.mark.parametrize("tile", [None, (32, 32)])
+@pytest.mark.parametrize("backend", ["triton", "auto"])
+def test_window_engine_resolves_tristate_before_cache_planning(
+    packages, monkeypatch, requested, tile, backend
+):
+    from tests.test_dory import tiny_dory_config
+    from vllm_rlt.attention import backend as selection
+    from vllm_rlt.engine import stage_engine
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+    original_import = selection.importlib.import_module
+    probes = []
+
+    def import_module(name):
+        if name == "vllm_rlt.kernels.triton_attention":
+
+            def probe(*args):
+                probes.append(args[-1])
+                return tile
+
+            return SimpleNamespace(select_packed_window_tile=probe)
+        return original_import(name)
+
+    monkeypatch.setattr(selection.importlib, "import_module", import_module)
+    config = tiny_dory_config()
+    model = SimpleNamespace(
+        config=config,
+        requires_boundary_kv=True,
+        requires_sliding_window=True,
+        parameters=lambda: iter(
+            [SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16)]
+        ),
+    )
+
+    class Planned(Exception):
+        pass
+
+    def plan_cache(model, cache, scheduler, execution, selected, **kwargs):
+        assert execution.packed_prefill is (requested is not False and tile is not None)
+        assert selected == "triton"
+        raise Planned
+
+    monkeypatch.setattr(stage_engine, "plan_cache", plan_cache)
+    error = ValueError if requested is True and tile is None else Planned
+    with pytest.raises(error):
+        LLMEngine(
+            model,
+            attention_backend=backend,
+            execution_config=ExecutionConfig(packed_prefill=requested),
+        )
+    assert len(probes) == int(requested is not False)
+    if probes:
+        assert probes[0].query_heads == config.num_attention_heads
+        assert probes[0].kv_layers == config.num_kv_layers
+        assert probes[0].window == config.sliding_window
+
+
+@pytest.mark.parametrize("missing", ["packed_prefill", "packed_sliding_window"])
+@pytest.mark.parametrize("requested", [None, True])
+def test_window_engine_requires_both_packed_capabilities(monkeypatch, missing, requested):
+    from dataclasses import replace
+
+    from tests.test_dory import tiny_dory_config
+    from vllm_rlt.attention import AttentionBackend
+    from vllm_rlt.attention import backend as selection
+    from vllm_rlt.engine import stage_engine
+
+    capabilities = replace(
+        BackendCapabilities(packed_prefill=True, sliding_window=True, packed_sliding_window=True),
+        **{missing: False},
+    )
+    monkeypatch.setattr(
+        selection,
+        "_create_explicit",
+        lambda *args, **kwargs: AttentionBackend(None, capabilities, {"backend": "triton"}),
+    )
+    model = SimpleNamespace(
+        config=tiny_dory_config(),
+        requires_boundary_kv=True,
+        requires_sliding_window=True,
+        parameters=lambda: iter(
+            [SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16)]
+        ),
+    )
+
+    class Planned(Exception):
+        pass
+
+    def plan_cache(model, cache, scheduler, execution, selected, **kwargs):
+        assert requested is None
+        assert execution.packed_prefill is False
+        raise Planned
+
+    monkeypatch.setattr(stage_engine, "plan_cache", plan_cache)
+    error = ValueError if requested is True else Planned
+    with pytest.raises(error, match=missing if requested else None):
+        LLMEngine(
+            model,
+            attention_backend="triton",
+            execution_config=ExecutionConfig(packed_prefill=requested),
+        )
+
+
+@pytest.mark.parametrize("requested", [None, True])
+@pytest.mark.parametrize(
+    "asynchronous,graphs,preemption,role",
+    [
+        (True, False, False, "prefill_decode"),
+        (False, True, False, "prefill_decode"),
+        (False, False, True, "prefill_decode"),
+        (False, False, False, "decode"),
+    ],
+)
+def test_incompatible_window_engine_does_not_probe_packed_tile(
+    packages, monkeypatch, requested, asynchronous, graphs, preemption, role
+):
+    from tests.test_dory import tiny_dory_config
+    from vllm_rlt import SchedulerConfig
+    from vllm_rlt.attention import backend as selection
+    from vllm_rlt.engine import stage_engine
+    from vllm_rlt.engine.stage_config import StageConfig
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+    original_import = selection.importlib.import_module
+
+    def import_module(name):
+        if name == "vllm_rlt.kernels.triton_attention":
+            return SimpleNamespace(
+                select_packed_window_tile=lambda *args: pytest.fail(
+                    "incompatible execution probed a packed tile"
+                )
+            )
+        return original_import(name)
+
+    monkeypatch.setattr(selection.importlib, "import_module", import_module)
+    model = SimpleNamespace(
+        config=tiny_dory_config(),
+        requires_boundary_kv=True,
+        requires_sliding_window=True,
+        fixed_loop_count=True,
+        supports_async_scheduling=True,
+        parameters=lambda: iter(
+            [SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16)]
+        ),
+    )
+
+    class Planned(Exception):
+        pass
+
+    def plan_cache(model, cache, scheduler, execution, selected, **kwargs):
+        assert requested is None and execution.packed_prefill is False
+        raise Planned
+
+    monkeypatch.setattr(stage_engine, "plan_cache", plan_cache)
+    with pytest.raises(ValueError if requested is True else Planned):
+        LLMEngine(
+            model,
+            attention_backend="triton",
+            stage_config=StageConfig(role=role),
+            scheduler_config=SchedulerConfig(enable_preemption=preemption),
+            execution_config=ExecutionConfig(
+                packed_prefill=requested, async_scheduling=asynchronous, cuda_graphs=graphs
+            ),
+        )
