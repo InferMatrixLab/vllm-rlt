@@ -1,9 +1,16 @@
-"""Bounded cross-round greedy speculation with device-owned token positions."""
+"""Bounded cross-round speculation with device-owned token positions.
+
+Block mode supports greedy and random (temperature/top-k/top-p) requests in one batch. Greedy
+requests verify by target argmax. Random requests draw drafts from their ``q`` distributions,
+verify with speculative rejection sampling against ``p`` (see ``speculative_sampling``) and
+return their committed sequence (accepted drafts, then correction or bonus) in the result rows.
+A batch without random requests takes the greedy path with no extra device work.
+"""
 
 import math
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import numpy as np
 import torch
@@ -25,6 +32,170 @@ from vllm_rlt.worker.speculative import (
     SpeculativeRunner,
     SpeculativeStats,
 )
+from vllm_rlt.worker.speculative_sampling import (
+    AcceptResult,
+    batched_probabilities,
+    categorical,
+    speculative_accept,
+)
+
+# Float plan arrays travel in the int64 upload as float64 bit patterns.
+_FLOAT_UPLOADS = frozenset({"r_temperature", "r_top_p", "v_temperature", "v_top_p"})
+
+
+@dataclass(frozen=True, eq=False)
+class RandomSamplingPlan:
+    """Host plan for the random requests of one block round (numpy only, no device access).
+
+    Random requests are those with ``temperature != 0``; their *rank* is their position among
+    random requests in item order, and it indexes ``u``/``q``/``p`` rows. ``width`` is the
+    largest ``token_count`` among random requests (``q`` is ``[r, width - 1, V]``, ``p`` is
+    ``[r, width, V]``).
+    """
+
+    requests: np.ndarray  # [r] item index of each random request
+    temperature: np.ndarray  # [r] float64
+    top_k: np.ndarray  # [r] int64, as given (-1 = full vocabulary)
+    top_p: np.ndarray  # [r] float64
+    max_top_k: int  # largest k with 0 < k < vocab over random requests, else 0
+    apply_top_p: bool  # any random request has top_p < 1
+    width: int
+    # Per draft offset o < width - 1: (rows of that offset's drafting block that are random,
+    # their ranks). Empty arrays when the offset drafts no random request.
+    draft_rows: tuple[tuple[np.ndarray, np.ndarray], ...]
+    verify_rows: np.ndarray  # flat request-major verify rows of random requests
+    verify_ranks: np.ndarray  # rank owning each such row
+    verify_offsets: np.ndarray  # row index within its request (p / result column)
+    verify_temperature: np.ndarray  # per verify row, float64
+    verify_top_k: np.ndarray
+    verify_top_p: np.ndarray
+
+    def uploads(self):
+        """(name, int64 array) pairs appended to the round's single index upload."""
+        parts = [
+            ("r_requests", self.requests),
+            ("r_temperature", self.temperature),
+            ("r_top_k", self.top_k),
+            ("r_top_p", self.top_p),
+            ("v_rows", self.verify_rows),
+            ("v_ranks", self.verify_ranks),
+            ("v_offsets", self.verify_offsets),
+            ("v_temperature", self.verify_temperature),
+            ("v_top_k", self.verify_top_k),
+            ("v_top_p", self.verify_top_p),
+        ]
+        for offset, (rows, ranks) in enumerate(self.draft_rows):
+            if len(rows):
+                parts += [(f"r_rows{offset}", rows), (f"r_ranks{offset}", ranks)]
+        return [
+            (
+                name,
+                np.asarray(values, dtype=np.float64).view(np.int64)
+                if name in _FLOAT_UPLOADS
+                else np.asarray(values, dtype=np.int64),
+            )
+            for name, values in parts
+        ]
+
+
+def plan_random_sampling(sampling_params, token_counts, vocab_size, num_speculative_tokens):
+    """Plan the random rows of a block round, or return None when every request is greedy.
+
+    ``sampling_params[i]`` and ``token_counts[i]`` describe item ``i`` (``token_count - 1``
+    drafts). Draft ``j`` of a request is proposed at offset ``j`` and checked against its
+    verify row ``j``; verify rows are request-major. Pure host code: no device access.
+    """
+    counts = np.asarray(token_counts, dtype=np.int64)
+    is_random = np.array([params.temperature != 0 for params in sampling_params], dtype=bool)
+    if not is_random.any():
+        return None
+    requests = np.flatnonzero(is_random)
+    r = len(requests)
+    rank_of = np.full(len(counts), -1, dtype=np.int64)
+    rank_of[requests] = np.arange(r)
+    request_counts = counts[requests]
+    width = int(request_counts.max())
+    if width - 1 > num_speculative_tokens:
+        raise ValueError("random request has more drafts than num_speculative_tokens")
+    temperature = np.array([sampling_params[i].temperature for i in requests], dtype=np.float64)
+    top_k = np.array([sampling_params[i].top_k for i in requests], dtype=np.int64)
+    top_p = np.array([sampling_params[i].top_p for i in requests], dtype=np.float64)
+    truncating = top_k[(top_k > 0) & (top_k < vocab_size)]
+    draft_rows = []
+    for offset in range(width - 1):
+        drafting = np.flatnonzero(counts > offset + 1)
+        rows = np.flatnonzero(is_random[drafting])
+        draft_rows.append((rows, rank_of[drafting[rows]]))
+    starts = np.cumsum(counts) - counts
+    verify_rows = np.concatenate([starts[i] + np.arange(counts[i]) for i in requests]).astype(
+        np.int64
+    )
+    verify_ranks = np.repeat(np.arange(r), request_counts)
+    verify_offsets = np.concatenate([np.arange(c) for c in request_counts]).astype(np.int64)
+    return RandomSamplingPlan(
+        requests=requests,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        max_top_k=int(truncating.max()) if len(truncating) else 0,
+        apply_top_p=bool((top_p < 1).any()),
+        width=width,
+        draft_rows=tuple(draft_rows),
+        verify_rows=verify_rows,
+        verify_ranks=verify_ranks,
+        verify_offsets=verify_offsets,
+        verify_temperature=np.repeat(temperature, request_counts),
+        verify_top_k=np.repeat(top_k, request_counts),
+        verify_top_p=np.repeat(top_p, request_counts),
+    )
+
+
+class RandomRoundMerge(NamedTuple):
+    rows: torch.Tensor  # [R] result rows (committed sequences for random requests)
+    accepted: torch.Tensor  # [n]
+    next_tokens: torch.Tensor  # [n] (placeholders for failed requests)
+    next_positions: torch.Tensor  # [n] starts + accepted + 1 (informational for failed rows)
+    next_values: torch.Tensor  # [n, 2] (token, position) to scatter into the slot table
+    error: torch.Tensor  # [n] int64 0/1 flags
+
+
+def merge_random_round(
+    target,
+    accepted,
+    next_tokens,
+    starts,
+    input_tokens,
+    result: AcceptResult,
+    random_requests,
+    verify_rows,
+    verify_ranks,
+    verify_offsets,
+):
+    """Overlay random-request outcomes on the greedy round tensors; no host reads.
+
+    ``target`` ``[R]`` argmax per request-major verify row, ``accepted``/``next_tokens``
+    ``[n]`` the greedy values, ``starts``/``input_tokens`` ``[n]`` the slot values read at the
+    start of the round. ``result`` is the ``speculative_accept`` outcome of the random requests
+    ``random_requests`` ``[r]``. Verify row ``start_i + j`` of random request ``rank`` becomes
+    ``result.tokens[rank, j]`` (accepted drafts, then the final token); greedy rows are
+    untouched. A failed request keeps its old ``(input_token, start)`` slot values, so a queued
+    next round reads the span it already reserved; the caller must treat the round as fatal.
+    """
+    rows = target.clone()
+    rows[verify_rows] = result.tokens[verify_ranks, verify_offsets]
+    accepted = accepted.clone()
+    accepted[random_requests] = result.accepted
+    next_tokens = next_tokens.clone()
+    next_tokens[random_requests] = result.final
+    failed = torch.zeros(len(starts), dtype=torch.bool, device=starts.device)
+    failed[random_requests] = result.error
+    next_positions = starts + accepted + 1
+    next_values = torch.where(
+        failed[:, None],
+        torch.stack((input_tokens, starts), 1),
+        torch.stack((next_tokens, next_positions), 1),
+    )
+    return RandomRoundMerge(rows, accepted, next_tokens, next_positions, next_values, failed.long())
 
 
 @dataclass
@@ -60,9 +231,11 @@ class SpeculativeRoundBuffer:
         self.host_tables = torch.empty(math.prod(shape), dtype=torch.int32, pin_memory=True)
         self.tables = torch.empty(math.prod(shape), dtype=torch.int32, device=cache.device)
         # Result capacity in int64 elements (not bytes), for one submission.
-        # Block layout: [target token IDs for all verification rows,
-        #                accepted counts per request, next positions per request].
-        # Its upper bound is max_num_batched_tokens + 2 * max_num_seqs.
+        # Block layout: [result token IDs for all verification rows,
+        #                accepted counts per request, next positions per request,
+        #                error flags per request (only when the round has random requests)].
+        # Result rows are target argmax IDs for greedy requests and committed sequences for
+        # random ones. Its upper bound is max_num_batched_tokens + 3 * max_num_seqs.
         # Pipeline layout: six consecutive values per request:
         # [prediction, accepted, emitted, next_position, drafted_count, verified_count].
         # `emitted` says whether this step produced a target output; prediction is
@@ -70,7 +243,7 @@ class SpeculativeRoundBuffer:
         # Reserve the larger layout in both GPU and pinned host storage; submit()
         # copies only the used prefix, and collect() decodes the selected layout.
         size = max(
-            scheduler.max_num_batched_tokens + 2 * scheduler.max_num_seqs,
+            scheduler.max_num_batched_tokens + 3 * scheduler.max_num_seqs,
             6 * scheduler.max_num_seqs,
         )
         self.host_result = torch.empty(size, dtype=torch.int64, pin_memory=True)
@@ -92,6 +265,8 @@ class SpeculativeRoundTicket:
     stats: SpeculativeStats | None = None
     cached: ModelRunnerOutput | None = None
     retired: bool = False
+    # Block rounds with random requests append one numerical-error flag per request.
+    error_flags: bool = False
 
     @property
     def has_result(self):
@@ -121,7 +296,11 @@ class SpeculativeRoundTicket:
                     self.stats.drafted_tokens += sum(row[4] for row in values)
                     self.stats.verified_rows += sum(row[5] for row in values)
                 return self.cached
-            values = self.buffer.host_result[: self.rows + 2 * b].tolist()
+            # [rows | accepted (b) | next positions (b) | error flags (b, random rounds only)]
+            # Only these ranges are read; a reused buffer's tail may hold older rounds' values.
+            values = self.buffer.host_result[: self.rows + (3 if self.error_flags else 2) * b]
+            values = values.tolist()
+            flags = values[self.rows + 2 * b : self.rows + 3 * b] if self.error_flags else None
             results, start = [], 0
             for i, scheduled_request in enumerate(self.batch.requests):
                 accepted = values[self.rows + i]
@@ -129,10 +308,13 @@ class SpeculativeRoundTicket:
                     SpeculativeResult(
                         values[start : start + accepted + 1],
                         accepted,
+                        numerical_error=bool(flags[i]) if flags is not None else False,
                     )
                 )
                 start += scheduled_request.token_count
-            self.cached = ModelRunnerOutput(speculative=results, frontiers=values[self.rows + b :])
+            self.cached = ModelRunnerOutput(
+                speculative=results, frontiers=values[self.rows + b : self.rows + 2 * b]
+            )
         return self.cached
 
     def retire(self, *, discard=False):
@@ -330,7 +512,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         """Host-built gather/scatter indices for a round, uploaded in one copy.
 
         Offset o drafts the requests whose token_count exceeds o, in item order;
-        verification rows stay request-major in item order, as results expect.
+        verification rows stay request-major in item order, as results expect. When any
+        request is random, ``plan.random`` is its host plan and its arrays join the same upload;
+        for an all-greedy round ``plan.random`` is None and nothing extra is built.
         """
         counts = np.array([item.token_count for item in items], dtype=np.int64)
         n, width = len(counts), int(counts.max())
@@ -361,13 +545,63 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         add("request_rows", request_rows)
         add("row_offsets", row_offsets)
         add("hidden_rows", base[row_offsets] + ranks[row_offsets, request_rows])
+        random = plan_random_sampling(
+            [item.request.sampling_params for item in items],
+            counts,
+            self.model.config.vocab_size,
+            self.config.num_speculative_tokens,
+        )
+        if random is not None:
+            for name, values in random.uploads():
+                add(name, values)
         host = torch.from_numpy(np.concatenate(parts)).pin_memory()
         values = host.to(self.device, non_blocking=True)
         buffer.keepalive.extend((host, values))
         views = {name: values[start : start + size] for name, (start, size) in layout.items()}
-        return SimpleNamespace(n=n, width=width, rows=len(request_rows), offsets=offsets, **views)
+        for name in _FLOAT_UPLOADS & views.keys():
+            views[name] = views[name].view(torch.float64).float()
+        return SimpleNamespace(
+            n=n, width=width, rows=len(request_rows), offsets=offsets, random=random, **views
+        )
 
-    def _draft(self, plan, tables, allocations):
+    def _uniforms(self, items, random):
+        """Uniforms ``[r, 2K + 1]`` for the random requests, drawn in item order.
+
+        Columns ``[0:K]`` sample drafts, ``[K:2K]`` decide acceptance and ``[2K]`` samples the
+        correction or bonus token. Each request consumes exactly one draw per round whatever
+        its draft count or acceptance outcome; greedy requests never touch the registry.
+        """
+        rows = []
+        for i in random.requests:
+            request = items[i].request
+            generator = self.rng.acquire(request.request_id, request.sampling_params, self.device)
+            rows.append(
+                torch.rand(
+                    (2 * self.config.num_speculative_tokens + 1,),
+                    generator=generator,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            )
+        return torch.stack(rows)
+
+    def _probabilities(self, plan, logits, temperature, top_k, top_p):
+        return batched_probabilities(
+            logits,
+            temperature,
+            top_k,
+            top_p,
+            max_top_k=plan.random.max_top_k,
+            apply_top_p=plan.random.apply_top_p,
+        )
+
+    def _draft(self, plan, tables, allocations, u=None):
+        """Propose drafts; returns ``(starts, tokens, hidden_blocks, q)``.
+
+        Greedy rows take the CODA argmax. For random rows (``plan.random``) the proposal is
+        drawn from ``q = batched_probabilities(logits)`` with ``u[rank, offset]`` and ``q`` is
+        stored in ``q[rank, offset]`` (``q`` is None when no random request drafts).
+        """
         from vllm_rlt.kernels.routing import gather_kernel
 
         slot_values = self.slot_values.new_empty((plan.n, 2))
@@ -385,6 +619,14 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         tokens = torch.zeros((plan.n, plan.width), dtype=torch.long, device=self.device)
         tokens[:, 0] = slot_values[:, 0]
         hidden_blocks = []
+        random = plan.random
+        q = None
+        if random is not None and random.width > 1:
+            q = torch.zeros(
+                (len(random.requests), random.width - 1, self.model.config.vocab_size),
+                dtype=torch.float32,
+                device=self.device,
+            )
         for offset, (active_count, drafting_count) in enumerate(plan.offsets):
             active = getattr(plan, f"active{offset}", None)
             if active is None:
@@ -402,23 +644,65 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             if drafting_count:
                 rows = getattr(plan, f"draft_rows{offset}", None)
                 drafting = hidden if rows is None else hidden[rows]
-                proposed = self._coda(drafting).argmax(-1)
+                # CUDA graphs may return a static buffer that the next _coda replay
+                # overwrites: everything below is derived from `logits` immediately.
+                logits = self._coda(drafting)
+                proposed = logits.argmax(-1)
+                random_rows = getattr(plan, f"r_rows{offset}", None)
+                if random_rows is not None:
+                    ranks = getattr(plan, f"r_ranks{offset}")
+                    q_o = self._probabilities(
+                        plan,
+                        logits[random_rows],
+                        plan.r_temperature[ranks],
+                        plan.r_top_k[ranks],
+                        plan.r_top_p[ranks],
+                    )
+                    # Invalid q rows give placeholder token 0; speculative_accept flags them.
+                    sampled, _ = categorical(q_o, u[ranks, offset])
+                    proposed[random_rows] = sampled
+                    q[ranks, offset] = q_o
                 tokens[getattr(plan, f"drafting{offset}"), offset + 1] = proposed
-        return starts, tokens, hidden_blocks
+        return starts, tokens, hidden_blocks, q
 
     def _verify(self, plan, starts, hidden_blocks, tables, allocations):
+        """Run the target loops; returns ``(target argmax per verify row, p)``.
+
+        ``p`` ``[r, width, V]`` holds the verify distributions of the random requests (zeros
+        in padding) and is None when every request is greedy.
+        """
         positions = starts[plan.request_rows] + plan.row_offsets
         row_tables = tables[plan.request_rows]
         hidden = torch.cat(hidden_blocks)[plan.hidden_rows]
         for depth in range(self.config.draft_loops, self.config.target_loops):
             hidden = self._execute_recurrent_step(hidden, positions, row_tables, depth, allocations)
-        return self._coda(hidden).argmax(-1)
+        logits = self._coda(hidden)
+        target = logits.argmax(-1)
+        random = plan.random
+        if random is None:
+            return target, None
+        p = torch.zeros(
+            (len(random.requests), random.width, self.model.config.vocab_size),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        p[plan.v_ranks, plan.v_offsets] = self._probabilities(
+            plan, logits[plan.v_rows], plan.v_temperature, plan.v_top_k, plan.v_top_p
+        )
+        return target, p
 
-    def _accept_and_update_state(self, plan, states, starts, tokens, target, buffer):
+    def _accept_and_update_state(
+        self, plan, states, starts, tokens, target, buffer, *, u=None, q=None, p=None
+    ):
+        """Commit the round on the device and fill ``buffer.result``.
+
+        Layout: ``[rows (count) | accepted (n) | next positions (n)]`` plus ``n`` error flags
+        when ``plan.random`` is set. Greedy requests keep the target-argmax rows; random
+        requests write their committed sequence (accepted drafts, then correction or bonus).
+        """
         from vllm_rlt.kernels.routing import scatter_kernel
 
         count = len(target)
-        buffer.result[:count].copy_(target)
         targets = torch.zeros((plan.n, plan.width), dtype=torch.long, device=self.device)
         targets[plan.request_rows, plan.row_offsets] = target
         # Candidate j (token column j+1) is checked against target row j; only
@@ -429,8 +713,44 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         # All target IDs through the first rejection equal the accepted
         # candidates followed by the correction (or final bonus).
         next_tokens = targets.gather(1, accepted[:, None]).squeeze(1)
-        next_positions = starts + accepted + 1
-        next_values = torch.stack((next_tokens, next_positions), 1)
+        rows = target
+        random = plan.random
+        if random is None:
+            next_positions = starts + accepted + 1
+            next_values = torch.stack((next_tokens, next_positions), 1)
+        else:
+            width = random.width
+            requests = plan.r_requests
+            if q is None:
+                q = p.new_empty((len(random.requests), 0, p.shape[-1]))
+            k = self.config.num_speculative_tokens
+            outcome = speculative_accept(
+                tokens[requests, 1:width],
+                plan.drafts[requests],
+                q,
+                p,
+                u[:, k : k + width - 1],
+                u[:, 2 * k],
+            )
+            merged = merge_random_round(
+                target,
+                accepted,
+                next_tokens,
+                starts,
+                tokens[:, 0],
+                outcome,
+                requests,
+                plan.v_rows,
+                plan.v_ranks,
+                plan.v_offsets,
+            )
+            rows, accepted, next_positions, next_values = (
+                merged.rows,
+                merged.accepted,
+                merged.next_positions,
+                merged.next_values,
+            )
+        buffer.result[:count].copy_(rows)
         scatter_kernel[(plan.n, 1)](
             next_values,
             plan.slots,
@@ -442,6 +762,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         )
         buffer.result[count : count + plan.n].copy_(accepted)
         buffer.result[count + plan.n : count + 2 * plan.n].copy_(next_positions)
+        if random is not None:
+            # Written every random round: a reused buffer never exposes older flags.
+            buffer.result[count + 2 * plan.n : count + 3 * plan.n].copy_(merged.error)
         for state in states:
             state.submitted += 1
         return count
@@ -463,13 +786,18 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             if any(s.submitted > s.delivered for s in states):
                 self.submitted_before_collect += 1
             tables.copy_(host_tables, non_blocking=True)
+            error_flags = False
             if self.config.mode == "pipeline":
                 count = self._pipeline_step(scheduled_requests, states, tables, allocations, buffer)
             else:
                 plan = self._round_plan(scheduled_requests, states, buffer)
-                starts, tokens, hidden_blocks = self._draft(plan, tables, allocations)
-                target = self._verify(plan, starts, hidden_blocks, tables, allocations)
-                count = self._accept_and_update_state(plan, states, starts, tokens, target, buffer)
+                u = None if plan.random is None else self._uniforms(scheduled_requests, plan.random)
+                starts, tokens, hidden_blocks, q = self._draft(plan, tables, allocations, u)
+                target, p = self._verify(plan, starts, hidden_blocks, tables, allocations)
+                count = self._accept_and_update_state(
+                    plan, states, starts, tokens, target, buffer, u=u, q=q, p=p
+                )
+                error_flags = plan.random is not None
             buffer.compute_done = torch.cuda.Event()
             buffer.compute_done.record(self.compute_stream)
             for state in states:
@@ -480,7 +808,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             n = (
                 6 * len(scheduled_requests)
                 if self.config.mode == "pipeline"
-                else count + 2 * len(scheduled_requests)
+                else count + (3 if error_flags else 2) * len(scheduled_requests)
             )
             buffer.host_result[:n].copy_(buffer.result[:n], non_blocking=True)
             buffer.copy_done = torch.cuda.Event()
@@ -497,6 +825,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             count,
             mode=self.config.mode,
             stats=self.stats,
+            error_flags=error_flags,
         )
 
     def _pipeline_step(self, spans, states, tables, allocations, buffer):
