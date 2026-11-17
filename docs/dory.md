@@ -102,9 +102,10 @@ single-stage execution. Speculation, preemption, CUDA graphs and asynchronous
 scheduling are outside its scope.
 
 On NVIDIA CUDA, the packed path uses a 32 × 32 tile. At startup, Triton compiles
-the full and sliding-window kernels and checks their shared-memory requirements
-against the device limit. The engine uses per-query attention if the check
-fails. The result is cached by device and attention geometry within the process.
+the full-attention kernel and, if the model uses a sliding window, the
+sliding-window kernel. It checks their shared-memory requirements against the
+device limit. The engine uses per-query attention if the check fails.
+The result is cached by device and attention geometry within the process.
 The check runs before KV memory planning and uses tensor metadata only.
 The full BF16 checkpoint and long-context service validation require enough
 device memory for the model weights, runtime buffers and KV pool.

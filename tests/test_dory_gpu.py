@@ -290,7 +290,7 @@ def test_dory_failed_submission_releases_kv_in_every_execution_mode(mode, monkey
     assert engine.cache_manager.num_used_blocks == 0
 
 
-def _packed_tile(query_heads, kv_heads, kv_layers=1):
+def _packed_tile(query_heads, kv_heads, kv_layers=1, *, window):
     from vllm_rlt.kernels.paged_attention import PackedWindowShape
     from vllm_rlt.kernels.triton_attention import select_packed_window_tile
 
@@ -299,7 +299,7 @@ def _packed_tile(query_heads, kv_heads, kv_layers=1):
         torch.bfloat16,
         256,
         16,
-        PackedWindowShape(query_heads, kv_heads, kv_layers, 32),
+        PackedWindowShape(query_heads, kv_heads, kv_layers, window),
     )
     if tile is None:
         pytest.skip("No supported packed prefill tile for this device")
@@ -310,7 +310,7 @@ def _packed_tile(query_heads, kv_heads, kv_layers=1):
 def test_dory_packed_attention_matches_per_row_reference(window):
     from vllm_rlt.kernels.triton_attention import paged_attention, paged_prefill_attention
 
-    tile = _packed_tile(16, 4)
+    _packed_tile(16, 4, window=window or None)
     # The first chunk is far enough into its history to skip a full SWA tile.
     # The two sequences have distinct pages and different causal offsets.
     torch.manual_seed(123)
@@ -328,25 +328,28 @@ def test_dory_packed_attention_matches_per_row_reference(window):
     row_lengths = torch.tensor([*range(98, 133), *range(9, 16)], device=DEVICE, dtype=torch.int32)
     expected = paged_attention(q, k, v, row_tables, row_lengths, window=window)
     actual = paged_prefill_attention(
-        q, k, v, tables, lengths, offsets, 35, window=window, compensate=True, tile=tile
+        q, k, v, tables, lengths, offsets, 35, window=window, compensate=True
     )
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-2)
 
 
 @pytest.mark.parametrize("multi_stream", [True, False])
 @pytest.mark.parametrize(("long_tokens", "max_num_seqs"), [(65, 1), (129, 2)])
+@pytest.mark.parametrize("sliding_window", [None, 32], ids=["full", "mixed"])
 def test_dory_packed_prefill_preserves_short_prompt_logits(
-    monkeypatch, multi_stream, long_tokens, max_num_seqs
+    monkeypatch, multi_stream, long_tokens, max_num_seqs, sliding_window
 ):
     from vllm_rlt.kernels import triton_attention
 
-    model = make_gpu_model(head_dim=256, max_position_embeddings=256, sliding_window=32).to(
-        dtype=torch.bfloat16
-    )
+    layout = {"layer_types": ("full_attention", "mlp") * 4} if sliding_window is None else {}
+    model = make_gpu_model(
+        head_dim=256, max_position_embeddings=256, sliding_window=sliding_window, **layout
+    ).to(dtype=torch.bfloat16)
     tile = _packed_tile(
         model.config.num_attention_heads,
         model.config.num_key_value_heads,
         model.config.num_kv_layers,
+        window=sliding_window,
     )
     prompt = [4, 7, 9, 3, 12, 5, 23]
     scheduler = SchedulerConfig(
@@ -415,7 +418,9 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(
     assert torch.equal(baseline, fallback)
     assert not baseline_packed
     assert {layer for layer, _ in packed} == set(range(model.config.num_kv_layers))
-    assert {window for _, window in packed} == {False, True}
+    assert {window for _, window in packed} == (
+        {False} if sliding_window is None else {False, True}
+    )
     assert torch.equal(baseline, actual)
 
 
@@ -439,7 +444,10 @@ def test_prefill_tile_probe_rejects_oversized_window(monkeypatch):
     assert probe(index, 256, 16, PackedWindowShape(16, 4, 36, 1024)) is None
 
 
-def test_prefill_tile_probe_compiles_only_the_default_and_caches_result(monkeypatch):
+@pytest.mark.parametrize(("window", "expected_windows"), [(None, [0]), (128, [0, 128])])
+def test_prefill_tile_probe_compiles_only_the_default_and_caches_result(
+    monkeypatch, window, expected_windows
+):
     from types import SimpleNamespace
 
     from vllm_rlt.kernels import triton_attention as attention
@@ -454,22 +462,22 @@ def test_prefill_tile_probe_compiles_only_the_default_and_caches_result(monkeypa
     windows = []
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "Unlisted GPU")
 
-    def compile_tile(*args, window, compile_only, tile, **kwargs):
-        assert compile_only
-        assert tile == (32, 32)
+    def compile_tile(*args, **kwargs):
+        assert (kwargs["BLOCK_M"], kwargs["BLOCK_N"]) == (32, 32)
+        assert kwargs["COMPENSATE"]
         assert all(arg.device.type == "meta" for arg in args if isinstance(arg, torch.Tensor))
-        windows.append(window)
+        windows.append(kwargs["WINDOW"])
         return SimpleNamespace(metadata=SimpleNamespace(shared=limit))
 
-    monkeypatch.setattr(attention, "_launch_paged_prefill", compile_tile)
-    args = (device, torch.bfloat16, 64, 16, PackedWindowShape(4, 2, 2, 128))
+    monkeypatch.setattr(attention._paged_prefill_kernel, "warmup", compile_tile)
+    args = (device, torch.bfloat16, 64, 16, PackedWindowShape(4, 2, 2, window))
 
     attention._select_packed_window_tile.cache_clear()
     try:
         assert attention.select_packed_window_tile(*args) == (32, 32)
-        assert windows == [0, 128]
+        assert windows == expected_windows
         assert attention.select_packed_window_tile(*args) == (32, 32)
-        assert windows == [0, 128]
+        assert windows == expected_windows
     finally:
         attention._select_packed_window_tile.cache_clear()
 
@@ -477,7 +485,7 @@ def test_prefill_tile_probe_compiles_only_the_default_and_caches_result(monkeypa
 def test_dory_packed_prefill_keeps_small_value_residual():
     from vllm_rlt.kernels.triton_attention import paged_attention, paged_prefill_attention
 
-    tile = _packed_tile(1, 1)
+    _packed_tile(1, 1, window=None)
     q = torch.zeros((1, 1, 256), device=DEVICE, dtype=torch.bfloat16)
     kv = torch.zeros((1, 16, 1, 256), device=DEVICE, dtype=torch.bfloat16)
     k, v = kv.clone(), kv.clone()
@@ -488,6 +496,6 @@ def test_dory_packed_prefill_keeps_small_value_residual():
     length = torch.tensor([2], device=DEVICE, dtype=torch.int32)
     offset = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
     expected = paged_attention(q, k, v, table, length)
-    actual = paged_prefill_attention(q, k, v, table, length, offset, 1, compensate=True, tile=tile)
+    actual = paged_prefill_attention(q, k, v, table, length, offset, 1, compensate=True)
     assert expected[0, 0, 0] > 0.0006
     torch.testing.assert_close(actual, expected, atol=5e-6, rtol=0)

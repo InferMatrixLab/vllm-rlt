@@ -108,7 +108,7 @@ class PackedWindowShape:
     query_heads: int
     kv_heads: int
     kv_layers: int
-    window: int
+    window: int | None
 
 
 def triton_paged_prefill(
@@ -122,7 +122,6 @@ def triton_paged_prefill(
     *,
     window=0,
     compensate=False,
-    tile=None,
 ):
     """Packed causal prefill with one block table per sequence (see triton_attention)."""
     from vllm_rlt.kernels.triton_attention import paged_prefill_attention
@@ -137,15 +136,14 @@ def triton_paged_prefill(
         max_seqlen_q,
         window=window,
         compensate=compensate,
-        tile=tile,
     )
 
 
 class TritonPagedAttention:
     """Triton single-query decode attention plus packed causal prefill."""
 
-    def __init__(self, *, packed_window_tile=None):
-        self.packed_window_tile = packed_window_tile
+    def __init__(self, *, compensate=False):
+        self.compensate = compensate
 
     def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
         return triton_paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
@@ -156,9 +154,4 @@ class TritonPagedAttention:
         )
 
     def prefill(self, *args, **kwargs):
-        return triton_paged_prefill(
-            *args,
-            **kwargs,
-            compensate=self.packed_window_tile is not None,
-            tile=self.packed_window_tile,
-        )
+        return triton_paged_prefill(*args, **kwargs, compensate=self.compensate)

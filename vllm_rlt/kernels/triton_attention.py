@@ -336,7 +336,6 @@ def paged_prefill_attention(
     *,
     window=0,
     compensate=False,
-    tile=None,
 ):
     """Packed causal prefill over paged K/V, bottom-right aligned per sequence.
 
@@ -367,7 +366,6 @@ def paged_prefill_attention(
         max_seqlen_q,
         window=window,
         compensate=compensate,
-        tile=tile,
     )
     return output
 
@@ -384,10 +382,9 @@ def _launch_paged_prefill(
     *,
     window,
     compensate,
-    tile,
     compile_only=False,
 ):
-    block_m, block_n = tile or (_PACKED_WINDOW_TILE if compensate else (64, 64))
+    block_m, block_n = _PACKED_WINDOW_TILE if compensate else (64, 64)
     q_blocks = triton.cdiv(int(max_seqlen_q), block_m)
     grid = (block_tables.shape[0] * q_blocks, q.shape[1])
     launch = (
@@ -450,10 +447,11 @@ def _select_packed_window_tile(index, head_dim, block_size, shape):
     table = q.new_empty((1, 16), dtype=torch.int32)
     lengths = q.new_empty(1, dtype=torch.int32)
     offsets = q.new_empty(2, dtype=torch.int32)
+    windows = (0,) if shape.window is None else (0, shape.window)
     with torch.cuda.device(index):
         limit = driver.active.utils.get_device_properties(index)["max_shared_mem"]
         try:
-            for window in (0, shape.window):
+            for window in windows:
                 compiled = _launch_paged_prefill(
                     q,
                     kv,
@@ -465,7 +463,6 @@ def _select_packed_window_tile(index, head_dim, block_size, shape):
                     len(q),
                     window=window,
                     compensate=True,
-                    tile=_PACKED_WINDOW_TILE,
                     compile_only=True,
                 )
                 if compiled.metadata.shared > limit:

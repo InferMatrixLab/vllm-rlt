@@ -96,7 +96,7 @@ def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, pa
         sm = None if torch.version.hip else torch.cuda.get_device_capability(device)
         if sm is not None and sm[0] < 8:
             raise ValueError("the Triton attention backend requires NVIDIA Compute Capability 8.0+")
-        # Import the implementations before selection and probe opted-in window tiles
+        # Import the implementation before selection and probe the opted-in tile
         # before the engine profiles and allocates its KV pool.
         implementation = importlib.import_module("vllm_rlt.kernels.triton_attention")
         tile = (
@@ -106,12 +106,13 @@ def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, pa
             if packed_window_shape is not None
             else None
         )
+        compensate = tile is not None
         capabilities = replace(
             _TRITON_CAPABILITIES,
-            packed_prefill=packed or tile is not None,
-            packed_sliding_window=tile is not None,
+            packed_prefill=packed or compensate,
+            packed_sliding_window=compensate,
         )
-        kernel = TritonPagedAttention(packed_window_tile=tile)
+        kernel = TritonPagedAttention(compensate=compensate)
         return AttentionBackend(
             kernel, capabilities, {"backend": backend, "packed_prefill_tile": tile}
         )
@@ -198,7 +199,7 @@ def create_backend(
         ):
             implementation.info.update(
                 packed_prefill_tile=None,
-                packed_prefill_fallback="no supported packed sliding-window tile",
+                packed_prefill_fallback="no supported packed prefill tile",
             )
         logging.getLogger(__name__).info("Attention selection: %s", implementation.info)
         return implementation

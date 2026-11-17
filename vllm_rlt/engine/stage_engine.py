@@ -193,7 +193,7 @@ class StageEngine:
             PackedWindowShape(
                 config.num_attention_heads, config.num_key_value_heads, kv_layers, window
             )
-            if require_packed and sliding_window and window
+            if require_packed and sliding_window
             else None
         )
         attention = create_backend(
