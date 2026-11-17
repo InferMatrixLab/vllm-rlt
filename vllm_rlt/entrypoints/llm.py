@@ -5,7 +5,7 @@ import torch
 from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.models import (
     load_tokenizer,
-    resolve_model_config,
+    prepare_model,
     resolve_model_source,
 )
 from vllm_rlt.sampling_params import SamplingParams
@@ -29,15 +29,17 @@ class LLM:
         execution_config=None,
         speculative_config=None,
     ):
-        self._tokenizer_source = None
-        if isinstance(model, str):
-            tokenizer_source = resolve_model_source(model)
-            model, revision, _ = resolve_model_config(model, revision=revision)
-            if tokenizer is None:
-                self._tokenizer_source = (tokenizer_source, revision)
+        tokenizer_source = resolve_model_source(model) if isinstance(model, str) else None
+        model, revision, model_config = prepare_model(model, revision=revision)
+        self._tokenizer_source = (
+            (tokenizer_source, revision)
+            if tokenizer is None and tokenizer_source is not None
+            else None
+        )
         self.tokenizer = tokenizer
         self.engine = StageClient(
             model,
+            model_config=model_config,
             device=device,
             dtype=dtype,
             revision=revision,

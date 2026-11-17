@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 
+from .config import ModelConfig, prepare_model
+from .dory import DoryConfig, DoryForCausalLM
 from .huginn import HuginnConfig, HuginnForCausalLM
 from .nanbeige import NanbeigeConfig, NanbeigeForCausalLM
 from .ouro import OuroConfig, OuroForCausalLM
@@ -16,6 +18,7 @@ MODEL_MAPPING = {
     "ouro": OuroForCausalLM,
     "nanbeige": NanbeigeForCausalLM,
     "huginn_raven": HuginnForCausalLM,
+    "dory": DoryForCausalLM,
 }
 
 
@@ -114,20 +117,50 @@ def special_token_ids(tokenizer):
     return ids
 
 
-def load_tokenizer(source, *, revision=None):
-    """Load cached tokenizer assets, asking before any missing Hub download."""
+def _rejected_config_errors():
+    """Errors transformers raises when it refuses a checkpoint configuration."""
+    errors = [ValueError]
+    try:
+        from huggingface_hub.errors import StrictDataclassClassValidationError
+    except ImportError:  # older huggingface_hub has no strict dataclass validation
+        pass
+    else:
+        errors.append(StrictDataclassClassValidationError)
+    return tuple(errors)
+
+
+def _auto_tokenizer(source, revision, *, local_files_only):
+    """Resolve the tokenizer, tolerating a config transformers does not model.
+
+    transformers builds the checkpoint config while choosing the tokenizer
+    class, so a configuration it rejects would fail before any tokenizer file is
+    read. Dory is such a case: its ``layer_types`` list ``mlp`` sublayers, which
+    the generic validator does not allow. Passing an empty config skips that
+    lookup; the tokenizer class still comes from ``tokenizer_config.json``.
+    """
     from transformers import AutoTokenizer
 
+    kwargs = {"revision": revision, "trust_remote_code": False}
+    if local_files_only:
+        kwargs["local_files_only"] = True
+    try:
+        return AutoTokenizer.from_pretrained(source, **kwargs)
+    except _rejected_config_errors():
+        from transformers import PretrainedConfig
+
+        return AutoTokenizer.from_pretrained(source, **kwargs, config=PretrainedConfig())
+
+
+def load_tokenizer(source, *, revision=None):
+    """Load cached tokenizer assets, asking before any missing Hub download."""
     source = resolve_model_source(source)
     try:
-        return AutoTokenizer.from_pretrained(
-            source, revision=revision, trust_remote_code=False, local_files_only=True
-        )
+        return _auto_tokenizer(source, revision, local_files_only=True)
     except OSError:
         if Path(source).is_dir():
             raise
     _confirm_download(source)
-    return AutoTokenizer.from_pretrained(source, revision=revision, trust_remote_code=False)
+    return _auto_tokenizer(source, revision, local_files_only=False)
 
 
 class AutoModelForCausalLM:
@@ -136,14 +169,19 @@ class AutoModelForCausalLM:
     @classmethod
     def _dispatch_from_config(
         cls,
-        config_data: dict[str, Any],
+        config_data: dict[str, Any] | ModelConfig,
         path_or_repo: str | Path,
         *,
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
     ):
-        model_type = config_data.get("model_type", "").lower()
+        config = (
+            config_data
+            if isinstance(config_data, ModelConfig)
+            else ModelConfig.from_dict(config_data)
+        )
+        model_type = config.model_type
         model_cls = MODEL_MAPPING.get(model_type)
         if model_cls is None:
             supported = sorted(MODEL_MAPPING.keys())
@@ -152,7 +190,11 @@ class AutoModelForCausalLM:
                 f"Supported types: {supported}"
             )
         return model_cls.from_pretrained(
-            path_or_repo, revision=revision, device=device, dtype=dtype
+            path_or_repo,
+            revision=revision,
+            device=device,
+            dtype=dtype,
+            config=config.model_specific_config,
         )
 
     @classmethod
@@ -160,23 +202,30 @@ class AutoModelForCausalLM:
         cls,
         path_or_repo: str | Path,
         *,
+        model_config: ModelConfig | None = None,
         revision: str | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
     ):
-        source, resolved_revision, config = resolve_model_config(path_or_repo, revision=revision)
+        source, resolved_revision, config = prepare_model(
+            path_or_repo, revision=revision, model_config=model_config
+        )
         return cls._dispatch_from_config(
             config, source, revision=resolved_revision, device=device, dtype=dtype
         )
 
 
 __all__ = [
+    "ModelConfig",
+    "prepare_model",
     "OuroConfig",
     "OuroForCausalLM",
     "NanbeigeConfig",
     "NanbeigeForCausalLM",
     "HuginnConfig",
     "HuginnForCausalLM",
+    "DoryConfig",
+    "DoryForCausalLM",
     "AutoModelForCausalLM",
     "resolve_local_model_path",
     "resolve_model_source",

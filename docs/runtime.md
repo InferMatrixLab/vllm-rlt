@@ -76,6 +76,27 @@ OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli --toy --dtype float32 \
 
 For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --attention-backend triton`. Use `--single-stream` for the single-stream pipeline. `--num-blocks` overrides automatic sizing, or specify `--kv-cache-memory-bytes`; these two overrides are mutually exclusive. CPU auto mode keeps a 256-block default. `StageEngine.memory_plan` records the worker-local sizing decision; it is not an attribute of the public `LLM.engine` client.
 
+## Packed prefill
+
+`ExecutionConfig.packed_prefill` controls packed prefill attention and metadata
+staging. Its default, `None`, selects packed prefill when the selected backend
+supports it on CUDA with `last_exited` KV and ordinary, non-staged prefill.
+Mixed scheduling and wavefront chunked prefill keep their existing paths.
+Sliding-window packing additionally requires backend support for both packed
+prefill and packed sliding-window attention, with ordinary synchronous eager
+single-stage execution, without speculation or preemption. These selection rules
+apply to all models. Incompatible automatic configurations keep per-query attention.
+
+Set `packed_prefill=True` / `--packed-prefill` to require packed prefill, or
+`packed_prefill=False` / `--no-packed-prefill` to disable its staging path.
+Explicit enable requests fail if execution constraints or required backend
+capabilities are unsupported; they do not silently fall back. Explicit disable
+does not probe a packed sliding-window tile.
+
+`ExecutionConfig.use_uva` independently controls how input buffers are read.
+`use_uva=False` / `--no-uva` copies them to the GPU and can be combined with
+packed prefill.
+
 ## Execution batches and mixed scheduling
 
 Stage composition, component ownership and Request handoff are described in the
@@ -138,7 +159,9 @@ for the selection order, shared budget and per-request progress.
 `SchedulerConfig(wavefront_chunked_prefill=True)` opts into WCPB and requires
 LAST_EXITED KV. It can run with
 refill or mixed scheduling. When combined with speculation, use refill mode;
-speculation cannot use preemption.
+asynchronous block speculation rejects preemption. Synchronous block and
+pipeline modes have different support constraints; do not infer that every
+combination is validated.
 
 The scheduler stages up to `total_ut_steps` chunks per request, then batches one
 ready chunk for each prompt depth. For four depths and chunk size two, recurrent

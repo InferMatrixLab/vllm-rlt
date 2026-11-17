@@ -4,8 +4,8 @@ One native Ouro backend serves both checkpoint sizes. This recipe targets BF16,
 fixed four-loop, synchronous eager inference with LAST_EXITED KV. It adds no chat
 endpoint, structured reasoning parser, alternate precision profile or PD path.
 See [RFC #69](https://github.com/InferMatrixLab/vllm-rlt/issues/69) for model scope
-and [RFC #32](https://github.com/InferMatrixLab/vllm-rlt/issues/32) for ownership:
-message preparation belongs to M1; model, sampling and attention remain unchanged.
+and the [unified architecture guide](../unified_execution.md) for ownership:
+message preparation belongs to the frontend; model, sampling and attention remain unchanged.
 
 ## 1. Prepare an environment and checkpoint
 

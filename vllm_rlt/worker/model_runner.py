@@ -16,7 +16,7 @@ from vllm_rlt.worker.buffers import (
     prefill_stage_rows,
     stage_metadata,
 )
-from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
+from vllm_rlt.worker.cuda_graph import CodaGraphs, PreludeGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
 from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
@@ -173,6 +173,7 @@ class ModelRunner:
         self.rng = rng if rng is not None else RngRegistry()
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
+        use_async_state = self.execution_config.async_scheduling and self.device.type == "cuda"
         scheduler = scheduler_config or SchedulerConfig()
         self.graphs = (
             RecurrentGraphs(
@@ -187,6 +188,11 @@ class ModelRunner:
         self.coda_graphs = (
             CodaGraphs(model, self.execution_config, cache_manager)
             if self.graphs is not None and getattr(model, "requires_boundary_kv", False)
+            else None
+        )
+        self.prelude_graphs = (
+            PreludeGraphs(model, self.execution_config, cache_manager)
+            if self.coda_graphs is not None and hasattr(model, "prelude_kv_layers")
             else None
         )
         self.input_buffers: dict[torch.dtype, StagedInputTensor] = {
@@ -329,18 +335,19 @@ class ModelRunner:
                     )
                     for _ in range(2)
                 ]
-            self.states = torch.empty(
-                (scheduler.max_num_seqs, model.config.hidden_size),
-                device=self.device,
-                dtype=parameter.dtype,
-            )
+            if not use_async_state:
+                self.states = torch.empty(
+                    (scheduler.max_num_seqs, model.config.hidden_size),
+                    device=self.device,
+                    dtype=parameter.dtype,
+                )
             # Buffers allocated after stream creation must be visible there too.
             for stream in (self.core_stream, self.boundary_stream):
                 if stream is not None:
                     stream.wait_stream(torch.cuda.current_stream(self.device))
 
         self.async_state = None
-        if self.execution_config.async_scheduling and self.device.type == "cuda":
+        if use_async_state:
             from vllm_rlt.worker.async_state import AsyncState
 
             rows = scheduler.max_num_batched_tokens
@@ -634,7 +641,7 @@ class ModelRunner:
             hidden[row].copy_(request.hidden_state)
         return hidden
 
-    def _prepare_prefill_coda(self, ids, positions, requests, kv=None):
+    def _prepare_prefill_coda(self, ids, positions, requests, kv=None, *, packed=None):
         if not getattr(self.model, "requires_boundary_kv", False):
             return None, None
         rows = [
@@ -652,7 +659,9 @@ class ModelRunner:
                 [ids[row] for row in rows],
                 [[0] * len(rows)],
                 [positions[row] for row in rows],
-                packed=self.cache_manager.attention_capabilities.packed_prefill,
+                packed=self.cache_manager.attention_capabilities.packed_prefill
+                if packed is None
+                else packed,
             )[0]
         return ForwardBatch(
             Operation.CODA, prelude_coda_kv_metadata=kv_metadata, compute_logits=False
@@ -729,12 +738,15 @@ class ModelRunner:
         return tuple(inputs)
 
     def _uses_packed_loop_inputs(self, batch):
+        capabilities = self.cache_manager.attention_capabilities
         return (
             batch.operation == Operation.PRELUDE
             and batch.loop_count
             and self.cache_manager.layout != "shared"
-            and self.cache_manager.attention_capabilities.packed_prefill
-            and self.execution_config.prefill_uva
+            and capabilities.packed_prefill
+            # Sliding-window batches share staging for packed and per-row metadata.
+            and not capabilities.packed_sliding_window
+            and self.execution_config.packed_prefill
         )
 
     def _prepare_loop_inputs(self, batch, packed_metadata=None):
@@ -750,7 +762,10 @@ class ModelRunner:
             tokens.extend(span.input_tokens)
             requests.extend([request] * count)
             outputs.append((len(tokens) - 1, request))
-        packed = cache.attention_capabilities.packed_prefill
+        packed = cache.attention_capabilities.packed_prefill and (
+            not cache.attention_capabilities.packed_sliding_window
+            or all(len(span.request.prompt_token_ids) > 64 for span in batch.spans)
+        )
         size = len(tokens) if packed else self._size(len(tokens))
         depth_sets = [[depth + offset for depth in depths] for offset in range(batch.loop_count)]
         if packed_metadata is not None:
@@ -766,7 +781,7 @@ class ModelRunner:
                 packed=packed,
                 padded_rows=size,
             )
-        coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests)
+        coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests, packed=packed)
         forwards = [
             PreparedForward(
                 ForwardBatch(Operation.PRELUDE, tokens=tensor, metadata=metadata),
@@ -1032,6 +1047,7 @@ class ModelRunner:
                 tokens=prepared.token_ids,
                 prelude_coda_kv_metadata=kv_metadata,
                 generators=self._prepare_generators(requests) if kv_metadata else None,
+                graphs=self.prelude_graphs if kv_metadata else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
         hidden = self._load_hidden(batch, prepared, workspace, size)
@@ -1322,7 +1338,7 @@ class ModelRunner:
         copies = []
         for request in requests:
             depth = request.loops_done - 1
-            if not cache.token_written(request.request_id, request.position, depth):
+            if not cache.exit_written(request.request_id, request.position, depth):
                 raise RuntimeError("cannot finalize before every layer has written KV")
             if depth + 1 < cache.max_loops:
                 copies.append(request)

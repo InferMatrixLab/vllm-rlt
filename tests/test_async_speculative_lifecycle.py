@@ -8,9 +8,7 @@ import torch
 
 from tests.helpers import (
     bootstrap_speculation,
-    make_speculative_engine,
     tiny_ouro_config,
-    tiny_ouro_model,
 )
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig, SpeculativeConfig
 from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
@@ -152,15 +150,20 @@ def test_discard_waits_for_copy_without_interpreting_payload():
 @pytest.mark.gpu
 @pytest.mark.parametrize("decode_failure", [False, True])
 @torch.inference_mode()
-def test_cuda_serving_two_completed_rounds_isolate_decode_failure(monkeypatch, decode_failure):
-    engine = make_speculative_engine(tiny_ouro_model("cuda"), k=2)
+@pytest.mark.parametrize("graphs", [False, True])
+def test_cuda_serving_two_completed_rounds_isolate_decode_failure(
+    monkeypatch, decode_failure, graphs
+):
+    from tests.test_async_speculative import make_engine, tiny
+
+    engine = make_engine(tiny("cuda"), k=2, graphs=graphs)
     try:
         bootstrap_speculation(engine, max_tokens=6)
         # Force full acceptance, so the two real queued rounds produce both
         # an intermediate snapshot and the terminal snapshot in the same tick.
         monkeypatch.setattr(
-            engine.model,
-            "coda",
+            engine.speculative_runner,
+            "_coda",
             lambda h: torch.zeros(len(h), engine.model.config.vocab_size, device=h.device),
         )
         engine.step()
@@ -212,8 +215,11 @@ def test_cuda_serving_two_completed_rounds_isolate_decode_failure(monkeypatch, d
 @pytest.mark.gpu
 @pytest.mark.parametrize("bad_second", [False, True])
 @torch.inference_mode()
-def test_cuda_failure_cleanup_preserves_error_and_releases_real_buffers(bad_second):
-    engine = make_speculative_engine(tiny_ouro_model("cuda"), k=2)
+@pytest.mark.parametrize("graphs", [False, True])
+def test_cuda_failure_cleanup_preserves_error_and_releases_real_buffers(bad_second, graphs):
+    from tests.test_async_speculative import make_engine, tiny
+
+    engine = make_engine(tiny("cuda"), k=2, graphs=graphs)
     try:
         bootstrap_speculation(engine)
         engine.step()
@@ -358,4 +364,138 @@ def test_serving_delivers_two_snapshots_or_isolates_failure(
     assert all(rid == "healthy" for rid, _ in healthy_events)
     assert healthy_events[-1][1].finish_reason == "length"
     assert not worker.decoders and engine.cache_manager.num_used_blocks == 0
+    engine.close()
+
+
+@pytest.mark.parametrize("mode", ["block", "pipeline"])
+@pytest.mark.parametrize("with_stats", [False, True])
+def test_ticket_result_format_does_not_depend_on_statistics(mode, with_stats):
+    from vllm_rlt.request import Request
+    from vllm_rlt.worker.speculative import SpeculativeStats
+
+    request = Request("r", [1], SamplingParams(max_tokens=8))
+    batch = SchedulerOutput(
+        RequestPhase.SPECULATIVE, [ScheduledRequest(request, token_start=1, token_count=2)]
+    )
+    values = [11, 0, 1, 2, 1, 1] if mode == "pipeline" else [11, 12, 0, 2]
+    buffer = SimpleNamespace(
+        host_result=torch.tensor(values), copy_done=Completion(), leased=True, keepalive=[]
+    )
+    stats = SpeculativeStats() if with_stats else None
+    ticket = SpeculativeRoundTicket(batch, buffer, (), (), 2, mode=mode, stats=stats)
+    result = ticket.collect()
+    assert result.speculative[0].token_ids == [11]
+    assert result.speculative[0].accepted_count == 0
+    assert result.frontiers == [2]
+    assert ticket.collect() is result
+    assert buffer.copy_done.waits == 1
+    if stats is not None:
+        assert stats.drafted_tokens == stats.verified_rows == int(mode == "pipeline")
+    ticket.retire()
+    assert not buffer.leased
+
+
+def host_ticket(request, counts, host, *, error_flags):
+    batch = SchedulerOutput(
+        RequestPhase.SPECULATIVE,
+        [ScheduledRequest(request, token_start=1, token_count=c) for c in counts],
+    )
+    buffer = SimpleNamespace(
+        host_result=torch.tensor(host), copy_done=Completion(), leased=True, keepalive=[]
+    )
+    ticket = SpeculativeRoundTicket(batch, buffer, (), (), sum(counts), error_flags=error_flags)
+    return ticket, buffer
+
+
+def test_random_ticket_decodes_explicit_ranges_and_flags():
+    from vllm_rlt.request import Request
+
+    request = Request("r", [1], SamplingParams(max_tokens=8))
+    # rows (3 + 2) | accepted | next positions | error flags | stale tail of an older round
+    host = [7, 8, 9, 5, 6, 1, 0, 11, 22, 0, 1, 999, 999]
+    ticket, buffer = host_ticket(request, [3, 2], host, error_flags=True)
+    result = ticket.collect()
+    assert [r.token_ids for r in result.speculative] == [[7, 8], [5]]
+    assert [r.accepted_count for r in result.speculative] == [1, 0]
+    assert [r.numerical_error for r in result.speculative] == [False, True]
+    # Frontiers are the explicit [rows + b, rows + 2b) range, not the remaining tail.
+    assert result.frontiers == [11, 22]
+    assert buffer.copy_done.waits == 1
+
+
+def test_greedy_ticket_ignores_stale_flag_region_of_a_reused_buffer():
+    from vllm_rlt.request import Request
+
+    request = Request("r", [1], SamplingParams(max_tokens=8))
+    # A previous random round left nonzero flags where a greedy round's tail now lies.
+    host = [7, 8, 9, 5, 6, 1, 0, 11, 22, 1, 1, 1]
+    ticket, _ = host_ticket(request, [3, 2], host, error_flags=False)
+    result = ticket.collect()
+    assert [r.numerical_error for r in result.speculative] == [False, False]
+    assert result.frontiers == [11, 22]
+    assert [r.token_ids for r in result.speculative] == [[7, 8], [5]]
+
+
+def test_round_buffer_reserves_room_for_error_flags(monkeypatch):
+    from vllm_rlt.worker.async_speculative import SpeculativeRoundBuffer
+
+    empty = torch.empty
+    monkeypatch.setattr(torch, "empty", lambda *a, pin_memory=False, **k: empty(*a, **k))
+    runner = SimpleNamespace(
+        cache=SimpleNamespace(block_size=4, max_loops=2, device=torch.device("cpu")),
+        model=SimpleNamespace(config=SimpleNamespace(max_position_embeddings=16)),
+    )
+    for tokens, seqs, expected in ((64, 4, 76), (8, 4, 24)):
+        scheduler = SimpleNamespace(max_num_batched_tokens=tokens, max_num_seqs=seqs)
+        buffer = SpeculativeRoundBuffer(runner, scheduler)
+        assert buffer.host_result.numel() == buffer.result.numel() == expected
+
+
+def flag_round(ticket, flag):
+    """Rewrite a prepared one-request ticket into a random round with an error flag."""
+    ticket.error_flags = True
+    ticket.buffer.host_result = torch.cat([ticket.buffer.host_result, torch.tensor([flag])])
+
+
+@torch.inference_mode()
+def test_engine_ignores_flags_of_stale_rows_and_keeps_the_live_request():
+    from vllm_rlt.request import Request
+
+    engine, tickets, _ = prepared_engine()
+    live = engine.scheduler.requests["r"]
+    # Round 0 belongs to an older request that reused the ID "r" (cancelled and replaced).
+    stale = Request("r", [2], live.sampling_params)
+    tickets[0].batch.requests[0] = ScheduledRequest(stale, token_start=1, token_count=3)
+    flag_round(tickets[0], 1)
+    # Round 1 is the live request's first round: one accepted draft, frontier 1 + 2 tokens.
+    tickets[1].rounds = (0,)
+    tickets[1].buffer.host_result = torch.tensor([13, 14, 1, 3])
+    flag_round(tickets[1], 0)
+    generated = len(live.generated_token_ids)
+
+    assert engine._collect_speculative() == []  # stale: ignored without error
+    assert engine.speculative_runner.discarded_rounds == 1
+    assert len(live.generated_token_ids) == generated
+    outputs = engine._collect_speculative()
+    assert [o.request_id for o in outputs] == ["r"]
+    assert live.generated_token_ids[generated:] == [13, 14]
+    assert live.finish_reason is None
+    engine.close()
+
+
+@torch.inference_mode()
+def test_engine_raises_on_a_live_flag_before_committing_and_cleans_up():
+    engine, tickets, _ = prepared_engine()
+    runner = engine.speculative_runner
+    live = engine.scheduler.requests["r"]
+    generated = list(live.generated_token_ids)
+    flag_round(tickets[0], 1)
+    with pytest.raises(RuntimeError, match="invalid speculative sampling distribution"):
+        engine.step()
+    # The numeric check precedes _update, so nothing from the failed round was committed.
+    assert live.generated_token_ids == generated
+    assert runner.synchronizations == 1
+    assert not engine._pending_speculative and not engine._retiring_speculative
+    assert not engine.scheduler.requests and engine.cache_manager.num_used_blocks == 0
+    assert all(not t.buffer.leased and not t.buffer.keepalive for t in tickets)
     engine.close()

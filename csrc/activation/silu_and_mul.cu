@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "../ops.h"
+
+#include <ATen/core/grad_mode.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <type_traits>
+
+namespace vllm_rlt {
+namespace {
+
+__device__ __forceinline__ float silu(float x) {
+  return x / (1.0f + expf(-x));
+}
+
+template <typename T>
+struct Math;
+
+template <>
+struct Math<__half> {
+  using Pair = __half2;
+  __device__ static float to_float(__half x) { return __half2float(x); }
+  __device__ static __half from_float(float x) { return __float2half_rn(x); }
+  __device__ static __half mul(__half a, __half b) { return __hmul(a, b); }
+  __device__ static Pair compute(Pair gate, Pair up) {
+    float2 g = __half22float2(gate);
+    Pair activated = __floats2half2_rn(silu(g.x), silu(g.y));
+    return __hmul2(activated, up);
+  }
+};
+
+template <>
+struct Math<__nv_bfloat16> {
+  using Pair = __nv_bfloat162;
+  __device__ static float to_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+  __device__ static __nv_bfloat16 from_float(float x) { return __float2bfloat16_rn(x); }
+  __device__ static __nv_bfloat16 mul(__nv_bfloat16 a, __nv_bfloat16 b) {
+    return __hmul(a, b);
+  }
+  __device__ static Pair compute(Pair gate, Pair up) {
+    float2 g = __bfloat1622float2(gate);
+    Pair activated = __floats2bfloat162_rn(silu(g.x), silu(g.y));
+    return __hmul2(activated, up);
+  }
+};
+
+template <>
+struct Math<float> {
+  using Pair = float2;
+  __device__ static float to_float(float x) { return x; }
+  __device__ static float from_float(float x) { return x; }
+  __device__ static float mul(float a, float b) { return __fmul_rn(a, b); }
+  __device__ static Pair compute(Pair gate, Pair up) {
+    Pair activated = make_float2(silu(gate.x), silu(gate.y));
+    // Packed FP32 products increased register allocation and reduced occupancy
+    // in the SM103 benchmarks, unlike the FP16/BF16 packed products above.
+    return make_float2(mul(activated.x, up.x), mul(activated.y, up.y));
+  }
+};
+
+template <typename T>
+struct alignas(16) Vector {
+  typename Math<T>::Pair pairs[16 / sizeof(typename Math<T>::Pair)];
+};
+
+template <typename T>
+__device__ __forceinline__ T compute_scalar(T gate, T up) {
+  // Match F.silu(gate) * up: round the activation before multiplying.
+  T activated = Math<T>::from_float(silu(Math<T>::to_float(gate)));
+  return Math<T>::mul(activated, up);
+}
+
+template <typename T, bool aligned>
+__device__ __forceinline__ Vector<T> load_vector(const T* input, int64_t index,
+                                                int64_t count) {
+  constexpr int elements = 16 / sizeof(T);
+  const int offset_bytes = aligned ? 0 : reinterpret_cast<uintptr_t>(input + index) & 15;
+  Vector<T> result;
+  if (offset_bytes == 0) {
+    *reinterpret_cast<uint4*>(&result) =
+        *reinterpret_cast<const uint4*>(input + index);
+    return result;
+  }
+
+  const int offset = offset_bytes / sizeof(T);
+  const int64_t lower = index - offset;
+  Vector<T> head{}, tail{};
+  // Never read before or after the input view, even if its storage is larger.
+  if (lower >= 0) {
+    *reinterpret_cast<uint4*>(&head) = *reinterpret_cast<const uint4*>(input + lower);
+  } else {
+#pragma unroll
+    for (int j = 0; j < elements; ++j) {
+      if (j >= offset) reinterpret_cast<T*>(&head)[j] = input[lower + j];
+    }
+  }
+  if (lower + 2 * elements <= count) {
+    *reinterpret_cast<uint4*>(&tail) =
+        *reinterpret_cast<const uint4*>(input + lower + elements);
+  } else {
+#pragma unroll
+    for (int j = 0; j < elements; ++j) {
+      if (j < offset) reinterpret_cast<T*>(&tail)[j] = input[lower + elements + j];
+    }
+  }
+
+  // Reassemble the requested logical vector with register moves and bit shifts.
+  uint4 lo = *reinterpret_cast<const uint4*>(&head);
+  uint4 hi = *reinterpret_cast<const uint4*>(&tail);
+  if (offset_bytes & 8) {
+    lo = make_uint4(lo.z, lo.w, hi.x, hi.y);
+    hi = make_uint4(hi.z, hi.w, 0, 0);
+  }
+  if (offset_bytes & 4) {
+    lo = make_uint4(lo.y, lo.z, lo.w, hi.x);
+    hi.x = hi.y;
+  }
+  if constexpr (sizeof(T) == 2) {
+    if (offset_bytes & 2) {
+      lo = make_uint4(__funnelshift_r(lo.x, lo.y, 16), __funnelshift_r(lo.y, lo.z, 16),
+                      __funnelshift_r(lo.z, lo.w, 16), __funnelshift_r(lo.w, hi.x, 16));
+    }
+  }
+  *reinterpret_cast<uint4*>(&result) = lo;
+  return result;
+}
+
+enum class AccessMode { Aligned, Misaligned, Scalar };
+
+template <typename T, AccessMode mode>
+__global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t count) {
+  const int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  int64_t tail_start = 0;
+  if constexpr (mode != AccessMode::Scalar) {
+    constexpr int elements = 16 / sizeof(T);
+    constexpr int pairs = 16 / sizeof(typename Math<T>::Pair);
+    int64_t prefix = 0;
+    if constexpr (mode == AccessMode::Misaligned) {
+      prefix = min(count, static_cast<int64_t>(
+          ((16 - (reinterpret_cast<uintptr_t>(out) & 15)) & 15) / sizeof(T)));
+    }
+    for (int64_t i = thread; i < prefix; i += stride) {
+      out[i] = compute_scalar(gate[i], up[i]);
+    }
+    const int64_t vectors = (count - prefix) / elements;
+    for (int64_t i = thread; i < vectors; i += stride) {
+      const int64_t index = prefix + i * elements;
+      Vector<T> g = load_vector<T, mode == AccessMode::Aligned>(gate, index, count);
+      Vector<T> u = load_vector<T, mode == AccessMode::Aligned>(up, index, count);
+      Vector<T> result;
+#pragma unroll
+      for (int j = 0; j < pairs; ++j) {
+        result.pairs[j] = Math<T>::compute(g.pairs[j], u.pairs[j]);
+      }
+      *reinterpret_cast<uint4*>(out + index) = *reinterpret_cast<const uint4*>(&result);
+    }
+    tail_start = prefix + vectors * elements;
+  }
+  // Scalar mode starts at zero; vector modes handle only their remaining tail.
+  for (int64_t i = tail_start + thread; i < count; i += stride) {
+    out[i] = compute_scalar(gate[i], up[i]);
+  }
+}
+
+template <typename T>
+void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
+  const T* g = reinterpret_cast<const T*>(gate.const_data_ptr());
+  const T* u = reinterpret_cast<const T*>(up.const_data_ptr());
+  T* result = reinterpret_cast<T*>(out.mutable_data_ptr());
+  // A contiguous storage-offset view is not necessarily 16-byte aligned.
+  const bool vectorized = ((reinterpret_cast<uintptr_t>(g) |
+                            reinterpret_cast<uintptr_t>(u) |
+                            reinterpret_cast<uintptr_t>(result)) & 15) == 0;
+  const int64_t count = gate.numel();
+  constexpr int threads = 256;
+  bool scalar = false;
+  if (!vectorized) {
+    // Use 160 reference vector blocks per SM to determine the element cutoff.
+    // The actual launch grid is calculated separately and may be capped.
+    constexpr int reference_blocks_per_sm = 160;
+    constexpr int elements_per_vector = 16 / sizeof(T);
+    const int sms = at::cuda::getDeviceProperties(gate.get_device())->multiProcessorCount;
+    const int64_t threshold =
+        static_cast<int64_t>(sms) * reference_blocks_per_sm * threads * elements_per_vector;
+    scalar = count < threshold;
+  }
+  const int64_t work = scalar ? count : std::max<int64_t>(count / (16 / sizeof(T)), 1);
+  int max_blocks = 4096;
+  if constexpr (std::is_same_v<T, float>) {
+    // More blocks improve large FP32 streaming workloads. Require enough work
+    // to fill the enlarged grid, preserving smaller shapes' launch geometry.
+    constexpr int streaming_blocks = 16384;
+    if (work >= static_cast<int64_t>(streaming_blocks) * threads) {
+      max_blocks = streaming_blocks;
+    }
+  }
+  const int blocks = static_cast<int>(std::min<int64_t>((work + threads - 1) / threads, max_blocks));
+  auto stream = c10::cuda::getCurrentCUDAStream(gate.get_device());
+  if (vectorized) {
+    silu_and_mul_kernel<T, AccessMode::Aligned><<<blocks, threads, 0, stream>>>(g, u, result, count);
+  } else if (scalar) {
+    silu_and_mul_kernel<T, AccessMode::Scalar><<<blocks, threads, 0, stream>>>(g, u, result, count);
+  } else {
+    silu_and_mul_kernel<T, AccessMode::Misaligned><<<blocks, threads, 0, stream>>>(g, u, result, count);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+at::Tensor silu_and_mul_cuda(const at::Tensor& gate, const at::Tensor& up) {
+  TORCH_CHECK(gate.is_cuda() && up.is_cuda(), "silu_and_mul expects CUDA inputs");
+  TORCH_CHECK(gate.device() == up.device(), "silu_and_mul expects inputs on the same device");
+  TORCH_CHECK(gate.sizes() == up.sizes(), "silu_and_mul expects inputs with the same shape");
+  TORCH_CHECK(gate.scalar_type() == up.scalar_type(),
+              "silu_and_mul expects inputs with the same dtype");
+  TORCH_CHECK(gate.scalar_type() == at::kFloat || gate.scalar_type() == at::kHalf ||
+                  gate.scalar_type() == at::kBFloat16,
+              "silu_and_mul supports float32, float16 and bfloat16");
+
+  TORCH_CHECK(gate.is_contiguous() && up.is_contiguous(),
+              "silu_and_mul expects contiguous inputs");
+  TORCH_CHECK(!at::GradMode::is_enabled() || (!gate.requires_grad() && !up.requires_grad()),
+              "silu_and_mul is inference-only; use torch.no_grad() or silu_and_mul_reference");
+
+  const c10::cuda::CUDAGuard guard(gate.device());
+  auto out = at::empty(gate.sizes(), gate.options());
+  if (gate.numel() == 0) {
+    return out;
+  }
+  switch (gate.scalar_type()) {
+    case at::kHalf: launch<__half>(gate, up, out); break;
+    case at::kBFloat16: launch<__nv_bfloat16>(gate, up, out); break;
+    case at::kFloat: launch<float>(gate, up, out); break;
+    default: TORCH_CHECK(false, "unsupported dtype");
+  }
+  return out;
+}
+
+}  // namespace vllm_rlt

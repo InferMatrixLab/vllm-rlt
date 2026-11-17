@@ -559,8 +559,6 @@ def run(args):
     import torch
     from transformers import AutoTokenizer
 
-    from benchmarks.gsm8k_backends import Generator
-
     protocol = json.loads(Path(args.protocol).read_text())
     if (
         "baseline" in protocol
@@ -579,6 +577,8 @@ def run(args):
     prompt_mode, scorer = validate_prompt_recipe(protocol)
     if protocol["source"]["packages"] != source()["packages"]:
         raise ValueError("Evaluation package versions changed after preparation")
+    from benchmarks.gsm8k_backends import Generator
+
     model = Path(protocol["model"])
     for name, expected in protocol["model_files"].items():
         if file_digest(model / name) != expected:

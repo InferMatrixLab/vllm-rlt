@@ -101,9 +101,11 @@ changes need relevant regression checks, not a speedup.
 
 Use targeted CPU tests or a small reproducer to resolve a concrete uncertainty.
 Check test dependencies and skips; a green suite with GPU cases skipped does not
-validate kernels or real serving. GPU validation requires the user's applicable
-experiment scope and verified scheduler reservation; never use an unreserved
-device or silently expand a benchmark's exhausted run budget. If unavailable,
+validate kernels or real serving. Run GPU validation within the user's authorized
+experiment scope and budget. A scheduler reservation is not a prerequisite; an
+explicit GPU testing request authorizes selecting an available device without
+another confirmation solely because a scheduler is unavailable. Do not silently
+expand a benchmark's exhausted run budget. If GPU execution is unavailable,
 finish the code/evidence review and identify the remaining validation precisely.
 
 For each finding, give priority, a short defect title, the smallest relevant

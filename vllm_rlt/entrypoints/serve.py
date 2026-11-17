@@ -15,6 +15,7 @@ from vllm_rlt.entrypoints.runtime_args import (
     runtime_configs,
 )
 from vllm_rlt.models import (
+    ModelConfig,
     load_tokenizer,
     resolve_model_config,
     resolve_model_source,
@@ -42,6 +43,7 @@ def load_engine(args):
             raise ValueError("serving requires the Ouro byte-level tokenizer")
     engine = StageClient(
         source,
+        model_config=ModelConfig.from_dict(config),
         revision=revision,
         device=args.device,
         dtype=args.dtype,
@@ -101,9 +103,11 @@ def main():
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
+    parser.add_argument("--max-output-tokens", type=int)
     defaults = asdict(ServingLimits())
     for name, default in defaults.items():
-        parser.add_argument("--" + name.replace("_", "-"), type=type(default), default=default)
+        if name != "max_output_tokens":
+            parser.add_argument("--" + name.replace("_", "-"), type=type(default), default=default)
     parser.add_argument("--cpu-threads", type=int, default=1)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
