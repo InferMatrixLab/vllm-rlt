@@ -112,46 +112,35 @@ class _DeviceCache:
         ):
             from vllm_rlt.kernels.graph_kv import write_graph_kv
 
-            write_graph_kv(cache.key_cache[:, layer], cache.value_cache[:, layer], batch, k, v)
+            keys, values = cache._layer_cache(layer)
+            write_graph_kv(keys, values, batch, k, v)
         elif batch.write_mask is not None:
             from vllm_rlt.kernels.routing import masked_kv_store
 
-            masked_kv_store(cache.key_cache[:, layer], cache.value_cache[:, layer], k, v, batch)
+            keys, values = cache._layer_cache(layer)
+            masked_kv_store(keys, values, k, v, batch)
         else:
-            cache.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
-            cache.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+            cache._store_layer(layer, batch.write_blocks, batch.write_offsets, k, v)
 
     def _attend_prepared(self, layer, batch, q, *, window=None):
         cache = self.cache
+        keys, values, tables = cache._layer_kv(layer, batch.block_tables)
         if window is not None:
             # The window is a kernel constant; lengths and tables stay graph inputs.
             if batch.cu_seqlens_q is not None:
                 raise NotImplementedError("sliding-window attention needs one query row per token")
-            return cache.attention.windowed(
-                q,
-                cache.key_cache[:, layer],
-                cache.value_cache[:, layer],
-                batch.block_tables,
-                batch.context_lengths,
-                window,
-            )
+            return cache.attention.windowed(q, keys, values, tables, batch.context_lengths, window)
         if batch.cu_seqlens_q is not None:
             return cache.attention.prefill(
                 q,
-                cache.key_cache[:, layer],
-                cache.value_cache[:, layer],
-                batch.block_tables,
+                keys,
+                values,
+                tables,
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
             )
-        return cache.attention(
-            q,
-            cache.key_cache[:, layer],
-            cache.value_cache[:, layer],
-            batch.block_tables,
-            batch.context_lengths,
-        )
+        return cache.attention(q, keys, values, tables, batch.context_lengths)
 
 
 def _graph_entry(

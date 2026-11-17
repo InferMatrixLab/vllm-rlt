@@ -381,3 +381,164 @@ def test_huginn_graph_states_logits_and_kv_match_eager():
     for cache in caches:
         cache.free("request")
         assert cache.num_used_blocks == 0
+
+
+def test_plane_packing_geometry_and_live_transfer_slots():
+    from vllm_rlt.core.kv_cache_manager import physical_planes, plane_packing
+
+    # Huginn-0125: 2 prelude + 4 recurrent + 2 coda layers, 32 recurrences.
+    assert plane_packing(8, range(2, 6), 32) == 2
+    assert physical_planes(8, range(2, 6), 32) == 17
+    assert physical_planes(8, range(2, 6), 32, enabled=False) == 32
+    assert physical_planes(8, range(2, 6), 32, layout="shared") == 1
+    # Fully recurrent models (Ouro, Nanbeige) and non-contiguous cores never pack.
+    assert plane_packing(24, None, 4) == 1
+    assert plane_packing(8, (1, 2, 4, 5), 32) == 1
+    assert plane_packing(8, range(1, 6), 32) == 1  # Five of eight layers recur.
+    assert physical_planes(9, range(3, 6), 8) == 1 + 3  # Three planes per block.
+
+    def cache(pack, loops=5):
+        return KVCacheManager(4, 1, 8, 64, 2, loops, recurrent_layers=(1, 2), **pack)
+
+    packed, unpacked = cache(dict(pack_recurrent_planes=True)), cache({})
+    assert (packed.plane_packing, packed.physical_planes) == (2, 3)
+    assert packed.transfer_slots == ((0, 4), (0, 4), (0, 4))
+    assert unpacked.transfer_slots == ((0, 4),) + ((1, 3),) * 4
+    assert cache(dict(pack_recurrent_planes=True), loops=4).transfer_slots == (
+        (0, 4),
+        (0, 4),
+        (0, 2),  # The last group holds one plane.
+    )
+    assert packed.required_blocks(5) == 3 * 3 and unpacked.required_blocks(5) == 3 * 5
+    # The finalize kernel copies recurrent slots of flattened pages when packed.
+    assert packed.finalize_layers == (1, 2) and unpacked.finalize_layers == (0, 4)
+    assert packed.entry_stride == packed.key_cache.stride(1)
+    assert unpacked.entry_stride == unpacked.key_cache.stride(0)
+
+
+def test_packed_entries_address_disjoint_live_slots():
+    cache = KVCacheManager(4, 1, 8, 64, 2, 5, recurrent_layers=(1, 2), pack_recurrent_planes=True)
+    assert cache.allocate("a", 5) and cache.allocate("b", 3)
+    assert cache.num_used_blocks == 3 * 3 + 2 * 3
+    addresses = {}
+    for rid in ("a", "b"):
+        for depth in range(5):
+            layers = range(4) if depth == 0 else (1, 2)
+            for entry in cache.get_block_table(rid, depth):
+                for layer in layers:
+                    page = entry + layer
+                    assert 0 <= page < cache.num_blocks * cache.num_layers
+                    assert page not in addresses, "two live (depth, layer) slots alias"
+                    addresses[page] = (rid, depth, layer)
+    physical = {b for rid in ("a", "b") for table in cache.plane_block_tables(rid) for b in table}
+    assert {page // cache.num_layers for page in addresses} == physical
+    # Growth keeps entries in step with the physical tables.
+    assert cache.allocate("c", 9, initial_tokens=2) and cache.ensure_capacity("c", 9)
+    grown = cache._get_allocation("c")
+    assert len(grown.block_tables[0]) == 5 and all(len(t) == 5 for t in grown.entry_tables)
+    assert grown.entry_tables[0] == tuple(b * 4 for b in grown.block_tables[0])
+    assert grown.entry_tables[2] == tuple(b * 4 + 2 - 1 for b in grown.block_tables[1])
+    batch = cache._prepare_batch(["a"], [1], [0])
+    with pytest.raises(ValueError, match="depth zero"):
+        cache._write_prepared(0, batch, torch.zeros(1, 1, 8), torch.zeros(1, 1, 8))
+    for rid in ("a", "b", "c"):
+        cache.free(rid)
+    assert cache.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("max_loops", [None, 2])
+@pytest.mark.parametrize("temperature", [0, 0.7])
+def test_packed_planes_match_unpacked_outputs_and_kv_bitwise(model, max_loops, temperature):
+    """Packing changes addresses only: tokens, exit copies and every live KV byte agree."""
+    model = HuginnForCausalLM(tiny_huginn_config(mean_recurrence=5)).eval()
+    prompts = {"first": [4, 7, 3, 9, 2], "second": [9, 2, 5]}
+    runs = []
+    for pack in (False, True):
+        engine = LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=128, block_size=2, pack_recurrent_planes=pack),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2, max_num_batched_tokens=8, prefill_chunk_size=3
+            ),
+        )
+        cache = engine.cache_manager
+        assert cache.plane_packing == (2 if pack else 1)
+        params = SamplingParams(
+            max_tokens=4, max_loops=max_loops, ignore_eos=True, seed=11, temperature=temperature
+        )
+        for name, prompt in prompts.items():
+            engine.add_request(name, prompt, params)
+        outputs, kv, peak = {}, {}, 0
+        while engine.has_unfinished_requests():
+            for output in engine.step():
+                if output.finished:
+                    outputs[output.request_id] = (output.token_ids, output.exit_depths)
+            peak = max(peak, cache.num_used_blocks)
+            for name in prompts:
+                if not cache.has_allocation(name):
+                    continue
+                allocation = cache._get_allocation(name)
+                for depth in range(5):
+                    for layer in range(4) if depth == 0 else model.recurrent_kv_layers:
+                        length = allocation.written[depth][layer].prefix
+                        if length:
+                            kv[name, depth, layer, length] = cache.read(layer, name, depth, length)
+        assert cache.num_used_blocks == 0
+        runs.append((outputs, kv, peak))
+    (unpacked, unpacked_kv, unpacked_peak), (packed, packed_kv, packed_peak) = runs
+    assert packed == unpacked
+    if max_loops is not None:
+        # Decode exits early, so finalization copies depth-2 KV into packed planes.
+        assert all(depths[1:] == [2] * 3 for _, depths in packed.values())
+    assert packed_kv.keys() == unpacked_kv.keys() and packed_kv
+    for key, (k, v) in packed_kv.items():
+        torch.testing.assert_close(k, unpacked_kv[key][0], rtol=0, atol=0)
+        torch.testing.assert_close(v, unpacked_kv[key][1], rtol=0, atol=0)
+    # Five planes need three physical blocks per page instead of five.
+    assert packed_peak * 5 == unpacked_peak * 3
+
+
+@pytest.mark.gpu
+def test_packed_planes_match_unpacked_on_gpu():
+    """CUDA graphs and exit copies address packed planes (Huginn runs synchronously)."""
+    torch.manual_seed(42)
+    model = (
+        HuginnForCausalLM(
+            tiny_huginn_config(n_embd=384, n_heads=4, intermediate_size=768, mean_recurrence=5)
+        )
+        .to(device="cuda", dtype=torch.bfloat16)
+        .eval()
+    )
+    prompts = ([4, 7, 3], [9, 2], [3, 8, 7, 6], [4])
+    runs = []
+    for pack in (False, True):
+        engine = LLMEngine(
+            model,
+            attention_backend="triton",
+            cache_config=CacheConfig(num_blocks=256, block_size=4, pack_recurrent_planes=pack),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4, max_num_batched_tokens=8, prefill_chunk_size=2
+            ),
+            execution_config=ExecutionConfig(cuda_graphs=True, cuda_graph_max_graphs=16),
+        )
+        cache = engine.cache_manager
+        assert cache.plane_packing == (2 if pack else 1)
+        torch.manual_seed(123)
+        for i, prompt in enumerate(prompts):
+            # Exit at depth 2 of 5: finalization copies into three deeper planes.
+            engine.add_request(
+                str(i),
+                prompt,
+                SamplingParams(max_tokens=4 + i, min_loops=2, max_loops=2, ignore_eos=True),
+            )
+        finished, peak = {}, 0
+        while engine.has_unfinished_requests():
+            for output in engine.step():
+                if output.finished:
+                    finished[output.request_id] = (output.token_ids, output.exit_depths)
+            peak = max(peak, cache.num_used_blocks)
+        assert len(finished) == 4 and cache.num_used_blocks == 0
+        runs.append((finished, peak))
+    (unpacked, unpacked_peak), (packed, packed_peak) = runs
+    assert packed == unpacked
+    assert packed_peak * 5 == unpacked_peak * 3

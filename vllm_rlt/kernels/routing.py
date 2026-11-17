@@ -153,13 +153,17 @@ def finalize_kernel(
     WIDTH: tl.constexpr,
     PLANES: tl.constexpr,
     PAGE: tl.constexpr,
+    FIRST_LAYER: tl.constexpr,
     LAYERS: tl.constexpr,
     CHANNELS: tl.constexpr,
-    BLOCK_STRIDE: tl.constexpr,
+    ENTRY_STRIDE: tl.constexpr,
     LAYER_STRIDE: tl.constexpr,
     TOKEN_STRIDE: tl.constexpr,
     TILE: tl.constexpr,
 ):
+    # Tables hold page entries: physical blocks (ENTRY_STRIDE = block stride) or,
+    # for packed planes, layer-flattened pages (ENTRY_STRIDE = layer stride). The
+    # copy covers LAYERS slots starting at FIRST_LAYER relative to the entry.
     row, target = tl.program_id(0), tl.program_id(1)
     slot = tl.load(D + row * 3)
     depth = tl.load(D + row * 3 + 1)
@@ -168,9 +172,13 @@ def finalize_kernel(
         source = tl.load(Tables + (slot * PLANES + depth) * WIDTH + pos // PAGE)
         dest = tl.load(Tables + (slot * PLANES + target) * WIDTH + pos // PAGE)
         x = tl.program_id(2) * TILE + tl.arange(0, TILE)
-        offset = (x // CHANNELS) * LAYER_STRIDE + (pos % PAGE) * TOKEN_STRIDE + x % CHANNELS
-        src = source.to(tl.int64) * BLOCK_STRIDE + offset
-        dst = dest.to(tl.int64) * BLOCK_STRIDE + offset
+        offset = (
+            (FIRST_LAYER + x // CHANNELS) * LAYER_STRIDE
+            + (pos % PAGE) * TOKEN_STRIDE
+            + x % CHANNELS
+        )
+        src = source.to(tl.int64) * ENTRY_STRIDE + offset
+        dst = dest.to(tl.int64) * ENTRY_STRIDE + offset
         k = tl.load(K + src, x < LAYERS * CHANNELS, 0)
         v = tl.load(V + src, x < LAYERS * CHANNELS, 0)
         tl.store(K + dst, k, x < LAYERS * CHANNELS)
