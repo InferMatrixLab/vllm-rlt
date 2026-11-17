@@ -809,6 +809,16 @@ class Scheduler:
             if (
                 phases == {RequestPhase.PRELUDE}
                 and self.coalesce_fixed_prelude
+                # Full-depth PRELUDE skips RECURRENT, where refill gets a turn.
+                # Keep that boundary while other prompt/core work needs a turn.
+                and not (
+                    self.config.mode in ("refill", "mixed")
+                    and (
+                        self.queues[RequestPhase.WAITING]
+                        or self.has_ready(RequestPhase.RECURRENT)
+                        or any(self.has_ready(phase) for phase in self.policy.PREFILL_PHASES)
+                    )
+                )
                 and self.speculative_config is None
                 and self.exit_mode != "trace"
                 and all(

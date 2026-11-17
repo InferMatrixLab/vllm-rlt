@@ -263,6 +263,11 @@ CPU/CUDA/ROCm do not import or build this extension. The FP32 CPU generation of
 RoPE constants is an explicit NPU-only numerical correction to match HF;
 CUDA/ROCm retain their original device arithmetic.
 
+With refill or mixed scheduling, pending prompts or runnable recurrent work
+temporarily disable full-depth decode prelude coalescing. Keeping the ordinary
+PRELUDE-to-RECURRENT boundary lets other requests make progress; stable batches
+without competing work still use the coalesced path.
+
 The November 17 refinement integrates upstream `c338aaa`, preserving its sliding
 windows, automatic `packed_prefill` policy and CUDA state-pool changes. Runtime
 source manifests, frozen inputs, pinned HF source, raw request records and
@@ -270,7 +275,10 @@ reproduction scripts are in `/work/vllm-rlt-engine-20261117` inside `kelei-rlt`
 on `ssh npu`. Fixed and natural-input quality checks are separate from timing;
 they do not establish a task-accuracy score or W1–W7 qualification.
 
-### Refinement validation
+### Prior O32 validation (`028f9c6`)
+
+These measurements predate the refill follow-up below and use different output
+lengths and token budgets from section 7.
 
 One NPU per case, CANN 9.0.0, Torch/Torch-NPU 2.10, Transformers 4.54.1,
 Ouro-1.4B BF16, UT4, greedy output, no graphs, one execution stream. All arms
@@ -298,11 +306,111 @@ at eight clients/four resident requests: 11.68 vs 13.54 s. Raw request records,
 variability, latency percentiles and peak allocations are in `slim-summary.json`
 and `slim-results` in the experiment bundle.
 
-The refinement passes 1,117 CPU regression tests (800 device tests skipped),
+The prior refinement passed 1,117 CPU regression tests (800 device tests skipped),
 81 targeted Ascend tests, three additional real-checkpoint regressions and three
 HTTP/SSE/disconnect regressions (Torch sync, Ascend sync and Ascend async).
 Separate fixed-input quality checks pass 192/192 sequences; 16 untruncated natural
 inputs also match HF under normal EOS with a 32-token cap (all reach the cap).
-Ruff and source/wheel packaging checks pass. CUDA `ict-90` and ROCm `DCU-02`
-were unreachable: unchanged shared implementations and CPU compatibility tests
-are evidence of isolation, not CUDA/ROCm hardware qualification.
+Ruff and source/wheel packaging checks pass. Staged CUDA compatibility runs on
+`ict-90` pass 1,736 unique tests, including 619 GPU cases (181 skipped), and five
+paired real-checkpoint configurations match the baseline. These runs do not
+qualify unsupported SM120 paged FlashAttention or NIXL configurations. ROCm
+hardware validation is deferred.
+
+## 7. Unified workload follow-up
+
+The refill follow-up preserves a RECURRENT scheduling opportunity when full-depth
+PRELUDE would otherwise bypass pending prompt or recurrent work. Bounded CPU
+regressions reproduce both starvation cases before the fix; the final tree passes
+1,121 CPU cases (802 skipped), 51 targeted CPU/NPU cases, and full-tree Ruff checks.
+The NPU-only option defaults off; its disabled CUDA/ROCm path is unchanged.
+
+This compares the whole enabled combination with official HF eager using the seven
+workloads and measurement rules in [unified execution](../unified_execution.md#protocol-and-comparison-rules).
+All 42 selected runs complete: three unprofiled 60-second closed-loop admission
+windows per arm/workload, each followed by full drain. They contain 1,087 successful
+requests and zero runtime failures. Model loading, compilation and full-output
+cohort warmup are excluded. These are in-process actor measurements, without HTTP
+or StageClient IPC.
+
+BF16, fixed UT4, greedy, one execution stream, graphs disabled. The engine uses
+async/refill, budget/chunk 1024, contiguous KV and native host plans with fixed-depth
+decode/prelude coalescing. W1–W5 ignore EOS; W6/W7 replay the frozen seed-0 selection
+of 256 untruncated ShareGPT first-human messages, without a chat template, using
+natural EOS and cap 512. Both arms use TASK_QUEUE_ENABLE=2, one Torch/OMP/MKL thread,
+and one fixed card/CPU affinity per workload; order is native/HF, HF/native,
+native/HF. The guide's CUDA FA4/graphs/PD/speculation modes are outside this NPU run.
+
+The 64 GiB device requires a capacity adjustment: W4 retains 32 clients with four
+resident requests, W6/W7 at most eight residents. Both arms use the same limits.
+Logical KV blocks are `max(256, residents * ceil((input_bound + output_cap)/16) * 4 + 16)`,
+with a 4096-token input bound for natural requests. HF uses ordinary batched eager
+and retains finished rows until its active cohort drains.
+
+Median output tok/s [three-run min–max]; throughput includes drain:
+
+| Workload | Input / output / clients | Residents | HF eager | Engine combination | vs HF |
+| --- | --- | ---: | ---: | ---: | ---: |
+| W1 | 128 / 128 / 1 | 1 | 6.152 [5.998–6.464] | 10.191 [8.951–10.274] | +65.65% |
+| W2 | 128 / 128 / 32 | 32 | 192.660 [184.098–204.178] | 131.489 [113.793–148.783] | -31.75% |
+| W3 | 4096 / 128 / 1 | 1 | 6.198 [6.028–6.318] | 8.379 [5.606–9.152] | +35.20% |
+| W4 | 4096 / 128 / 32 | 4 | 20.449 [20.192–20.910] | 16.045 [15.719–16.325] | -21.54% |
+| W5 | 1024 / 512 / 8 | 8 | 51.508 [50.409–52.387] | 40.692 [39.713–40.696] | -21.00% |
+| W6 | ShareGPT / EOS cap 512 / 8 | 8 | 25.353 [23.451–25.831] | 35.410 [33.534–37.133] | +39.67% |
+| W7 | ShareGPT / EOS cap 512 / 32 | 8 | 35.557 [35.320–35.800] | 35.961 [34.726–36.356] | +1.14% |
+
+W7's 1.14% median difference lies within the observed run ranges. W3 also has
+substantial engine variability; one paired run is slower than HF. This matrix
+supports case-dependent performance, not a universal speedup.
+
+Native layer execution is active throughout W1/W3 with zero fallback. W2/W4/W5/W6/W7
+materialize paged KV during warmup and have zero native-executor layer calls in
+the timed windows; those layers use the Python eager fallback. Enabling the flag
+does not establish native-path coverage for these mixed/chunked geometries.
+
+Complete token sequences and finish reasons match the paired HF requests as follows:
+
+| Workload | Identical / paired requests | Supplemental HF reference coverage |
+| --- | ---: | --- |
+| W1 | 10/10 | All 15 engine requests match HF |
+| W2 | 221/224 | None |
+| W3 | 9/9 | All 13 engine requests match HF |
+| W4 | 93/108 | None |
+| W5 | 18/24 | None |
+| W6 | 15/27 | None |
+| W7 | 45/99 | None |
+
+The supplemental checks cover three additional fixed inputs after all timing ends.
+A bounded natural-input diagnostic also finds different HF outputs at batch 1 and
+batch 8; this does not explain all engine/HF differences. Full greedy equivalence
+and equal-quality performance acceptance have not passed. Natural EOS output
+lengths differ: mean HF/engine output is 458.33/452.44 tokens for W6 and
+457.15/466.58 for W7. Fresh GSM8K-87 task qualification has not been run.
+
+Latency triples are mean / p95 / p99, pooling successful requests across all three
+runs. TTFT and E2E include queuing; TPOT is first-to-last arrival divided by N−1.
+ITL pools adjacent token delivery intervals, with zero intervals within a delivered
+chunk. Small-sample tail percentiles are descriptive.
+
+| Workload / arm | TTFT (ms) | TPOT (ms) | ITL (ms) | E2E (s) |
+| --- | ---: | ---: | ---: | ---: |
+| W1 / HF | 158.26 / 164.42 / 164.72 | 160.67 / 174.41 / 177.74 | 160.67 / 175.26 / 292.54 | 20.56 / 22.31 / 22.73 |
+| W1 / engine | 210.43 / 252.72 / 313.55 | 101.54 / 119.08 / 128.71 | 101.54 / 153.61 / 161.31 | 13.11 / 15.38 / 16.66 |
+| W2 / HF | 315.94 / 316.78 / 316.87 | 164.36 / 174.60 / 174.60 | 164.36 / 174.36 / 241.96 | 21.19 / 22.49 / 22.49 |
+| W2 / engine | 807.75 / 1535.41 / 1569.18 | 237.03 / 330.89 / 334.54 | 237.03 / 365.28 / 448.81 | 30.91 / 42.86 / 43.11 |
+| W3 / HF | 1126.36 / 1127.27 / 1127.31 | 154.25 / 159.01 / 159.36 | 154.25 / 164.21 / 166.66 | 20.72 / 21.32 / 21.37 |
+| W3 / engine | 1038.28 / 1129.21 / 1134.81 | 121.93 / 172.03 / 174.34 | 121.93 / 182.16 / 190.80 | 16.52 / 22.92 / 23.25 |
+| W4 / HF | 108201.82 / 184760.44 / 185035.97 | 162.69 / 185.42 / 199.48 | 162.69 / 197.72 / 215.71 | 128.86 / 204.86 / 205.16 |
+| W4 / engine | 128120.96 / 228911.74 / 232203.32 | 228.93 / 241.58 / 242.65 | 228.93 / 449.12 / 640.13 | 157.19 / 258.43 / 262.65 |
+| W5 / HF | 948.24 / 949.16 / 949.17 | 154.02 / 157.16 / 157.16 | 154.02 / 164.57 / 181.10 | 79.65 / 81.26 / 81.26 |
+| W5 / engine | 1716.00 / 3022.56 / 3034.33 | 194.26 / 198.29 / 198.68 | 194.26 / 205.56 / 256.37 | 100.98 / 103.11 / 103.14 |
+| W6 / HF | 9446.60 / 73948.53 / 74441.99 | 157.54 / 158.20 / 176.94 | 157.82 / 162.33 / 211.88 | 81.62 / 153.98 / 164.74 |
+| W6 / engine | 900.40 / 1247.62 / 1247.82 | 205.59 / 217.85 / 218.08 | 205.19 / 214.00 / 358.37 | 93.53 / 112.26 / 112.26 |
+| W7 / HF | 135933.80 / 259319.34 / 335009.35 | 162.34 / 165.82 / 167.64 | 162.53 / 169.73 / 218.95 | 210.07 / 343.37 / 416.61 |
+| W7 / engine | 151301.80 / 320714.48 / 333012.61 | 207.59 / 222.27 / 222.30 | 207.95 / 413.73 / 441.94 | 248.12 / 425.01 / 438.91 |
+
+Source/protocol manifests, per-request arrivals, memory peaks, fallback counters
+and the full summary are retained in
+`/work/vllm-rlt-engine-20261117/unified-fairness-20261117`. The initial pre-fix
+campaign is retained separately as an aborted defect diagnostic and contributes
+no selected performance runs above.

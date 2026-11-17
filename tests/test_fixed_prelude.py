@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from tests.helpers import make_cpu_cache, tiny_ouro_config
 from tests.test_ascend import make_npu_model
 from tests.test_npu_async import drain
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
@@ -37,13 +38,67 @@ def test_fixed_prelude_planning_and_submission_progress(exit_mode, min_loops, ex
     assert request.phase == RequestPhase.PRELUDE  # Stale submissions cannot advance a reused ID.
 
 
-def engine_for(model, planned, multi_stream=False):
+@pytest.mark.parametrize("coalesced", [False, True])
+@pytest.mark.parametrize("late_arrival", [False, True])
+def test_fixed_prelude_preserves_refill_opportunity(coalesced, late_arrival):
+    scheduler = Scheduler(
+        SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=3, prefill_chunk_size=3),
+        make_cpu_cache(tiny_ouro_config(), blocks=128),
+        total_ut_steps=4,
+        exit_mode="ouro_delayed",
+        coalesce_fixed_prelude=coalesced,
+        coalesce_fixed_decode=True,
+    )
+    params = SamplingParams(max_tokens=16, min_loops=4, max_loops=4, ignore_eos=True)
+    first = Request("a", [1, 2, 3], params)
+    second = Request("b", [4, 5, 6], params)
+    scheduler.add_request(first)
+    if not late_arrival:
+        scheduler.add_request(second)
+    batch = scheduler.schedule()
+    assert batch.phase == RequestPhase.PREFILL
+    assert [item.request for item in batch.requests] == [first]
+    scheduler.update_after_submission(batch)
+    batch = scheduler.schedule()
+    assert batch.phase == RequestPhase.CODA
+    scheduler.update_after_submission(batch)
+    if late_arrival:
+        scheduler.add_request(second)
+    assert second.phase == (RequestPhase.WAITING if late_arrival else RequestPhase.PREFILL)
+
+    # Every prompt consumes a complete token budget. Refill must still get a
+    # turn before the first generation ends, with or without prelude coalescing.
+    for _ in range(8):
+        batch = scheduler.schedule()
+        assert batch is not None
+        scheduler.update_after_submission(batch)
+        if any(item.request is second for item in batch.requests):
+            assert batch.phase == RequestPhase.PREFILL
+            assert first.num_scheduled_outputs < params.max_tokens
+            break
+    else:
+        pytest.fail("decode boundaries starved a pending prompt")
+    targets = {request.request_id: request.num_scheduled_outputs + 1 for request in (first, second)}
+    for _ in range(12):
+        batch = scheduler.schedule()
+        assert batch is not None
+        scheduler.update_after_submission(batch)
+        if all(
+            request.num_scheduled_outputs >= targets[request.request_id]
+            for request in (first, second)
+        ):
+            break
+    else:
+        pytest.fail("refilled decode starved the existing recurrent request")
+
+
+def engine_for(model, planned, multi_stream=False, token_budget=128):
     return StageEngine(
         model,
         attention_backend="ascend_eager",
         cache_config=CacheConfig(num_blocks=128, block_size=16, contiguous_kv=True),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=3, max_num_batched_tokens=128, prefill_chunk_size=128
+            max_num_seqs=3, max_num_batched_tokens=token_budget, prefill_chunk_size=128
         ),
         execution_config=ExecutionConfig(
             async_scheduling=True,
@@ -53,6 +108,56 @@ def engine_for(model, planned, multi_stream=False):
         ),
         exit_config=ExitConfig("ouro_delayed"),
     )
+
+
+@pytest.mark.npu
+@torch.inference_mode()
+@pytest.mark.parametrize("multi_stream", [False, True])
+def test_fixed_prelude_refills_during_generation(multi_stream):
+    resolve_device("npu")
+    torch.npu.set_device(0)
+    model = make_npu_model(torch.device("npu:0"))
+    params = SamplingParams(max_tokens=8, min_loops=4, max_loops=4, ignore_eos=True)
+    expected = None
+    for planned in [False, True]:
+        engine = engine_for(model, planned, multi_stream, token_budget=3)
+        try:
+            for name, prompt in [("a", [3, 7, 11]), ("b", [13, 17, 19])]:
+                engine.add_request(name, prompt, params)
+            actual, first_finished, second_started = {}, False, False
+            first_tokens_at_second_start = None
+            first_tokens, first_advanced = 0, False
+            for _ in range(128):
+                if not engine.has_unfinished_requests():
+                    break
+                for out in engine.step():
+                    if out.request_id == "b" and not second_started:
+                        assert not first_finished
+                        second_started = True
+                        first_tokens_at_second_start = first_tokens
+                    if out.request_id == "a":
+                        first_tokens = len(out.token_ids)
+                        if second_started and "b" not in actual:
+                            first_advanced |= first_tokens > first_tokens_at_second_start
+                    if out.finished:
+                        actual[out.request_id] = (
+                            list(out.token_ids),
+                            list(out.exit_depths),
+                            out.finish_reason,
+                        )
+                        if out.request_id == "a":
+                            first_finished = True
+            else:
+                pytest.fail("refill did not drain in 128 steps")
+            assert second_started and first_advanced
+            assert set(actual) == {"a", "b"}
+            if expected is None:
+                expected = actual
+            else:
+                assert actual == expected
+            assert engine.cache_manager.num_used_blocks == 0
+        finally:
+            engine.close()
 
 
 @pytest.mark.npu
