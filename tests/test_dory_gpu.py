@@ -409,14 +409,19 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(
                 engine.close()
         return torch.stack(short_logits), packed_layers
 
-    baseline, baseline_packed = run(enable=None, expect_packed=False)
+    baseline, baseline_packed = run(enable=False, expect_packed=False)
+    automatic, automatic_packed = run(enable=None, expect_packed=True)
     actual, packed = run(enable=True, expect_packed=True)
     with monkeypatch.context() as patch:
         patch.setattr(triton_attention, "select_packed_window_tile", lambda *args: None)
-        fallback, fallback_packed = run(enable=True, expect_packed=False)
+        fallback, fallback_packed = run(enable=None, expect_packed=False)
+        with pytest.raises(ValueError, match="lacks required capabilities: packed_sliding_window"):
+            run(enable=True, expect_packed=False)
     assert not fallback_packed
     assert torch.equal(baseline, fallback)
     assert not baseline_packed
+    assert automatic_packed == packed
+    assert torch.equal(automatic, actual)
     assert {layer for layer, _ in packed} == set(range(model.config.num_kv_layers))
     assert {window for _, window in packed} == (
         {False} if sliding_window is None else {False, True}

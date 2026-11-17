@@ -90,12 +90,13 @@ layer id rather than their physical sublayer index.
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
 
-## Opt-in packed Triton prefill
+## Packed Triton prefill
 
-In Python, set `attention_backend="triton"` and
-`execution_config=ExecutionConfig(packed_prefill=True)`. On the CLI, pass
-`--attention-backend triton --packed-prefill`. Dory uses per-query prefill when
-the option is omitted or when `--no-packed-prefill` is set.
+With `attention_backend="triton"`, the default `packed_prefill=None` automatically
+enables packed prefill when execution and backend support it. Set
+`ExecutionConfig(packed_prefill=True)` / `--packed-prefill` to require support,
+or `packed_prefill=False` / `--no-packed-prefill` to keep per-query prefill.
+An unsupported explicit enable request fails at startup.
 
 This path uses BF16, `per_loop` KV, ordinary prefill, and synchronous eager
 single-stage execution. Speculation, preemption, CUDA graphs and asynchronous
@@ -104,9 +105,13 @@ scheduling are outside its scope.
 On NVIDIA CUDA, the packed path uses a 32 × 32 tile. At startup, Triton compiles
 the full-attention kernel and, if the model uses a sliding window, the
 sliding-window kernel. It checks their shared-memory requirements against the
-device limit. The engine uses per-query attention if the check fails.
+device limit. Automatic mode uses per-query attention if the check fails;
+explicit enable requests fail through backend capability validation.
 The result is cached by device and attention geometry within the process.
 The check runs before KV memory planning and uses tensor metadata only.
+The check establishes that the tile fits, not that it is fastest. The fixed
+32 × 32 tile was validated on RTX 4060 and RTX 5090; other GPUs and workloads
+need measurements to determine their best tile.
 The full BF16 checkpoint and long-context service validation require enough
 device memory for the model weights, runtime buffers and KV pool.
 

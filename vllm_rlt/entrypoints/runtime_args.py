@@ -29,8 +29,8 @@ def add_runtime_args(parser):
         "--packed-prefill",
         action="store_true",
         default=None,
-        help="Enable packed prefill on a compatible backend. "
-        "Defaults to automatic selection. Sliding-window attention requires explicit opt-in.",
+        help="Require packed prefill on a compatible backend; fail if unsupported. "
+        "Defaults to automatic selection when execution and backend support it.",
     )
     packed_prefill_mode.add_argument(
         "--no-packed-prefill",

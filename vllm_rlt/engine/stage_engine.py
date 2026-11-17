@@ -193,7 +193,7 @@ class StageEngine:
             PackedWindowShape(
                 config.num_attention_heads, config.num_key_value_heads, kv_layers, window
             )
-            if require_packed and sliding_window
+            if prefer_packed and sliding_window
             else None
         )
         attention = create_backend(
@@ -203,7 +203,8 @@ class StageEngine:
             config.head_dim,
             cache_config.block_size,
             required_capabilities=BackendCapabilities(
-                packed_prefill=require_packed and not sliding_window,
+                packed_prefill=require_packed,
+                packed_sliding_window=require_packed and sliding_window,
                 cuda_graphs=self.execution_config.cuda_graphs,
                 async_scheduling=(
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
@@ -214,11 +215,9 @@ class StageEngine:
             prefer_packed_prefill=prefer_packed and not sliding_window,
             packed_window_shape=packed_window_shape,
         )
-        if sliding_window or self.execution_config.packed_prefill is None:
-            supported = (
-                attention.capabilities.packed_sliding_window
-                if sliding_window
-                else attention.capabilities.packed_prefill
+        if self.execution_config.packed_prefill is None:
+            supported = attention.capabilities.packed_prefill and (
+                not sliding_window or attention.capabilities.packed_sliding_window
             )
             self.execution_config = replace(
                 self.execution_config, packed_prefill=prefer_packed and supported

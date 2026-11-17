@@ -673,7 +673,7 @@ def test_exit_written_ignores_boundary_layers(model):
 
 
 @pytest.mark.parametrize("packed_prefill", [None, False])
-def test_dory_defaults_to_per_row_prefill(model, packed_prefill):
+def test_dory_cpu_keeps_per_row_prefill(model, packed_prefill):
     engine = LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=packed_prefill))
     assert engine.execution_config.packed_prefill is False
     assert not engine.cache_manager.attention_capabilities.packed_sliding_window
