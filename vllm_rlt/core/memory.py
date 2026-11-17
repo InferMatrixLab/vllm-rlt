@@ -5,7 +5,13 @@ import math
 import torch
 
 from vllm_rlt.config import cuda_graph_rows
-from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.core.kv_cache_manager import (
+    KVCacheManager,
+    codec_scratch_bytes,
+    packed_page_bytes,
+    staging_pages_bound,
+)
+from vllm_rlt.kernels.kv_quantization import KV_CODECS
 from vllm_rlt.worker.buffers import execution_buffer_bytes
 from vllm_rlt.worker.cuda_graph import speculative_capture_sizes
 
@@ -50,6 +56,44 @@ def graph_memory_reserve(model, scheduler, execution, speculative=None):
     return pools * execution.cuda_graph_memory_reserve_bytes + retained_logits
 
 
+def _quantized_plan(model, cache, scheduler):
+    """Packed bytes per block id, staging pages and reference-attention costs."""
+    if cache.kv_quantization is None:
+        return None
+    parameter = next(model.parameters())
+    config = model.config
+    group = cache.kv_quantization_group_size or KV_CODECS[cache.kv_quantization].default_group_size
+    packed = packed_page_bytes(
+        format=cache.kv_quantization,
+        group_size=group,
+        block_size=cache.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        num_layers=config.num_hidden_layers,
+        dtype=parameter.dtype,
+    )
+    planes = config.total_ut_steps if cache.layout == "last_exited" else 1
+    staging = cache.kv_quantization_staging_blocks or staging_pages_bound(
+        block_size=cache.block_size,
+        window=cache.kv_quantization_window,
+        tokens_per_step=scheduler.max_num_batched_tokens,
+        requests=scheduler.max_num_seqs,
+        planes=planes,
+    )
+    page_elements = cache.block_size * config.num_key_value_heads * config.head_dim
+    # Reference attention decodes each page a batch reads into BF16 K/V, one
+    # layer at a time, so it can hold one layer of every block id at once.
+    gather = 2 * page_elements * parameter.element_size()
+    scratch = codec_scratch_bytes(
+        group_size=group,
+        block_size=cache.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        num_layers=config.num_hidden_layers,
+    )
+    return packed, staging, gather, scratch
+
+
 @torch.inference_mode()
 def plan_cache(
     model, cache, scheduler, execution, backend, *, speculative=None, staged_prefill=None
@@ -67,13 +111,36 @@ def plan_cache(
         * config.head_dim
         * parameter.element_size()
     )
+    quantized = _quantized_plan(model, cache, scheduler)
+    staging_page, staging, quantized_scratch, gather = per_block, 0, 0, 0
+    if quantized is not None:
+        # A block id then owns a packed slot; BF16 pages only stage recent KV.
+        per_block, staging, gather, quantized_scratch = quantized
+
+    def kv_blocks(available, cost_per_block):
+        if quantized is None:
+            return budget_blocks(available, cost_per_block)
+        # The manager stages at most min(staging, blocks) BF16 pages.
+        blocks = budget_blocks(available, cost_per_block + staging_page)
+        if blocks >= staging:
+            blocks = budget_blocks(available - staging * staging_page, cost_per_block)
+        return blocks
+
+    def quantized_info(blocks):
+        if quantized is None:
+            return {}
+        pages = min(staging, blocks)
+        return dict(kv_staging_blocks=pages, kv_staging_bytes=pages * staging_page)
+
+    def fixed(blocks, source):
+        return blocks, {"source": source, "bytes_per_block": per_block, **quantized_info(blocks)}
+
     if cache.num_blocks is not None:
-        return cache.num_blocks, {"source": "blocks", "bytes_per_block": per_block}
+        return fixed(cache.num_blocks, "blocks")
     if cache.kv_cache_memory_bytes is not None:
-        blocks = budget_blocks(cache.kv_cache_memory_bytes, per_block)
-        return blocks, {"source": "bytes", "bytes_per_block": per_block}
+        return fixed(kv_blocks(cache.kv_cache_memory_bytes, per_block), "bytes")
     if device.type != "cuda":
-        return 256, {"source": "cpu_default", "bytes_per_block": per_block}
+        return fixed(256, "cpu_default")
     torch.cuda.synchronize(device)
     # Return unused allocator segments before measuring driver-free memory.
     # In particular, a previous engine may have left its KV pool cached here.
@@ -164,6 +231,7 @@ def plan_cache(
         + metadata
         + cache.memory_reserve_bytes
         + graph_reserve
+        + quantized_scratch
     )
     # More blocks than all concurrent full-context requests can use only waste
     # memory, particularly for tiny-model GPU tests with very small pages.
@@ -172,7 +240,11 @@ def plan_cache(
         * (config.total_ut_steps if cache.layout == "last_exited" else 1)
         * scheduler.max_num_seqs
     )
-    blocks = min(budget_blocks(budget, per_block), useful_blocks)
+    blocks = min(kv_blocks(budget, per_block + gather), useful_blocks)
+    extra = quantized_info(blocks)
+    if quantized is not None:
+        extra["kv_gather_bytes_per_block"] = gather
+        extra["kv_quantized_scratch_bytes"] = quantized_scratch
     return blocks, dict(
         source="cuda_profile",
         bytes_per_block=per_block,
@@ -183,4 +255,5 @@ def plan_cache(
         static_buffer_bytes=buffers,
         context_scratch_bytes=context_scratch,
         kv_budget_bytes=int(budget),
+        **extra,
     )
