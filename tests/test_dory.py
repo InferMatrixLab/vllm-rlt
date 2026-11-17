@@ -676,3 +676,23 @@ def test_wise_decode_rejects_the_sliding_window_model():
     # Checked before the WISE kernels load, so it needs neither CUDA nor Triton.
     with pytest.raises(ValueError, match="sliding-window"):
         LLMEngine(DoryForCausalLM(tiny_dory_config()).eval(), wise_config=object())
+
+
+@pytest.mark.parametrize("packed_prefill", [None, False])
+def test_dory_cpu_keeps_per_row_prefill(model, packed_prefill):
+    engine = LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=packed_prefill))
+    assert engine.execution_config.packed_prefill is False
+    assert not engine.cache_manager.attention_capabilities.packed_sliding_window
+
+
+def test_dory_packed_prefill_requires_cuda(model):
+    with pytest.raises(ValueError, match="packed_prefill requires CUDA"):
+        LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=True))
+
+
+def test_dory_packed_prefill_rejects_graphs(model):
+    with pytest.raises(ValueError, match="packed prefill requires synchronous eager"):
+        LLMEngine(
+            model,
+            execution_config=ExecutionConfig(packed_prefill=True, cuda_graphs=True),
+        )
