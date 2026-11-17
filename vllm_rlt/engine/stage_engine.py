@@ -18,7 +18,6 @@ from vllm_rlt.engine.connector import StageConnector
 from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
-from vllm_rlt.models.dory import DoryForCausalLM
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
 from vllm_rlt.sampling_params import SamplingParams
@@ -76,23 +75,17 @@ class StageEngine:
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
-        dory_packed = self.execution_config.dory_packed_prefill
-        if dory_packed:
-            if not isinstance(model, DoryForCausalLM):
-                raise ValueError("Dory packed prefill requires a Dory model")
-            if (
-                self.execution_config.async_scheduling
-                or self.execution_config.cuda_graphs
-                or staged_prefill
-                or scheduler_config.enable_preemption
-                or speculative_config is not None
-                or self.stage_config.role != "prefill_decode"
-                or cache_config.layout != "last_exited"
-            ):
-                raise ValueError(
-                    "Dory packed prefill requires synchronous eager single-stage execution "
-                    "with per_loop KV and ordinary prefill, without speculation or preemption"
-                )
+        sliding_window = getattr(model, "requires_sliding_window", False)
+        prefer_packed = packed_prefill_eligible(
+            self.execution_config,
+            device_type=parameter.device.type,
+            layout=cache_config.layout,
+            staged_prefill=staged_prefill,
+            sliding_window=sliding_window,
+            stage_role=self.stage_config.role,
+            speculative=speculative_config is not None,
+            preemption=scheduler_config.enable_preemption,
+        )
         if getattr(model, "requires_boundary_kv", False):
             if staged_prefill:
                 raise ValueError(
@@ -192,13 +185,7 @@ class StageEngine:
                 )
         if staged_prefill and cache_config.layout != "last_exited":
             raise ValueError("staged prefill requires last_exited KV planes")
-        auto_packed = packed_prefill_eligible(
-            self.execution_config.packed_prefill,
-            device_type=parameter.device.type,
-            layout=cache_config.layout,
-            staged_prefill=staged_prefill,
-            sliding_window=getattr(model, "requires_sliding_window", False),
-        )
+        require_packed = self.execution_config.packed_prefill is True
         attention = create_backend(
             attention_backend,
             parameter.device,
@@ -206,21 +193,21 @@ class StageEngine:
             config.head_dim,
             cache_config.block_size,
             required_capabilities=BackendCapabilities(
-                packed_prefill=bool(self.execution_config.packed_prefill) or dory_packed,
-                packed_sliding_window=dory_packed,
+                packed_prefill=require_packed,
+                packed_sliding_window=require_packed and sliding_window,
                 cuda_graphs=self.execution_config.cuda_graphs,
                 async_scheduling=(
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
-                sliding_window=getattr(model, "requires_sliding_window", False),
+                sliding_window=sliding_window,
             ),
-            prefer_packed_prefill=auto_packed,
+            prefer_packed_prefill=prefer_packed,
         )
         if self.execution_config.packed_prefill is None:
             self.execution_config = replace(
                 self.execution_config,
-                packed_prefill=auto_packed and attention.capabilities.packed_prefill,
+                packed_prefill=prefer_packed and attention.capabilities.packed_prefill,
             )
         num_blocks, self.memory_plan = plan_cache(
             model,

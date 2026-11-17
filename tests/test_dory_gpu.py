@@ -341,7 +341,7 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(
             cache_config=CacheConfig(num_blocks=64),
             scheduler_config=scheduler,
             attention_backend="triton",
-            execution_config=ExecutionConfig(dory_packed_prefill=enable, multi_stream=multi_stream),
+            execution_config=ExecutionConfig(packed_prefill=enable, multi_stream=multi_stream),
         )
         packed_layers = set()
         short_logits = []
@@ -365,7 +365,10 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(
             mp.setattr(sampler, "sample", sample)
             mp.setattr(engine.cache_manager, "_attend_prepared", attention)
             try:
-                assert engine.execution_config.packed_prefill is False
+                assert engine.execution_config.packed_prefill is (enable is True)
+                assert engine.cache_manager.attention_capabilities.packed_sliding_window is (
+                    enable is True
+                )
                 engine.add_request(
                     "long",
                     (prompt * 19)[:long_tokens],
@@ -379,7 +382,7 @@ def test_dory_packed_prefill_preserves_short_prompt_logits(
                 engine.close()
         return torch.stack(short_logits), packed_layers
 
-    baseline, baseline_packed = run(enable=False)
+    baseline, baseline_packed = run(enable=None)
     actual, packed = run(enable=True)
     assert not baseline_packed
     assert {layer for layer, _ in packed} == set(range(model.config.num_kv_layers))

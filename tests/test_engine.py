@@ -423,16 +423,27 @@ def test_packed_prefill_resolves_automatically_when_unset():
 
     common = dict(layout="last_exited", staged_prefill=False)
     # Unset: on for CUDA, last_exited, ordinary prefill without sliding windows.
-    assert packed_prefill_eligible(None, device_type="cuda", **common)
-    assert not packed_prefill_eligible(None, device_type="cpu", **common)
-    assert not packed_prefill_eligible(None, device_type="cuda", **{**common, "layout": "shared"})
-    assert not packed_prefill_eligible(None, device_type="cuda", **common, sliding_window=True)
+    assert packed_prefill_eligible(ExecutionConfig(), device_type="cuda", **common)
+    assert not packed_prefill_eligible(ExecutionConfig(), device_type="cpu", **common)
     assert not packed_prefill_eligible(
-        None, device_type="cuda", **{**common, "staged_prefill": True}
+        ExecutionConfig(), device_type="cuda", **{**common, "layout": "shared"}
     )
-    # Explicit settings win regardless of eligibility.
-    assert not packed_prefill_eligible(False, device_type="cuda", **common)
-    assert packed_prefill_eligible(True, device_type="cuda", **common)
+    assert not packed_prefill_eligible(
+        ExecutionConfig(), device_type="cuda", **common, sliding_window=True
+    )
+    assert not packed_prefill_eligible(
+        ExecutionConfig(), device_type="cuda", **{**common, "staged_prefill": True}
+    )
+    # Explicit settings override the automatic choice.
+    assert not packed_prefill_eligible(
+        ExecutionConfig(packed_prefill=False), device_type="cuda", **common
+    )
+    assert packed_prefill_eligible(
+        ExecutionConfig(packed_prefill=True), device_type="cuda", **common
+    )
+    assert packed_prefill_eligible(
+        ExecutionConfig(packed_prefill=True), device_type="cuda", **common, sliding_window=True
+    )
     assert ExecutionConfig().packed_prefill is None
     with pytest.raises(ValueError, match="packed_prefill"):
         ExecutionConfig(packed_prefill=1)

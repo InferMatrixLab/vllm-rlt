@@ -672,19 +672,21 @@ def test_exit_written_ignores_boundary_layers(model):
     cache.free("request")
 
 
-def test_dory_packed_prefill_requires_a_qualified_backend(model):
-    with pytest.raises(ValueError, match="packed_sliding_window"):
-        LLMEngine(model, execution_config=ExecutionConfig(dory_packed_prefill=True))
+@pytest.mark.parametrize("packed_prefill", [None, False])
+def test_dory_defaults_to_per_row_prefill(model, packed_prefill):
+    engine = LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=packed_prefill))
+    assert engine.execution_config.packed_prefill is False
+    assert not engine.cache_manager.attention_capabilities.packed_sliding_window
+
+
+def test_dory_packed_prefill_requires_cuda(model):
+    with pytest.raises(ValueError, match="packed_prefill requires CUDA"):
+        LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=True))
 
 
 def test_dory_packed_prefill_rejects_graphs(model):
     with pytest.raises(ValueError, match="packed prefill requires synchronous eager"):
         LLMEngine(
             model,
-            execution_config=ExecutionConfig(dory_packed_prefill=True, cuda_graphs=True),
+            execution_config=ExecutionConfig(packed_prefill=True, cuda_graphs=True),
         )
-
-
-def test_generic_packed_prefill_rejects_dory_sliding_windows(model):
-    with pytest.raises(ValueError, match="packed_prefill does not support sliding-window"):
-        LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=True))

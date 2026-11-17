@@ -83,17 +83,26 @@ def validate_backend_name(backend: str) -> None:
         raise ValueError("unknown attention backend")
 
 
-def _create_explicit(backend, device, dtype, head_dim, block_size):
+def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, packed_window):
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
         if head_dim > 256:
             raise ValueError("the Triton attention backend supports head_dim <= 256")
-        if not torch.version.hip and torch.cuda.get_device_capability(device)[0] < 8:
+        sm = None if torch.version.hip else torch.cuda.get_device_capability(device)
+        if sm is not None and sm[0] < 8:
             raise ValueError("the Triton attention backend requires NVIDIA Compute Capability 8.0+")
+        if packed_window and (sm != (12, 0) or dtype != torch.bfloat16):
+            raise ValueError("Triton packed_sliding_window requires NVIDIA SM 12.0 and BF16")
         # Probe the actual module, including its dependency imports, before selection.
         importlib.import_module("vllm_rlt.kernels.triton_attention")
-        return AttentionBackend(TritonPagedAttention(), _TRITON_CAPABILITIES, {"backend": backend})
+        capabilities = replace(
+            _TRITON_CAPABILITIES,
+            packed_prefill=packed or packed_window,
+            packed_sliding_window=packed_window,
+        )
+        kernel = TritonPagedAttention(packed_sliding_window=packed_window)
+        return AttentionBackend(kernel, capabilities, {"backend": backend})
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))
@@ -127,27 +136,15 @@ def create_backend(
         skipped.append(f"{device.type.upper()} uses Torch reference attention")
     for candidate in candidates:
         try:
-            implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
-            if candidate == "triton" and required_capabilities.packed_sliding_window:
-                if (
-                    dtype != torch.bfloat16
-                    or torch.version.hip
-                    or torch.cuda.get_device_capability(device) != (12, 0)
-                ):
-                    raise ValueError("packed_sliding_window requires NVIDIA SM 12.0 and BF16")
-                implementation.kernel = TritonPagedAttention(packed_sliding_window=True)
-                implementation.capabilities = replace(
-                    implementation.capabilities, packed_prefill=True, packed_sliding_window=True
-                )
-            elif candidate == "triton" and (
-                required_capabilities.packed_prefill or prefer_packed_prefill
-            ):
-                # Packed BF16 prefill has different arithmetic from per-row decode.
-                # Opt in for packed_prefill without changing existing split/mixed or
-                # Huginn boundary attention when that option is disabled.
-                implementation.capabilities = replace(
-                    implementation.capabilities, packed_prefill=True
-                )
+            implementation = _create_explicit(
+                candidate,
+                device,
+                dtype,
+                head_dim,
+                block_size,
+                packed=required_capabilities.packed_prefill or prefer_packed_prefill,
+                packed_window=required_capabilities.packed_sliding_window,
+            )
             missing = [
                 name
                 for name in (

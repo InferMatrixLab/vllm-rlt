@@ -2,19 +2,39 @@
 
 
 def packed_prefill_eligible(
-    packed_prefill, *, device_type, layout, staged_prefill, sliding_window=False
+    execution,
+    *,
+    device_type,
+    layout,
+    staged_prefill,
+    sliding_window=False,
+    stage_role="prefill_decode",
+    speculative=False,
+    preemption=False,
 ):
-    """Validate explicit requests and return whether packing may be enabled.
+    """Validate execution constraints before filtering by backend capability.
 
-    Staged prefill and sliding-window attention retain their existing metadata.
-    Backend support is checked separately by attention selection.
+    Sliding-window packing is opt-in. Its current implementation requires host-planned
+    metadata and ordinary synchronous prefill in a single stage.
     """
-    if packed_prefill and sliding_window:
-        raise ValueError("packed_prefill does not support sliding-window attention")
-    if packed_prefill and (device_type != "cuda" or layout != "last_exited"):
-        raise ValueError("packed_prefill requires CUDA packed prefill with last_exited KV")
-    if packed_prefill is not None:
-        return bool(packed_prefill)
+    requested = execution.packed_prefill
+    if requested:
+        if sliding_window and (
+            execution.async_scheduling
+            or execution.cuda_graphs
+            or staged_prefill
+            or speculative
+            or preemption
+            or stage_role != "prefill_decode"
+        ):
+            raise ValueError(
+                "sliding-window packed prefill requires synchronous eager single-stage execution "
+                "with ordinary prefill, without speculation or preemption"
+            )
+        if device_type != "cuda" or layout != "last_exited":
+            raise ValueError("packed_prefill requires CUDA packed prefill with last_exited KV")
+    if requested is not None:
+        return requested
     return (
         device_type == "cuda"
         and layout == "last_exited"

@@ -309,6 +309,37 @@ def test_explicit_triton_rejects_unsupported_nvidia_hardware(packages, monkeypat
         create_backend("triton", torch.device("cuda"), torch.float16, 128, 256)
 
 
+@pytest.mark.parametrize(
+    "sm,dtype,hip,expected",
+    [
+        ((12, 0), torch.bfloat16, None, True),
+        ((12, 1), torch.bfloat16, None, False),
+        ((8, 9), torch.bfloat16, None, False),
+        ((12, 0), torch.float32, None, False),
+        ((12, 0), torch.bfloat16, "test", False),
+    ],
+)
+def test_triton_packed_sliding_window_capability(packages, monkeypatch, sm, dtype, hip, expected):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
+    monkeypatch.setattr(torch.version, "hip", hip)
+    args = (torch.device("cuda"), dtype, 256, 16)
+    required = BackendCapabilities(
+        packed_prefill=True, sliding_window=True, packed_sliding_window=True
+    )
+    if not expected:
+        with pytest.raises(
+            ValueError, match="packed_sliding_window requires NVIDIA SM 12.0 and BF16"
+        ):
+            create_backend("triton", *args, required_capabilities=required)
+        with pytest.raises(ValueError, match="no compatible attention backend"):
+            create_backend("auto", *args, required_capabilities=required)
+        return
+    backend = create_backend("auto", *args, required_capabilities=required)
+    assert backend.info["selected_backend"] == "triton"
+    assert backend.capabilities.packed_prefill and backend.capabilities.packed_sliding_window
+    assert not create_backend("triton", *args).capabilities.packed_sliding_window
+
+
 def test_auto_skips_broken_binary_import(packages, monkeypatch):
     from vllm_rlt.kernels import flash_attention
 

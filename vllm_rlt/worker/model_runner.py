@@ -718,11 +718,14 @@ class ModelRunner:
         return tuple(inputs)
 
     def _uses_packed_loop_inputs(self, batch):
+        capabilities = self.cache_manager.attention_capabilities
         return (
             batch.operation == Operation.PRELUDE
             and batch.loop_count
             and self.cache_manager.layout != "shared"
-            and self.cache_manager.attention_capabilities.packed_prefill
+            and capabilities.packed_prefill
+            # Sliding-window batches share staging for packed and per-row metadata.
+            and not capabilities.packed_sliding_window
             and self.execution_config.packed_prefill
         )
 
@@ -740,7 +743,7 @@ class ModelRunner:
             requests.extend([request] * count)
             outputs.append((len(tokens) - 1, request))
         packed = cache.attention_capabilities.packed_prefill and (
-            not self.execution_config.dory_packed_prefill
+            not cache.attention_capabilities.packed_sliding_window
             or all(len(span.request.prompt_token_ids) > 64 for span in batch.spans)
         )
         size = len(tokens) if packed else self._size(len(tokens))

@@ -153,15 +153,13 @@ class ExecutionConfig:
     # None resolves at engine construction: on when the attention backend packs
     # prefill (Triton opts in, FlashAttention-4 natively) with last_exited KV and
     # ordinary (non-staged) prefill without sliding-window attention; off otherwise.
+    # Sliding-window prefill requires explicit opt-in.
     packed_prefill: bool | None = None
-    # Dory selects packed sliding-window attention per batch.
-    dory_packed_prefill: bool = False
 
     def __post_init__(self):
         if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
             raise ValueError("packed_prefill must be a boolean or None")
         for name in (
-            "dory_packed_prefill",
             "use_uva",
             "async_scheduling",
             "multi_stream",

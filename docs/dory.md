@@ -93,9 +93,9 @@ layer id rather than their physical sublayer index.
 ## Opt-in packed Triton prefill
 
 In Python, set `attention_backend="triton"` and
-`execution_config=ExecutionConfig(dory_packed_prefill=True)`. On the CLI, pass
-`--attention-backend triton --dory-packed-prefill`. The `--dory-packed-prefill`
-and `--no-packed-prefill` flags are mutually exclusive.
+`execution_config=ExecutionConfig(packed_prefill=True)`. On the CLI, pass
+`--attention-backend triton --packed-prefill`. Dory uses per-query prefill when
+the option is omitted or when `--no-packed-prefill` is set.
 
 This path requires Dory BF16, NVIDIA SM 12.0, `per_loop` KV, ordinary prefill,
 and synchronous eager single-stage execution. Speculation, preemption, CUDA
@@ -123,7 +123,7 @@ even with per-query attention.
 
 These fail fast rather than degrade silently:
 
-- WCPB, mixed or staged prefill; packed prefill metadata (`packed_prefill`); PD.
+- WCPB, mixed or staged prefill, and PD.
 - Prefix caching.
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
   preemption or `last_loop` KV, and sampled token-pipeline speculation. The

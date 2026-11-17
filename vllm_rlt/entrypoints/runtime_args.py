@@ -24,24 +24,19 @@ def add_runtime_args(parser):
     parser.add_argument("--kv-watermark", type=float, default=0.0)
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
     parser.add_argument("--enable-preemption", action="store_true")
-    parser.add_argument(
+    packed_prefill_mode = parser.add_mutually_exclusive_group()
+    packed_prefill_mode.add_argument(
         "--packed-prefill",
         action="store_true",
         default=None,
-        help="Force packed prefill metadata staging (requires packed attention); "
-        "default resolves automatically (on for CUDA with last_exited KV)",
+        help="Enable packed prefill on a compatible backend. "
+        "Defaults to automatic selection. Sliding-window attention requires explicit opt-in.",
     )
-    packed_prefill_mode = parser.add_mutually_exclusive_group()
     packed_prefill_mode.add_argument(
         "--no-packed-prefill",
         action="store_false",
         dest="packed_prefill",
         help="Keep per-row prefill even when packed attention is available",
-    )
-    packed_prefill_mode.add_argument(
-        "--dory-packed-prefill",
-        action="store_true",
-        help="Enable packed Triton prefill for Dory BF16 on NVIDIA SM 12.0",
     )
     parser.add_argument(
         "--no-uva",
@@ -133,7 +128,6 @@ def runtime_configs(args):
         ),
         execution_config=ExecutionConfig(
             packed_prefill=args.packed_prefill,
-            dory_packed_prefill=args.dory_packed_prefill,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,
