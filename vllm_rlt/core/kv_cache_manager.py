@@ -13,6 +13,7 @@ from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from numbers import Integral
+from typing import Protocol
 
 import torch
 
@@ -77,6 +78,23 @@ class KVSnapshot:
     values: torch.Tensor
 
 
+class KVBlockStorage(Protocol):
+    """Block storage whose physical backing can grow while the VA stays fixed.
+
+    ``GPUKVStorage`` implements this over CUDA VMM. The manager only reads the
+    capacity counters and the K/V planes; mapping stays the storage's job.
+    """
+
+    max_blocks: int
+    committed_blocks: int
+    bytes_per_block: int
+    dtype: torch.dtype
+
+    def keys(self, shape) -> torch.Tensor: ...
+
+    def values(self, shape) -> torch.Tensor: ...
+
+
 class KVCacheManager:
     """Own a fixed physical page pool shared by request/depth allocations.
 
@@ -103,6 +121,7 @@ class KVCacheManager:
         recurrent_layers: Sequence[int] | None = None,
         *,
         attention: AttentionBackend | None = None,
+        storage: KVBlockStorage | None = None,
     ):
         for name, value in (
             ("num_layers", num_layers),
@@ -140,9 +159,19 @@ class KVCacheManager:
         )
         self.attention_info = self.attention.info
         self.backend = self.attention_info["selected_backend"]
-        shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
-        self.key_cache = torch.empty(shape, device=self.device, dtype=dtype)
-        self.value_cache = torch.empty_like(self.key_cache)
+        self._storage = storage
+        self._watermark_ratio = watermark_ratio
+        if storage is None:
+            shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
+            self.key_cache = torch.empty(shape, device=self.device, dtype=dtype)
+            self.value_cache = torch.empty_like(self.key_cache)
+            self.max_blocks = num_blocks
+            self.committed_blocks = num_blocks
+        else:
+            self.key_cache, self.value_cache = self._attach_storage(storage, num_blocks)
+        # Requests are only ever given published blocks, and publishing requires
+        # committed physical memory, so published <= committed <= max holds.
+        self.published_blocks = num_blocks
         # Resolve an implicit CUDA index to the actual storage device once.
         self.device = self.key_cache.device
         self._free_blocks = list(reversed(range(num_blocks)))
@@ -150,7 +179,7 @@ class KVCacheManager:
         self.enable_prefix_caching = enable_prefix_caching
         self.incremental_allocation = incremental_allocation
         # Full allocation already reserves each request's maximum KV capacity.
-        self.watermark_blocks = int(watermark_ratio * num_blocks) if incremental_allocation else 0
+        self.watermark_blocks = self._watermark(num_blocks)
         self._refs = [0] * num_blocks
         self._prefixes = OrderedDict()
         self._pending_prefixes = []
@@ -182,6 +211,85 @@ class KVCacheManager:
             * self.head_dim
             * self.key_cache.element_size()
         )
+
+    @property
+    def storage(self) -> KVBlockStorage | None:
+        return self._storage
+
+    def _watermark(self, blocks: int) -> int:
+        return int(self._watermark_ratio * blocks) if self.incremental_allocation else 0
+
+    def _attach_storage(self, storage: KVBlockStorage, num_blocks: int):
+        """Take the K/V planes from a pre-reserved pool instead of allocating them."""
+        expected = (
+            2
+            * self.num_layers
+            * self.block_size
+            * self.num_kv_heads
+            * self.head_dim
+            * torch.empty((), dtype=self.dtype).element_size()
+        )
+        if storage.bytes_per_block != expected:
+            raise ValueError(
+                f"storage holds {storage.bytes_per_block} bytes per block, "
+                f"but this cache needs {expected}"
+            )
+        if storage.dtype != self.dtype:
+            raise ValueError("storage dtype does not match the KV dtype")
+        if storage.max_blocks < num_blocks:
+            raise ValueError(
+                f"storage reserves {storage.max_blocks} blocks but {num_blocks} were requested"
+            )
+        if storage.committed_blocks < num_blocks:
+            raise ValueError(
+                f"storage committed {storage.committed_blocks} blocks but {num_blocks} "
+                "were requested; commit the pool before building the cache"
+            )
+        shape = (
+            storage.max_blocks,
+            self.num_layers,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        keys, values = storage.keys(shape), storage.values(shape)
+        for name, tensor in (("keys", keys), ("values", values)):
+            if tensor.dtype != self.dtype or tuple(tensor.shape) != shape:
+                raise ValueError(f"storage {name} do not match the KV layout")
+        self.max_blocks = storage.max_blocks
+        self.committed_blocks = storage.committed_blocks
+        return keys, values
+
+    def publish_capacity(self, blocks: int) -> int:
+        """Grow the allocatable pool after the storage mapped more blocks.
+
+        The K/V tensors keep their address, shape and stride; only the free pool
+        and the published count grow. Uncommitted blocks are never published, so
+        no allocation can reference unmapped memory.
+        """
+        if self._storage is None:
+            raise RuntimeError("capacity publishing requires VMM-backed storage")
+        if type(blocks) is not int or blocks < self.published_blocks:
+            raise ValueError("published capacity can only grow")
+        if blocks > self.max_blocks:
+            raise ValueError(
+                f"cannot publish {blocks} blocks; the reservation holds {self.max_blocks}"
+            )
+        # Re-read the pool: a commit may have happened since the last publish.
+        self.committed_blocks = self._storage.committed_blocks
+        if blocks > self.committed_blocks:
+            raise ValueError(
+                f"cannot publish {blocks} blocks; the storage committed {self.committed_blocks}"
+            )
+        if blocks == self.published_blocks:
+            return blocks
+        self._refs.extend([0] * (blocks - self.published_blocks))
+        # _claim pops from the tail, so later blocks follow in ascending order.
+        self._free_blocks.extend(reversed(range(self.published_blocks, blocks)))
+        self.published_blocks = blocks
+        self.num_blocks = blocks
+        self.watermark_blocks = self._watermark(blocks)
+        return blocks
 
     def required_blocks(self, max_tokens: int) -> int:
         if not isinstance(max_tokens, Integral) or isinstance(max_tokens, bool) or max_tokens <= 0:

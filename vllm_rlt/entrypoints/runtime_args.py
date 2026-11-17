@@ -22,6 +22,13 @@ def add_runtime_args(parser):
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--incremental-kv", action="store_true")
     parser.add_argument("--kv-watermark", type=float, default=0.0)
+    parser.add_argument(
+        "--kv-vmm-bootstrap-blocks",
+        type=int,
+        default=None,
+        help="map only this many KV blocks at startup, then grow the pool to the planned "
+        "capacity (RFC #192 stage 2; CUDA only, automatic planning only)",
+    )
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
     parser.add_argument("--enable-preemption", action="store_true")
     parser.add_argument(
@@ -117,6 +124,7 @@ def runtime_configs(args):
             gpu_memory_utilization=args.gpu_memory_utilization,
             kv_cache_memory_bytes=args.kv_cache_memory_bytes,
             memory_reserve_bytes=args.memory_reserve_bytes,
+            vmm_bootstrap_blocks=args.kv_vmm_bootstrap_blocks,
         ),
         exit_config=ExitConfig(
             mode=args.exit_mode,

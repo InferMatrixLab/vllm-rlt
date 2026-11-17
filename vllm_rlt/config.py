@@ -20,6 +20,12 @@ class CacheConfig:
     incremental_allocation: bool = False
     # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
+    # Bootstrap block count for CUDA VMM-backed KV storage (RFC #192 stage 2).
+    # None keeps the ordinary torch allocation. When set, the pool reserves the
+    # planned capacity and maps only this many blocks up front, then maps the
+    # rest during startup. Automatic planning is required, so explicit
+    # num_blocks/kv_cache_memory_bytes keep their fixed-capacity semantics.
+    vmm_bootstrap_blocks: int | None = None
 
     def __post_init__(self):
         for name in ("enable_prefix_caching", "incremental_allocation"):
@@ -45,6 +51,13 @@ class CacheConfig:
                 raise ValueError("specify num_blocks or kv_cache_memory_bytes, not both")
         if type(self.memory_reserve_bytes) is not int or self.memory_reserve_bytes < 0:
             raise ValueError("memory_reserve_bytes must be a nonnegative integer")
+        if self.vmm_bootstrap_blocks is not None:
+            _positive("vmm_bootstrap_blocks", self.vmm_bootstrap_blocks)
+            if self.num_blocks is not None or self.kv_cache_memory_bytes is not None:
+                raise ValueError(
+                    "vmm_bootstrap_blocks requires automatic KV planning; "
+                    "num_blocks/kv_cache_memory_bytes keep fixed capacity"
+                )
 
 
 @dataclass(frozen=True)

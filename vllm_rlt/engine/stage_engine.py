@@ -14,6 +14,7 @@ from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.core.scheduling_policy import requires_staged_prefill
+from vllm_rlt.core.vmm_pool import GPUKVStorage
 from vllm_rlt.engine.connector import StageConnector
 from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
 from vllm_rlt.engine.preemption import PreemptionManager
@@ -68,6 +69,14 @@ class StageEngine:
                 raise ValueError(f"boundary-KV models require {required_layout} KV")
             if cache_config.enable_prefix_caching:
                 raise ValueError("boundary-KV prefix caching is not yet supported")
+        if cache_config.vmm_bootstrap_blocks is not None:
+            if parameter.device.type != "cuda":
+                raise ValueError("vmm_bootstrap_blocks requires a CUDA device")
+            if connector is not None:
+                raise ValueError(
+                    "vmm_bootstrap_blocks is not supported with a PD connector yet; "
+                    "NIXL registers the KV planes once at startup"
+                )
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
@@ -212,12 +221,25 @@ class StageEngine:
             speculative=speculative_config,
             staged_prefill=staged_prefill,
         )
+        # RFC #192 stage 2: reserve the planned capacity once, map only the
+        # bootstrap blocks now, and map the remainder after the runners exist.
+        self.kv_storage = None
+        bootstrap_blocks = num_blocks
+        if cache_config.vmm_bootstrap_blocks is not None:
+            self.kv_storage = GPUKVStorage(
+                max_blocks=num_blocks,
+                bytes_per_block=self.memory_plan["bytes_per_block"],
+                device=parameter.device,
+                dtype=parameter.dtype,
+            )
+            bootstrap_blocks = min(cache_config.vmm_bootstrap_blocks, num_blocks)
+            self.kv_storage.commit_blocks(bootstrap_blocks)
         self.cache_manager = KVCacheManager(
             num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_loops=config.total_ut_steps,
-            num_blocks=num_blocks,
+            num_blocks=bootstrap_blocks,
             layout=cache_config.layout,
             block_size=cache_config.block_size,
             device=parameter.device,
@@ -228,6 +250,7 @@ class StageEngine:
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
+            storage=self.kv_storage,
         )
         self.scheduler = Scheduler(
             scheduler_config,
@@ -296,6 +319,19 @@ class StageEngine:
         if scheduler_config.enable_preemption:
             self.scheduler.suspend_callback = self.preemption.suspend
             self.scheduler.resume_callback = self.preemption.resume
+        if self.kv_storage is not None:
+            # Every buffer the runners own now exists, so the remaining physical
+            # memory can be mapped into the same reservation and published.
+            self.kv_storage.commit_blocks(num_blocks)
+            self.cache_manager.publish_capacity(num_blocks)
+            self.memory_plan = dict(
+                self.memory_plan,
+                vmm=True,
+                vmm_bootstrap_blocks=bootstrap_blocks,
+                vmm_max_blocks=num_blocks,
+                vmm_committed_blocks=self.kv_storage.committed_blocks,
+                vmm_reserve_bytes=self.kv_storage.reserve_bytes,
+            )
 
     @property
     def connector(self):
@@ -439,6 +475,10 @@ class StageEngine:
             self.abort_request(rid)
         if self.async_speculative:
             self._discard_speculative()
+        # Device work is drained, so the reservation can be returned last.
+        if self.kv_storage is not None:
+            self.kv_storage.close()
+            self.kv_storage = None
 
     def _discard_speculative(self):
         """Release speculative owners after the caller has drained both streams."""
