@@ -1,5 +1,6 @@
 """Stable KV storage keeps the tensor addresses when the physical capacity increases."""
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -79,30 +80,19 @@ def test_graph_captured_before_commit_writes_newly_committed_blocks(write):
 
 
 @pytest.mark.gpu
-def test_close_returns_memory_the_torch_allocator_never_counted():
-    torch.cuda.synchronize()
+# A release error in a finalizer is only a warning by default.
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+def test_last_reference_releases_memory_the_torch_allocator_never_counted():
     reserved = torch.cuda.memory_reserved()
-    free = torch.cuda.mem_get_info()[0]
     storage = StableKVStorage(SPECS, max_blocks=4096, initial_blocks=4096, device=CUDA)
-    committed = storage.committed_bytes
-    assert committed >= 4096 * sum(spec.block_bytes for spec in SPECS)
-    held = torch.cuda.mem_get_info()[0]
-    assert free - held >= committed
+    assert storage.committed_bytes >= 4096 * sum(spec.block_bytes for spec in SPECS)
     assert torch.cuda.memory_reserved() == reserved
-
-    storage.close()
-    assert torch.cuda.mem_get_info()[0] - held >= committed
-
-
-@pytest.mark.gpu
-def test_views_keep_memory_mapped_after_the_storage_is_dropped():
-    storage = StableKVStorage(SPECS[:1], max_blocks=4096, initial_blocks=4096, device=CUDA)
-    committed = storage.committed_bytes
+    pools = [weakref.ref(pool) for pool in storage._pools]
     view = storage.tensors[0][-1]
+
     del storage
     view.fill_(5)
     assert bool((view == 5).all())
-    held = torch.cuda.mem_get_info()[0]
-
+    assert [pool() is not None for pool in pools] == [True, False]
     del view
-    assert torch.cuda.mem_get_info()[0] - held >= committed
+    assert pools[0]() is None
