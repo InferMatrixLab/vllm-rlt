@@ -8,9 +8,15 @@ result does not depend on the batch it runs in. Without splitting, one long
 row serialized its whole context in one program and set the decode step time.
 """
 
+from functools import lru_cache, partial
+
 import torch
 import triton
 import triton.language as tl
+from triton.errors import TritonError
+from triton.runtime import driver
+
+_PACKED_WINDOW_TILE = (32, 32)
 
 # Splits per row for single-query attention. A power of two (tl.arange) and a
 # constant, so the grid is static under CUDA graphs and independent of batch.
@@ -330,6 +336,7 @@ def paged_prefill_attention(
     *,
     window=0,
     compensate=False,
+    tile=None,
 ):
     """Packed causal prefill over paged K/V, bottom-right aligned per sequence.
 
@@ -344,15 +351,51 @@ def paged_prefill_attention(
         return output
     if type(window) is not int or window < 0:
         raise ValueError("window must be a nonnegative integer")
-    # The compensated head-dim-256 variant must fit SM 12.0's shared memory limit.
-    block_m, block_n = (32, 64) if compensate else (64, 64)
-    q_blocks = triton.cdiv(int(max_seqlen_q), block_m)
     for tensor in (key_cache, value_cache):
         if tensor.stride(3) != 1:
             raise ValueError("paged prefill requires a contiguous head dimension")
     if q.stride(2) != 1:
         raise ValueError("paged prefill requires contiguous query rows")
-    _paged_prefill_kernel[(sequences * q_blocks, q.shape[1])](
+    _launch_paged_prefill(
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        cu_seqlens_q,
+        output,
+        max_seqlen_q,
+        window=window,
+        compensate=compensate,
+        tile=tile,
+    )
+    return output
+
+
+def _launch_paged_prefill(
+    q,
+    key_cache,
+    value_cache,
+    block_tables,
+    context_lengths,
+    cu_seqlens_q,
+    output,
+    max_seqlen_q,
+    *,
+    window,
+    compensate,
+    tile,
+    compile_only=False,
+):
+    block_m, block_n = tile or (_PACKED_WINDOW_TILE if compensate else (64, 64))
+    q_blocks = triton.cdiv(int(max_seqlen_q), block_m)
+    grid = (block_tables.shape[0] * q_blocks, q.shape[1])
+    launch = (
+        partial(_paged_prefill_kernel.warmup, grid=grid)
+        if compile_only
+        else _paged_prefill_kernel[grid]
+    )
+    return launch(
         q,
         key_cache,
         value_cache,
@@ -386,4 +429,47 @@ def paged_prefill_attention(
         num_warps=4,
         num_stages=1 if compensate else 2,
     )
-    return output
+
+
+def select_packed_window_tile(device, dtype, head_dim, block_size, shape):
+    if torch.version.hip or dtype != torch.bfloat16:
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    try:
+        return _select_packed_window_tile(index, head_dim, block_size, shape)
+    except torch.OutOfMemoryError:
+        # A transient failure must not be cached for other engines.
+        return None
+
+
+@lru_cache(maxsize=16)
+def _select_packed_window_tile(index, head_dim, block_size, shape):
+    # Warmup only needs tensor metadata. Preserve the KV pool's interleaved layer strides.
+    q = torch.empty((256, shape.query_heads, head_dim), device="meta", dtype=torch.bfloat16)
+    kv = q.new_empty((1, shape.kv_layers, block_size, shape.kv_heads, head_dim))[:, 0]
+    table = q.new_empty((1, 16), dtype=torch.int32)
+    lengths = q.new_empty(1, dtype=torch.int32)
+    offsets = q.new_empty(2, dtype=torch.int32)
+    with torch.cuda.device(index):
+        limit = driver.active.utils.get_device_properties(index)["max_shared_mem"]
+        try:
+            for window in (0, shape.window):
+                compiled = _launch_paged_prefill(
+                    q,
+                    kv,
+                    kv,
+                    table,
+                    lengths,
+                    offsets,
+                    q,
+                    len(q),
+                    window=window,
+                    compensate=True,
+                    tile=_PACKED_WINDOW_TILE,
+                    compile_only=True,
+                )
+                if compiled.metadata.shared > limit:
+                    return None
+        except TritonError:
+            return None
+    return _PACKED_WINDOW_TILE

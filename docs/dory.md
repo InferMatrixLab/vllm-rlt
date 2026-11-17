@@ -97,12 +97,17 @@ In Python, set `attention_backend="triton"` and
 `--attention-backend triton --packed-prefill`. Dory uses per-query prefill when
 the option is omitted or when `--no-packed-prefill` is set.
 
-This path requires Dory BF16, NVIDIA SM 12.0, `per_loop` KV, ordinary prefill,
-and synchronous eager single-stage execution. Speculation, preemption, CUDA
-graphs and asynchronous scheduling are outside its scope. RTX 5090 is the
-only GPU tested. Validate other SM 12.0 GPUs locally. Other GPU
-architectures require a separate kernel configuration and validation
-before the option can be enabled.
+This path uses BF16, `per_loop` KV, ordinary prefill, and synchronous eager
+single-stage execution. Speculation, preemption, CUDA graphs and asynchronous
+scheduling are outside its scope.
+
+On NVIDIA CUDA, the packed path uses a 32 × 32 tile. At startup, Triton compiles
+the full and sliding-window kernels and checks their shared-memory requirements
+against the device limit. The engine uses per-query attention if the check
+fails. The result is cached by device and attention geometry within the process.
+The check runs before KV memory planning and uses tensor metadata only.
+The full BF16 checkpoint and long-context service validation require enough
+device memory for the model weights, runtime buffers and KV pool.
 
 A batch uses packed attention across PRELUDE, recurrence and the CODA
 writes for prompt history when every prompt is longer than 64 tokens.

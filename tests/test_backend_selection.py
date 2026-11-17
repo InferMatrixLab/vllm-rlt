@@ -24,7 +24,7 @@ def packages(monkeypatch):
         if name == "vllm_rlt.kernels.triton_attention":
             if "triton" not in installed:
                 raise ImportError("triton is not installed")
-            return SimpleNamespace()
+            return SimpleNamespace(select_packed_window_tile=lambda *args: None)
         if name in ("flash_attn", "flash_attn_3.flash_attn_interface", "flash_attn.cute"):
             if name not in installed:
                 raise ImportError(f"{name} is not installed")
@@ -309,35 +309,60 @@ def test_explicit_triton_rejects_unsupported_nvidia_hardware(packages, monkeypat
         create_backend("triton", torch.device("cuda"), torch.float16, 128, 256)
 
 
-@pytest.mark.parametrize(
-    "sm,dtype,hip,expected",
-    [
-        ((12, 0), torch.bfloat16, None, True),
-        ((12, 1), torch.bfloat16, None, False),
-        ((8, 9), torch.bfloat16, None, False),
-        ((12, 0), torch.float32, None, False),
-        ((12, 0), torch.bfloat16, "test", False),
-    ],
-)
-def test_triton_packed_sliding_window_capability(packages, monkeypatch, sm, dtype, hip, expected):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
-    monkeypatch.setattr(torch.version, "hip", hip)
-    args = (torch.device("cuda"), dtype, 256, 16)
-    required = BackendCapabilities(
-        packed_prefill=True, sliding_window=True, packed_sliding_window=True
+def test_triton_advertises_packed_window_only_after_selecting_a_tile(packages, monkeypatch):
+    from vllm_rlt.attention import backend as selection
+    from vllm_rlt.kernels.paged_attention import PackedWindowShape
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+    base_import = selection.importlib.import_module
+    shape = PackedWindowShape(16, 4, 36, 1024)
+    calls = []
+
+    def probe(device, dtype, head_dim, block_size, requested_shape):
+        calls.append((device, dtype, head_dim, block_size, requested_shape))
+        return (32, 32)
+
+    def import_module(name):
+        if name == "vllm_rlt.kernels.triton_attention":
+            return SimpleNamespace(select_packed_window_tile=probe)
+        return base_import(name)
+
+    monkeypatch.setattr(selection.importlib, "import_module", import_module)
+    args = (torch.device("cuda"), torch.bfloat16, 256, 16)
+    backend = create_backend(
+        "auto",
+        *args,
+        required_capabilities=BackendCapabilities(sliding_window=True),
+        packed_window_shape=shape,
     )
-    if not expected:
-        with pytest.raises(
-            ValueError, match="packed_sliding_window requires NVIDIA SM 12.0 and BF16"
-        ):
-            create_backend("triton", *args, required_capabilities=required)
-        with pytest.raises(ValueError, match="no compatible attention backend"):
-            create_backend("auto", *args, required_capabilities=required)
-        return
-    backend = create_backend("auto", *args, required_capabilities=required)
     assert backend.info["selected_backend"] == "triton"
+    assert backend.info["packed_prefill_tile"] == (32, 32)
     assert backend.capabilities.packed_prefill and backend.capabilities.packed_sliding_window
     assert not create_backend("triton", *args).capabilities.packed_sliding_window
+    assert calls == [(*args, shape)]
+
+
+@pytest.mark.parametrize("backend", ["triton", "auto"])
+def test_packed_window_falls_back_to_per_query_when_probe_has_no_tile(
+    packages, monkeypatch, backend
+):
+    from vllm_rlt.kernels.paged_attention import PackedWindowShape
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+    shape = PackedWindowShape(16, 4, 36, 1024)
+    selected = create_backend(
+        backend,
+        torch.device("cuda"),
+        torch.bfloat16,
+        256,
+        16,
+        required_capabilities=BackendCapabilities(sliding_window=True),
+        packed_window_shape=shape,
+    )
+    assert selected.info["selected_backend"] == "triton"
+    assert selected.info["packed_prefill_tile"] is None
+    assert not selected.capabilities.packed_prefill
+    assert not selected.capabilities.packed_sliding_window
 
 
 def test_auto_skips_broken_binary_import(packages, monkeypatch):
