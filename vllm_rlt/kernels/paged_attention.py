@@ -5,6 +5,7 @@ manager selects each row's depth-specific block table before dispatching here.
 """
 
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -159,6 +160,15 @@ def triton_paged_attention(
     )
 
 
+@dataclass(frozen=True)
+class PackedWindowShape:
+    query_heads: int
+    kv_heads: int
+    kv_layers: int
+    window: int | None
+    fp8_kv: bool = False
+
+
 def triton_paged_prefill(
     q,
     key_cache,
@@ -169,6 +179,9 @@ def triton_paged_prefill(
     max_seqlen_q,
     key_scale=None,
     value_scale=None,
+    *,
+    window=0,
+    compensate=False,
 ):
     """Packed causal prefill with one block table per sequence (see triton_attention)."""
     from vllm_rlt.kernels.triton_attention import paged_prefill_attention
@@ -183,11 +196,16 @@ def triton_paged_prefill(
         max_seqlen_q,
         key_scale,
         value_scale,
+        window=window,
+        compensate=compensate,
     )
 
 
 class TritonPagedAttention:
     """Triton single-query decode attention plus packed causal prefill."""
+
+    def __init__(self, *, compensate=False):
+        self.compensate = compensate
 
     def __call__(
         self,
@@ -226,4 +244,4 @@ class TritonPagedAttention:
         )
 
     def prefill(self, *args, **kwargs):
-        return triton_paged_prefill(*args, **kwargs)
+        return triton_paged_prefill(*args, **kwargs, compensate=self.compensate)

@@ -844,8 +844,17 @@ class KVCacheManager:
         self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
         if window is not None:
-            return self._attend_windowed(layer, batch, q, window)
+            if batch.cu_seqlens_q is None:
+                return self._attend_windowed(layer, batch, q, window)
+            if not self.attention_capabilities.packed_sliding_window:
+                raise NotImplementedError("sliding-window attention needs one query row per token")
+            if type(window) is not int or window <= 0:
+                raise ValueError("window must be a positive integer")
         if isinstance(batch, DeviceKVMetadata):
+            if window is not None:
+                raise NotImplementedError(
+                    "packed sliding-window attention requires host-planned KV"
+                )
             return self.attention(
                 q,
                 self.key_cache[:, layer],
@@ -868,6 +877,7 @@ class KVCacheManager:
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
                 **self._layer_scales(layer),
+                **({} if window is None else {"window": window}),
             )
         return self.attention(
             q,

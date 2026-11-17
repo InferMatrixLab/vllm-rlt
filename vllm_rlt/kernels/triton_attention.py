@@ -11,9 +11,15 @@ FP8 e4m3 pools are read with one float32 scale per (block, token, KV head)
 vector; both kernels dequantize on load.
 """
 
+from functools import lru_cache, partial
+
 import torch
 import triton
 import triton.language as tl
+from triton.errors import TritonError
+from triton.runtime import driver
+
+_PACKED_WINDOW_TILE = (32, 32)
 
 # Splits per row for single-query attention. A power of two (tl.arange) and a
 # constant, so the grid is static under CUDA graphs and independent of batch.
@@ -274,6 +280,8 @@ def _paged_prefill_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRECISION: tl.constexpr,
+    WINDOW: tl.constexpr,
+    COMPENSATE: tl.constexpr,
     max_q_blocks,
 ):
     pid = tl.program_id(0)
@@ -305,7 +313,8 @@ def _paged_prefill_kernel(
     accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
     # Bottom-right causal alignment: the last query row sees every key.
     end = tl.minimum(kv_len, prefix + (q_block + 1) * BLOCK_M)
-    for start in range(0, end, BLOCK_N):
+    first = tl.maximum(0, prefix + q_block * BLOCK_M - WINDOW + 1) if WINDOW else 0
+    for start in range(first // BLOCK_N * BLOCK_N, end, BLOCK_N):
         keys_pos = start + tl.arange(0, BLOCK_N)
         key_valid = keys_pos < end
         blocks = tl.load(
@@ -333,6 +342,8 @@ def _paged_prefill_kernel(
             keys = tl.load(key_pointers, mask=kv_mask, other=0.0)
         scores = tl.dot(query, tl.trans(keys), input_precision=PRECISION) * SCALE
         visible = key_valid[None, :] & (keys_pos[None, :] <= positions[:, None])
+        if WINDOW:
+            visible = visible & (keys_pos[None, :] >= positions[:, None] - WINDOW + 1)
         scores = tl.where(visible, scores, -float("inf"))
         next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
         # Rows with no visible key in this tile keep -inf; avoid inf - inf.
@@ -352,9 +363,13 @@ def _paged_prefill_kernel(
             values = values.to(Q.dtype.element_ty)
         else:
             values = tl.load(value_pointers, mask=kv_mask, other=0.0)
-        accumulator = accumulator * correction[:, None] + tl.dot(
-            weights.to(values.dtype), values, input_precision=PRECISION
-        )
+        rounded = weights.to(values.dtype)
+        partial = tl.dot(rounded, values, input_precision=PRECISION)
+        if COMPENSATE:
+            # Recover the leading bits lost when the FP32 weight is cast for MMA.
+            residual = (weights - rounded.to(tl.float32)).to(values.dtype)
+            partial = tl.dot(residual, values, partial, input_precision=PRECISION)
+        accumulator = accumulator * correction[:, None] + partial
         normalizer = normalizer * correction + tl.sum(weights, axis=1)
         maximum = next_maximum
     out = accumulator / tl.maximum(normalizer, 1.0e-30)[:, None]
@@ -378,6 +393,9 @@ def paged_prefill_attention(
     max_seqlen_q,
     key_scale=None,
     value_scale=None,
+    *,
+    window=0,
+    compensate=False,
 ):
     """Packed causal prefill over paged K/V, bottom-right aligned per sequence.
 
@@ -391,19 +409,60 @@ def paged_prefill_attention(
     sequences = block_tables.shape[0]
     if q.shape[0] == 0 or sequences == 0:
         return output
-    block_m, block_n = 64, 64
-    q_blocks = triton.cdiv(int(max_seqlen_q), block_m)
+    if type(window) is not int or window < 0:
+        raise ValueError("window must be a nonnegative integer")
     for tensor in (key_cache, value_cache):
         if tensor.stride(3) != 1:
             raise ValueError("paged prefill requires a contiguous head dimension")
     if q.stride(2) != 1:
         raise ValueError("paged prefill requires contiguous query rows")
+    _launch_paged_prefill(
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        cu_seqlens_q,
+        output,
+        max_seqlen_q,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        window=window,
+        compensate=compensate,
+    )
+    return output
+
+
+def _launch_paged_prefill(
+    q,
+    key_cache,
+    value_cache,
+    block_tables,
+    context_lengths,
+    cu_seqlens_q,
+    output,
+    max_seqlen_q,
+    *,
+    window,
+    compensate,
+    key_scale=None,
+    value_scale=None,
+    compile_only=False,
+):
+    block_m, block_n = _PACKED_WINDOW_TILE if compensate else (64, 64)
+    q_blocks = triton.cdiv(int(max_seqlen_q), block_m)
+    grid = (block_tables.shape[0] * q_blocks, q.shape[1])
+    launch = (
+        partial(_paged_prefill_kernel.warmup, grid=grid)
+        if compile_only
+        else _paged_prefill_kernel[grid]
+    )
     has_scale = key_scale is not None
     # Unused pointer arguments when the pool is not quantized.
     key_scale = key_scale if has_scale else context_lengths
     value_scale = value_scale if has_scale else context_lengths
     scale_strides = key_scale.stride() if has_scale else (0, 0, 0)
-    _paged_prefill_kernel[(sequences * q_blocks, q.shape[1])](
+    return launch(
         q,
         key_cache,
         value_cache,
@@ -435,11 +494,12 @@ def paged_prefill_attention(
         BLOCK_N=block_n,
         # FP32 callers (reference checks) need exact products, not TF32.
         PRECISION="ieee" if q.dtype == torch.float32 else "tf32",
+        WINDOW=window,
+        COMPENSATE=compensate,
         max_q_blocks=q_blocks,
         num_warps=4,
-        num_stages=2,
+        num_stages=1 if compensate else 2,
     )
-    return output
 
 
 @triton.jit
@@ -552,3 +612,52 @@ def store_fp8(
         TINY=torch.finfo(torch.float32).tiny,
         num_warps=1,
     )
+
+
+def select_packed_window_tile(device, dtype, head_dim, block_size, shape):
+    if torch.version.hip or dtype != torch.bfloat16:
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    try:
+        return _select_packed_window_tile(index, head_dim, block_size, shape)
+    except torch.OutOfMemoryError:
+        # A transient failure must not be cached for other engines.
+        return None
+
+
+@lru_cache(maxsize=16)
+def _select_packed_window_tile(index, head_dim, block_size, shape):
+    # Warmup only needs tensor metadata. Preserve the KV pool's interleaved layer strides.
+    q = torch.empty((256, shape.query_heads, head_dim), device="meta", dtype=torch.bfloat16)
+    kv_shape = (1, shape.kv_layers, block_size, shape.kv_heads)
+    kv_dtype = torch.float8_e4m3fn if shape.fp8_kv else q.dtype
+    kv = q.new_empty((*kv_shape, head_dim), dtype=kv_dtype)[:, 0]
+    scale = q.new_empty(kv_shape, dtype=torch.float32)[:, 0] if shape.fp8_kv else None
+    table = q.new_empty((1, 16), dtype=torch.int32)
+    lengths = q.new_empty(1, dtype=torch.int32)
+    offsets = q.new_empty(2, dtype=torch.int32)
+    windows = (0,) if shape.window is None else (0, shape.window)
+    with torch.cuda.device(index):
+        limit = driver.active.utils.get_device_properties(index)["max_shared_mem"]
+        try:
+            for window in windows:
+                compiled = _launch_paged_prefill(
+                    q,
+                    kv,
+                    kv,
+                    table,
+                    lengths,
+                    offsets,
+                    q,
+                    len(q),
+                    window=window,
+                    compensate=True,
+                    key_scale=scale,
+                    value_scale=scale,
+                    compile_only=True,
+                )
+                if compiled.metadata.shared > limit:
+                    return None
+        except TritonError:
+            return None
+    return _PACKED_WINDOW_TILE

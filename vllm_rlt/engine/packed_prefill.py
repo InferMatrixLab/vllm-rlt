@@ -2,22 +2,40 @@
 
 
 def packed_prefill_eligible(
-    packed_prefill, *, device_type, layout, staged_prefill, sliding_window=False
+    execution,
+    *,
+    device_type,
+    layout,
+    staged_prefill,
+    sliding_window=False,
+    stage_role="prefill_decode",
+    speculative=False,
+    preemption=False,
 ):
-    """Validate explicit requests and return whether packing may be enabled.
+    """Validate execution constraints before filtering by backend capability.
 
-    Staged prefill and sliding-window attention retain their existing metadata.
-    Backend support is checked separately by attention selection.
+    Sliding-window packing requires host-planned metadata and ordinary
+    synchronous prefill in a single stage.
     """
-    if packed_prefill and sliding_window:
-        raise ValueError("packed_prefill does not support sliding-window attention")
-    if packed_prefill and (device_type != "cuda" or layout != "last_exited"):
-        raise ValueError("packed_prefill requires CUDA packed prefill with last_exited KV")
-    if packed_prefill is not None:
-        return bool(packed_prefill)
-    return (
-        device_type == "cuda"
-        and layout == "last_exited"
-        and not staged_prefill
-        and not sliding_window
-    )
+    requested = execution.packed_prefill
+    if requested is False:
+        return False
+    if sliding_window and (
+        execution.async_scheduling
+        or execution.cuda_graphs
+        or staged_prefill
+        or speculative
+        or preemption
+        or stage_role != "prefill_decode"
+    ):
+        if requested is True:
+            raise ValueError(
+                "sliding-window packed prefill requires synchronous eager single-stage execution "
+                "with ordinary prefill, without speculation or preemption"
+            )
+        return False
+    if device_type != "cuda" or layout != "last_exited":
+        if requested is True:
+            raise ValueError("packed_prefill requires CUDA packed prefill with last_exited KV")
+        return False
+    return requested is True or not staged_prefill
