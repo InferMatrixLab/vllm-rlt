@@ -4,7 +4,9 @@ Run Ouro on one Ascend NPU with BF16, synchronous greedy decoding and four
 recurrent loops. Use the explicit `ascend_eager` attention backend.
 
 Sections 1–5 describe the synchronous path and its historical measurements.
-Section 6 covers the optional asynchronous engine plan.
+Section 6 covers the optional asynchronous engine plan. Sections 7–8 record
+successive serving campaigns and their qualification limits. Sections 7–8 record
+successive serving campaigns and their qualification limits.
 
 ## 1. Prepare the environment and model
 
@@ -317,7 +319,7 @@ paired real-checkpoint configurations match the baseline. These runs do not
 qualify unsupported SM120 paged FlashAttention or NIXL configurations. ROCm
 hardware validation is deferred.
 
-## 7. Unified workload follow-up
+## 7. Unified workload follow-up (`394f3b1`, quota1) (`394f3b1`, quota1)
 
 The refill follow-up preserves a RECURRENT scheduling opportunity when full-depth
 PRELUDE would otherwise bypass pending prompt or recurrent work. Bounded CPU
@@ -414,3 +416,128 @@ and the full summary are retained in
 `/work/vllm-rlt-engine-20261117/unified-fairness-20261117`. The initial pre-fix
 campaign is retained separately as an aborted defect diagnostic and contributes
 no selected performance runs above.
+
+## 8. Profile-guided high-batch scheduling
+
+This follow-up keeps model arithmetic, global defaults and CUDA/ROCm execution
+unchanged. The runtime delta is two scheduler-accounting lines: a full-depth
+coalesced PRELUDE has performed recurrent work, so it must reset the prefill
+fairness counter. Embedding-only PRELUDE retains the previous counter.
+
+The main throughput change is an existing configuration option,
+`max_prefill_batches_before_decode=32`, rather than an isolated benefit from
+those two lines. At budget/chunk 1024, the default quota of one interrupts
+P128/C32 prompt cohorts with decode: observed KV lengths become 130–133.
+Nonuniform ranges export owned KV to paged storage and force Python layer
+execution. Quota32 completes the resident prompt cohort first, preserving
+uniform KV and the native eager host path. Higher quotas can postpone decode
+for existing requests; the global default remains one.
+
+Independent P128/C32 profiles cover one complete resident UT4 decode (96 layer
+calls), without model hooks. Both ops-only and full modes are retained; full
+enables shapes, memory, stacks and CPU/NPU activities. Instrumented durations
+are not throughput measurements. CPU trace counts and Python call counts are:
+
+| Decode path | Python calls | KV index_select | contiguous | linear |
+| --- | ---: | ---: | ---: | ---: |
+| Quota1 / paged Python fallback | 74323 | 192 | 192 | 677 |
+| Quota32 / owned KV + native host | 31447 | 0 | 4 | 677 |
+| HF eager | 26754 | 0 | 0 | 677 |
+
+Python calls fall 57.7%; the model projections remain separate. No fused
+attention/norm/activation or graph replay is introduced. One HF ops-only
+export lacks hardware events and is retained separately from its post-timing
+recapture. Missing events are not interpreted as zero device work.
+
+### Unified matrix with quota32 and budget/chunk 1024
+
+All 48 preselected runs complete: W1–W7 plus P128/O128/C64, each arm with
+three unprofiled 60-second closed-loop admission windows followed by full
+drain. Conditions, frozen inputs, complete-output cohort warmup exclusions,
+capacity adjustments and latency definitions follow section 7. Each workload
+uses a fixed card/CPU affinity for both arms; orders alternate native/HF,
+HF/native, native/HF. Values are median [min–max] output tok/s. Output mismatch
+makes affected rows diagnostic rather than equal-quality acceptance.
+
+| Workload | Input / output / clients | Residents | HF eager tok/s | Engine tok/s | vs HF |
+| --- | --- | ---: | ---: | ---: | ---: |
+| W1 | 128 / 128 / 1 | 1 | 6.112 [5.080–6.254] | 9.638 [9.317–10.071] | +57.69% |
+| W2 | 128 / 128 / 32 | 32 | 198.614 [134.124–199.151] | 300.251 [283.298–305.138] | +51.17% |
+| W2C64 | 128 / 128 / 64 | 64 | 370.250 [326.423–401.186] | 548.771 [536.924–557.119] | +48.22% |
+| W3 | 4096 / 128 / 1 | 1 | 5.963 [5.800–6.100] | 8.913 [7.599–9.286] | +49.48% |
+| W4 | 4096 / 128 / 32 | 4 | 19.987 [19.460–20.839] | 29.371 [29.081–30.408] | +46.95% |
+| W5 | 1024 / 512 / 8 | 8 | 49.459 [47.994–50.664] | 77.213 [76.857–78.132] | +56.11% |
+| W6 | ShareGPT / EOS cap 512 / 8 | 8 | 25.614 [25.385–26.475] | 37.633 [36.620–37.645] | +46.93% |
+| W7 | ShareGPT / EOS cap 512 / 32 | 8 | 35.655 [35.381–36.094] | 34.811 [33.708–36.959] | -2.37% |
+
+W1–W5 and C64 retain owned KV and native host execution throughout their timed
+windows, without fallback. W6/W7 materialize paged storage during warmup and
+have zero native layer calls in the timed windows. W7 does not establish a
+speedup; its ranges overlap and its natural outputs remain different.
+
+Complete-output comparison after bounded supplemental HF reference coverage:
+
+| Workload | Identical / engine requests with HF reference | Unverified |
+| --- | ---: | ---: |
+| W1 | 15 / 15 | 0 |
+| W2 | 474 / 480 | 0 |
+| W2C64 | 854 / 896 | 0 |
+| W3 | 14 / 14 | 0 |
+| W4 | 114 / 132 | 0 |
+| W5 | 39 / 48 | 0 |
+| W6 | 15 / 27 | 0 |
+| W7 | 42 / 99 | 0 |
+
+### Separate full-cohort prefill preset
+
+The first W2 pilot divergence is input44, generated token0. A post-timing
+diagnostic saves complete logits and LM-head inputs under identical prompt
+history, comparing Python/native engine execution, HF batch8/batch32 and
+full-cohort engine prefill. For this input:
+
+- Native logits equal Python logits: **True**.
+- Small-budget native logits equal HF batch8: **True**.
+- Full-cohort prefill logits equal HF batch32: **True**.
+
+Batch geometry is therefore checked explicitly, rather than treating a greedy
+mismatch as acceptable rounding. This bounded diagnostic does not explain all
+mixed/natural-input output differences.
+
+A separately declared C32/C64 matrix uses the existing settings
+`max_num_batched_tokens=8192`, `prefill_chunk_size=1024` and
+`max_prefill_batches_before_decode=32`. Whole-cohort prefill fits the budget;
+no runtime or arithmetic change is made. Both resident counts equal client
+concurrency. The logical KV block counts are 2064/4112 (16 tokens per block).
+An independent 128-sequence/O128 parity gate precedes 12 fresh selected timing
+runs, with the same three-run, 60-second-plus-drain protocol. They do not
+replace any run in the 48-run matrix above.
+
+| Workload | Input / output / clients | Residents | HF eager tok/s | Engine tok/s | vs HF |
+| --- | --- | ---: | ---: | ---: | ---: |
+| W2 | 128 / 128 / 32 | 32 | 194.630 [194.316–201.176] | 300.901 [293.366–302.529] | +54.60% |
+| W2C64 | 128 / 128 / 64 | 64 | 395.422 [389.372–414.086] | 574.780 [560.031–591.155] | +45.36% |
+
+Pooled TTFT p50 is 329.6/316.1 ms at C32 and 873.2/646.2 ms at C64
+(engine/HF); C32 TTFT p95 is 629.8/317.9 ms. The throughput gain does not
+establish faster first output. Mean TPOT is 104.84/161.51 ms at C32 and
+105.26/155.86 ms at C64.
+
+| Workload | Selected engine outputs equal independent HF reference | Unverified |
+| --- | ---: | ---: |
+| W2 | 480 / 480 | 0 |
+| W2C64 | 960 / 960 | 0 |
+
+Fixed-input equal-quality acceptance for this separate preset: **True**.
+This does not qualify natural-input task accuracy or arbitrary mixed batches.
+Fresh GSM8K-87 qualification has not been run.
+
+The counter regression fails before the fix. The final runtime passes 1124
+CPU tests (802 skipped), 54 targeted CPU/NPU tests and full-tree Ruff checks.
+The disabled coalescing option short-circuits the new accounting; no new
+CUDA throughput or ROCm hardware result is claimed.
+
+The full report retains pooled mean/p95/p99 TTFT/TPOT/ITL/E2E, per-run memory
+peaks, natural output lengths, native/fallback counters and failed/slow runs.
+Raw requests, both predeclared protocols, source hashes, diagnostics and
+profiles are retained in
+`/work/vllm-rlt-engine-20261117/high-batch-20261117`.

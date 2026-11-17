@@ -110,6 +110,34 @@ def engine_for(model, planned, multi_stream=False, token_budget=128):
     )
 
 
+@pytest.mark.parametrize("coalesced,waiting", [(True, False), (False, False), (True, True)])
+def test_fixed_prelude_accounts_for_recurrent_fairness(coalesced, waiting):
+    scheduler = Scheduler(
+        SchedulerConfig(max_num_seqs=2, max_prefill_batches_before_decode=4),
+        make_cpu_cache(tiny_ouro_config(), blocks=128),
+        total_ut_steps=4,
+        exit_mode="ouro_delayed",
+        coalesce_fixed_prelude=coalesced,
+    )
+    params = SamplingParams(max_tokens=8, min_loops=4, max_loops=4, ignore_eos=True)
+    scheduler.add_request(Request("a", [1, 2, 3], params))
+    for expected in (RequestPhase.PREFILL, RequestPhase.CODA):
+        batch = scheduler.schedule()
+        assert batch.phase == expected
+        scheduler.update_after_submission(batch)
+    if waiting:
+        scheduler.add_request(Request("b", [4, 5, 6], params))
+    for _ in range(scheduler.config.max_prefill_batches_before_decode):
+        scheduler.policy.record_batch(RequestPhase.PREFILL)
+    assert scheduler.policy.decode_due
+    batch = scheduler.schedule()
+    assert batch.phase == RequestPhase.PRELUDE
+    assert bool(batch.loop_count) == (coalesced and not waiting)
+    # A coalesced decode submission actually runs recurrent work. Embedding-only
+    # PRELUDE must retain the pending prefill budget until its core is selected.
+    assert scheduler.policy.decode_due == (not coalesced or waiting)
+
+
 @pytest.mark.npu
 @torch.inference_mode()
 @pytest.mark.parametrize("multi_stream", [False, True])

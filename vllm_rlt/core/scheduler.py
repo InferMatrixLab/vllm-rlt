@@ -781,6 +781,8 @@ class Scheduler:
         )
         self.policy.record_batch(recorded)
         loop_count = self._planned_loop_count(scheduled_requests)
+        if self.coalesce_fixed_prelude and selected_phases == {RequestPhase.PRELUDE} and loop_count:
+            self.policy.record_batch(RequestPhase.RECURRENT)
         scheduled_requests = [
             replace(
                 item,
