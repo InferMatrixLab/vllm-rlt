@@ -670,3 +670,23 @@ def test_exit_written_ignores_boundary_layers(model):
     # The output stage has not run, so "every layer" is still false.
     assert not cache.token_written("request", 0, model.config.total_ut_steps - 1)
     cache.free("request")
+
+
+@pytest.mark.parametrize("packed_prefill", [None, False])
+def test_dory_cpu_keeps_per_row_prefill(model, packed_prefill):
+    engine = LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=packed_prefill))
+    assert engine.execution_config.packed_prefill is False
+    assert not engine.cache_manager.attention_capabilities.packed_sliding_window
+
+
+def test_dory_packed_prefill_requires_cuda(model):
+    with pytest.raises(ValueError, match="packed_prefill requires CUDA"):
+        LLMEngine(model, execution_config=ExecutionConfig(packed_prefill=True))
+
+
+def test_dory_packed_prefill_rejects_graphs(model):
+    with pytest.raises(ValueError, match="packed prefill requires synchronous eager"):
+        LLMEngine(
+            model,
+            execution_config=ExecutionConfig(packed_prefill=True, cuda_graphs=True),
+        )

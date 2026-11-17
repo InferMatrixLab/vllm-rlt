@@ -81,12 +81,17 @@ For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --att
 `ExecutionConfig.packed_prefill` controls packed prefill attention and metadata
 staging. Its default, `None`, selects packed prefill when the selected backend
 supports it on CUDA with `last_exited` KV and ordinary, non-staged prefill.
-Mixed scheduling, wavefront chunked prefill and sliding-window attention keep
-their existing paths. These selection rules apply to all models.
+Mixed scheduling and wavefront chunked prefill keep their existing paths.
+Sliding-window packing additionally requires backend support for both packed
+prefill and packed sliding-window attention, with ordinary synchronous eager
+single-stage execution, without speculation or preemption. These selection rules
+apply to all models. Incompatible automatic configurations keep per-query attention.
 
 Set `packed_prefill=True` / `--packed-prefill` to require packed prefill, or
 `packed_prefill=False` / `--no-packed-prefill` to disable its staging path.
-Explicit requests still undergo device, model and backend compatibility checks.
+Explicit enable requests fail if execution constraints or required backend
+capabilities are unsupported; they do not silently fall back. Explicit disable
+does not probe a packed sliding-window tile.
 
 `ExecutionConfig.use_uva` independently controls how input buffers are read.
 `use_uva=False` / `--no-uva` copies them to the GPU and can be combined with

@@ -5,6 +5,7 @@ manager selects each row's depth-specific block table before dispatching here.
 """
 
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -102,19 +103,47 @@ def triton_paged_attention(
     return paged_attention(q, key_cache, value_cache, block_tables, context_lengths, window=window)
 
 
+@dataclass(frozen=True)
+class PackedWindowShape:
+    query_heads: int
+    kv_heads: int
+    kv_layers: int
+    window: int | None
+
+
 def triton_paged_prefill(
-    q, key_cache, value_cache, block_tables, context_lengths, cu_seqlens_q, max_seqlen_q
+    q,
+    key_cache,
+    value_cache,
+    block_tables,
+    context_lengths,
+    cu_seqlens_q,
+    max_seqlen_q,
+    *,
+    window=0,
+    compensate=False,
 ):
     """Packed causal prefill with one block table per sequence (see triton_attention)."""
     from vllm_rlt.kernels.triton_attention import paged_prefill_attention
 
     return paged_prefill_attention(
-        q, key_cache, value_cache, block_tables, context_lengths, cu_seqlens_q, max_seqlen_q
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        cu_seqlens_q,
+        max_seqlen_q,
+        window=window,
+        compensate=compensate,
     )
 
 
 class TritonPagedAttention:
     """Triton single-query decode attention plus packed causal prefill."""
+
+    def __init__(self, *, compensate=False):
+        self.compensate = compensate
 
     def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
         return triton_paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
@@ -125,4 +154,4 @@ class TritonPagedAttention:
         )
 
     def prefill(self, *args, **kwargs):
-        return triton_paged_prefill(*args, **kwargs)
+        return triton_paged_prefill(*args, **kwargs, compensate=self.compensate)

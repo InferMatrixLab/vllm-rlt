@@ -746,7 +746,12 @@ class KVCacheManager:
                 raise NotImplementedError(
                     "sliding-window attention is not implemented for sparse decode rows"
                 )
-            return self._attend_windowed(layer, batch, q, window)
+            if batch.cu_seqlens_q is None:
+                return self._attend_windowed(layer, batch, q, window)
+            if not self.attention_capabilities.packed_sliding_window:
+                raise NotImplementedError("sliding-window attention needs one query row per token")
+            if type(window) is not int or window <= 0:
+                raise ValueError("window must be a positive integer")
         if not isinstance(batch, DeviceKVMetadata):
             for allocation, depth, position in batch.rows:
                 self._require_prefix(allocation, layer, depth, position + 1)
@@ -762,6 +767,10 @@ class KVCacheManager:
                 dense_attention=self.attention,
             )
         if isinstance(batch, DeviceKVMetadata):
+            if window is not None:
+                raise NotImplementedError(
+                    "packed sliding-window attention requires host-planned KV"
+                )
             return self.attention(
                 q,
                 self.key_cache[:, layer],
@@ -780,6 +789,7 @@ class KVCacheManager:
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
+                **({} if window is None else {"window": window}),
             )
         return self.attention(
             q,
