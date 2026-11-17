@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import LLM, CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import LLM, CacheConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
@@ -183,6 +183,36 @@ def test_same_id_after_finish_starts_from_a_fresh_generator():
     assert second["r"].exit_depths == first["r"].exit_depths
 
 
+@pytest.mark.parametrize("depth", [1, 2, 4])
+def test_request_fixed_target_is_read_only(depth):
+    request = Request("request", [2, 4], SamplingParams(), _target_loops=depth)
+    assert request.target_loops == request.loop_limit(4) == depth
+    request.loops_done = 1
+    assert request.target_loops == depth
+    with pytest.raises(AttributeError):
+        request.target_loops = 3
+
+
+def test_target_loops_are_rejected_for_dynamic_models():
+    with pytest.raises(ValueError, match="fixed-loop models"):
+        LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2)).add_request(
+            "request", [2, 4], SamplingParams(max_tokens=1, target_loops=1)
+        )
+
+
+def test_trace_takes_precedence_over_dynamic_target():
+    engine = LLMEngine(
+        tiny_model(),
+        cache_config=CacheConfig(64, 2),
+        exit_config=ExitConfig("trace", depths_by_request={"request": [4, 2]}),
+    )
+    engine.add_request(
+        "request", [2, 4], SamplingParams(max_tokens=2, target_loops=1, ignore_eos=True)
+    )
+    outputs, _ = drain(engine)
+    assert outputs["request"].exit_depths == [4, 2]
+
+
 def test_abort_drops_the_rng_slot_so_id_reuse_starts_over():
     params = SamplingParams(max_tokens=4, temperature=0.8, seed=23, ignore_eos=True)
     engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
@@ -318,6 +348,7 @@ def test_integer_limits_rejected_before_scheduling(invalid):
         (SamplingParams, "max_tokens"),
         (SamplingParams, "min_loops"),
         (SamplingParams, "max_loops"),
+        (SamplingParams, "target_loops"),
         (SchedulerConfig, "max_num_seqs"),
         (SchedulerConfig, "max_num_batched_tokens"),
         (CacheConfig, "num_blocks"),

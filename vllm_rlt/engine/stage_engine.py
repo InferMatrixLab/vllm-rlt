@@ -19,7 +19,7 @@ from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
-from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.sampling_params import DEFAULT_MIN_LOOPS, SamplingParams
 from vllm_rlt.worker.executor import Executor
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
@@ -319,6 +319,44 @@ class StageEngine:
             self._connector_blocked.add(request.request_id)
         return ready
 
+    def _resolve_loop_bounds(self, params):
+        model_depth = self.model.config.total_ut_steps
+        fixed_loop_count = getattr(self.model, "fixed_loop_count", False)
+        trace_mode = self.exit_config.mode == "trace"
+
+        if trace_mode:
+            if params.target_loops is not None and params.target_loops > model_depth:
+                raise ValueError("target_loops cannot exceed total_ut_steps")
+            max_loops = params.max_loops or model_depth
+            if max_loops > model_depth or (not fixed_loop_count and params.min_loops > max_loops):
+                raise ValueError("requested loop bounds exceed the model's supported depth")
+            return (None if fixed_loop_count else model_depth), max_loops
+
+        if params.target_loops is not None and not fixed_loop_count:
+            raise ValueError("target_loops is only supported for fixed-loop models")
+        if params.target_loops is not None and params.target_loops > model_depth:
+            raise ValueError("target_loops cannot exceed total_ut_steps")
+
+        if fixed_loop_count:
+            target_loops = params.target_loops or model_depth
+            if params.max_loops is not None and params.max_loops != target_loops:
+                raise ValueError("max_loops must match the fixed target_loops")
+            if params.min_loops not in (DEFAULT_MIN_LOOPS, target_loops):
+                raise ValueError(
+                    "min_loops and max_loops must match the fixed target_loops when specified, "
+                    "except the min_loops default"
+                )
+            if target_loops != model_depth:
+                raise ValueError(
+                    "target_loops below total_ut_steps requires per-request prefill support"
+                )
+            return target_loops, target_loops
+
+        max_loops = params.max_loops or model_depth
+        if max_loops > model_depth or params.min_loops > max_loops:
+            raise ValueError("requested loop bounds exceed the model's supported depth")
+        return model_depth, max_loops
+
     def add_request(
         self,
         request_id: str,
@@ -349,16 +387,8 @@ class StageEngine:
             raise ValueError("prompt must contain at least one token")
         if any(type(t) is not int or not 0 <= t < config.vocab_size for t in prompt_token_ids):
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
-        max_loops = params.max_loops or config.total_ut_steps
-        if max_loops > config.total_ut_steps or params.min_loops > max_loops:
-            raise ValueError("requested loop bounds exceed the model's supported depth")
-        if getattr(self.model, "fixed_loop_count", False) and (
-            max_loops != config.total_ut_steps or params.min_loops != config.total_ut_steps
-        ):
-            raise ValueError(
-                "this model always runs the configured loop count; min_loops and "
-                "max_loops must both equal it"
-            )
+        fixed_loop_count = getattr(self.model, "fixed_loop_count", False)
+        target_loops, max_loops = self._resolve_loop_bounds(params)
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
@@ -378,7 +408,8 @@ class StageEngine:
                 len(trace) < params.max_tokens
                 or trace[0] != config.total_ut_steps
                 or any(
-                    type(d) is not int or not params.min_loops <= d <= max_loops
+                    type(d) is not int
+                    or not (1 if fixed_loop_count else params.min_loops) <= d <= max_loops
                     for d in trace[1 : params.max_tokens]
                 )
             ):
@@ -405,6 +436,9 @@ class StageEngine:
                 # loop bound the request asks for.
                 prefill_depth_ranges=Request.prefill_boundaries(
                     len(prompt_token_ids), config.total_ut_steps
+                ),
+                _target_loops=(
+                    target_loops if fixed_loop_count and self.exit_config.mode != "trace" else None
                 ),
             )
         )
@@ -661,7 +695,7 @@ class StageEngine:
         request.num_prefilled_tokens = request.num_preluded_tokens = count
         request.prefill_window_origin = count
         request.prefill_reclaimable_tokens = count
-        request.loops_done = self.model.config.total_ut_steps
+        request.loops_done = request.target_loops or self.model.config.total_ut_steps
         request.hidden_state = hidden
         # Keep RECEIVING until the scheduler grants a compute slot. The lease
         # protects the imported allocation while it waits alongside local work.

@@ -280,6 +280,8 @@ class PDEngine:
             raise ValueError("PD pending-request limit reached")
         params = sampling_params or SamplingParams()
         cfg = self.model_config
+        if params.target_loops is not None:
+            raise ValueError("PD does not support per-request target_loops")
         if self.speculative_config is not None:
             if (
                 params.exit_threshold != 1.0

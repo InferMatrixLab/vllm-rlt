@@ -94,13 +94,14 @@ def test_cancelled_import_cannot_activate_reused_request_id():
 
 @pytest.mark.parametrize("atomic", [False, True])
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_independent_stage_resources_preserve_output_after_import(atomic, asynchronous):
+@pytest.mark.parametrize("max_loops", [None, 2])
+def test_independent_stage_resources_preserve_output_after_import(atomic, asynchronous, max_loops):
     p = make_stage_engine(role="prefill", atomic=atomic, asynchronous=asynchronous)
     d = make_stage_engine(role="decode", atomic=atomic, asynchronous=asynchronous)
     local = make_stage_engine(atomic=atomic, asynchronous=asynchronous)
     p.connector = RecordingConnector()
     prompt = [1, 2, 3, 4, 5]
-    params = SamplingParams(max_tokens=3, ignore_eos=True)
+    params = SamplingParams(max_tokens=3, max_loops=max_loops, ignore_eos=True)
     source = p.reserve_transfer("r", prompt, params, receiving=False)
     target = d.reserve_transfer("r", prompt, params, receiving=True)
     assert source is not target
@@ -125,6 +126,7 @@ def test_independent_stage_resources_preserve_output_after_import(atomic, asynch
     assert d.accept_import(target, source.hidden_state.clone())
     assert d.scheduler.requests["r"] is target
     assert target.prefill_reclaimable_tokens == len(prompt)
+    assert target.loops_done == d.model.config.total_ut_steps
     assert p.release_transfer(source)
     local.add_request("r", prompt, params)
     assert drain(d) == drain(local)

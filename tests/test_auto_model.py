@@ -406,6 +406,32 @@ def test_cli_requires_source_for_real_model(monkeypatch):
     assert error.value.code == 2
 
 
+def test_cli_request_and_speculative_targets_are_distinct(monkeypatch):
+    import vllm_rlt.entrypoints.cli as cli
+
+    client = Mock()
+    client.engine.model_config.total_ut_steps = 4
+    client.generate.return_value = []
+    llm = Mock(return_value=client)
+    monkeypatch.setattr(cli, "LLM", llm)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "vllm-rlt",
+            "--toy",
+            "--speculative-tokens",
+            "1",
+            "--target-loops",
+            "4",
+            "--request-target-loops",
+            "3",
+        ],
+    )
+    cli.main()
+    assert llm.call_args.kwargs["speculative_config"].target_loops == 4
+    assert client.generate.call_args.args[1].target_loops == 3
+
+
 @pytest.mark.parametrize("answer", ["yes", "no"])
 def test_missing_tokenizer_prompts_before_download(monkeypatch, answer):
     from vllm_rlt.models import load_tokenizer
