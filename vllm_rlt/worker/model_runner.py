@@ -781,7 +781,7 @@ class ModelRunner:
             )
         return result
 
-    def _prepare_prefill_coda(self, ids, positions, requests, kv=None):
+    def _prepare_prefill_coda(self, ids, positions, requests, kv=None, *, packed=None):
         if not getattr(self.model, "requires_boundary_kv", False):
             return None, None
         rows = [
@@ -799,7 +799,9 @@ class ModelRunner:
                 [ids[row] for row in rows],
                 [[0] * len(rows)],
                 [positions[row] for row in rows],
-                packed=self.cache_manager.attention_capabilities.packed_prefill,
+                packed=self.cache_manager.attention_capabilities.packed_prefill
+                if packed is None
+                else packed,
             )[0]
         return ForwardBatch(
             Operation.CODA, prelude_coda_kv_metadata=kv_metadata, compute_logits=False
@@ -876,11 +878,14 @@ class ModelRunner:
         return tuple(inputs)
 
     def _uses_packed_loop_inputs(self, batch):
+        capabilities = self.cache_manager.attention_capabilities
         return (
             batch.operation == Operation.PRELUDE
             and batch.loop_count
             and self.cache_manager.layout != "shared"
-            and self.cache_manager.attention_capabilities.packed_prefill
+            and capabilities.packed_prefill
+            # Sliding-window batches share staging for packed and per-row metadata.
+            and not capabilities.packed_sliding_window
             and self.execution_config.packed_prefill
         )
 
@@ -897,7 +902,10 @@ class ModelRunner:
             tokens.extend(span.input_tokens)
             requests.extend([request] * count)
             outputs.append((len(tokens) - 1, request))
-        packed = cache.attention_capabilities.packed_prefill
+        packed = cache.attention_capabilities.packed_prefill and (
+            not cache.attention_capabilities.packed_sliding_window
+            or all(len(span.request.prompt_token_ids) > 64 for span in batch.spans)
+        )
         size = len(tokens) if packed else self._size(len(tokens))
         depth_sets = [[depth + offset for depth in depths] for offset in range(batch.loop_count)]
         if packed_metadata is not None:
@@ -913,7 +921,7 @@ class ModelRunner:
                 packed=packed,
                 padded_rows=size,
             )
-        coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests)
+        coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests, packed=packed)
         forwards = [
             PreparedForward(
                 ForwardBatch(Operation.PRELUDE, tokens=tensor, metadata=metadata),

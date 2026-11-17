@@ -152,8 +152,9 @@ class ExecutionConfig:
     # use_uva independently controls its transfer mechanism.
     # None resolves at engine construction: on when the attention backend packs
     # prefill (Triton opts in, FlashAttention-4 natively) with last_exited KV and
-    # ordinary (non-staged) prefill without sliding-window attention or LoopCD
-    # readout references; off otherwise.
+    # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
+    # support and compatible synchronous eager execution; off otherwise.
+    # LoopCD reserves per-row readout references and defaults to per-row prefill.
     packed_prefill: bool | None = None
     loopcd: bool = False
     prefill_depth: int | None = None

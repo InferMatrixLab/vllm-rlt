@@ -290,11 +290,11 @@ def test_reserved_loopcd_keeps_unset_packed_prefill_off():
     from vllm_rlt.worker.loopcd import validate
 
     common = dict(device_type="cuda", layout="last_exited", staged_prefill=False)
-    assert packed_prefill_eligible(None, **common)
+    assert packed_prefill_eligible(ExecutionConfig(), **common)
     # Unset packing resolves to per-row prefill when the engine reserves LoopCD.
-    assert not packed_prefill_eligible(None, **common, loopcd=True)
+    assert not packed_prefill_eligible(ExecutionConfig(loopcd=True), **common)
     # An explicit request still wins; guided admission then rejects it.
-    assert packed_prefill_eligible(True, **common, loopcd=True)
+    assert packed_prefill_eligible(ExecutionConfig(loopcd=True, packed_prefill=True), **common)
     model = model_for()
     for packed, rejected in ((None, False), (False, False), (True, True)):
         execution = ExecutionConfig(loopcd=True, packed_prefill=packed)
