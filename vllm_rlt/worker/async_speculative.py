@@ -25,6 +25,7 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Operation, Request
 from vllm_rlt.worker.cuda_graph import (
     CodaGraphs,
+    DeviceBoundaryGraphs,
     DeviceRecurrentGraphs,
     speculative_capture_sizes,
 )
@@ -368,19 +369,17 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             compute_stream=compute_stream,
         )
         sizes = speculative_capture_sizes(execution, scheduler, config)
-        self.graphs = (
-            DeviceRecurrentGraphs(model, cache, execution, False, capture_sizes=sizes)
-            if execution.cuda_graphs
-            else None
-        )
-        self.coda_graphs = (
-            CodaGraphs(model, execution, bucketed=True, capture_sizes=sizes)
-            if execution.cuda_graphs
-            else None
-        )
-        if self.graphs is not None:
+        if execution.cuda_graphs:
+            self.graphs = DeviceRecurrentGraphs(model, cache, execution, False, capture_sizes=sizes)
+            if self.boundary_kv:
+                self.prelude_graphs = DeviceBoundaryGraphs(model, cache, Operation.PRELUDE, sizes)
+                self.coda_graphs = DeviceBoundaryGraphs(model, cache, Operation.CODA, sizes)
+            else:
+                self.coda_graphs = CodaGraphs(model, execution, bucketed=True, capture_sizes=sizes)
             self.graphs.prepare()
             self.coda_graphs.prepare()
+            if self.prelude_graphs is not None:
+                self.prelude_graphs.prepare()
         self.compute_stream = compute_stream
         self.copy_stream = copy_stream
         self.compute_stream.wait_stream(torch.cuda.current_stream(self.device))

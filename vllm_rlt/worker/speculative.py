@@ -20,7 +20,7 @@ import torch
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Operation, Request
 from vllm_rlt.worker.buffers import stage_metadata
-from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
+from vllm_rlt.worker.cuda_graph import CodaGraphs, PreludeGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
 from vllm_rlt.worker.metadata import KVMetadata
 from vllm_rlt.worker.output import ModelRunnerOutput, SpeculativeResult
@@ -216,7 +216,13 @@ class SpeculativeRunner:
         self.graphs = (
             RecurrentGraphs(model, cache, execution, False) if execution.cuda_graphs else None
         )
-        self.coda_graphs = CodaGraphs(model, execution) if execution.cuda_graphs else None
+        self.coda_graphs = self.prelude_graphs = None
+        if execution.cuda_graphs and self.boundary_kv:
+            # Boundary stages attend KV, so their graphs take KV metadata as input.
+            self.coda_graphs = CodaGraphs(model, execution, cache)
+            self.prelude_graphs = PreludeGraphs(model, execution, cache)
+        elif execution.cuda_graphs:
+            self.coda_graphs = CodaGraphs(model, execution)
 
     def _packed(self, packed):
         capabilities = self.cache.attention_capabilities
@@ -315,7 +321,14 @@ class SpeculativeRunner:
 
     def _prelude(self, tokens, boundary=None):
         return self.runtime.forward(
-            ForwardBatch(Operation.PRELUDE, tokens=tokens, prelude_coda_kv_metadata=boundary)
+            self.runtime.prepare(
+                ForwardBatch(
+                    Operation.PRELUDE,
+                    tokens=tokens,
+                    prelude_coda_kv_metadata=boundary,
+                    graphs=self.prelude_graphs,
+                )
+            )
         ).hidden
 
     def _recurrent(self, hidden, metadata):

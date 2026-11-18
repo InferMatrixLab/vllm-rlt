@@ -211,8 +211,10 @@ class Harness:
         runner.rng = RngRegistry()
         runner.slot_values = torch.zeros((8, 2), dtype=torch.long)
         runner.runtime = SimpleNamespace(
-            forward=lambda batch: SimpleNamespace(hidden=self.E[batch.tokens])
+            prepare=lambda batch: batch,
+            forward=lambda batch: SimpleNamespace(hidden=self.E[batch.tokens]),
         )
+        runner.prelude_graphs = None
         runner._execute_recurrent_step = lambda hidden, positions, tables, depth, allocations: (
             hidden if depth < 1 else hidden @ self.M
         )

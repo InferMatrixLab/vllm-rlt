@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Asynchronous Dory self-speculation on CUDA: block and token-pipeline rounds.
+"""Dory self-speculation on CUDA: asynchronous rounds and CUDA Graphs.
 
 Every case needs an explicit ``CUDA_VISIBLE_DEVICES`` and ``--run-gpu``. Each
-mode must serve the greedy tokens of the dense oracle. Forced drafts check that
-the committed KV of every plane is the serial target history while the next
-round is already submitted.
+execution mode must serve the greedy tokens of the dense oracle. Forced drafts
+check that the committed KV of every plane is the serial target history while
+the next round is already submitted.
 """
 
 import pytest
@@ -28,6 +28,11 @@ DEPTH_PAIRS = [(1, 2), (1, 4), (2, 4)]
 # Prompts shorter than and longer than the tiny window of four.
 PROMPTS = {"a": [4, 7, 3], "b": [9], "c": [5, 6, 8, 2, 11]}
 LIMITS = {"a": 12, "b": 1, "c": 7}
+EXECUTION = {
+    "async_eager": dict(asynchronous=True, graphs=False),
+    "async_graph": dict(asynchronous=True, graphs=True),
+    "sync_graph": dict(asynchronous=False, graphs=True),
+}
 
 
 def reference_pair(loops, **overrides):
@@ -39,13 +44,13 @@ def reference_pair(loops, **overrides):
     return reference, model.to("cuda").eval()
 
 
-def engine(model, k, draft, mode="block", *, asynchronous=True):
+def engine(model, k, draft, mode="block", *, asynchronous=True, graphs=False):
     return LLMEngine(
         model,
         attention_backend="triton",
         cache_config=CacheConfig(num_blocks=1024, block_size=2),
         scheduler_config=SchedulerConfig(max_num_seqs=4),
-        execution_config=ExecutionConfig(async_scheduling=asynchronous),
+        execution_config=ExecutionConfig(async_scheduling=asynchronous, cuda_graphs=graphs),
         speculative_config=SpeculativeConfig(
             k, draft_loops=draft, target_loops=model.config.total_ut_steps, mode=mode
         ),
@@ -82,6 +87,12 @@ def assert_released(e):
     assert not runner.states
     assert all(not buffer.leased for buffer in runner.buffers)
     assert e.cache_manager.num_used_blocks == 0
+
+
+def assert_graphs_replayed(e):
+    runner = e.speculative_runner
+    for graphs in (runner.prelude_graphs, runner.graphs, runner.coda_graphs):
+        assert graphs.replays > 0
 
 
 def serial_cache(reference, tokens):
@@ -171,12 +182,13 @@ def force_drafts(monkeypatch, e, sequence, wrong):
     monkeypatch.setattr(runner, "_coda", controlled)
 
 
+@pytest.mark.parametrize("execution", EXECUTION)
 @pytest.mark.parametrize("mode", ["block", "pipeline"])
 @pytest.mark.parametrize(("draft", "target"), DEPTH_PAIRS)
 @pytest.mark.parametrize("k", [1, 3])
-def test_async_greedy_matches_the_dense_reference(mode, draft, target, k):
+def test_greedy_matches_the_dense_reference(execution, mode, draft, target, k):
     reference, model = reference_pair(target)
-    e = engine(model, k, draft, mode)
+    e = engine(model, k, draft, mode, **EXECUTION[execution])
     for rid, prompt in PROMPTS.items():
         e.add_request(rid, prompt, params(model, LIMITS[rid]))
     final = drain(e)
@@ -184,7 +196,18 @@ def test_async_greedy_matches_the_dense_reference(mode, draft, target, k):
         expected = greedy_reference(reference, prompt, LIMITS[rid])[len(prompt) :]
         assert final[rid].token_ids == expected
         assert final[rid].exit_depths == [target] * LIMITS[rid]
-    assert e.speculative_runner.submitted_before_collect > 0
+    runner = e.speculative_runner
+    if EXECUTION[execution]["graphs"]:
+        assert_graphs_replayed(e)
+    if not EXECUTION[execution]["asynchronous"]:
+        assert not runner.pipeline_states
+        assert e.cache_manager.num_used_blocks == 0
+        return
+    assert runner.submitted_before_collect > 0
+    if EXECUTION[execution]["graphs"]:
+        # Every async row count fits a captured bucket.
+        for graphs in (runner.prelude_graphs, runner.graphs, runner.coda_graphs):
+            assert graphs.fallbacks == 0
     assert_released(e)
 
 
@@ -197,10 +220,11 @@ def bootstrap(e, model, prompt, count):
     pytest.fail("bootstrap did not produce a token")
 
 
+@pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize("mode", ["block", "pipeline"])
-def test_submission_reads_no_device_value(mode, monkeypatch):
+def test_submission_reads_no_device_value(mode, graphs, monkeypatch):
     _, model = reference_pair(4)
-    e = engine(model, 3, 1, mode)
+    e = engine(model, 3, 1, mode, graphs=graphs)
     request = bootstrap(e, model, [4, 7, 3], 16)
 
     def forbidden(*args, **kwargs):
@@ -218,14 +242,17 @@ def test_submission_reads_no_device_value(mode, monkeypatch):
     assert_released(e)
 
 
+@pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize(("draft", "target"), DEPTH_PAIRS)
 @pytest.mark.parametrize("rejected", [0, 1, 2, 3])
-def test_block_commits_target_history_through_each_rejection(draft, target, rejected, monkeypatch):
+def test_block_commits_target_history_through_each_rejection(
+    draft, target, rejected, graphs, monkeypatch
+):
     """rejected=3 accepts all three candidates and commits the bonus token."""
     reference, model = reference_pair(target)
     prompt, count = [4, 7, 3], 13
     sequence = greedy_reference(reference, prompt, count)
-    e = engine(model, 3, draft)
+    e = engine(model, 3, draft, graphs=graphs)
     force_drafts(monkeypatch, e, sequence, lambda position, index: index == rejected)
     e.add_request("r", prompt, params(model, count))
     request = e.scheduler.requests["r"]
@@ -248,13 +275,16 @@ def test_block_commits_target_history_through_each_rejection(draft, target, reje
     else:
         assert stats.accepted_tokens == 0
     assert request.generated_token_ids == sequence[len(prompt) :]
+    if graphs:
+        assert_graphs_replayed(e)
     assert_released(e)
 
 
+@pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize(("draft", "target"), DEPTH_PAIRS)
 @pytest.mark.parametrize("pattern", ["all", "none", "every_third"])
 def test_pipeline_commits_target_history_under_forced_acceptance(
-    draft, target, pattern, monkeypatch
+    draft, target, pattern, graphs, monkeypatch
 ):
     reference, model = reference_pair(target)
     prompt, count = [4, 7, 3], 12
@@ -264,7 +294,7 @@ def test_pipeline_commits_target_history_under_forced_acceptance(
         "none": lambda position, index: True,
         "every_third": lambda position, index: position % 3 == 0,
     }[pattern]
-    e = engine(model, 3, draft, "pipeline")
+    e = engine(model, 3, draft, "pipeline", graphs=graphs)
     force_drafts(monkeypatch, e, sequence, wrong)
     e.add_request("r", prompt, params(model, count))
     request = e.scheduler.requests["r"]
@@ -287,6 +317,8 @@ def test_pipeline_commits_target_history_under_forced_acceptance(
         assert stats.accepted_tokens == 0
     else:
         assert 0 < stats.accepted_tokens < verified
+    if graphs:
+        assert_graphs_replayed(e)
     assert_released(e)
 
 
@@ -300,8 +332,9 @@ def stage_kv(e, layers, position):
     )
 
 
+@pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize(("draft", "target"), DEPTH_PAIRS)
-def test_pipeline_keeps_the_boundary_kv_of_rows_in_flight(draft, target, monkeypatch):
+def test_pipeline_keeps_the_boundary_kv_of_rows_in_flight(draft, target, graphs, monkeypatch):
     """A pipeline step stores boundary KV only for the rows that use that stage.
 
     A retained row keeps the input-stage KV of its first pass. A row between
@@ -309,7 +342,7 @@ def test_pipeline_keeps_the_boundary_kv_of_rows_in_flight(draft, target, monkeyp
     which the draft rows behind it attend.
     """
     _, model = reference_pair(target, ngpt_alpha_init=1.0)
-    e = engine(model, 3, draft, "pipeline")
+    e = engine(model, 3, draft, "pipeline", graphs=graphs)
     runner = e.speculative_runner
     coda = runner._coda
     steps = []
@@ -346,13 +379,16 @@ def test_pipeline_keeps_the_boundary_kv_of_rows_in_flight(draft, target, monkeyp
                 between += 1
     assert retained
     assert bool(between) == (target - draft > draft)
+    if graphs:
+        assert_graphs_replayed(e)
     assert_released(e)
 
 
+@pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize("mode", ["block", "pipeline"])
-def test_cancellation_with_rounds_in_flight_allows_id_reuse(mode):
+def test_cancellation_with_rounds_in_flight_allows_id_reuse(mode, graphs):
     reference, model = reference_pair(4)
-    e = engine(model, 3, 2, mode)
+    e = engine(model, 3, 2, mode, graphs=graphs)
     e.add_request("a", [4, 7, 3], params(model, 14))
     e.add_request("b", [9, 5], params(model, 8))
     final = {}
@@ -369,10 +405,11 @@ def test_cancellation_with_rounds_in_flight_allows_id_reuse(mode):
     assert_released(e)
 
 
+@pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize("mode", ["block", "pipeline"])
-def test_failed_round_releases_requests_and_allows_id_reuse(mode, monkeypatch):
+def test_failed_round_releases_requests_and_allows_id_reuse(mode, graphs, monkeypatch):
     reference, model = reference_pair(2)
-    e = engine(model, 3, 1, mode)
+    e = engine(model, 3, 1, mode, graphs=graphs)
     bootstrap(e, model, [4, 7, 3], 8)
     runner = e.speculative_runner
     name = "_pipeline_step" if mode == "pipeline" else "_verify"

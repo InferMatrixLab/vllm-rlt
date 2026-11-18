@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import torch
 
 from vllm_rlt.config import cuda_graph_rows
+from vllm_rlt.request import Operation
 from vllm_rlt.worker.metadata import DeviceKVMetadata
 
 logger = logging.getLogger(__name__)
@@ -534,3 +535,76 @@ class PreludeGraphs(CodaGraphs):
 
     def _eager(self, tokens, batch):
         return self.model.prelude_prepared(tokens, batch, self.cache)
+
+
+class DeviceBoundaryGraphs:
+    """Bucketed input- or output-stage graphs of a boundary-KV model.
+
+    Asynchronous speculation keeps row positions on the device, so positions,
+    write addresses, write masks and context lengths stay graph inputs. Entries
+    hold no request allocation and never touch CPU written-position state.
+    """
+
+    def __init__(self, model, cache, operation, capture_sizes):
+        self.cache = cache
+        self.capture_sizes = capture_sizes
+        self.max_positions = model.config.max_position_embeddings
+        if operation == Operation.PRELUDE:
+            self.stage = model.prelude_prepared
+            self.example = torch.empty(0, dtype=torch.long, device=cache.device)
+        else:
+            self.stage = model.coda_prepared
+            self.example = next(model.parameters()).new_empty((0, model.config.hidden_size))
+        self.entries = {}
+        self.pool = torch.cuda.graph_pool_handle()
+        self.stream = torch.cuda.Stream(device=cache.device)
+        self.captures = self.replays = self.fallbacks = 0
+
+    @torch.inference_mode()
+    def prepare(self):
+        """Capture every bucket before any serving request exists."""
+        device = self.cache.device
+        batch = SimpleNamespace(
+            position_ids=torch.empty(0, device=device, dtype=torch.long),
+            write_blocks=torch.empty(0, device=device, dtype=torch.long),
+            write_offsets=torch.empty(0, device=device, dtype=torch.long),
+            context_lengths=torch.empty(0, device=device, dtype=torch.int32),
+            block_tables=torch.empty((0, 1), device=device, dtype=torch.int32),
+            cu_seqlens_q=None,
+        )
+        proxy = _DeviceCache(self.cache)
+        for size in self.capture_sizes:
+            entry = _graph_entry(
+                self.example, batch, self.cache, self.max_positions, count=size, bucketed=True
+            )
+            _copy_graph_inputs(entry, self.example, batch, count=0)
+            entry.graph, entry.output = _capture(
+                entry.hidden,
+                self.stream,
+                self.pool,
+                lambda: self.stage(entry.hidden, entry.metadata, proxy),
+                startup=True,
+            )
+            self.entries[size] = entry
+            self.captures += 1
+
+    def select(self, inputs, batch):
+        count = _query_count(batch)
+        if count > self.capture_sizes[-1]:
+            self.fallbacks += 1
+            return PreparedGraph(batch)
+        return PreparedGraph(batch, self.entries[_bucket_size(self.capture_sizes, count)])
+
+    @torch.inference_mode()
+    def prepare_inputs(self, call, inputs):
+        if call.entry is not None:
+            _copy_graph_inputs(call.entry, inputs, call.metadata)
+
+    @torch.inference_mode()
+    def execute(self, call, inputs):
+        if call.entry is None:
+            return self.stage(inputs, call.metadata, self.cache)
+        call.entry.graph.replay()
+        self.replays += 1
+        # The next replay of this bucket overwrites the static output.
+        return call.entry.output[: _query_count(call.metadata)].clone()
