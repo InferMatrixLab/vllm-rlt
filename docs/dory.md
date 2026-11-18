@@ -479,79 +479,106 @@ so its acceptance differs. Its tokens do not.
 
 **GSM8K, BF16.** The first 200 test questions, 8-shot prompt from the first
 eight training examples, at most 256 generated tokens. An answer is correct
-when the number after `####` equals the reference. All 200 requests are
-submitted at once, at most 64 in flight:
+when the number after `####` equals the reference:
 
-| Arm | Correct | Wall time (s) | Tokens identical to the baseline |
-| --- | --- | --- | --- |
-| Baseline: async Graph, no speculation | 161/200 | 188 | — |
-| Async Graph pipeline | 164/200 | 78 | 32/200 |
-| Async Graph block | 163/200 | 77 | 34/200 |
+| Arm | Correct |
+| --- | --- |
+| Baseline: async Graph, no speculation | 161/200 |
+| Async Graph pipeline | 164/200 |
+| Async Graph block | 163/200 |
 
 BF16 tokens depend on the batch composition, so most sequences differ from the
 baseline after some token. Accuracy does not drop.
 
-**BF16 wall time.** Two loops, a one-loop draft. "Requests" is the number of
-concurrent requests, "Prompt" the prompt length of each request in tokens, and
-"Generated" the number of tokens that each request generates. All requests are
-submitted at once. Each arm runs one warmup and then five timed repetitions in a
-row; values are the mean whole-run time in seconds, prefill included. All arms
-ran in one container.
+**BF16 wall time.** Two loops, a one-loop draft. All requests are sent at the
+same time. Each arm runs one warmup, then five timed repetitions, all in one
+container. Wall times are the mean whole-run time in seconds, prefill included.
+Every Graph arm uses `cuda_graph_max_graphs=128`, so no arm runs eager because
+its graph cache is full; every Graph arm had zero graph fallbacks. BF16
+acceptance is 0.85–0.88.
 
-With CUDA Graphs (`cuda_graphs=True` in every column, the baseline included).
-Percentages are against the baseline:
+Table 1: with CUDA Graphs, concurrency sweep. Prompt 1024 tokens, 128 generated
+tokens for each request. Percentages are against the baseline.
 
-| Requests | Prompt | Generated | Baseline: async Graph, no speculation | Sync Graph pipeline | Async Graph pipeline | Async Graph block |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | 1024 | 128 | 2.48 | 1.80 (−28 %) | **1.77 (−29 %)** | 1.91 (−23 %) |
-| 16 | 1024 | 128 | 5.84 | 5.61 (−4 %) | **5.27 (−10 %)** | 5.61 (−4 %) |
-| 64 | 937 | 128 | 22.19 | 16.72 (−25 %) | **13.61 (−39 %)** | 14.96 (−33 %) |
-| 8 | 7500 | 128 | 20.79 | 20.20 (−3 %) | **20.15 (−3 %)** | 20.36 (−2 %) |
-
-Time to first token p50 / time per output token p50 / p90, in seconds and
-milliseconds:
-
-| Requests | Prompt | Generated | Baseline | Async Graph pipeline | Async Graph block |
+| Requests | Baseline (async Graph, no spec) | Baseline, default graph cache | Sync Graph pipeline | Async Graph pipeline | Async Graph block |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 1024 | 128 | 0.17 / 18.2 / 18.2 | 0.17 / 12.6 / 12.6 | 0.17 / 13.7 / 13.7 |
-| 16 | 1024 | 128 | 1.97 / 35.0 / 40.6 | 1.65 / 28.6 / 35.9 | 1.79 / 30.0 / 36.1 |
-| 64 | 937 | 128 | 5.86 / 129.3 / 155.7 | 5.35 / 63.7 / 92.6 | 6.16 / 61.8 / 87.9 |
-| 8 | 7500 | 128 | 17.56 / 32.9 / 47.6 | 17.19 / 28.3 / 49.6 | 17.21 / 29.0 / 48.7 |
+| 1 | 2.50 | 2.49 (−0.1 %) | 1.83 (−27 %) | **1.78 (−29 %)** | 1.91 (−23 %) |
+| 4 | 3.17 | 3.18 (+0.4 %) | 2.66 (−16 %) | **2.63 (−17 %)** | 2.95 (−7 %) |
+| 16 | 5.89 | 5.90 (+0.1 %) | 5.51 (−6 %) | **5.30 (−10 %)** | 5.63 (−5 %) |
+| 64 | 15.60 | 25.72 (+65 %) | 16.00 (+3 %) | **15.10 (−3 %)** | 16.45 (+5 %) |
 
-Without CUDA Graphs (eager, `cuda_graphs=False`), sync against async. There is
-no eager baseline without speculation, so each async percentage is against the
-sync value of the same mode:
+Table 2: latency with CUDA Graphs, same workload. TTFT is the time to the first
+token; TPOT is the time per output token after the first token. Percentages are
+against the baseline at the same concurrency.
 
-| Requests | Prompt | Generated | Pipeline, sync | Pipeline, async | Block, sync | Block, async |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | 1024 | 128 | 5.50 | 5.79 (+5 %) | 6.33 | 6.26 (−1 %) |
-| 16 | 1024 | 128 | 9.18 | 8.97 (−2 %) | 10.87 | 10.75 (−1 %) |
-| 64 | 937 | 128 | 17.53 | 16.94 (−3 %) | 22.48 | 21.43 (−5 %) |
-| 8 | 7500 | 128 | 23.94 | 23.71 (−1 %) | 25.69 | 25.71 (+0.1 %) |
+| Requests | Arm | TTFT p50 (s) | TTFT p90 (s) | TPOT p50 (ms) | TPOT p90 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Baseline (async Graph, no spec) | 0.18 | 0.18 | 18.3 | 18.3 |
+| 1 | Async Graph pipeline | 0.17 (−2 %) | 0.20 (+13 %) | 12.6 (−31 %) | 12.6 (−31 %) |
+| 1 | Async Graph block | 0.17 (−1 %) | 0.19 (+7 %) | 13.7 (−25 %) | 13.7 (−25 %) |
+| 4 | Baseline (async Graph, no spec) | 0.67 | 0.67 | 20.0 | 20.0 |
+| 4 | Async Graph pipeline | 0.66 (−1 %) | 0.67 (−0.8 %) | 16.6 (−17 %) | 17.4 (−13 %) |
+| 4 | Async Graph block | 0.69 (+3 %) | 0.69 (+3 %) | 18.1 (−10 %) | 19.0 (−5 %) |
+| 16 | Baseline (async Graph, no spec) | 2.01 | 2.75 | 35.2 | 40.9 |
+| 16 | Async Graph pipeline | 1.68 (−17 %) | 2.70 (−2 %) | 28.8 (−18 %) | 36.1 (−12 %) |
+| 16 | Async Graph block | 1.79 (−11 %) | 2.93 (+6 %) | 30.1 (−15 %) | 36.1 (−12 %) |
+| 64 | Baseline (async Graph, no spec) | 6.21 | 10.58 | 76.6 | 108.5 |
+| 64 | Async Graph pipeline | 5.78 (−7 %) | 10.02 (−5 %) | 70.9 (−7 %) | 102.5 (−5 %) |
+| 64 | Async Graph block | 6.43 (+3 %) | 11.54 (+9 %) | 68.1 (−11 %) | 96.4 (−11 %) |
+
+Table 3: without CUDA Graphs (eager), sync against async, same workload. There
+is no eager baseline without speculation, so each async percentage is against
+the sync value of the same mode.
+
+| Requests | Pipeline sync | Pipeline async | Block sync | Block async |
+| --- | --- | --- | --- | --- |
+| 1 | 6.80 | 6.42 (−6 %) | 6.83 | 7.16 (+5 %) |
+| 4 | 7.80 | 8.24 (+6 %) | 9.64 | 9.71 (+0.8 %) |
+| 16 | 10.74 | 10.57 (−2 %) | 13.24 | 13.25 (+0.1 %) |
+| 64 | 21.22 | 20.49 (−3 %) | 28.02 | 27.29 (−3 %) |
+
+Table 4: long context. 8 requests, prompt 8192 tokens, 128 generated tokens for
+each request.
+
+| Arm | Wall (s) | TTFT p50 (s) | TTFT p90 (s) | TPOT p50 (ms) | TPOT p90 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| Baseline (async Graph, no spec) | 23.73 | 18.60 | 20.71 | 53.2 | 68.9 |
+| Sync Graph pipeline | 23.52 (−0.9 %) | 17.85 (−4 %) | 20.73 (+0.1 %) | 51.2 (−4 %) | 72.5 (+5 %) |
+| Async Graph pipeline | 23.18 (−2 %) | 17.69 (−5 %) | 20.58 (−0.6 %) | 49.4 (−7 %) | 70.3 (+2 %) |
+| Async Graph block | 23.13 (−3 %) | 17.60 (−5 %) | 20.42 (−1 %) | 49.9 (−6 %) | 67.9 (−1 %) |
+| Sync eager pipeline | 28.83 | 18.04 | 21.08 | 86.1 | 111.4 |
+| Async eager pipeline | 28.52 (−1 % vs sync) | 18.10 (+0.3 % vs sync) | 21.15 (+0.3 % vs sync) | 87.2 (+1 % vs sync) | 108.0 (−3 % vs sync) |
 
 Reading the numbers:
 
-- With CUDA Graphs, the asynchronous pipeline is the fastest form in every
-  shape. Most of its gain is in decode: at 64 requests the time per output token
-  p50 falls from 129 ms to 64 ms. At 8 × 7500 the run is mostly prefill (17 of
-  21 s), which speculation does not change.
-- The single-request eager pipeline is the only arm where the asynchronous form
-  is slower on average (+5 %). The repetitions overlap: synchronous 5.20–5.80 s,
-  asynchronous 5.50–6.02 s. In an earlier container the same arm was 4 % faster
-  than synchronous. The cause is not measured. One candidate is the fixed set of
-  about 50 small operations in a batched pipeline step, whose share is largest
-  for one request. Before the batch
-  update, the asynchronous eager pipeline launched about 35 operations for each
-  request in each step and was 2 %, 10 % and 27 % slower than synchronous at 1,
-  16 and 64 requests.
-- The synchronous Graph pipeline captures one graph per row count, up to
-  `cuda_graph_max_graphs` (16). At 64 requests, most of its calls ran eager.
-- Eager arms depend on the host: the single-request synchronous eager pipeline
-  took 5.5 s to 9.5 s on different H100 containers. Compare arms only within one
-  table. These runs use a different harness and host than the 2D and 3A tables
-  above, so the absolute numbers do not compare with those tables.
-- Not covered: HTTP serving and open-loop arrival traces. All requests are
-  submitted at once to the engine.
+- The gain of speculation falls as concurrency rises. At one request the GPU
+  has spare capacity, so draft and verify work is almost free. At 64 requests
+  the GPU is busy, and the extra verify rows cancel most of the saved steps.
+- At 8 × 8192, prefill takes about 18 of 24 seconds. Speculation shortens only
+  decode, so the whole run is 2–3 % faster.
+- The baseline with the default graph cache (16 shapes) runs eager in most calls
+  at 64 requests and takes 25.72 s instead of 15.60 s. Comparisons against that
+  baseline overstate the gain of speculation.
+- These runs use a different harness and host than the 2D and 3A tables above,
+  so the absolute numbers do not compare with those tables.
+- Not covered: HTTP serving and open-loop arrival traces.
+
+**Known issues.**
+
+- Async Graph block is 5 % slower than the baseline at 64 requests. Its time per
+  output token is 11 % lower, but its time to the first token is 3–9 % higher.
+  The async Graph pipeline is 3 % faster there, so it is the better mode at high
+  concurrency.
+- Without CUDA Graphs, async rounds at 1 and 4 requests are between 6 % faster
+  and 6 % slower than sync rounds (Table 3). A dedicated run alternated a sync
+  and an async engine in ABBA order, 10 timed repetitions each, at one request
+  in pipeline mode. Async was 2.7 % and 3.9 % slower in two containers. The
+  profiler counts 5503 kernel launches per generated token for sync and 5626 for
+  async (+124, +2.2 %). Async rounds keep positions on the GPU, so the GPU
+  computes the KV metadata, the PRELUDE and CODA write masks and the slot-pool
+  update; sync rounds do this work on the CPU. Eager Dory is bound by host-side
+  launch cost, so the extra launches give the extra time. At 16 and 64 requests,
+  async eager is 0–3 % faster than sync eager.
 
 ### Not yet performed
 
