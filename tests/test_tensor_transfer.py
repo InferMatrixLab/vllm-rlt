@@ -395,12 +395,14 @@ def test_uva_configuration_and_capability(monkeypatch, flags, packed_prefill):
     assert not args.use_uva and args.packed_prefill is packed_prefill
     execution = runtime_configs(args)["execution_config"]
     assert not execution.use_uva and execution.packed_prefill is packed_prefill
-    monkeypatch.setattr(torch.version, "hip", None)
-    assert use_uva_on("cuda")
-    assert not use_uva_on("cuda", False)
     assert not use_uva_on("cpu")
-    monkeypatch.setattr(torch.version, "hip", "test")
+    monkeypatch.setenv("VLLM_RLT_UVA", "0")
     assert not use_uva_on("cuda")
+    monkeypatch.setenv("VLLM_RLT_UVA", "1")
+    assert use_uva_on("cuda") is torch.cuda.is_available()
+    monkeypatch.delenv("VLLM_RLT_UVA")
+    assert use_uva_on("cuda") is torch.cuda.is_available()
+    assert not use_uva_on("cuda", False)
 
 
 @pytest.mark.parametrize(

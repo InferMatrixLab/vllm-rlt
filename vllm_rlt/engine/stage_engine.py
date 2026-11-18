@@ -152,7 +152,7 @@ class StageEngine:
                 cache_config, memory_reserve_bytes=cache_config.memory_reserve_bytes + scratch
             )
         if self.execution_config.cuda_graphs and parameter.device.type != "cuda":
-            raise ValueError("CUDA graphs require CUDA with Triton or FlashAttention")
+            raise ValueError("CUDA graphs require CUDA or ROCm with Triton or FlashAttention")
         if self.execution_config.cuda_graphs and speculative_config is not None:
             rows = min(
                 scheduler_config.max_num_seqs * (speculative_config.num_speculative_tokens + 1),
@@ -169,6 +169,7 @@ class StageEngine:
                     scheduler_config.max_num_seqs,
                     speculative_config.num_speculative_tokens,
                 )
+
         if self.execution_config.async_scheduling:
             # A fixed-loop model has no exit decision to delay or look ahead to.
             if (

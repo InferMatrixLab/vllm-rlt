@@ -36,7 +36,18 @@ def test_cuda_mlp_matches_torch_expression(dtype, rows):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("native_available", [True, False])
+@pytest.mark.parametrize(
+    "native_available",
+    [
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                torch.version.hip is not None, reason="native CUDA extension is NVIDIA-only"
+            ),
+        ),
+        False,
+    ],
+)
 def test_cuda_mlp_selects_native_or_missing_extension_fallback(native_available):
     # Dispatcher registrations last for the process lifetime. Exercise an absent
     # extension in a fresh process rather than changing an already loaded backend.

@@ -493,7 +493,8 @@ def _launch_paged_prefill(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         # FP32 callers (reference checks) need exact products, not TF32.
-        PRECISION="ieee" if q.dtype == torch.float32 else "tf32",
+        # ROCm Triton rejects "tf32" even for BF16/FP16 inputs; only "ieee" is accepted.
+        PRECISION="ieee" if torch.version.hip or q.dtype == torch.float32 else "tf32",
         WINDOW=window,
         COMPENSATE=compensate,
         max_q_blocks=q_blocks,

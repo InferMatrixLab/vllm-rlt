@@ -1,5 +1,7 @@
 """Validate packed prefill requests and decide whether automatic packing is eligible."""
 
+from vllm_rlt.platform import is_rocm
+
 
 def packed_prefill_eligible(
     execution,
@@ -18,6 +20,8 @@ def packed_prefill_eligible(
     synchronous prefill in a single stage.
     """
     requested = execution.packed_prefill
+    if requested is None and is_rocm():
+        return False
     if requested is False:
         return False
     if sliding_window and (

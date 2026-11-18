@@ -17,6 +17,17 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "gpu" in item.keywords and not enabled:
             item.add_marker(pytest.mark.skip(reason="set CUDA_VISIBLE_DEVICES and use --run-gpu"))
+            continue
+        callspec = getattr(item, "callspec", None)
+        if (
+            enabled
+            and torch.version.hip
+            and callspec is not None
+            and "flash_attn" in str(callspec.params)
+        ):
+            # FlashAttention packages have no ROCm kernels; the Triton backend
+            # covers these parametrizations on AMD hardware.
+            item.add_marker(pytest.mark.skip(reason="FlashAttention is NVIDIA-only"))
 
 
 @pytest.fixture(autouse=True, scope="session")

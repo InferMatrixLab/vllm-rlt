@@ -3,7 +3,8 @@
 Follow steps 1–8 to serve Ouro-1.4B on one NVIDIA GPU and receive a generated
 response. Commands work in Bash and fish on Linux; use the activation command
 for your shell. Run them in the same terminal unless a step explicitly asks
-you to open another one.
+you to open another one. For AMD Instinct GPUs, use the
+[ROCm guide](rocm.md) instead of the `nvidia-smi`/CUDA wheel steps.
 
 This guide targets **v0.2.0**. Pin the tag below rather than a moving `main`.
 For migration from v0.1.0, read the [changelog](../CHANGELOG.md); Python scripts

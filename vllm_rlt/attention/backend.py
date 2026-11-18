@@ -13,6 +13,7 @@ from vllm_rlt.kernels.paged_attention import (
     TorchPagedAttention,
     TritonPagedAttention,
 )
+from vllm_rlt.platform import is_rocm
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,7 @@ def create_backend(
 ) -> AttentionBackend:
     """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
 
+    ROCm skips the NVIDIA-only FlashAttention candidates.
     Each candidate validates hardware/configuration and imports its implementation.
     Only compatibility and import failures permit auto to try the next candidate;
     kernel execution errors never trigger a runtime fallback. Execution requirements
@@ -175,6 +177,9 @@ def create_backend(
     if backend == "auto" and device.type != "cuda":
         candidates = ("torch",)
         skipped.append(f"{device.type.upper()} uses Torch reference attention")
+    elif backend == "auto" and is_rocm():
+        candidates = ("triton", "torch")
+        skipped.append("ROCm uses Triton or Torch attention; FlashAttention is NVIDIA-only")
     for candidate in candidates:
         try:
             implementation = _create_explicit(
