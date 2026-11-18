@@ -86,6 +86,7 @@ Sliding-window packing additionally requires backend support for both packed
 prefill and packed sliding-window attention, with ordinary synchronous eager
 single-stage execution, without speculation or preemption. These selection rules
 apply to all models. Incompatible automatic configurations keep per-query attention.
+Engines reserving LoopCD select per-row prefill by default.
 
 Set `packed_prefill=True` / `--packed-prefill` to require packed prefill, or
 `packed_prefill=False` / `--no-packed-prefill` to disable its staging path.

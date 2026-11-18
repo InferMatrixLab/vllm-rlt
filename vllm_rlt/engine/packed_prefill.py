@@ -38,4 +38,4 @@ def packed_prefill_eligible(
         if requested is True:
             raise ValueError("packed_prefill requires CUDA packed prefill with last_exited KV")
         return False
-    return requested is True or not staged_prefill
+    return requested is True or (not staged_prefill and not execution.loopcd)

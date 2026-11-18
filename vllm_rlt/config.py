@@ -159,12 +159,18 @@ class ExecutionConfig:
     # prefill (Triton opts in, FlashAttention-4 natively) with last_exited KV and
     # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
     # support and compatible synchronous eager execution; off otherwise.
+    # LoopCD reserves per-row readout references and defaults to per-row prefill.
     packed_prefill: bool | None = None
+    loopcd: bool = False
+    prefill_depth: int | None = None
 
     def __post_init__(self):
         if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
             raise ValueError("packed_prefill must be a boolean or None")
+        if self.prefill_depth is not None:
+            _positive("prefill_depth", self.prefill_depth)
         for name in (
+            "loopcd",
             "use_uva",
             "async_scheduling",
             "multi_stream",
