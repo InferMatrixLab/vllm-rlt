@@ -983,7 +983,11 @@ combination with compatible attention backends such as Triton and FA4.
 The asynchronous pipeline uses the same compute/copy streams and two leased result
 buffers as asynchronous block speculation. The compute stream advances or rejects
 token slots; the copy stream transfers compact results to pinned host storage.
-Collecting an older step never rewinds GPU state. Inactive slots have masked KV
+Collecting an older step never rewinds GPU state. The token slots of all live
+requests share one device pool, indexed by the slot table of block rounds. A step
+gathers the slots of its requests, updates them in one batch and scatters them
+back. Thus its number of launched operations does not grow with the number of
+requests. Inactive slots have masked KV
 writes and zero attention lengths. Fixed-shape prelude/coda calls can include
 unused rows; this avoids a host dependency for selecting dynamic batch sizes.
 Pending steps cannot be preempted. Waiting admissions drain outstanding steps so
@@ -1073,6 +1077,22 @@ operations. Aggregate GPU kernel time was 45.08 → 44.95 ms; this is not E2E ti
 The saved work did not offset selection and result-copy overhead. The experiment
 was reverted; the runtime retains the simpler fixed-slot boundary calls. These
 results do not rule out a different implementation or workload benefiting.
+
+### Boundary-KV models
+
+Dory's PRELUDE and CODA contain attention and keep their KV at depth 0. Its
+asynchronous rounds keep the fixed-slot boundary calls above. Each call gets
+depth-0 device metadata, and a pipeline step adds a write mask:
+
+- PRELUDE stores KV only for rows at depth 0. A retained row keeps the KV of
+  its first pass.
+- CODA stores KV only for rows that reach the draft or the target depth. A row
+  between them keeps the KV of its draft pass, which later draft rows attend.
+
+With CUDA Graphs, `DeviceBoundaryGraphs` replays both stages in the same buckets
+as the recurrent loops, and the write mask is a graph input. Asynchronous Dory
+rounds take greedy requests only. `docs/dory.md` describes the KV contract and
+its validation.
 
 ## Validation
 
