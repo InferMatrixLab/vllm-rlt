@@ -76,6 +76,54 @@ OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli --toy --dtype float32 \
 
 For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --attention-backend triton`. Use `--single-stream` for the single-stream pipeline. `--num-blocks` overrides automatic sizing, or specify `--kv-cache-memory-bytes`; these two overrides are mutually exclusive. CPU auto mode keeps a 256-block default. `StageEngine.memory_plan` records the worker-local sizing decision; it is not an attribute of the public `LLM.engine` client.
 
+## Startup execution
+
+CUDA workers prepare their actual runners after connector initialization and
+before sending `ready`. Preparation runs bounded prefill, decode and configured
+speculative work with valid scratch KV allocations. It captures the graph shapes
+encountered by those workloads and replays representative paths. Scratch requests
+never enter the scheduler or publish prefix-cache entries. Streams and submission
+queues are drained before request state and KV leases are released; the serving
+RNG and request counters are preserved. CPU workers do not execute this workload.
+
+Preparation increases startup time and retains serving workspaces earlier. It
+reduces setup work in the first request; steady-state throughput and total cold
+process latency require separate measurement for each model and workload.
+
+`StageEngine.prepare_runtime()` is idempotent. Its worker-local `startup_report`
+records the covered token lengths and batch sizes, graph keys and replay/fallback
+counts, and remaining coverage gaps. The `initialized`, `captured`, `replayed`
+and `cleaned` phase snapshots record elapsed time, driver-free memory and PyTorch
+allocated/reserved memory, including peaks since the preceding snapshot. The
+allocator cache is retained consistently at these boundaries. Times are cumulative
+seconds from the start of preparation; memory values are bytes. The first peak
+includes earlier engine initialization; subsequent peaks cover the interval since
+the preceding snapshot. Driver-free values are boundary samples, not a continuous
+device high-water mark. The report is published only after successful cleanup.
+
+Single-request history covers the configured prefill limit and crosses a sliding
+window when committed KV permits. Decode batch buckets also cross a KV page.
+Greedy and full-vocabulary top-p sampling use scratch request generators.
+Async multi-stream preparation additionally submits an independent prompt core
+and coda before collection, followed by a decode core/coda pair, within the
+request/token/KV limits. Its
+`concurrent_prepared` and `concurrent` snapshots separate initial shape preparation
+from repeated concurrent execution. `concurrent_batches` lists coda row counts;
+each is submitted alongside one independent core request. Actual overlap depends
+on device execution and host submission cost. These phases drain the serving streams.
+
+This preparation does not replace automatic KV sizing. The report describes the
+existing allocated KV pool, including FP8 scale storage when configured, and
+sizing still uses the current estimates and reserves. The graph and workspace
+allocations remain resident; the KV pool itself is not a transient workspace.
+Future storage integration must preserve captured pointers, views and strides,
+and validate replay after physical commitment before publishing readiness. Small explicit pools can reduce warmup coverage. Unseen exact graph
+shapes retain bounded lazy capture. Longer contexts and mixed speculative/prompt
+overlap retain estimated transient allowances. Pipeline preparation reaches
+target verification before releasing its scratch state. The report is a lifecycle
+boundary for subsequent memory-planning integration, not a guarantee that every
+serving shape or peak allocation has been measured.
+
 ## Packed prefill
 
 `ExecutionConfig.packed_prefill` controls packed prefill attention and metadata

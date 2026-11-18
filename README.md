@@ -126,6 +126,7 @@ No PyPI publication is implied.
   gateway; the server has no built-in authentication or TLS.
 - [Supported models](#model-support) and [Ouro-Thinking recipe](docs/recipes/ouro_thinking.md)
 - [Configuration and compatibility](docs/runtime.md)
+- [CUDA startup preparation and its latency tradeoff](docs/runtime.md#startup-execution)
 - [Native CUDA build](docs/launching.md#automatic-native-cuda-build)
 - [Migration from v0.1.0](CHANGELOG.md)
 

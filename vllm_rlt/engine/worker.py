@@ -59,13 +59,25 @@ class StageWorker:
                 dtype=dtype,
                 model_config=model_config,
             )
-        self.engine = StageEngine(self.model, stage_config=stage_config, **options["engine"])
-        self.connector = (
-            connector_factory(self.engine, notify=self.send)
-            if connector_factory is not None
-            else None
+        self.engine = StageEngine(
+            self.model,
+            stage_config=stage_config,
+            _defer_runtime_preparation=True,
+            **options["engine"],
         )
-        self.engine.connector = self.connector
+        self.connector = None
+        try:
+            if connector_factory is not None:
+                self.connector = connector_factory(self.engine, notify=self.send)
+            self.engine.connector = self.connector
+            self.engine.prepare_runtime()
+        except BaseException:
+            try:
+                self.engine.close()
+            finally:
+                if self.connector is not None:
+                    self.connector.close()
+            raise
         self.running = True
         self.draining = False
         cache = self.engine.cache_manager
