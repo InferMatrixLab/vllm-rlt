@@ -449,9 +449,10 @@ def test_prefill_tile_probe_rejects_oversized_window(monkeypatch):
     assert probe(index, 256, 16, PackedWindowShape(16, 4, 36, 1024)) is None
 
 
+@pytest.mark.parametrize("fp8_kv", [False, True])
 @pytest.mark.parametrize(("window", "expected_windows"), [(None, [0]), (128, [0, 128])])
 def test_prefill_tile_probe_compiles_only_the_default_and_caches_result(
-    monkeypatch, window, expected_windows
+    monkeypatch, window, expected_windows, fp8_kv
 ):
     from types import SimpleNamespace
 
@@ -470,12 +471,17 @@ def test_prefill_tile_probe_compiles_only_the_default_and_caches_result(
     def compile_tile(*args, **kwargs):
         assert (kwargs["BLOCK_M"], kwargs["BLOCK_N"]) == (32, 32)
         assert kwargs["COMPENSATE"]
+        assert kwargs["HAS_SCALE"] is fp8_kv
+        assert args[1].dtype == (torch.float8_e4m3fn if fp8_kv else torch.bfloat16)
+        if fp8_kv:
+            assert args[7].dtype == args[8].dtype == torch.float32
+            assert args[7].shape == args[1].shape[:-1]
         assert all(arg.device.type == "meta" for arg in args if isinstance(arg, torch.Tensor))
         windows.append(kwargs["WINDOW"])
         return SimpleNamespace(metadata=SimpleNamespace(shared=limit))
 
     monkeypatch.setattr(attention._paged_prefill_kernel, "warmup", compile_tile)
-    args = (device, torch.bfloat16, 64, 16, PackedWindowShape(4, 2, 2, window))
+    args = (device, torch.bfloat16, 64, 16, PackedWindowShape(4, 2, 2, window, fp8_kv))
 
     attention._select_packed_window_tile.cache_clear()
     try:

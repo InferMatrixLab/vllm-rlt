@@ -25,6 +25,10 @@ class BackendCapabilities:
     # Packed rows reproduce single-query decode exactly; speculative verification
     # relies on this to match serial decoding token for token.
     packed_matches_decode: bool = False
+    # Reads an FP8 e4m3 KV pool with per-vector float32 scales.
+    fp8_kv: bool = False
+    # Reads FP8 KV quantized using one fixed scalar for the cache lifetime.
+    fp8_kv_static: bool = False
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
     # Mask keys outside a per-layer sliding window (not storage reclamation).
@@ -60,13 +64,26 @@ class AttentionBackend:
         return getattr(self.kernel, "generation", None)
 
 
-_TORCH_CAPABILITIES = BackendCapabilities(sliding_window=True)
+_TORCH_CAPABILITIES = BackendCapabilities(fp8_kv=True, fp8_kv_static=True, sliding_window=True)
 _TRITON_CAPABILITIES = BackendCapabilities(
-    cuda_graphs=True, async_scheduling=True, device_context_lengths=True, sliding_window=True
+    cuda_graphs=True,
+    async_scheduling=True,
+    device_context_lengths=True,
+    fp8_kv=True,
+    fp8_kv_static=True,
+    sliding_window=True,
 )
 _FLASH_CAPABILITIES = {
-    2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
-    3: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
+    2: BackendCapabilities(
+        cuda_graphs=True,
+        async_scheduling=True,
+        device_context_lengths=True,
+    ),
+    3: BackendCapabilities(
+        cuda_graphs=True,
+        async_scheduling=True,
+        device_context_lengths=True,
+    ),
     4: BackendCapabilities(
         packed_prefill=True,
         cuda_graphs=True,
@@ -118,7 +135,13 @@ def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, pa
         )
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
-        return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))
+        capabilities = replace(
+            _FLASH_CAPABILITIES[kernel.generation],
+            fp8_kv_static=kernel.supports_fp8_static,
+            sliding_window=kernel.supports_sliding_window,
+            packed_sliding_window=kernel.supports_sliding_window,
+        )
+        return AttentionBackend(kernel, capabilities, dict(kernel.info))
     return AttentionBackend(TorchPagedAttention(), _TORCH_CAPABILITIES, {"backend": "torch"})
 
 
@@ -132,6 +155,7 @@ def create_backend(
     required_capabilities: BackendCapabilities = BackendCapabilities(),
     prefer_packed_prefill: bool = False,
     packed_window_shape: PackedWindowShape | None = None,
+    allow_fp8_calibration: bool = False,
 ) -> AttentionBackend:
     """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
 
@@ -142,6 +166,8 @@ def create_backend(
     Preferred packed prefill enables it where available without filtering or
     reordering candidates; required packed prefill still rejects unsupported ones.
     A packed window shape opts into tile selection and keeps row attention available.
+    Engine callers that can calibrate may satisfy an FP8 KV request with a
+    fixed-scale backend. Cache-only callers must provide a resolved scale.
     """
     validate_backend_name(backend)
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
@@ -160,6 +186,20 @@ def create_backend(
                 packed=required_capabilities.packed_prefill or prefer_packed_prefill,
                 packed_window_shape=packed_window_shape,
             )
+            capabilities = implementation.capabilities
+            requirements = required_capabilities
+            if (
+                allow_fp8_calibration
+                and requirements.fp8_kv
+                and not capabilities.fp8_kv
+                and capabilities.fp8_kv_static
+            ):
+                requirements = replace(requirements, fp8_kv=False, fp8_kv_static=True)
+            if requirements.fp8_kv_static and candidate in FLASH_BACKENDS:
+                # Native FP8 packed-vs-decode bitwise equality is not established.
+                implementation.capabilities = replace(
+                    implementation.capabilities, packed_matches_decode=False
+                )
             missing = [
                 name
                 for name in (
@@ -167,11 +207,12 @@ def create_backend(
                     "cuda_graphs",
                     "async_scheduling",
                     "device_context_lengths",
+                    "fp8_kv",
+                    "fp8_kv_static",
                     "sliding_window",
                     "packed_sliding_window",
                 )
-                if getattr(required_capabilities, name)
-                and not getattr(implementation.capabilities, name)
+                if getattr(requirements, name) and not getattr(implementation.capabilities, name)
             ]
             if missing:
                 raise ValueError(f"{candidate} lacks required capabilities: {', '.join(missing)}")
