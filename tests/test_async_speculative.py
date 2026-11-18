@@ -132,7 +132,7 @@ def test_second_round_executes_before_cpu_commit_at_every_rejection(accepted, mo
     start = request.position
     calls = 0
 
-    def controlled(hidden):
+    def controlled(hidden, boundary=None):
         nonlocal calls
         phase = calls % 4
         calls += 1
@@ -182,7 +182,7 @@ def test_eos_discards_queued_round_and_request_id_can_be_reused(monkeypatch, gra
     monkeypatch.setattr(
         e.speculative_runner,
         "_coda",
-        lambda h: torch.zeros(
+        lambda h, boundary=None: torch.zeros(
             len(h),
             model.config.vocab_size,
             device="cuda",

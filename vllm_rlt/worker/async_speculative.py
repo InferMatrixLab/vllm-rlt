@@ -5,6 +5,11 @@ requests verify by target argmax. Random requests draw drafts from their ``q`` d
 verify with speculative rejection sampling against ``p`` (see ``speculative_sampling``) and
 return their committed sequence (accepted drafts, then correction or bonus) in the result rows.
 A batch without random requests takes the greedy path with no extra device work.
+
+Boundary-KV models (attention in PRELUDE and CODA) keep the history of both stages at
+depth 0. The contract is the same as in ``speculative``: all KV below the start of the
+next round is the serial target history. The boundary stages use device metadata, as
+the recurrent loops do, because the actual positions exist only on the device.
 """
 
 import math
@@ -446,13 +451,18 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         for state in self.states.values():
             state.token, state.position = new[state.slot, 0], new[state.slot, 1]
 
-    def _execute_recurrent_step(self, hidden, positions, tables, depth, allocations, active=None):
+    def device_metadata(self, positions, tables, depth, allocations, active=None, writes=None):
+        """Describe rows whose positions stay on the device.
+
+        Inactive rows attend no keys. Only ``writes`` rows store KV; the
+        default is the active rows.
+        """
         if isinstance(depth, torch.Tensor):
             table = tables.gather(1, depth[:, None, None].expand(-1, 1, tables.shape[2])).squeeze(1)
         else:
             table = tables[:, depth].contiguous()
         blocks = table.gather(1, (positions // self.cache.block_size)[:, None]).squeeze(1)
-        metadata = self.metadata.prepare_device(
+        return self.metadata.prepare_device(
             allocations=allocations,
             position_ids=positions,
             write_blocks=blocks.long(),
@@ -461,8 +471,17 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             context_lengths=(
                 (positions + 1) if active is None else torch.where(active, positions + 1, 0)
             ).int(),
-            write_mask=active,
+            write_mask=active if writes is None else writes,
         )
+
+    def boundary_metadata(self, positions, tables, allocations):
+        """PRELUDE and CODA rows of a boundary-KV model, which keep their history at depth 0."""
+        if not self.boundary_kv:
+            return None
+        return self.device_metadata(positions, tables, 0, allocations)
+
+    def _execute_recurrent_step(self, hidden, positions, tables, depth, allocations, active=None):
+        metadata = self.device_metadata(positions, tables, depth, allocations, active)
         forward = ForwardBatch(
             Operation.RECURRENT, hidden=hidden, metadata=(metadata,), graphs=self.graphs
         )
@@ -635,7 +654,8 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 row_tokens = tokens[active, offset]
                 positions = starts[active] + offset
                 row_tables = tables[active]
-            hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=row_tokens)).hidden
+            boundary = self.boundary_metadata(positions, row_tables, allocations)
+            hidden = self._prelude(row_tokens, boundary)
             for depth in range(self.config.draft_loops):
                 hidden = self._execute_recurrent_step(
                     hidden, positions, row_tables, depth, allocations
@@ -644,9 +664,13 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             if drafting_count:
                 rows = getattr(plan, f"draft_rows{offset}", None)
                 drafting = hidden if rows is None else hidden[rows]
+                if self.boundary_kv and rows is not None:
+                    boundary = self.boundary_metadata(
+                        positions[rows], row_tables[rows], allocations
+                    )
                 # CUDA graphs may return a static buffer that the next _coda replay
                 # overwrites: everything below is derived from `logits` immediately.
-                logits = self._coda(drafting)
+                logits = self._coda(drafting, boundary)
                 proposed = logits.argmax(-1)
                 random_rows = getattr(plan, f"r_rows{offset}", None)
                 if random_rows is not None:
@@ -676,7 +700,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         hidden = torch.cat(hidden_blocks)[plan.hidden_rows]
         for depth in range(self.config.draft_loops, self.config.target_loops):
             hidden = self._execute_recurrent_step(hidden, positions, row_tables, depth, allocations)
-        logits = self._coda(hidden)
+        logits = self._coda(hidden, self.boundary_metadata(positions, row_tables, allocations))
         target = logits.argmax(-1)
         random = plan.random
         if random is None:
@@ -844,15 +868,30 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         positions = torch.where(active, positions, 0)
         tokens = torch.cat([state.pipeline.tokens[:w] for state, w in zip(states, widths)])
         retained = torch.cat([state.pipeline.hidden[:w] for state, w in zip(states, widths)])
-        prelude = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=tokens)).hidden
-        hidden = torch.where((depths == 0)[:, None], prelude, retained)
         row_tables = torch.cat([tables[i : i + 1].expand(w, -1, -1) for i, w in enumerate(widths)])
+        fresh = depths == 0
+        prelude_kv = coda_kv = None
+        if self.boundary_kv:
+            # Every row runs both boundary stages to keep one call shape. A
+            # retained row already holds the input-stage KV of its token.
+            prelude_kv = self.device_metadata(
+                positions, row_tables, 0, allocations, active, active & fresh
+            )
+            # Only rows that reach the draft or target depth read a distribution.
+            # The output-stage KV of other rows must stay the KV of their draft pass.
+            reached = depths + self.config.draft_loops
+            endpoints = (reached == self.config.draft_loops) | (reached == self.config.target_loops)
+            coda_kv = self.device_metadata(
+                positions, row_tables, 0, allocations, active, active & endpoints
+            )
+        prelude = self._prelude(tokens, prelude_kv)
+        hidden = torch.where(fresh[:, None], prelude, retained)
         for offset in range(self.config.draft_loops):
             depth = torch.where(active, depths + offset, 0)
             hidden = self._execute_recurrent_step(
                 hidden, positions, row_tables, depth, allocations, active
             )
-        choices = self._coda(hidden).argmax(-1)
+        choices = self._coda(hidden, coda_kv).argmax(-1)
         start = 0
         for i, (span, state, w) in enumerate(zip(spans, states, widths)):
             p = state.pipeline
