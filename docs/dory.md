@@ -161,6 +161,12 @@ than the requests may need as they advance.
   the next input stage and only its readback is deferred. The two switches are
   independent: sync eager, sync Graph, async eager and async Graph are tested
   separately.
+- Preemption (`SchedulerConfig(enable_preemption=True)`). Priority admission and
+  KV capacity pressure can suspend a request at any stage boundary, with
+  resident or CPU-offloaded KV, in both KV modes and in the four execution
+  modes above. A suspended request keeps its boundary and recurrent KV, its
+  carried state with the injection input, its stage and loop progress, and its
+  sampling RNG. See [Preemption](#preemption).
 - The official tokenizer, including the Hub's `tokenizer.json` and chat
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
@@ -233,8 +239,7 @@ These fail fast rather than degrade silently:
 
 `enable_preemption` selects the all-layer fallback, so suspend, CPU offload and
 restore work, with or without prefix caching, in execution modes that accept
-preemption (self-speculation does not). Dory preemption has not been qualified
-on GPU.
+preemption (self-speculation does not).
 
 Sliding-window masking exists in the Torch reference backend and in the Triton
 decode kernel (`window=` on `KVCacheManager.attend`). Backend selection requires
@@ -467,6 +472,27 @@ cohorts into one decode wave and BF16 greedy tokens depend on batch
 composition. FP32 tokens matched in these measured workloads; BF16 agreement is
 not promised across batch shapes.
 
+### Preemption
+
+`tests/test_dory_preemption.py` suspends and resumes requests on the tiny model:
+
+- CPU, 58 cases. A request is suspended at six stage boundaries: inside the
+  prefill chunks, at the prompt's output stage, at the input stage, after the
+  first loop, between the loops and at the output stage. Each boundary runs in
+  both KV modes, with resident and with CPU-offloaded KV. Greedy output equals
+  the dense oracle, and seeded sampled output equals an uninterrupted run. After
+  resumption, every plane below the request frontier equals the serial KV. Two
+  more cases cover a resident suspension that is later offloaded and preemption
+  under KV capacity pressure.
+- CUDA, 48 cases on Triton. Capacity-pressure and priority preemption run in sync
+  eager, sync Graph, async eager and async Graph, in both KV modes, against the
+  dense oracle.
+
+The tests fail when restoration drops output-stage KV, reseeds the RNG or
+permutes the carried state. On one H100 (torch 2.15.0+cu132), the file passes
+together with `tests/test_dory_gpu.py` (222 passed). The existing suspension and
+snapshot path needed no Dory-specific change.
+
 ### Self-speculation
 
 `tests/test_dory_speculative.py` checks block and token-pipeline
@@ -558,3 +584,5 @@ Reading the numbers:
   sampled token-pipeline, adaptive exit, or a draft width above the fixed K.
 - Sampled speculation on the real checkpoint (the rejection-sampling contract is
   qualified on the tiny CPU model only).
+- Preemption on the real checkpoint. Preemption is qualified on the tiny model
+  only.
