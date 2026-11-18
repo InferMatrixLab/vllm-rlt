@@ -16,8 +16,13 @@ def torch_paged_attention(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reference attention over [physical block, token, KV head, dimension]."""
+    """Reference attention over [physical block, token, KV head, dimension].
+
+    FP8 pools pass per-vector scales shaped [physical block, token, KV head].
+    """
     output = torch.empty_like(q)
     block_size = key_cache.shape[1]
     head_groups = q.shape[1] // key_cache.shape[2]
@@ -29,8 +34,13 @@ def torch_paged_attention(
         token_positions = torch.arange(length, device=q.device)
         blocks = block_tables[row, token_positions // block_size]
         offsets = token_positions % block_size
-        keys = key_cache[blocks, offsets].repeat_interleave(head_groups, dim=1)
-        values = value_cache[blocks, offsets].repeat_interleave(head_groups, dim=1)
+        keys = key_cache[blocks, offsets].float()
+        values = value_cache[blocks, offsets].float()
+        if key_scale is not None:
+            keys = keys * key_scale[blocks, offsets].unsqueeze(-1)
+            values = values * value_scale[blocks, offsets].unsqueeze(-1)
+        keys = keys.repeat_interleave(head_groups, dim=1)
+        values = values.repeat_interleave(head_groups, dim=1)
         scores = torch.einsum("hd,thd->ht", q[row].float(), keys.float()) * scale
         probabilities = torch.softmax(scores, dim=-1)
         output[row] = torch.einsum("ht,thd->hd", probabilities, values.float()).to(q.dtype)
@@ -44,12 +54,15 @@ def torch_paged_attention_windowed(
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
     window: int,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference sliding-window attention over the same layout.
 
     Row ``row`` attends only its last ``window`` keys, including the query's own
     position, matching per-layer sliding-window semantics. History outside the
-    window stays stored: this is masking, not reclamation.
+    window stays stored: this is masking, not reclamation. FP8 pools pass
+    per-vector scales as in ``torch_paged_attention``.
     """
     if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
         raise ValueError("window must be a positive integer")
@@ -64,8 +77,13 @@ def torch_paged_attention_windowed(
         token_positions = torch.arange(max(0, length - window), length, device=q.device)
         blocks = block_tables[row, token_positions // block_size]
         offsets = token_positions % block_size
-        keys = key_cache[blocks, offsets].repeat_interleave(head_groups, dim=1)
-        values = value_cache[blocks, offsets].repeat_interleave(head_groups, dim=1)
+        keys = key_cache[blocks, offsets].float()
+        values = value_cache[blocks, offsets].float()
+        if key_scale is not None:
+            keys = keys * key_scale[blocks, offsets].unsqueeze(-1)
+            values = values * value_scale[blocks, offsets].unsqueeze(-1)
+        keys = keys.repeat_interleave(head_groups, dim=1)
+        values = values.repeat_interleave(head_groups, dim=1)
         scores = torch.einsum("hd,thd->ht", q[row].float(), keys.float()) * scale
         probabilities = torch.softmax(scores, dim=-1)
         output[row] = torch.einsum("ht,thd->hd", probabilities, values.float()).to(q.dtype)
@@ -75,12 +93,40 @@ def torch_paged_attention_windowed(
 class TorchPagedAttention:
     """Reference single-query attention, with and without sliding windows."""
 
-    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
-        return torch_paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
+    def __call__(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        key_scale=None,
+        value_scale=None,
+    ):
+        return torch_paged_attention(
+            q, key_cache, value_cache, block_tables, context_lengths, key_scale, value_scale
+        )
 
-    def windowed(self, q, key_cache, value_cache, block_tables, context_lengths, window):
+    def windowed(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        window,
+        key_scale=None,
+        value_scale=None,
+    ):
         return torch_paged_attention_windowed(
-            q, key_cache, value_cache, block_tables, context_lengths, window
+            q,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            window,
+            key_scale,
+            value_scale,
         )
 
 
@@ -90,6 +136,8 @@ def triton_paged_attention(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
     window: int = 0,
 ) -> torch.Tensor:
     """Dispatch explicitly to Triton, with no silent reference fallback."""
@@ -100,7 +148,16 @@ def triton_paged_attention(
     # Keep Triton optional and avoid loading its runtime for CPU-only callers.
     from vllm_rlt.kernels.triton_attention import paged_attention
 
-    return paged_attention(q, key_cache, value_cache, block_tables, context_lengths, window=window)
+    return paged_attention(
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        key_scale,
+        value_scale,
+        window=window,
+    )
 
 
 @dataclass(frozen=True)
@@ -109,6 +166,7 @@ class PackedWindowShape:
     kv_heads: int
     kv_layers: int
     window: int | None
+    fp8_kv: bool = False
 
 
 def triton_paged_prefill(
@@ -119,6 +177,8 @@ def triton_paged_prefill(
     context_lengths,
     cu_seqlens_q,
     max_seqlen_q,
+    key_scale=None,
+    value_scale=None,
     *,
     window=0,
     compensate=False,
@@ -134,6 +194,8 @@ def triton_paged_prefill(
         context_lengths,
         cu_seqlens_q,
         max_seqlen_q,
+        key_scale,
+        value_scale,
         window=window,
         compensate=compensate,
     )
@@ -145,12 +207,40 @@ class TritonPagedAttention:
     def __init__(self, *, compensate=False):
         self.compensate = compensate
 
-    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
-        return triton_paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
-
-    def windowed(self, q, key_cache, value_cache, block_tables, context_lengths, window):
+    def __call__(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        key_scale=None,
+        value_scale=None,
+    ):
         return triton_paged_attention(
-            q, key_cache, value_cache, block_tables, context_lengths, window=window
+            q, key_cache, value_cache, block_tables, context_lengths, key_scale, value_scale
+        )
+
+    def windowed(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        window,
+        key_scale=None,
+        value_scale=None,
+    ):
+        return triton_paged_attention(
+            q,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale,
+            value_scale,
+            window=window,
         )
 
     def prefill(self, *args, **kwargs):

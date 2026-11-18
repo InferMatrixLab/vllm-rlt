@@ -107,7 +107,18 @@ class _DeviceCache:
 
     def _write_prepared(self, layer, batch, k, v):
         cache = self.cache
-        if batch.active_rows is not None or (
+        if cache.key_scale is not None:
+            # FP8 pools: one fused quantizing writer that honors the same row masks.
+            cache._store_layer(
+                layer,
+                batch.write_blocks,
+                batch.write_offsets,
+                k,
+                v,
+                mask=batch.write_mask,
+                active=batch.active_rows,
+            )
+        elif batch.active_rows is not None or (
             batch.write_mask is None and cache.backend == "triton"
         ):
             from vllm_rlt.kernels.graph_kv import write_graph_kv
@@ -127,10 +138,9 @@ class _DeviceCache:
             return cache.wise.attend_static(
                 layer, batch, q, cache.key_cache[:, layer], cache.value_cache[:, layer]
             )
-        if window is not None:
+        scales = cache._layer_scales(layer)
+        if window is not None and batch.cu_seqlens_q is None:
             # The window is a kernel constant; lengths and tables stay graph inputs.
-            if batch.cu_seqlens_q is not None:
-                raise NotImplementedError("sliding-window attention needs one query row per token")
             return cache.attention.windowed(
                 q,
                 cache.key_cache[:, layer],
@@ -138,6 +148,7 @@ class _DeviceCache:
                 batch.block_tables,
                 batch.context_lengths,
                 window,
+                **scales,
             )
         if batch.cu_seqlens_q is not None:
             return cache.attention.prefill(
@@ -148,6 +159,8 @@ class _DeviceCache:
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
+                **({"window": window} if window is not None else {}),
+                **scales,
             )
         return cache.attention(
             q,
@@ -155,6 +168,7 @@ class _DeviceCache:
             cache.value_cache[:, layer],
             batch.block_tables,
             batch.context_lengths,
+            **scales,
         )
 
 

@@ -546,3 +546,16 @@ def test_mixed_packed_fa4_decode_rows_fall_back_to_dense(model, graphs):
     assert forced.engine.cache_manager.wise.fallbacks > 0
     real = engine(None)
     assert all(len(o.token_ids) == 10 for o in real.generate(prompts, params))
+
+
+def test_wise_rejects_fp8_kv_cache():
+    from types import SimpleNamespace
+
+    from vllm_rlt.engine.stage_engine import StageEngine
+
+    engine = SimpleNamespace(
+        model=SimpleNamespace(),
+        cache_manager=SimpleNamespace(kv_cache_dtype="fp8_e4m3", backend="flash_attn_4"),
+    )
+    with pytest.raises(ValueError, match="kv_cache_dtype='auto'"):
+        StageEngine._init_wise(engine, None, None, None, None)
