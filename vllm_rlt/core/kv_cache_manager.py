@@ -238,6 +238,9 @@ class KVCacheManager:
         self._prefixes = OrderedDict()
         self._pending_prefixes = []
         self.prefix_hits = self.prefix_queries = 0
+        # Optional WISE decode state (vllm_rlt.wise). The runner marks decode
+        # metadata; unmarked traversals, including prefill, stay dense.
+        self.wise = None
         if enable_prefix_caching and layout != "last_exited":
             raise ValueError("prefix caching requires last_exited KV")
 
@@ -446,6 +449,8 @@ class KVCacheManager:
         allocation = self._allocations.pop(request_id, None)
         if allocation is not None:
             self._drop_refs(b for table in allocation.block_tables for b in reversed(table))
+        if self.wise is not None:
+            self.wise.release(request_id)
 
     def pin_transfer(self, request_id: str, transfer_id: str):
         allocation = self._get_allocation(request_id)
@@ -926,6 +931,10 @@ class KVCacheManager:
                 batch.max_seqlen_q,
                 **self._layer_scales(layer),
                 **({} if window is None else {"window": window}),
+            )
+        if self.wise is not None and self.wise.is_decode(batch):
+            return self.wise.attend(
+                layer, batch, q, self.key_cache[:, layer], self.value_cache[:, layer]
             )
         return self.attention(
             q,

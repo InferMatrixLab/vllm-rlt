@@ -535,6 +535,96 @@ def test_invalid_k(k):
         SpeculativeConfig(k)
 
 
+def test_wise_draft_requires_block_speculation():
+    # Pipeline rounds have no WISE draft path; only block speculation accepts it.
+    assert SpeculativeConfig(4, draft_attention="wise").mode == "block"
+    with pytest.raises(ValueError, match="requires block speculation"):
+        SpeculativeConfig(4, draft_loops=1, mode="pipeline", draft_attention="wise")
+
+
+class _WiseRecorder:
+    """Records WISE decode marks; every row still attends densely on CPU."""
+
+    draft_only = True
+
+    def __init__(self):
+        self.marked = {}
+
+    def mark(self, metadata, decode_rows):
+        self.marked[id(metadata)] = tuple(decode_rows)
+
+    def is_decode(self, metadata):
+        return False
+
+    def release(self, request_id):
+        pass
+
+
+def test_wise_draft_marks_only_draft_layouts(monkeypatch):
+    from dataclasses import replace
+
+    from vllm_rlt.request import Operation
+
+    m = model()
+    prompts = [[2], [3, 4, 5, 6, 7], [9, 3]]
+    params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in [1, 13, 8]]
+    expected = [o.token_ids for o in LLM(m).generate(prompts, params)]
+    e = engine(m, cache_config=CacheConfig(256, 2))
+    runner = e.speculative_runner
+    runner.config = replace(runner.config, draft_attention="wise")
+    wise = e.cache_manager.wise = _WiseRecorder()
+    draft, target = runner.config.draft_loops, runner.config.target_loops
+    prepare, seen = runner._prepare_inputs, set()
+    recurrent_calls, reuse_layouts = [], []
+    original_recurrent = runner._recurrent
+
+    def recorded(hidden, metadata):
+        recurrent_calls.append({id(kv) for kv in metadata})
+        return original_recurrent(hidden, metadata)
+
+    def checked(batch):
+        wise.marked.clear()
+        prepared = prepare(batch)
+        layouts, marked = prepared.layouts, set()
+        for step in prepared.steps:
+            views = step.views[Operation.RECURRENT]
+            recurrent = layouts[views[0]]
+            if step.coda_rows:
+                seen.add("reuse")
+                # The draft readout runs the remaining loops over the same rows.
+                assert len(step.reuse) == target - draft
+                reuse_layouts.append({id(layouts[index]) for index in step.reuse})
+                for depth, index in zip(range(draft, target), step.reuse):
+                    assert [row[1] for row in layouts[index].rows] == [depth] * len(step.requests)
+                    assert [row[2] for row in layouts[index].rows] == [
+                        row[2] for row in recurrent.rows
+                    ]
+            else:
+                seen.add("none")
+                assert step.reuse == ()
+            marked |= {id(layouts[index]) for index in views + step.reuse}
+        assert set(wise.marked) == marked
+        assert all(rows == (True,) * len(rows) for rows in wise.marked.values())
+        # Verification never shares a layout with the WISE draft.
+        for index in prepared.target[Operation.RECURRENT]:
+            assert id(layouts[index]) not in wise.marked
+        return prepared
+
+    monkeypatch.setattr(runner, "_prepare_inputs", checked)
+    monkeypatch.setattr(runner, "_recurrent", recorded)
+    try:
+        for i, (prompt, p) in enumerate(zip(prompts, params)):
+            e.add_request(str(i), prompt, p)
+        actual = drain(e)
+        assert [actual[str(i)].token_ids for i in range(3)] == expected
+        assert seen == {"reuse", "none"}
+        # Each drafting step ran its reuse loops before the draft readout.
+        assert reuse_layouts and all(ids in recurrent_calls for ids in reuse_layouts)
+        assert e.cache_manager.num_used_blocks == 0
+    finally:
+        e.close()
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["triton", "flash_attn_4"])
 def test_gpu_sampling_and_greedy_match_replay_with_ragged_requests(backend):

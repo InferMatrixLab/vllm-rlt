@@ -152,11 +152,14 @@ class DraftStep:
     reads exactly these hidden rows. ``views`` maps each model operation to
     indices in ``PreparedRound.layouts``; it never owns separate KV metadata.
     PRELUDE and a full-row CODA reuse the recurrent depth-0 layout index.
+    ``reuse`` indexes a WISE draft's remaining (reuse-depth) loops over the
+    same rows; it is empty without a WISE draft or when no row drafts.
     """
 
     requests: tuple[int, ...]
     coda_rows: tuple[int, ...]
     views: dict[Operation, tuple[int, ...]]
+    reuse: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -277,6 +280,7 @@ class SpeculativeRunner:
             ids.extend([span.request.request_id] * span.token_count)
             positions.extend(range(span.token_start, span.token_start + span.token_count))
         draft, target = self.config.draft_loops, self.config.target_loops
+        wise = self.config.draft_attention == "wise"
         source = self.metadata.build(
             ids, [[depth] * len(ids) for depth in range(target)], positions
         )
@@ -293,7 +297,16 @@ class SpeculativeRunner:
                 views[Operation.CODA] = self._view(
                     source, tuple(rows[row] for row in coda_rows), (0,), layouts
                 )
-            steps.append(DraftStep(active, coda_rows, views))
+            # A WISE draft also runs the remaining loops (sparse) for its readout.
+            # Only drafting steps run them; a step without CODA rows stops the
+            # round first. These selections never equal the target's all-row
+            # selection, so verification keeps its own dense layouts.
+            reuse = (
+                self._view(source, rows, range(draft, target), layouts)
+                if wise and coda_rows
+                else ()
+            )
+            steps.append(DraftStep(active, coda_rows, views, reuse))
         target_views = {
             Operation.RECURRENT: self._view(
                 source, None, range(draft, target), layouts, packed=self._packed(True)
@@ -302,13 +315,17 @@ class SpeculativeRunner:
         if self.boundary_kv:
             target_views[Operation.CODA] = self._view(source, None, (0,), layouts)
         uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
+        bound = tuple(self.metadata.bind(metadata, uploaded) for _, metadata in layouts.values())
+        if wise:
+            # Every draft row is a WISE decode row; verification stays dense.
+            for step in steps:
+                for index in step.views[Operation.RECURRENT] + step.reuse:
+                    self.cache.wise.mark(bound[index], [True] * len(step.requests))
         return PreparedRound(
             tokens=uploaded[tokens.dtype].as_strided(
                 tokens.shape, tokens.stride(), tokens.storage_offset()
             ),
-            layouts=tuple(
-                self.metadata.bind(metadata, uploaded) for _, metadata in layouts.values()
-            ),
+            layouts=bound,
             steps=tuple(steps),
             target=target_views,
         )
@@ -541,6 +558,10 @@ class SpeculativeRunner:
                 states[i].append(hidden[row])
             if not step.coda_rows:
                 break
+            if step.reuse:
+                # Shared dense discovery loops above; WISE-sparse remaining loops
+                # only for the draft readout. Verification overwrites their KV.
+                hidden = self._recurrent(hidden, tuple(layouts[index] for index in step.reuse))
             logits = self._coda(
                 torch.stack([hidden[row] for row in step.coda_rows]),
                 self._boundary(layouts, step.views, Operation.CODA),

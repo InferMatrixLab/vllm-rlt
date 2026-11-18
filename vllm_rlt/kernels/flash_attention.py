@@ -163,17 +163,20 @@ class FlashPagedAttention:
         value_cache,
         block_tables,
         context_lengths,
+        return_lse=False,
         *,
         key_scale=None,
         value_scale=None,
         window=None,
     ):
+        """Decode attention; with ``return_lse`` also the [rows, heads] natural-log normalizers."""
         if window is not None and not self.supports_sliding_window:
             raise NotImplementedError(
                 "this FlashAttention implementation lacks sliding-window support"
             )
         if q.shape[0] == 0:
-            return torch.empty_like(q)
+            empty = torch.empty_like(q)
+            return (empty, q.new_empty(q.shape[:2], dtype=torch.float32)) if return_lse else empty
         # The visible prefix already includes exactly the current causal position.
         # Do not append K/V here: the cache manager has written it at this depth.
         output_dtype = q.dtype
@@ -194,6 +197,7 @@ class FlashPagedAttention:
                 # Auto splitting depends on batch size and changes BF16 reductions.
                 # Keep the partition fixed across scheduler batch compositions.
                 num_splits=1,
+                **({"return_lse": True} if return_lse else {}),
                 **({"window_size": (window - 1, 0)} if window is not None else {}),
                 **descales,
             )
@@ -206,9 +210,20 @@ class FlashPagedAttention:
                 cache_seqlens=context_lengths,
                 causal=True,
                 **{page_argument: block_tables},
+                **({"return_softmax_lse": True} if return_lse else {}),
             )
+        lse = None
         if isinstance(out, tuple):
-            out = out[0]  # FA4 beta returns (output, optional LSE).
+            out, lse = out[0], out[1]  # FA4 beta returns (output, optional LSE).
+        if return_lse:
+            # [rows, heads, 1] or [rows, 1, heads]; one query position per row.
+            rows, heads = q.shape[:2]
+            lse = (
+                lse.reshape(rows, heads)
+                if lse.shape[1] == heads
+                else lse.transpose(1, 2).reshape(rows, heads)
+            )
+            return out.squeeze(1).to(output_dtype), lse.float()
         return out.squeeze(1).to(output_dtype)
 
     def windowed(
