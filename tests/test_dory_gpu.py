@@ -288,3 +288,225 @@ def test_dory_failed_submission_releases_kv_in_every_execution_mode(mode, monkey
     engine.add_request("a", PROMPTS["a"], params)
     assert drain(engine)["a"].token_ids == greedy_reference(reference, PROMPTS["a"], 4)
     assert engine.cache_manager.num_used_blocks == 0
+
+
+def _packed_tile(query_heads, kv_heads, kv_layers=1, *, window):
+    from vllm_rlt.kernels.paged_attention import PackedWindowShape
+    from vllm_rlt.kernels.triton_attention import select_packed_window_tile
+
+    tile = select_packed_window_tile(
+        torch.device(DEVICE),
+        torch.bfloat16,
+        256,
+        16,
+        PackedWindowShape(query_heads, kv_heads, kv_layers, window),
+    )
+    if tile is None:
+        pytest.skip("No supported packed prefill tile for this device")
+    return tile
+
+
+@pytest.mark.parametrize("window", [0, 32])
+def test_dory_packed_attention_matches_per_row_reference(window):
+    from vllm_rlt.kernels.triton_attention import paged_attention, paged_prefill_attention
+
+    _packed_tile(16, 4, window=window or None)
+    # The first chunk is far enough into its history to skip a full SWA tile.
+    # The two sequences have distinct pages and different causal offsets.
+    torch.manual_seed(123)
+    q = torch.randn((42, 16, 256), device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn((10, 16, 4, 256), device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    tables = torch.tensor(
+        [[8, 2, 3, 0, 1, 4, 5, 6, 7], [9, -1, -1, -1, -1, -1, -1, -1, -1]],
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    lengths = torch.tensor([132, 15], device=DEVICE, dtype=torch.int32)
+    offsets = torch.tensor([0, 35, 42], device=DEVICE, dtype=torch.int32)
+    row_tables = torch.cat((tables[:1].expand(35, -1), tables[1:].expand(7, -1)))
+    row_lengths = torch.tensor([*range(98, 133), *range(9, 16)], device=DEVICE, dtype=torch.int32)
+    expected = paged_attention(q, k, v, row_tables, row_lengths, window=window)
+    actual = paged_prefill_attention(
+        q, k, v, tables, lengths, offsets, 35, window=window, compensate=True
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize("multi_stream", [True, False])
+@pytest.mark.parametrize(("long_tokens", "max_num_seqs"), [(65, 1), (129, 2)])
+@pytest.mark.parametrize("sliding_window", [None, 32], ids=["full", "mixed"])
+def test_dory_packed_prefill_preserves_short_prompt_logits(
+    monkeypatch, multi_stream, long_tokens, max_num_seqs, sliding_window
+):
+    from vllm_rlt.kernels import triton_attention
+
+    layout = {"layer_types": ("full_attention", "mlp") * 4} if sliding_window is None else {}
+    model = make_gpu_model(
+        head_dim=256, max_position_embeddings=256, sliding_window=sliding_window, **layout
+    ).to(dtype=torch.bfloat16)
+    tile = _packed_tile(
+        model.config.num_attention_heads,
+        model.config.num_key_value_heads,
+        model.config.num_kv_layers,
+        window=sliding_window,
+    )
+    prompt = [4, 7, 9, 3, 12, 5, 23]
+    scheduler = SchedulerConfig(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=128,
+        prefill_chunk_size=64,
+    )
+
+    def run(*, enable, expect_packed):
+        engine = LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=64),
+            scheduler_config=scheduler,
+            attention_backend="triton",
+            execution_config=ExecutionConfig(packed_prefill=enable, multi_stream=multi_stream),
+        )
+        packed_layers = set()
+        short_logits = []
+        sampler = engine.model_runner.sampler
+        original_sample = sampler.sample
+        original_attention = engine.cache_manager._attend_prepared
+
+        def sample(logits, params, generator):
+            if params is short_options:
+                short_logits.append(logits.detach().cpu())
+            return original_sample(logits, params, generator)
+
+        def attention(layer, metadata, q, *, window=None):
+            if metadata.cu_seqlens_q is not None:
+                assert all(rid == "long" for rid, _ in metadata.allocations)
+                packed_layers.add((layer, window is not None))
+            return original_attention(layer, metadata, q, window=window)
+
+        short_options = SamplingParams(max_tokens=3, ignore_eos=True)
+        with monkeypatch.context() as mp:
+            mp.setattr(sampler, "sample", sample)
+            mp.setattr(engine.cache_manager, "_attend_prepared", attention)
+            try:
+                assert engine.execution_config.packed_prefill is expect_packed
+                assert (
+                    engine.cache_manager.attention_capabilities.packed_sliding_window
+                    is expect_packed
+                )
+                assert engine.cache_manager.attention_info["packed_prefill_tile"] == (
+                    tile if expect_packed else None
+                )
+                engine.add_request(
+                    "long",
+                    (prompt * 19)[:long_tokens],
+                    SamplingParams(max_tokens=3, ignore_eos=True),
+                )
+                engine.add_request("short", (prompt * 10)[:64], short_options)
+                while engine.has_unfinished_requests():
+                    engine.step()
+                assert engine.cache_manager.num_used_blocks == 0
+            finally:
+                engine.close()
+        return torch.stack(short_logits), packed_layers
+
+    baseline, baseline_packed = run(enable=False, expect_packed=False)
+    automatic, automatic_packed = run(enable=None, expect_packed=True)
+    actual, packed = run(enable=True, expect_packed=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(triton_attention, "select_packed_window_tile", lambda *args: None)
+        fallback, fallback_packed = run(enable=None, expect_packed=False)
+        with pytest.raises(ValueError, match="lacks required capabilities: packed_sliding_window"):
+            run(enable=True, expect_packed=False)
+    assert not fallback_packed
+    assert torch.equal(baseline, fallback)
+    assert not baseline_packed
+    assert automatic_packed == packed
+    assert torch.equal(automatic, actual)
+    assert {layer for layer, _ in packed} == set(range(model.config.num_kv_layers))
+    assert {window for _, window in packed} == (
+        {False} if sliding_window is None else {False, True}
+    )
+    assert torch.equal(baseline, actual)
+
+
+def test_prefill_tile_probe_rejects_oversized_window(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_rlt.kernels import triton_attention
+    from vllm_rlt.kernels.paged_attention import PackedWindowShape
+
+    if torch.version.hip:
+        pytest.skip("NVIDIA shared-memory resource check")
+
+    index = torch.cuda.current_device()
+    limit = triton_attention.driver.active.utils.get_device_properties(index)["max_shared_mem"]
+
+    def compile_tile(*args, window, **kwargs):
+        return SimpleNamespace(metadata=SimpleNamespace(shared=limit + bool(window)))
+
+    monkeypatch.setattr(triton_attention, "_launch_paged_prefill", compile_tile)
+    probe = triton_attention._select_packed_window_tile.__wrapped__
+    assert probe(index, 256, 16, PackedWindowShape(16, 4, 36, 1024)) is None
+
+
+@pytest.mark.parametrize("fp8_kv", [False, True])
+@pytest.mark.parametrize(("window", "expected_windows"), [(None, [0]), (128, [0, 128])])
+def test_prefill_tile_probe_compiles_only_the_default_and_caches_result(
+    monkeypatch, window, expected_windows, fp8_kv
+):
+    from types import SimpleNamespace
+
+    from vllm_rlt.kernels import triton_attention as attention
+    from vllm_rlt.kernels.paged_attention import PackedWindowShape
+
+    if torch.version.hip:
+        pytest.skip("NVIDIA packed prefill selection")
+
+    device = torch.device(DEVICE)
+    index = torch.cuda.current_device()
+    limit = attention.driver.active.utils.get_device_properties(index)["max_shared_mem"]
+    windows = []
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "Unlisted GPU")
+
+    def compile_tile(*args, **kwargs):
+        assert (kwargs["BLOCK_M"], kwargs["BLOCK_N"]) == (32, 32)
+        assert kwargs["COMPENSATE"]
+        assert kwargs["HAS_SCALE"] is fp8_kv
+        assert args[1].dtype == (torch.float8_e4m3fn if fp8_kv else torch.bfloat16)
+        if fp8_kv:
+            assert args[7].dtype == args[8].dtype == torch.float32
+            assert args[7].shape == args[1].shape[:-1]
+        assert all(arg.device.type == "meta" for arg in args if isinstance(arg, torch.Tensor))
+        windows.append(kwargs["WINDOW"])
+        return SimpleNamespace(metadata=SimpleNamespace(shared=limit))
+
+    monkeypatch.setattr(attention._paged_prefill_kernel, "warmup", compile_tile)
+    args = (device, torch.bfloat16, 64, 16, PackedWindowShape(4, 2, 2, window, fp8_kv))
+
+    attention._select_packed_window_tile.cache_clear()
+    try:
+        assert attention.select_packed_window_tile(*args) == (32, 32)
+        assert windows == expected_windows
+        assert attention.select_packed_window_tile(*args) == (32, 32)
+        assert windows == expected_windows
+    finally:
+        attention._select_packed_window_tile.cache_clear()
+
+
+def test_dory_packed_prefill_keeps_small_value_residual():
+    from vllm_rlt.kernels.triton_attention import paged_attention, paged_prefill_attention
+
+    _packed_tile(1, 1, window=None)
+    q = torch.zeros((1, 1, 256), device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.zeros((1, 16, 1, 256), device=DEVICE, dtype=torch.bfloat16)
+    k, v = kv.clone(), kv.clone()
+    q[0, 0, 0], k[0, 1, 0, 0] = 16, -0.5
+    # Rounding exp(-0.5) to BF16 before multiplying would zero the numerator.
+    v[0, 0, 0, 0], v[0, 1, 0, 0] = -0.60546875, 1
+    table = torch.tensor([[0]], device=DEVICE, dtype=torch.int32)
+    length = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+    offset = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+    expected = paged_attention(q, k, v, table, length)
+    actual = paged_prefill_attention(q, k, v, table, length, offset, 1, compensate=True)
+    assert expected[0, 0, 0] > 0.0006
+    torch.testing.assert_close(actual, expected, atol=5e-6, rtol=0)

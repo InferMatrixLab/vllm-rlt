@@ -3,11 +3,11 @@
 This guide covers cross-round asynchronous block speculation and
 [pipelined self-speculation](#pipelined-self-speculation).
 
-The cross-round asynchronous block path uses fixed-depth Ouro, `last_exited` KV, greedy sampling,
-CUDA execution, and refill scheduling. Triton and compatible paged FlashAttention
-backends can consume its GPU-owned context lengths; `auto` selects against this
-capability as well as hardware, dtype and block size. Draft depth is configurable, with `d=2, D=4`
-as the initial validation configuration. The target depth must match the model.
+The cross-round asynchronous block path uses fixed-depth Ouro, `last_exited` KV, greedy or
+[random sampling](#random-sampling), CUDA execution, and refill scheduling. Triton and compatible
+paged FlashAttention backends can consume its GPU-owned context lengths; `auto` selects against
+this capability as well as hardware, dtype and block size. Draft depth is configurable, with
+`d=2, D=4` as the initial validation configuration. The target depth must match the model.
 
 ## Timeline: synchronous versus asynchronous speculation
 
@@ -158,7 +158,8 @@ if __name__ == "__main__":
 
 The CLI combines `--async-scheduling --attention-backend flash_attn_4 --cuda-graphs
 --speculative-tokens 2 --draft-loops 2 --target-loops 4 --temperature 0`.
-For the default block mode, random sampling, adaptive exit and preemption remain rejected.
+For the default block mode, adaptive exit and preemption remain rejected; random sampling is
+accepted (see [Random sampling](#random-sampling)).
 PD can enable speculation on its decode stage. Incoming prompts wait for transfer
 completion and shared scheduler admission before CODA bootstraps local speculative
 rounds. Cancellation retains GPU resources until the final round completes.
@@ -183,6 +184,83 @@ The block-mode async runner gathers and scatters its two-column `(token, positio
 state with the existing Triton routing kernels (`H=2`). Acceptance still computes
 each request's prefix match and correction independently. Slot allocation,
 round completion events and deferred retirement retain their existing owners.
+
+## Random sampling
+
+Async block speculation accepts `temperature`, `top_k`, `top_p` and `seed` in
+`SamplingParams`, and greedy (`temperature=0`) and random requests can share one
+speculative batch. Pipeline mode and the PD decode stage still reject
+`temperature != 0` and require greedy sampling.
+
+```python
+SamplingParams(temperature=0.8, top_k=50, top_p=0.95, seed=1234,
+               max_loops=4, exit_threshold=1.0, max_tokens=64)
+```
+
+**Algorithm.** Standard speculative rejection sampling, computed on the device
+without host reads during submission. `p` is the target distribution and `q` the
+proposal; both are the request's temperature/top-k/top-p distributions, normalized
+per row, and every step below uses these normalized values.
+
+- Drafts are sampled from the actual proposal `q` of the draft pass.
+- Draft `x` is accepted if `p(x) >= q(x)`, without consulting a uniform; otherwise
+  if `u * q(x) < p(x)`, i.e. with probability `min(1, p/q)`.
+- At the first rejection the replacement token is sampled from `max(p - q, 0)`.
+- If every draft is accepted, the bonus token is sampled from `p` at the next
+  position. A request with no drafts in a round (effective K=0) samples from `p`.
+- Draft and final sampling share one inverse-CDF helper. The threshold is clamped
+  below the total mass, so a sample always lies in the support of its distribution.
+
+**Result layout.** Greedy rows keep returning the target argmax prefix. A random
+request returns its committed sequence in its result rows: the accepted drafts,
+then the correction or bonus token. An accepted draft need not equal the target
+argmax, so the committed tokens, the next-round input token on the device and the
+CPU-side output all come from this sequence. Rounds containing random requests
+append one numerical-error flag per request after the accepted counts and next
+positions; greedy-only rounds keep the previous layout and do no extra device work.
+
+**RNG protocol.** The engine-owned per-request generator (`RngRegistry`, seeded from
+`SamplingParams.seed`) is used as follows.
+
+- Each random request draws one `torch.rand(2K + 1)` per submitted round, with
+  `K = num_speculative_tokens`: `[0:K]` for draft sampling, `[K:2K]` for acceptance
+  and `[2K]` for the correction or bonus token.
+- Consumption does not depend on the round's draft count or acceptance outcomes,
+  so no host synchronization is needed. It differs from synchronous speculation,
+  which draws per token and stops at the first rejection.
+- Greedy requests never acquire a generator.
+- The first token is sampled by the ordinary CODA path with the same generator.
+
+**Reproducibility.** A fixed seed reproduces outputs only on the same execution
+path: the same mode (eager or CUDA Graph), round shapes and batch plan. Outputs are
+not token-identical to synchronous speculation, to ordinary non-speculative
+sampling, or between graph and eager execution (padding can change BF16 logits; see
+the numerical notes below).
+
+**Numerical errors.** If a request's probabilities are invalid at its stop point
+(the first non-accepted position, or the bonus position), such as a non-finite or
+zero-mass row or an empty residual, the whole round fails through the existing
+fatal cleanup rather than isolating the request. The check runs after the stale-row
+filter and before the scheduler's EOS truncation. Positions after the stop point are
+ignored, and results for finished or reused requests are discarded as before. A
+failed request's device state is not advanced, so an already queued round reads the
+span it had reserved.
+
+| Combination | Random sampling |
+| --- | --- |
+| Async block, local stage, eager | Validated on one RTX 5090 (SM120) with the Triton backend |
+| Async block, local stage, CUDA Graphs | Validated on one RTX 5090 (SM120) with the Triton backend |
+| Pipeline mode (synchronous or asynchronous) | Greedy only |
+| PD decode stage with async speculation | Greedy only |
+| FA4 | Not yet validated |
+| Speculative preemption | Not applicable (preemption is rejected in async block mode) |
+
+**Validation status.** CPU tests cover probability construction, rejection sampling
+against an exact oracle, and host round planning and result decoding. CUDA tests
+cover two in-flight rounds, CUDA Graph replay, ragged and `K = 0` rounds, request
+lifecycle and numerical-error cleanup, and the public entry point; they pass on one
+RTX 5090 (SM120) with the Triton backend. Other GPUs, FA4, multi-GPU and PD
+deployments are not validated. This section makes no performance claim.
 
 ## CUDA Graph execution
 

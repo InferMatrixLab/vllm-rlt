@@ -8,7 +8,11 @@ from dataclasses import dataclass, replace
 import torch
 
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS, FlashPagedAttention
-from vllm_rlt.kernels.paged_attention import TorchPagedAttention, TritonPagedAttention
+from vllm_rlt.kernels.paged_attention import (
+    PackedWindowShape,
+    TorchPagedAttention,
+    TritonPagedAttention,
+)
 
 
 @dataclass(frozen=True)
@@ -21,10 +25,15 @@ class BackendCapabilities:
     # Packed rows reproduce single-query decode exactly; speculative verification
     # relies on this to match serial decoding token for token.
     packed_matches_decode: bool = False
+    # Reads an FP8 e4m3 KV pool with per-vector float32 scales.
+    fp8_kv: bool = False
+    # Reads FP8 KV quantized using one fixed scalar for the cache lifetime.
+    fp8_kv_static: bool = False
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
     # Mask keys outside a per-layer sliding window (not storage reclamation).
     sliding_window: bool = False
+    packed_sliding_window: bool = False
 
 
 @dataclass
@@ -55,13 +64,26 @@ class AttentionBackend:
         return getattr(self.kernel, "generation", None)
 
 
-_TORCH_CAPABILITIES = BackendCapabilities(sliding_window=True)
+_TORCH_CAPABILITIES = BackendCapabilities(fp8_kv=True, fp8_kv_static=True, sliding_window=True)
 _TRITON_CAPABILITIES = BackendCapabilities(
-    cuda_graphs=True, async_scheduling=True, device_context_lengths=True, sliding_window=True
+    cuda_graphs=True,
+    async_scheduling=True,
+    device_context_lengths=True,
+    fp8_kv=True,
+    fp8_kv_static=True,
+    sliding_window=True,
 )
 _FLASH_CAPABILITIES = {
-    2: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
-    3: BackendCapabilities(cuda_graphs=True, async_scheduling=True, device_context_lengths=True),
+    2: BackendCapabilities(
+        cuda_graphs=True,
+        async_scheduling=True,
+        device_context_lengths=True,
+    ),
+    3: BackendCapabilities(
+        cuda_graphs=True,
+        async_scheduling=True,
+        device_context_lengths=True,
+    ),
     4: BackendCapabilities(
         packed_prefill=True,
         cuda_graphs=True,
@@ -82,20 +104,44 @@ def validate_backend_name(backend: str) -> None:
         raise ValueError("unknown attention backend")
 
 
-def _create_explicit(backend, device, dtype, head_dim, block_size):
+def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, packed_window_shape):
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
         if head_dim > 256:
             raise ValueError("the Triton attention backend supports head_dim <= 256")
-        if not torch.version.hip and torch.cuda.get_device_capability(device)[0] < 8:
+        sm = None if torch.version.hip else torch.cuda.get_device_capability(device)
+        if sm is not None and sm[0] < 8:
             raise ValueError("the Triton attention backend requires NVIDIA Compute Capability 8.0+")
-        # Probe the actual module, including its dependency imports, before selection.
-        importlib.import_module("vllm_rlt.kernels.triton_attention")
-        return AttentionBackend(TritonPagedAttention(), _TRITON_CAPABILITIES, {"backend": backend})
+        # Import the implementation before selection and probe the opted-in tile
+        # before the engine profiles and allocates its KV pool.
+        implementation = importlib.import_module("vllm_rlt.kernels.triton_attention")
+        tile = (
+            implementation.select_packed_window_tile(
+                device, dtype, head_dim, block_size, packed_window_shape
+            )
+            if packed_window_shape is not None
+            else None
+        )
+        compensate = tile is not None
+        capabilities = replace(
+            _TRITON_CAPABILITIES,
+            packed_prefill=packed or compensate,
+            packed_sliding_window=compensate,
+        )
+        kernel = TritonPagedAttention(compensate=compensate)
+        return AttentionBackend(
+            kernel, capabilities, {"backend": backend, "packed_prefill_tile": tile}
+        )
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
-        return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))
+        capabilities = replace(
+            _FLASH_CAPABILITIES[kernel.generation],
+            fp8_kv_static=kernel.supports_fp8_static,
+            sliding_window=kernel.supports_sliding_window,
+            packed_sliding_window=kernel.supports_sliding_window,
+        )
+        return AttentionBackend(kernel, capabilities, dict(kernel.info))
     return AttentionBackend(TorchPagedAttention(), _TORCH_CAPABILITIES, {"backend": "torch"})
 
 
@@ -107,6 +153,9 @@ def create_backend(
     block_size: int,
     *,
     required_capabilities: BackendCapabilities = BackendCapabilities(),
+    prefer_packed_prefill: bool = False,
+    packed_window_shape: PackedWindowShape | None = None,
+    allow_fp8_calibration: bool = False,
 ) -> AttentionBackend:
     """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
 
@@ -114,6 +163,11 @@ def create_backend(
     Only compatibility and import failures permit auto to try the next candidate;
     kernel execution errors never trigger a runtime fallback. Execution requirements
     filter candidates before memory profiling or device-buffer allocation.
+    Preferred packed prefill enables it where available without filtering or
+    reordering candidates; required packed prefill still rejects unsupported ones.
+    A packed window shape opts into tile selection and keeps row attention available.
+    Engine callers that can calibrate may satisfy an FP8 KV request with a
+    fixed-scale backend. Cache-only callers must provide a resolved scale.
     """
     validate_backend_name(backend)
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
@@ -123,13 +177,28 @@ def create_backend(
         skipped.append(f"{device.type.upper()} uses Torch reference attention")
     for candidate in candidates:
         try:
-            implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
-            if candidate == "triton" and required_capabilities.packed_prefill:
-                # Packed BF16 prefill has different arithmetic from per-row decode.
-                # Opt in for prefill_uva without changing existing split/mixed or
-                # Huginn boundary attention when that option is disabled.
+            implementation = _create_explicit(
+                candidate,
+                device,
+                dtype,
+                head_dim,
+                block_size,
+                packed=required_capabilities.packed_prefill or prefer_packed_prefill,
+                packed_window_shape=packed_window_shape,
+            )
+            capabilities = implementation.capabilities
+            requirements = required_capabilities
+            if (
+                allow_fp8_calibration
+                and requirements.fp8_kv
+                and not capabilities.fp8_kv
+                and capabilities.fp8_kv_static
+            ):
+                requirements = replace(requirements, fp8_kv=False, fp8_kv_static=True)
+            if requirements.fp8_kv_static and candidate in FLASH_BACKENDS:
+                # Native FP8 packed-vs-decode bitwise equality is not established.
                 implementation.capabilities = replace(
-                    implementation.capabilities, packed_prefill=True
+                    implementation.capabilities, packed_matches_decode=False
                 )
             missing = [
                 name
@@ -138,10 +207,12 @@ def create_backend(
                     "cuda_graphs",
                     "async_scheduling",
                     "device_context_lengths",
+                    "fp8_kv",
+                    "fp8_kv_static",
                     "sliding_window",
+                    "packed_sliding_window",
                 )
-                if getattr(required_capabilities, name)
-                and not getattr(implementation.capabilities, name)
+                if getattr(requirements, name) and not getattr(implementation.capabilities, name)
             ]
             if missing:
                 raise ValueError(f"{candidate} lacks required capabilities: {', '.join(missing)}")
@@ -163,6 +234,14 @@ def create_backend(
         implementation.info.update(
             requested_backend=backend, selected_backend=selected, selection_reason=reason
         )
+        if (
+            packed_window_shape is not None
+            and not implementation.capabilities.packed_sliding_window
+        ):
+            implementation.info.update(
+                packed_prefill_tile=None,
+                packed_prefill_fallback="no supported packed prefill tile",
+            )
         logging.getLogger(__name__).info("Attention selection: %s", implementation.info)
         return implementation
     raise ValueError("no compatible attention backend; " + "; ".join(skipped))

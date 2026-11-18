@@ -20,6 +20,9 @@ class CacheConfig:
     incremental_allocation: bool = False
     # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
+    # "auto" stores KV in the model dtype; "fp8_e4m3" stores float8 e4m3 codes with
+    # scales chosen by the engine for the selected attention backend.
+    kv_cache_dtype: str = "auto"
 
     def __post_init__(self):
         for name in ("enable_prefix_caching", "incremental_allocation"):
@@ -34,6 +37,8 @@ class CacheConfig:
         _positive("block_size", self.block_size)
         if self.layout not in ("last_exited", "shared"):
             raise ValueError("layout must be 'last_exited' or 'shared'")
+        if self.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+            raise ValueError("kv_cache_dtype must be 'auto' or 'fp8_e4m3'")
         if (
             not math.isfinite(self.gpu_memory_utilization)
             or not 0 < self.gpu_memory_utilization <= 1
@@ -149,12 +154,17 @@ class ExecutionConfig:
     # Shared switch for mapped pinned-memory reads; unsupported devices copy instead.
     use_uva: bool = True
     # Select packed prefill metadata staging (and require packed attention).
-    # The historical name is retained; use_uva controls its transfer mechanism.
-    prefill_uva: bool = False
+    # use_uva independently controls its transfer mechanism.
+    # None resolves at engine construction: on when the attention backend packs
+    # prefill (Triton opts in, FlashAttention-4 natively) with last_exited KV and
+    # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
+    # support and compatible synchronous eager execution; off otherwise.
+    packed_prefill: bool | None = None
 
     def __post_init__(self):
+        if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
+            raise ValueError("packed_prefill must be a boolean or None")
         for name in (
-            "prefill_uva",
             "use_uva",
             "async_scheduling",
             "multi_stream",

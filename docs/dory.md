@@ -90,11 +90,51 @@ layer id rather than their physical sublayer index.
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
 
+## Packed Triton prefill
+
+With `attention_backend="triton"`, the default `packed_prefill=None` automatically
+enables packed prefill when execution and backend support it. Set
+`ExecutionConfig(packed_prefill=True)` / `--packed-prefill` to require support,
+or `packed_prefill=False` / `--no-packed-prefill` to keep per-query prefill.
+An unsupported explicit enable request fails at startup.
+
+This path uses BF16, `per_loop` KV, ordinary prefill, and synchronous eager
+single-stage execution. Speculation, preemption, CUDA graphs and asynchronous
+scheduling are outside its scope.
+
+On NVIDIA CUDA, the packed path uses a 32 × 32 tile. At startup, Triton compiles
+the full-attention kernel and, if the model uses a sliding window, the
+sliding-window kernel. It checks their shared-memory requirements against the
+device limit. Automatic mode uses per-query attention if the check fails;
+explicit enable requests fail through backend capability validation.
+The result is cached by device and attention geometry within the process.
+The check runs before KV memory planning and uses tensor metadata only.
+The check establishes that the tile fits, not that it is fastest. The fixed
+32 × 32 tile was validated on RTX 4060 and RTX 5090; other GPUs and workloads
+need measurements to determine their best tile.
+The full BF16 checkpoint and long-context service validation require enough
+device memory for the model weights, runtime buffers and KV pool.
+
+A batch uses packed attention across PRELUDE, recurrence and the CODA
+writes for prompt history when every prompt is longer than 64 tokens.
+The CODA that samples the first token uses per-query attention. A batch containing
+a shorter prompt or a 64-token prompt uses per-query attention. The
+cutoff uses the full prompt length. Decode keeps the per-query path.
+
+Packed full and sliding-window attention use the same causal ranges as
+per-query attention. The matrix products and softmax reductions use a
+different order and intermediate rounding. The value product compensates
+for the BF16 rounding of softmax weights. Remaining differences can
+propagate through Dory's recurrent layers and change a greedy choice.
+For reproducible comparisons, use per-query attention and hold the
+batch shape fixed. Changes in arrival timing can change the batch shape
+even with per-query attention.
+
 ## Rejected today
 
 These fail fast rather than degrade silently:
 
-- WCPB, mixed or staged prefill; packed prefill metadata (`prefill_uva`); PD.
+- WCPB, mixed or staged prefill, and PD.
 - Prefix caching.
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
   preemption or `last_loop` KV, and sampled token-pipeline speculation. The

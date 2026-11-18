@@ -78,6 +78,27 @@ OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli --toy --dtype float32 \
 
 For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --attention-backend triton`. Use `--single-stream` for the single-stream pipeline. `--num-blocks` overrides automatic sizing, or specify `--kv-cache-memory-bytes`; these two overrides are mutually exclusive. CPU auto mode keeps a 256-block default. `StageEngine.memory_plan` records the worker-local sizing decision; it is not an attribute of the public `LLM.engine` client.
 
+## Packed prefill
+
+`ExecutionConfig.packed_prefill` controls packed prefill attention and metadata
+staging. Its default, `None`, selects packed prefill when the selected backend
+supports it on CUDA with `last_exited` KV and ordinary, non-staged prefill.
+Mixed scheduling and wavefront chunked prefill keep their existing paths.
+Sliding-window packing additionally requires backend support for both packed
+prefill and packed sliding-window attention, with ordinary synchronous eager
+single-stage execution, without speculation or preemption. These selection rules
+apply to all models. Incompatible automatic configurations keep per-query attention.
+
+Set `packed_prefill=True` / `--packed-prefill` to require packed prefill, or
+`packed_prefill=False` / `--no-packed-prefill` to disable its staging path.
+Explicit enable requests fail if execution constraints or required backend
+capabilities are unsupported; they do not silently fall back. Explicit disable
+does not probe a packed sliding-window tile.
+
+`ExecutionConfig.use_uva` independently controls how input buffers are read.
+`use_uva=False` / `--no-uva` copies them to the GPU and can be combined with
+packed prefill.
+
 ## Execution batches and mixed scheduling
 
 Stage composition, component ownership and Request handoff are described in the
@@ -305,6 +326,80 @@ For bounded admission scans, bypass fairness, incremental growth budgets and the
 zero watermark in non-incremental mode, see [scheduler admission](scheduler.md#admission-available-memory-is-not-the-whole-budget).
 Pool sizing establishes physical capacity; scheduler admission decides how much
 of that capacity can safely be promised to new work.
+
+## FP8 KV cache
+
+`CacheConfig(kv_cache_dtype="fp8_e4m3")` (CLI `--kv-cache-dtype fp8_e4m3`) stores K and V as
+float8 e4m3 codes with one float32 scale per (block, layer, token, KV head) vector
+(`scale = amax / 448`). Values are quantized when written and dequantized by the attention
+backend when read, so a block costs `head_dim + 4` bytes per vector instead of
+`head_dim * element_size`: 51.6% of BF16 at `head_dim=128`, and automatic sizing or
+`--kv-cache-memory-bytes` admits about 1.94x as many tokens. The default `"auto"` stores the
+model dtype and leaves every existing path unchanged.
+
+- Supported: Torch (reference) and Triton attention; synchronous and asynchronous scheduling;
+  CUDA graphs (quantized writes are captured); LAST_EXITED finalize copies, including the
+  asynchronous finalize kernel, copy codes and scales; preemption snapshots carry the scales;
+  `KVCacheManager.read` returns dequantized values.
+- Triton's split-KV decode and packed paged-prefill kernels both apply the scales on load
+  (prefill dequantizes to the query dtype before `tl.dot`). Device-masked writes (speculative
+  verification, bucketed CUDA graphs) use the same fused writer with the row mask applied.
+- Triton writes with one fused quantize-and-store kernel per layer. The Torch backend quantizes
+  with Torch ops and is the reference; both writers produce the same codes and scales.
+- With Triton FP8 KV, PD transfer sends K/V scales with the corresponding cache
+  rows. P and D must use the same KV dtype.
+- Each layer writes the current token's K/V before attending, so attention reads the current
+  token in FP8 as well. Accuracy should be checked per model and workload; adaptive exits can
+  change where a token exits because the gate sees slightly different attention.
+
+### Experimental FA4 static-scale adapter
+
+Use `--kv-cache-dtype fp8_e4m3 --attention-backend flash_attn_4`
+(Python: `CacheConfig(kv_cache_dtype="fp8_e4m3")` with `attention_backend="flash_attn_4"`).
+Backend `auto` also selects this path when FA4 meets the execution requirements. The prototype
+targets FA4 4.0.0b39 on SM10x with BF16 models and head dimensions 64, 128 or 256.
+Install the pinned dependency with `pip install -e '.[flash-attn4]'`. Both BF16
+and FP8 use FA4's public API; FP8 passes `TensorwiseScales`, without a private
+forward entry point or temporary BF16 KV staging.
+At startup the engine runs a short BF16 prefill with deterministic vocabulary
+IDs and one decode input when context length permits. It measures the maximum
+absolute Q/K/V value across all layers and loops, adds 10% headroom, divides by 448,
+and rounds up to a power of two. The result stays fixed for the lifetime of the
+KV pool and is recorded in the startup log. Values outside `±448 * scale`
+saturate. FA4 quantizes Q with this scale and receives `[batch, kv_head]`
+Q/K/V descales in both decode and packed prefill. This changes compute precision
+in addition to KV storage precision. Validate model accuracy on representative
+requests because the startup probe only samples a short synthetic sequence.
+
+The existing per-vector scale pools and finalize/snapshot paths are retained
+for a small reviewable prototype; byte accounting still includes them. Snapshots
+with different scale policies cannot be restored. Torch/Triton can read the
+fixed-scale cache for reference checks. FA4 packed-vs-decode bitwise matching is
+not advertised for FP8. In PD, workers calibrate from the same startup inputs
+and verify that their fixed scale matches before exchanging KV pages.
+
+Dory uses the same adapter: sliding attention passes `(window - 1, 0)` to FA4,
+because the runtime window includes the current token. Full-attention layers
+keep their causal mask. Packed prompt chunks retain bottom-right alignment
+against an existing prefix. Both `per_loop` and `last_loop` KV modes, using
+their required layouts, support asynchronous scheduling and CUDA Graphs in
+the input, recurrent and output stages. Dory's existing rejection of mixed
+scheduling and boundary-KV prefix caching remains in effect.
+
+Validation on B300 with FA4 4.0.0b39 covers 69 GPU cases across kernel,
+end-to-end and regression checks: head dimensions 64/128/256, packed sliding
+windows with existing prefixes, snapshot/finalize paths, and Dory 2/4-loop
+eager versus async single/multi-stream Graph execution without fallback.
+The real Dory 4B checkpoint also completed a 1030-token prompt across its
+1024-token window and matched FP8 eager output under asynchronous Graphs.
+
+An unprofiled eager comparison on that checkpoint (2 loops, 128 input tokens,
+16 output tokens, one request, three warmed repetitions) measured median
+output throughput of 20.45 tok/s with BF16 and 18.21 tok/s with FP8. Allocated
+KV pool storage fell from 576 MiB to 292.5 MiB at equal block counts. This
+small case does not demonstrate a speedup or establish model accuracy. Its
+fixed scale of 16 came from one separate calibration prompt and is not a
+recommended default; validate calibration and task quality for deployment.
 
 ## Replay and validation commands
 

@@ -247,11 +247,16 @@ packages, and execution requirements. CPU uses Torch. For example, on an RTX
 4090, the default 16-token block size rules out FA2's 256-token page requirement;
 auto selects Triton if it is installed.
 
-GPU async scheduling and CUDA Graphs require a device backend. UVA packed
+GPU async scheduling and CUDA Graphs require a device backend. Packed
 prefill requires declared packed-prefill support and LAST_EXITED KV. Auto reports
 an error if no implementation satisfies these requirements. Selection occurs
 before memory profiling, and the startup log reports the selected backend and
 why earlier candidates were skipped.
+
+`--packed-prefill` forces packed prefill and `--no-packed-prefill` disables it;
+omitting both selects it automatically when supported. `--no-uva` independently
+selects copies instead of mapped host-memory reads. See the
+[packed-prefill selection rules](runtime.md#packed-prefill).
 
 Explicit choices (`torch`, `triton`, `flash_attn`, or `flash_attn_2/3/4`) retain
 their validation errors and never fall back. Existing defaults are unchanged:

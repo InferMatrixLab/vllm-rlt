@@ -96,6 +96,8 @@ class PDEngine:
         d_cache = decode_cache_config or CacheConfig()
         if (p_cache.layout, p_cache.block_size) != (d_cache.layout, d_cache.block_size):
             raise ValueError("P and D must use the same KV layout and block size")
+        if p_cache.kv_cache_dtype != d_cache.kv_cache_dtype:
+            raise ValueError("P and D must use the same KV cache dtype")
         if attention_backend not in ("triton", "flash_attn", "flash_attn_4"):
             raise ValueError("PD supports CUDA Triton or paged FA4 attention")
         self.scheduling_policy = p_scheduler.policy
