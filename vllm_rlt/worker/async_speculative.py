@@ -206,13 +206,33 @@ def merge_random_round(
 
 @dataclass
 class DevicePipelineState:
-    """Fixed-capacity, oldest-first token slots; all validity and depths live on GPU."""
+    """Fixed-capacity, oldest-first token slots; all validity and depths live on GPU.
+
+    The runner keeps one pool with a leading slot dimension. A request state holds
+    the views of its own slot.
+    """
 
     tokens: torch.Tensor
     depths: torch.Tensor
     hidden: torch.Tensor
     candidates: torch.Tensor
     active: torch.Tensor
+
+    @classmethod
+    def zeros(cls, slots, width, hidden_size, dtype, device):
+        return cls(
+            torch.zeros((slots, width), dtype=torch.long, device=device),
+            torch.zeros((slots, width), dtype=torch.long, device=device),
+            torch.zeros((slots, width, hidden_size), dtype=dtype, device=device),
+            torch.zeros((slots, width), dtype=torch.long, device=device),
+            torch.zeros((slots, width), dtype=torch.bool, device=device),
+        )
+
+    def tensors(self):
+        return (self.tokens, self.depths, self.hidden, self.candidates, self.active)
+
+    def row(self, slot):
+        return DevicePipelineState(*(tensor[slot] for tensor in self.tensors()))
 
 
 @dataclass
@@ -392,6 +412,22 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         )
         self.free_slots = list(reversed(range(len(self.slot_values))))
         self._retired_slot_values: list[torch.Tensor] = []
+        # Pipeline token slots of every live request, indexed like the slot table, so
+        # a step gathers, updates and scatters all its requests in one operation each.
+        self.pipeline_width = min(
+            config.num_speculative_tokens + 1, config.target_loops // config.draft_loops
+        )
+        self.pipeline_pool = (
+            DevicePipelineState.zeros(
+                len(self.slot_values),
+                self.pipeline_width,
+                model.config.hidden_size,
+                next(model.parameters()).dtype,
+                self.device,
+            )
+            if config.mode == "pipeline"
+            else None
+        )
         self.submitted_before_collect = 0
         self.discarded_rounds = 0
         self.readback_waits = 0
@@ -408,35 +444,28 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         host = torch.tensor([request.input_token_id, request.position], pin_memory=True)
         values = host.to(self.device, non_blocking=True)
         buffer.keepalive.extend((host, values))
-        if self.config.mode == "pipeline":
-            state = SpeculativeRequestState(request, allocation, values[0], values[1])
-        else:
-            if not self.free_slots:
-                self._grow_slots()
-            slot = self.free_slots.pop()
-            self.slot_values[slot].copy_(values)
-            state = SpeculativeRequestState(
-                request, allocation, self.slot_values[slot, 0], self.slot_values[slot, 1], slot=slot
-            )
-        if self.config.mode == "pipeline":
-            width = min(
-                self.config.num_speculative_tokens + 1,
-                self.config.target_loops // self.config.draft_loops,
-            )
-            parameter = next(self.model.parameters())
-            state.pipeline = DevicePipelineState(
-                state.token.expand(width).clone(),
-                torch.zeros(width, dtype=torch.long, device=self.device),
-                torch.zeros(
-                    (width, self.model.config.hidden_size),
-                    dtype=parameter.dtype,
-                    device=self.device,
-                ),
-                torch.zeros(width, dtype=torch.long, device=self.device),
-                torch.arange(width, device=self.device) == 0,
-            )
+        if not self.free_slots:
+            self._grow_slots()
+        slot = self.free_slots.pop()
+        self.slot_values[slot].copy_(values)
+        if self.pipeline_pool is not None:
+            pool = self.pipeline_pool
+            pool.tokens[slot].copy_(values[0].expand(self.pipeline_width))
+            for tensor in (pool.depths, pool.hidden, pool.candidates, pool.active):
+                tensor[slot].zero_()
+            pool.active[slot, 0] = True
+        state = SpeculativeRequestState(
+            request, allocation, *self.slot_values[slot].unbind(), slot=slot
+        )
+        if self.pipeline_pool is not None:
+            state.pipeline = self.pipeline_pool.row(slot)
         self.states[rid] = state
         return state
+
+    def bind_slot(self, state):
+        state.token, state.position = self.slot_values[state.slot].unbind()
+        if self.pipeline_pool is not None:
+            state.pipeline = self.pipeline_pool.row(state.slot)
 
     def _grow_slots(self):
         """Double the slot table on the compute stream; live states move with it."""
@@ -446,9 +475,18 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         # Work already queued still addresses the old storage.
         self._retired_slot_values.append(old)
         self.slot_values = new
+        if self.pipeline_pool is not None:
+            pool = self.pipeline_pool
+            grown = DevicePipelineState.zeros(
+                len(new), self.pipeline_width, pool.hidden.shape[2], pool.hidden.dtype, self.device
+            )
+            for source, target in zip(pool.tensors(), grown.tensors()):
+                target[: len(old)].copy_(source)
+            self._retired_slot_values.extend(pool.tensors())
+            self.pipeline_pool = grown
         self.free_slots = list(reversed(range(len(old), len(new)))) + self.free_slots
         for state in self.states.values():
-            state.token, state.position = new[state.slot, 0], new[state.slot, 1]
+            self.bind_slot(state)
 
     def device_metadata(self, positions, tables, depth, allocations, active=None, writes=None):
         """Describe rows whose positions stay on the device.
@@ -852,103 +890,116 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         )
 
     def _pipeline_step(self, spans, states, tables, allocations, buffer):
-        widths = [
-            min(span.token_count, len(state.pipeline.tokens)) for span, state in zip(spans, states)
+        pool, width = self.pipeline_pool, self.pipeline_width
+        n = len(spans)
+        # Budget reductions discard speculative descendants, never the root.
+        widths = np.array([min(span.token_count, width) for span in spans], dtype=np.int64)
+        # Row r of the step is slot column flat[r] % width of request requests[r],
+        # request-major and oldest first, as the per-request rows were before.
+        requests = np.repeat(np.arange(n), widths)
+        columns = np.arange(len(requests)) - np.repeat(np.cumsum(widths) - widths, widths)
+        limits = [
+            len(span.request.prompt_token_ids) + span.request.sampling_params.max_tokens - 1
+            for span in spans
         ]
-        active = torch.cat([state.pipeline.active[:w] for state, w in zip(states, widths)])
-        depths = torch.cat([state.pipeline.depths[:w] for state, w in zip(states, widths)])
-        positions = torch.cat(
-            [
-                state.position + torch.arange(w, device=self.device)
-                for state, w in zip(states, widths)
-            ]
-        )
+        host = torch.from_numpy(
+            np.concatenate(
+                (
+                    [state.slot for state in states],
+                    widths,
+                    limits,
+                    requests,
+                    requests * width + columns,
+                )
+            )
+        ).pin_memory()
+        values = host.to(self.device, non_blocking=True)
+        buffer.keepalive.extend((host, values))
+        slots, w, limit, row_requests, flat = values.split((n, n, n, len(requests), len(requests)))
+        tokens, depths, retained, candidates, active = (t[slots] for t in pool.tensors())
+        token, position = self.slot_values[slots].unbind(1)
+        ids = torch.arange(width, device=self.device)
+        row_active = active.view(-1)[flat]
+        row_depths = depths.view(-1)[flat]
         # Padding never reads beyond the reserved context or writes live KV.
-        positions = torch.where(active, positions, 0)
-        tokens = torch.cat([state.pipeline.tokens[:w] for state, w in zip(states, widths)])
-        retained = torch.cat([state.pipeline.hidden[:w] for state, w in zip(states, widths)])
-        row_tables = torch.cat([tables[i : i + 1].expand(w, -1, -1) for i, w in enumerate(widths)])
-        fresh = depths == 0
+        positions = torch.where(row_active, (position[:, None] + ids).view(-1)[flat], 0)
+        row_tables = tables[row_requests]
+        fresh = row_depths == 0
         prelude_kv = coda_kv = None
         if self.boundary_kv:
             # Every row runs both boundary stages to keep one call shape. A
             # retained row already holds the input-stage KV of its token.
             prelude_kv = self.device_metadata(
-                positions, row_tables, 0, allocations, active, active & fresh
+                positions, row_tables, 0, allocations, row_active, row_active & fresh
             )
             # Only rows that reach the draft or target depth read a distribution.
             # The output-stage KV of other rows must stay the KV of their draft pass.
-            reached = depths + self.config.draft_loops
+            reached = row_depths + self.config.draft_loops
             endpoints = (reached == self.config.draft_loops) | (reached == self.config.target_loops)
             coda_kv = self.device_metadata(
-                positions, row_tables, 0, allocations, active, active & endpoints
+                positions, row_tables, 0, allocations, row_active, row_active & endpoints
             )
-        prelude = self._prelude(tokens, prelude_kv)
-        hidden = torch.where(fresh[:, None], prelude, retained)
+        prelude = self._prelude(tokens.view(-1)[flat], prelude_kv)
+        hidden = torch.where(fresh[:, None], prelude, retained.view(n * width, -1)[flat])
         for offset in range(self.config.draft_loops):
-            depth = torch.where(active, depths + offset, 0)
+            depth = torch.where(row_active, row_depths + offset, 0)
             hidden = self._execute_recurrent_step(
-                hidden, positions, row_tables, depth, allocations, active
+                hidden, positions, row_tables, depth, allocations, row_active
             )
         choices = self._coda(hidden, coda_kv).argmax(-1)
-        start = 0
-        for i, (span, state, w) in enumerate(zip(spans, states, widths)):
-            p = state.pipeline
-            ids = torch.arange(len(p.tokens), device=self.device)
-            # Budget reductions discard speculative descendants, never the root.
-            valid = p.active & (ids < w)
-            new_depths = p.depths + valid.long() * self.config.draft_loops
-            predictions = torch.zeros_like(p.tokens)
-            predictions[:w].copy_(choices[start : start + w])
-            next_hidden = p.hidden.clone()
-            next_hidden[:w].copy_(hidden[start : start + w])
-            drafted = valid & (new_depths == self.config.draft_loops)
-            candidates = torch.where(drafted, predictions, p.candidates)
-            emitted = valid[0] & (new_depths[0] == self.config.target_loops)
-            accepted = emitted & (candidates[0] == predictions[0])
-            reject = emitted & ~accepted
-            state.token.copy_(torch.where(emitted, predictions[0], state.token))
-            state.position.add_(emitted.long())
-            # Shift only on target completion. All decisions remain stream-ordered tensors.
-            source = (ids + emitted.long()).clamp_max(len(ids) - 1)
-            remaining = valid.long().sum() - emitted.long()
-            surviving = (ids < remaining) & ~reject
-            p.tokens.copy_(p.tokens.gather(0, source))
-            p.depths.copy_(new_depths.gather(0, source))
-            p.hidden.copy_(next_hidden[source])
-            p.candidates.copy_(candidates.gather(0, source))
-            tail = (valid.long().sum() - 1).clamp_min(0)
-            append = drafted.gather(0, tail.reshape(1)).squeeze(0) & ~reject
-            newborn = (ids == remaining) & append
-            # A rejection (or a one-row budget) restarts from the corrected root.
-            restart = reject | (emitted & (remaining == 0))
-            newborn = torch.where(restart, ids == 0, newborn)
-            limit = len(span.request.prompt_token_ids) + span.request.sampling_params.max_tokens - 1
-            newborn &= (ids < w) & (state.position + ids < limit)
-            candidate = candidates.gather(0, tail.reshape(1)).squeeze(0)
-            token = torch.where(restart, state.token, candidate)
-            p.tokens.copy_(torch.where(newborn, token, p.tokens))
-            p.depths.masked_fill_(newborn, 0)
-            p.active.copy_((surviving | newborn) & (state.position + ids < limit))
-            # Per-request wire order matches SpeculativeRoundTicket.collect():
-            # prediction, accepted, emitted, next_position, drafted, verified.
-            # A pipeline step verifies at most one token per request, so the
-            # verified count equals emitted (0 or 1).
-            buffer.result[6 * i : 6 * i + 6].copy_(
-                torch.stack(
-                    (
-                        predictions[0],
-                        accepted.long(),
-                        emitted.long(),
-                        state.position,
-                        drafted.long().sum(),
-                        emitted.long(),
-                    )
-                )
+        # One update for all requests; every decision stays a stream-ordered tensor.
+        valid = active & (ids < w[:, None])
+        new_depths = depths + valid.long() * self.config.draft_loops
+        predictions = torch.zeros_like(tokens)
+        predictions.view(-1)[flat] = choices
+        retained.view(n * width, -1)[flat] = hidden
+        drafted = valid & (new_depths == self.config.draft_loops)
+        candidates = torch.where(drafted, predictions, candidates)
+        emitted = valid[:, 0] & (new_depths[:, 0] == self.config.target_loops)
+        accepted = emitted & (candidates[:, 0] == predictions[:, 0])
+        reject = emitted & ~accepted
+        token = torch.where(emitted, predictions[:, 0], token)
+        position = position + emitted.long()
+        # Shift only on target completion.
+        source = (ids + emitted.long()[:, None]).clamp_max(width - 1)
+        count = valid.long().sum(1)
+        remaining = count - emitted.long()
+        surviving = (ids < remaining[:, None]) & ~reject[:, None]
+        tail = (count - 1).clamp_min(0)[:, None]
+        append = drafted.gather(1, tail).squeeze(1) & ~reject
+        newborn = (ids == remaining[:, None]) & append[:, None]
+        # A rejection (or a one-row budget) restarts from the corrected root.
+        restart = reject | (emitted & (remaining == 0))
+        newborn = torch.where(restart[:, None], ids == 0, newborn)
+        inside = position[:, None] + ids < limit[:, None]
+        newborn &= (ids < w[:, None]) & inside
+        start = torch.where(restart, token, candidates.gather(1, tail).squeeze(1))
+        pool.tokens[slots] = torch.where(newborn, start[:, None], tokens.gather(1, source))
+        pool.depths[slots] = new_depths.gather(1, source).masked_fill(newborn, 0)
+        pool.hidden[slots] = retained.gather(1, source[:, :, None].expand_as(retained))
+        pool.candidates[slots] = candidates.gather(1, source)
+        pool.active[slots] = (surviving | newborn) & inside
+        self.slot_values[slots] = torch.stack((token, position), 1)
+        # Per-request wire order matches SpeculativeRoundTicket.collect():
+        # prediction, accepted, emitted, next_position, drafted, verified.
+        # A pipeline step verifies at most one token per request, so the
+        # verified count equals emitted (0 or 1).
+        buffer.result[: 6 * n].view(n, 6).copy_(
+            torch.stack(
+                (
+                    predictions[:, 0],
+                    accepted.long(),
+                    emitted.long(),
+                    position,
+                    drafted.long().sum(1),
+                    emitted.long(),
+                ),
+                1,
             )
+        )
+        for state in states:
             state.submitted += 1
-            start += w
-        return start
+        return len(requests)
 
     def snapshot_pipeline(self, request, device):
         state = self.states.get(request.request_id)
@@ -988,44 +1039,40 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             raise RuntimeError("invalid pipeline restoration generation")
         if snapshot.pending or snapshot.position != request.position:
             raise RuntimeError("pipeline snapshot disagrees with committed request position")
-        width = min(
-            self.config.num_speculative_tokens + 1,
-            self.config.target_loops // self.config.draft_loops,
-        )
+        width = self.pipeline_width
         if len(snapshot.tokens) > width:
             raise RuntimeError("pipeline snapshot exceeds the configured window")
         with torch.cuda.stream(self.compute_stream):
+            if not self.free_slots:
+                self._grow_slots()
+            slot = self.free_slots.pop()
+            pool = self.pipeline_pool
+            padding = [0] * (width - len(snapshot.tokens))
             values = torch.tensor(
                 [
-                    [t.token for t in snapshot.tokens] + [0] * (width - len(snapshot.tokens)),
-                    [t.depth for t in snapshot.tokens] + [0] * (width - len(snapshot.tokens)),
-                    [t.candidate or 0 for t in snapshot.tokens]
-                    + [0] * (width - len(snapshot.tokens)),
+                    [t.token for t in snapshot.tokens] + padding,
+                    [t.depth for t in snapshot.tokens] + padding,
+                    [t.candidate or 0 for t in snapshot.tokens] + padding,
                 ],
                 device=self.device,
             )
-            hidden = torch.zeros(
-                (width, self.model.config.hidden_size),
-                device=self.device,
-                dtype=next(self.model.parameters()).dtype,
-            )
+            pool.tokens[slot], pool.depths[slot], pool.candidates[slot] = values
+            pool.hidden[slot].zero_()
             for i, token in enumerate(snapshot.tokens):
                 if token.hidden is not None:
-                    hidden[i].copy_(token.hidden)
-            pipeline = DevicePipelineState(
-                values[0],
-                values[1],
-                hidden,
-                values[2],
-                torch.arange(width, device=self.device) < len(snapshot.tokens),
+                    pool.hidden[slot, i].copy_(token.hidden)
+            pool.active[slot] = torch.arange(width, device=self.device) < len(snapshot.tokens)
+            self.slot_values[slot] = torch.tensor(
+                [request.input_token_id, snapshot.position], device=self.device
             )
-            self.states[request.request_id] = SpeculativeRequestState(
+            state = SpeculativeRequestState(
                 request,
                 self.cache._get_allocation(request.request_id),
-                torch.tensor(request.input_token_id, device=self.device),
-                torch.tensor(snapshot.position, device=self.device),
-                pipeline,
+                *self.slot_values[slot].unbind(),
+                pool.row(slot),
+                slot=slot,
             )
+            self.states[request.request_id] = state
 
     def request_ready(self, request):
         state = self.states.get(request.request_id)
