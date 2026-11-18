@@ -13,7 +13,7 @@ from vllm_rlt.config import (
     resolve_cuda_graph_rows,
 )
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
-from vllm_rlt.core.memory import plan_cache
+from vllm_rlt.core.memory import calibrate_fp8_scale, plan_cache
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.engine.connector import StageConnector
@@ -82,6 +82,8 @@ class StageEngine:
                 raise ValueError("NPU currently supports Ouro with four loops")
             if parameter.dtype != torch.bfloat16:
                 raise ValueError("NPU Ouro requires BF16 weights")
+            if cache_config.kv_cache_dtype != "auto":
+                raise ValueError("NPU Ouro requires BF16 KV cache")
             if (
                 self.execution_config.cuda_graphs
                 or (self.execution_config.async_scheduling and self.execution_config.static_buffers)
@@ -215,7 +217,11 @@ class StageEngine:
         window = getattr(config, "sliding_window", None)
         packed_window_shape = (
             PackedWindowShape(
-                config.num_attention_heads, config.num_key_value_heads, kv_layers, window
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                kv_layers,
+                window,
+                fp8_kv=cache_config.kv_cache_dtype == "fp8_e4m3",
             )
             if prefer_packed and sliding_window
             else None
@@ -235,11 +241,19 @@ class StageEngine:
                     and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
+                fp8_kv=cache_config.kv_cache_dtype == "fp8_e4m3",
                 sliding_window=sliding_window,
             ),
             prefer_packed_prefill=prefer_packed and not sliding_window,
             packed_window_shape=packed_window_shape,
+            allow_fp8_calibration=True,
         )
+        fp8_scale = None
+        if cache_config.kv_cache_dtype == "fp8_e4m3" and not attention.capabilities.fp8_kv:
+            fp8_scale = calibrate_fp8_scale(model, cache_config, attention)
+            logger.info(
+                "Calibrated FP8 scale %g for %s", fp8_scale, attention.info["selected_backend"]
+            )
         if self.execution_config.packed_prefill is None:
             supported = attention.capabilities.packed_prefill and (
                 not sliding_window or attention.capabilities.packed_sliding_window
@@ -255,6 +269,7 @@ class StageEngine:
             attention.info["selected_backend"],
             speculative=speculative_config,
             staged_prefill=staged_prefill,
+            fp8_scale=fp8_scale,
         )
         self.cache_manager = KVCacheManager(
             num_layers=kv_layers,
@@ -272,6 +287,8 @@ class StageEngine:
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
+            kv_cache_dtype=cache_config.kv_cache_dtype,
+            fp8_scale=fp8_scale,
         )
         if self.execution_config.coalesce_fixed_prelude and (
             parameter.device.type != "npu"

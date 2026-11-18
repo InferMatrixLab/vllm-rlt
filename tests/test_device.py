@@ -47,6 +47,16 @@ def test_npu_unsupported_execution_rejected_before_allocation(options):
         StageEngine(npu_model_stub(), **options)
 
 
+@pytest.mark.parametrize("backend", ["torch", "ascend_eager"])
+def test_npu_requires_bf16_kv_before_allocation(backend):
+    with pytest.raises(ValueError, match="NPU Ouro requires BF16 KV cache"):
+        StageEngine(
+            npu_model_stub(),
+            cache_config=CacheConfig(kv_cache_dtype="fp8_e4m3"),
+            attention_backend=backend,
+        )
+
+
 def test_npu_does_not_use_cpu_default_memory_budget():
     model = npu_model_stub()
     with pytest.raises(ValueError, match="explicit num_blocks"):

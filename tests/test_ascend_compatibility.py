@@ -19,16 +19,20 @@ from vllm_rlt.worker.sampler import Sampler
 
 def test_backend_capability_positional_arguments_keep_their_meaning():
     names = tuple(f.name for f in fields(BackendCapabilities))
-    assert names[:6] == (
+    assert names == (
         "packed_prefill",
         "cuda_graphs",
         "async_scheduling",
         "packed_matches_decode",
+        "fp8_kv",
+        "fp8_kv_static",
         "device_context_lengths",
         "sliding_window",
+        "packed_sliding_window",
+        "sequence_ranges",
     )
-    caps = BackendCapabilities(False, False, False, False, False, True)
-    assert caps.sliding_window and not caps.sequence_ranges
+    caps = BackendCapabilities(False, False, False, False, False, True, False, True)
+    assert caps.sliding_window and caps.fp8_kv_static and not caps.sequence_ranges
 
 
 @pytest.mark.parametrize("hip", [None, "6.4"])
