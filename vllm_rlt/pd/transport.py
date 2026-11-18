@@ -15,6 +15,17 @@ class Transfer:
     submitted: float
 
 
+def _kv_region(key, value):
+    element = key.element_size()
+    return dict(
+        key_ptr=key.data_ptr(),
+        value_ptr=value.data_ptr(),
+        block_bytes=key.stride(0) * element,
+        layer_bytes=key.stride(1) * element,
+        token_bytes=key.stride(2) * element,
+    )
+
+
 def kv_segments(info, tables, start, end):
     """Map valid token ranges to contiguous byte segments, preserving every depth.
 
@@ -24,6 +35,8 @@ def kv_segments(info, tables, start, end):
     page = info["block_size"]
     if not 0 <= start < end:
         raise ValueError("invalid KV range")
+    scale_region = info.get("scale_region")
+    regions = (info,) if scale_region is None else (info, scale_region)
     for table in tables:
         if end > len(table) * page:
             raise ValueError("KV range exceeds allocation")
@@ -33,17 +46,21 @@ def kv_segments(info, tables, start, end):
                 raise ValueError("physical block outside registered pool")
             lo = max(start - logical * page, 0)
             hi = min(end - logical * page, page)
-            for base in (info["key_ptr"], info["value_ptr"]):
-                address = base + block * info["block_bytes"]
-                if lo == 0 and hi == page:
-                    yield (address, info["block_bytes"], info["device"])
-                else:
-                    for layer in range(info["num_layers"]):
-                        yield (
-                            address + layer * info["layer_bytes"] + lo * info["token_bytes"],
-                            (hi - lo) * info["token_bytes"],
-                            info["device"],
-                        )
+            for region in regions:
+                block_bytes = region["block_bytes"]
+                layer_bytes = region["layer_bytes"]
+                token_bytes = region["token_bytes"]
+                for base in (region["key_ptr"], region["value_ptr"]):
+                    address = base + block * block_bytes
+                    if lo == 0 and hi == page:
+                        yield (address, block_bytes, info["device"])
+                    else:
+                        for layer in range(info["num_layers"]):
+                            yield (
+                                address + layer * layer_bytes + lo * token_bytes,
+                                (hi - lo) * token_bytes,
+                                info["device"],
+                            )
 
 
 def coalesce_segments(source, target):
@@ -99,10 +116,6 @@ class NixlConnector:
     def __init__(self, name, cache, hidden, config):
         from nixl._api import nixl_agent, nixl_agent_config
 
-        if getattr(cache, "key_scale", None) is not None:
-            raise ValueError(
-                "PD transfer does not yet carry FP8 KV scales; use kv_cache_dtype='auto'"
-            )
         self.config = config
         if config.backend == "UCX":
             # NIXL's default (peer) error handling requires a peer failure handler,
@@ -116,14 +129,18 @@ class NixlConnector:
         else:
             self.agent = nixl_agent(name, nixl_agent_config(backends=[config.backend]))
         self.storage = (cache.key_cache, cache.value_cache, hidden)
+        # Dynamic scales travel with their KV rows. Fixed scales are checked
+        # during the handshake and already initialized on the receiving side.
+        scale_region = None
+        if cache.key_scale is not None and cache.fp8_scale is None:
+            self.storage += (cache.key_scale, cache.value_scale)
+            scale_region = _kv_region(cache.key_scale, cache.value_scale)
         self.registrations = [self.agent.register_memory(t) for t in self.storage]
         k = cache.key_cache
-        element = k.element_size()
         self.info = dict(
+            **_kv_region(k, cache.value_cache),
             agent=name,
             metadata=self.agent.get_agent_metadata(),
-            key_ptr=k.data_ptr(),
-            value_ptr=cache.value_cache.data_ptr(),
             hidden_ptr=hidden.data_ptr(),
             hidden_bytes=hidden.stride(0) * hidden.element_size(),
             device=k.device.index,
@@ -131,9 +148,9 @@ class NixlConnector:
             block_size=cache.block_size,
             num_layers=cache.num_layers,
             depths=cache.storage_depths,
-            block_bytes=k.stride(0) * element,
-            layer_bytes=k.stride(1) * element,
-            token_bytes=k.stride(2) * element,
+            kv_dtype=str(k.dtype),
+            fp8_scale=cache.fp8_scale,
+            scale_region=scale_region,
         )
         self.peers = {}
         self.pending = deque()
@@ -143,15 +160,23 @@ class NixlConnector:
         self.transfer_seconds = 0.0
 
     def connect(self, peer):
+        strides = ("block_bytes", "layer_bytes", "token_bytes")
+        for key in ("block_size", "num_layers", "depths", "hidden_bytes", "kv_dtype", *strides):
+            if peer[key] != self.info[key]:
+                raise ValueError(f"PD KV geometry mismatch: {key}")
+        if peer["fp8_scale"] != self.info["fp8_scale"]:
+            raise ValueError("P and D must use the same calibrated FP8 scale")
+        local_scales, peer_scales = self.info["scale_region"], peer["scale_region"]
+        if (local_scales is None) != (peer_scales is None) or (
+            local_scales is not None and any(local_scales[k] != peer_scales[k] for k in strides)
+        ):
+            raise ValueError("PD KV scale geometry mismatch")
         name = self.agent.add_remote_agent(peer["metadata"])
         name = name.decode() if isinstance(name, bytes) else name
         if name != peer["agent"]:
             raise ValueError(
                 f"NIXL agent metadata identity mismatch: {name!r} != {peer['agent']!r}"
             )
-        for key in ("block_size", "num_layers", "depths", "block_bytes", "hidden_bytes"):
-            if peer[key] != self.info[key]:
-                raise ValueError(f"PD KV geometry mismatch: {key}")
         self.peers[name] = peer
 
     def submit(self, transfer_id, sequence, peer, local, remote, size):

@@ -11,7 +11,7 @@ from vllm_rlt.config import (
     resolve_cuda_graph_rows,
 )
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
-from vllm_rlt.core.memory import plan_cache
+from vllm_rlt.core.memory import calibrate_fp8_scale, plan_cache
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.engine.connector import StageConnector
@@ -219,15 +219,13 @@ class StageEngine:
             ),
             prefer_packed_prefill=prefer_packed and not sliding_window,
             packed_window_shape=packed_window_shape,
+            allow_fp8_calibration=True,
         )
-        if (
-            cache_config.kv_cache_dtype == "fp8_e4m3"
-            and self.execution_config.cuda_graphs
-            and not attention.capabilities.fp8_kv_graphs
-        ):
-            raise ValueError(
-                "FP8 KV with FlashAttention stages pages per call and cannot be CUDA-graph "
-                "captured; disable cuda_graphs or use the triton backend"
+        fp8_scale = None
+        if cache_config.kv_cache_dtype == "fp8_e4m3" and not attention.capabilities.fp8_kv:
+            fp8_scale = calibrate_fp8_scale(model, cache_config, attention)
+            logger.info(
+                "Calibrated FP8 scale %g for %s", fp8_scale, attention.info["selected_backend"]
             )
         if self.execution_config.packed_prefill is None:
             supported = attention.capabilities.packed_prefill and (
@@ -244,6 +242,7 @@ class StageEngine:
             attention.info["selected_backend"],
             speculative=speculative_config,
             staged_prefill=staged_prefill,
+            fp8_scale=fp8_scale,
         )
         self.cache_manager = KVCacheManager(
             num_layers=kv_layers,
@@ -262,6 +261,7 @@ class StageEngine:
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
             kv_cache_dtype=cache_config.kv_cache_dtype,
+            fp8_scale=fp8_scale,
         )
         self.scheduler = Scheduler(
             scheduler_config,

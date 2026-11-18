@@ -20,7 +20,7 @@ def select_version(capability, backend):
     if major == 12 and backend in ("flash_attn", "flash_attn_4"):
         raise ValueError(
             f"Paged FlashAttention-4 is not supported on SM{major}{minor} by "
-            "flash-attn-4==4.0.0b30; use --attention-backend triton until a "
+            "the pinned flash-attn-4 release; use --attention-backend triton until a "
             "compatible paged implementation is available."
         )
     automatic = 4 if major == 10 else 3 if major == 9 else 2
@@ -31,9 +31,6 @@ def select_version(capability, backend):
     return selected
 
 
-_MAPPED: dict = {}
-
-
 class FlashPagedAttention:
     def __init__(self, device, dtype, head_dim, block_size, backend="flash_attn"):
         if device.type != "cuda" or torch.version.hip:
@@ -42,7 +39,8 @@ class FlashPagedAttention:
             raise ValueError("flash_attn requires float16 or bfloat16")
         if head_dim > 256 or head_dim % 8:
             raise ValueError("flash_attn requires head_dim divisible by 8 and <= 256")
-        self.generation = select_version(torch.cuda.get_device_capability(device), backend)
+        capability = torch.cuda.get_device_capability(device)
+        self.generation = select_version(capability, backend)
         if self.generation == 2 and block_size % 256:
             raise ValueError("FlashAttention-2 paged KV requires --block-size a multiple of 256")
         module, package, function = {
@@ -51,13 +49,27 @@ class FlashPagedAttention:
             4: ("flash_attn.cute", "flash-attn-4", "flash_attn_varlen_func"),
         }[self.generation]
         try:
-            self.kernel = getattr(importlib.import_module(module), function)
+            implementation = importlib.import_module(module)
+            self.kernel = getattr(implementation, function)
             package_version = version(package)
         except (ImportError, AttributeError) as error:
             raise ImportError(
                 f"{backend} selected FA{self.generation}; install the official {package} package. "
                 "No backend fallback was performed."
             ) from error
+        # FA4's public scale API also identifies the release family with generic
+        # hd256 paged kernels. Older releases used a restricted hd256 kernel.
+        self.scale_type = getattr(implementation, "TensorwiseScales", None)
+        self.supports_fp8_static = (
+            self.generation == 4
+            and self.scale_type is not None
+            and capability[0] == 10
+            and dtype == torch.bfloat16
+            and head_dim in (64, 128, 256)
+        )
+        self.supports_sliding_window = self.generation == 4 and (
+            head_dim != 256 or self.scale_type is not None
+        )
         self.info = dict(
             backend="flash_attn",
             generation=self.generation,
@@ -66,49 +78,36 @@ class FlashPagedAttention:
         )
         logging.getLogger(__name__).warning("Attention implementation: %s", self.info)
 
-    @staticmethod
-    @torch.no_grad()
-    def dequantize_kv(key_cache, value_cache, block_tables, key_scale, value_scale, dtype):
-        """Stage referenced FP8 pages as BF16/FP16 and remap the page table.
+    def _fp8_inputs(self, q, key_cache, value_cache, key_scale, value_scale, batch_size):
+        """FA4 consumes one descale per sequence/KV head, never per token.
 
-        Invalid (-1) entries keep -1 and are skipped by the staging kernel; all
-        other entries get their own staged block, so duplicates are repeated and
-        the remap is a single where/arange (no sort or unique pass).
+        This prototype accepts immutable scalar scales only. Q uses the K scale,
+        independent of batch composition and prefill chunk boundaries.
         """
-        if key_scale is None or value_scale is None:
-            raise ValueError("FP8 KV cache requires per-vector key/value scales")
-        blocks = block_tables.reshape(-1)
-        import os
-
-        staged_key = staged_value = None
-        if key_cache.is_cuda and os.environ.get("VLLM_RLT_FP8_STAGE", "triton") == "triton":
-            try:
-                from vllm_rlt.kernels.fp8_stage import stage_fp8_kv
-
-                staged_key, staged_value = stage_fp8_kv(
-                    key_cache, value_cache, key_scale, value_scale, blocks, dtype
-                )
-            except ImportError:
-                pass
-        if staged_key is None:
-            valid = blocks >= 0
-            safe = blocks.clamp_min(0)
-            staged_key = (
-                key_cache.view(torch.uint8)[safe].view(torch.float8_e4m3fn).float()
-                * key_scale[safe].unsqueeze(-1)
-            ).to(dtype)
-            staged_value = (
-                value_cache.view(torch.uint8)[safe].view(torch.float8_e4m3fn).float()
-                * value_scale[safe].unsqueeze(-1)
-            ).to(dtype)
-            staged_key[~valid] = 0
-            staged_value[~valid] = 0
-        # Invalid (-1) entries are staged as zero and only appear past the
-        # context length, so a plain arange is enough for the FA page table.
-        mapped = torch.arange(blocks.numel(), device=blocks.device, dtype=torch.int32).reshape(
-            block_tables.shape
-        )
-        return staged_key, staged_value, mapped
+        if key_cache.dtype != torch.float8_e4m3fn:
+            if key_scale is not None or value_scale is not None:
+                raise ValueError("FA descales require an FP8 KV cache")
+            return q, {}
+        if not self.supports_fp8_static:
+            raise ValueError(
+                "static FP8 requires FA4 with TensorwiseScales on SM10x, BF16, "
+                "head_dim 64, 128 or 256; install the flash-attn4 extra"
+            )
+        if value_cache.dtype != key_cache.dtype:
+            raise ValueError("FA FP8 K/V must have the same dtype")
+        for scale in (key_scale, value_scale):
+            if (
+                scale is None
+                or scale.ndim != 0
+                or scale.dtype != torch.float32
+                or scale.device != q.device
+            ):
+                raise ValueError("FA4 FP8 requires fixed scalar float32 scales on the query device")
+        shape = (batch_size, key_cache.shape[-2])
+        q_codes = (q.float() / key_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        k_descale = key_scale.expand(shape).contiguous()
+        v_descale = value_scale.expand(shape).contiguous()
+        return q_codes, dict(scales=self.scale_type(q=k_descale, k=k_descale, v=v_descale))
 
     def prefill(
         self,
@@ -119,8 +118,10 @@ class FlashPagedAttention:
         context_lengths,
         cu_seqlens_q,
         max_seqlen_q,
+        *,
         key_scale=None,
         value_scale=None,
+        window=None,
     ):
         """Attend packed chunks to their prefixes with bottom-right causal alignment.
 
@@ -130,10 +131,14 @@ class FlashPagedAttention:
         """
         if self.generation != 4:
             raise ValueError("packed paged prefill requires FlashAttention-4")
-        if key_cache.dtype == torch.float8_e4m3fn:
-            key_cache, value_cache, block_tables = self.dequantize_kv(
-                key_cache, value_cache, block_tables, key_scale, value_scale, q.dtype
+        if window is not None and not self.supports_sliding_window:
+            raise NotImplementedError(
+                "this FlashAttention implementation lacks sliding-window support"
             )
+        output_dtype = q.dtype
+        q, descales = self._fp8_inputs(
+            q, key_cache, value_cache, key_scale, value_scale, block_tables.shape[0]
+        )
         out = self.kernel(
             q,
             key_cache,
@@ -145,8 +150,11 @@ class FlashPagedAttention:
             max_seqlen_k=block_tables.shape[1] * key_cache.shape[1],
             causal=True,
             num_splits=1,
+            **({"window_size": (window - 1, 0)} if window is not None else {}),
+            **descales,
         )
-        return out[0] if isinstance(out, tuple) else out
+        out = out[0] if isinstance(out, tuple) else out
+        return out.to(output_dtype)
 
     def __call__(
         self,
@@ -155,17 +163,23 @@ class FlashPagedAttention:
         value_cache,
         block_tables,
         context_lengths,
+        *,
         key_scale=None,
         value_scale=None,
+        window=None,
     ):
-        if key_cache.dtype == torch.float8_e4m3fn:
-            key_cache, value_cache, block_tables = self.dequantize_kv(
-                key_cache, value_cache, block_tables, key_scale, value_scale, q.dtype
+        if window is not None and not self.supports_sliding_window:
+            raise NotImplementedError(
+                "this FlashAttention implementation lacks sliding-window support"
             )
         if q.shape[0] == 0:
             return torch.empty_like(q)
         # The visible prefix already includes exactly the current causal position.
         # Do not append K/V here: the cache manager has written it at this depth.
+        output_dtype = q.dtype
+        q, descales = self._fp8_inputs(
+            q, key_cache, value_cache, key_scale, value_scale, block_tables.shape[0]
+        )
         query = q.unsqueeze(1)
         if self.generation == 4:
             out = self.kernel(
@@ -180,6 +194,8 @@ class FlashPagedAttention:
                 # Auto splitting depends on batch size and changes BF16 reductions.
                 # Keep the partition fixed across scheduler batch compositions.
                 num_splits=1,
+                **({"window_size": (window - 1, 0)} if window is not None else {}),
+                **descales,
             )
         else:
             page_argument = "block_table" if self.generation == 2 else "page_table"
@@ -193,4 +209,28 @@ class FlashPagedAttention:
             )
         if isinstance(out, tuple):
             out = out[0]  # FA4 beta returns (output, optional LSE).
-        return out.squeeze(1)
+        return out.squeeze(1).to(output_dtype)
+
+    def windowed(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        window,
+        *,
+        key_scale=None,
+        value_scale=None,
+    ):
+        # The runtime window includes the current token; FA counts preceding keys.
+        return self(
+            q,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale=key_scale,
+            value_scale=value_scale,
+            window=window,
+        )

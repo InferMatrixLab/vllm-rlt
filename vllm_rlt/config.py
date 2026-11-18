@@ -21,7 +21,7 @@ class CacheConfig:
     # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
     # "auto" stores KV in the model dtype; "fp8_e4m3" stores float8 e4m3 codes with
-    # one float32 scale per (block, layer, token, KV head) vector (Torch/Triton only).
+    # scales chosen by the engine for the selected attention backend.
     kv_cache_dtype: str = "auto"
 
     def __post_init__(self):

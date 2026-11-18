@@ -45,12 +45,16 @@ def kv_bytes_per_block(
     return 2 * num_layers * block_size * num_kv_heads * vector
 
 
-def quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-vector symmetric e4m3: x [..., head_dim] -> (codes, float32 scale [...])."""
+def quantize_fp8(x: torch.Tensor, fixed_scale=None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric e4m3 with dynamic per-vector scales or an explicit fixed scale."""
     x = x.float()
     # A reciprocal multiply, as CUDA division by a scalar does anyway: CPU, CUDA and
     # the fused Triton writer then produce the same scale bits.
-    scale = (x.abs().amax(-1) * (1.0 / FP8_E4M3_MAX)).clamp_min(torch.finfo(torch.float32).tiny)
+    scale = (
+        (x.abs().amax(-1) * (1.0 / FP8_E4M3_MAX)).clamp_min(torch.finfo(torch.float32).tiny)
+        if fixed_scale is None
+        else torch.full(x.shape[:-1], fixed_scale, dtype=torch.float32, device=x.device)
+    )
     codes = (x / scale.unsqueeze(-1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
     return codes.to(torch.float8_e4m3fn), scale
 
@@ -109,6 +113,7 @@ class KVSnapshot:
     # FP8 pools only: per-vector scales, laid out like keys/values minus head_dim.
     key_scales: torch.Tensor | None = None
     value_scales: torch.Tensor | None = None
+    fp8_scale: float | None = None
 
 
 class KVCacheManager:
@@ -138,6 +143,7 @@ class KVCacheManager:
         *,
         attention: AttentionBackend | None = None,
         kv_cache_dtype: str = "auto",
+        fp8_scale: float | None = None,
     ):
         for name, value in (
             ("num_layers", num_layers),
@@ -158,6 +164,16 @@ class KVCacheManager:
         if kv_cache_dtype not in KV_CACHE_DTYPES:
             raise ValueError(f"kv_cache_dtype must be one of {KV_CACHE_DTYPES}")
         self.kv_cache_dtype = kv_cache_dtype
+        if fp8_scale is not None:
+            if kv_cache_dtype != "fp8_e4m3":
+                raise ValueError("fp8_scale requires kv_cache_dtype='fp8_e4m3'")
+            # Keep the value finite and normal after conversion to device float32.
+            if (
+                type(fp8_scale) not in (int, float)
+                or not 2**-126 <= fp8_scale <= (2 - 2**-23) * 2**127
+            ):
+                raise ValueError("fp8_scale must be a positive, finite, normal float32 value")
+        self.fp8_scale = fp8_scale
         self.layout = layout
         self.recurrent_layers = (
             tuple(range(num_layers)) if recurrent_layers is None else tuple(recurrent_layers)
@@ -174,12 +190,24 @@ class KVCacheManager:
         self.device = torch.device(device)
         self.dtype = dtype
         self.attention = attention or create_backend(
-            backend, self.device, dtype, head_dim, block_size
+            backend,
+            self.device,
+            dtype,
+            head_dim,
+            block_size,
+            required_capabilities=BackendCapabilities(
+                fp8_kv=kv_cache_dtype == "fp8_e4m3" and fp8_scale is None,
+                fp8_kv_static=fp8_scale is not None,
+            ),
         )
         self.attention_info = self.attention.info
         self.backend = self.attention_info["selected_backend"]
-        if kv_cache_dtype != "auto" and not getattr(self.attention.capabilities, "fp8_kv", False):
-            raise ValueError(f"the {self.attention_info['backend']} backend does not read FP8 KV")
+        capability = "fp8_kv" if fp8_scale is None else "fp8_kv_static"
+        if kv_cache_dtype != "auto" and not getattr(self.attention.capabilities, capability):
+            raise ValueError(
+                f"the {self.attention_info['backend']} backend does not read FP8 KV "
+                f"with {'per-vector' if fp8_scale is None else 'fixed'} scales"
+            )
         shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
         storage = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else dtype
         self.key_cache = torch.empty(shape, device=self.device, dtype=storage)
@@ -187,8 +215,17 @@ class KVCacheManager:
         # One scale per stored vector; None for an unquantized pool.
         self.key_scale = self.value_scale = None
         if kv_cache_dtype == "fp8_e4m3":
-            self.key_scale = torch.ones(shape[:-1], device=self.device, dtype=torch.float32)
-            self.value_scale = torch.ones_like(self.key_scale)
+            # Imported fixed-scale pages use the same local scale as locally written pages.
+            scale = 1.0 if fp8_scale is None else fp8_scale
+            self.key_scale = torch.full(shape[:-1], scale, device=self.device, dtype=torch.float32)
+            self.value_scale = torch.full_like(self.key_scale, scale)
+        # Keep the existing per-vector storage/lifecycle for this prototype. FA
+        # borrows the immutable scalar; Torch/Triton continue reading the scale pool.
+        self._fixed_scale = (
+            torch.tensor(fp8_scale, device=self.device, dtype=torch.float32)
+            if fp8_scale is not None
+            else None
+        )
         # Resolve an implicit CUDA index to the actual storage device once.
         self.device = self.key_cache.device
         self._free_blocks = list(reversed(range(num_blocks)))
@@ -552,6 +589,7 @@ class KVCacheManager:
             values=values,
             key_scales=key_scales,
             value_scales=value_scales,
+            fp8_scale=self.fp8_scale,
         )
 
     def restore(self, request_id: str, snapshot: KVSnapshot) -> None:
@@ -570,6 +608,8 @@ class KVCacheManager:
             raise RuntimeError("cannot restore into an allocation that already holds KV")
         if (self.key_scale is None) != (snapshot.key_scales is None):
             raise ValueError("snapshot KV dtype does not match the pool")
+        if self.fp8_scale != snapshot.fp8_scale:
+            raise ValueError("snapshot FP8 scale policy does not match the pool")
         blocks = [b for table in allocation.block_tables for b in table]
         for row, block in enumerate(blocks):
             self.key_cache[block].copy_(snapshot.keys[row])
@@ -773,7 +813,12 @@ class KVCacheManager:
             self.key_cache[blocks, layer, offsets] = k
             self.value_cache[blocks, layer, offsets] = v
             return
-        if self.backend == "triton" or mask is not None or active is not None:
+        if (
+            self.backend == "triton"
+            or mask is not None
+            or active is not None
+            or (self.fp8_scale is not None and self.device.type == "cuda")
+        ):
             # One fused launch instead of about 20 small kernels per layer write.
             # Masked writes always take it, as the unquantized masked writers are
             # Triton too and boolean indexing would read the mask on the host.
@@ -791,10 +836,11 @@ class KVCacheManager:
                 FP8_E4M3_MAX,
                 mask=mask,
                 active=active,
+                fixed_scale=self.fp8_scale,
             )
             return
-        k_codes, k_scale = quantize_fp8(k)
-        v_codes, v_scale = quantize_fp8(v)
+        k_codes, k_scale = quantize_fp8(k, self.fp8_scale)
+        v_codes, v_scale = quantize_fp8(v, self.fp8_scale)
         self.key_cache[blocks, layer, offsets] = k_codes
         self.value_cache[blocks, layer, offsets] = v_codes
         self.key_scale[blocks, layer, offsets] = k_scale
@@ -804,6 +850,8 @@ class KVCacheManager:
         """Extra attention arguments for one layer: its scales, or nothing."""
         if self.key_scale is None:
             return {}
+        if self._fixed_scale is not None and not self.attention.capabilities.fp8_kv:
+            return dict(key_scale=self._fixed_scale, value_scale=self._fixed_scale)
         return dict(key_scale=self.key_scale[:, layer], value_scale=self.value_scale[:, layer])
 
     def _require_prefix(self, allocation, layer, depth, length):
@@ -903,8 +951,6 @@ class KVCacheManager:
             raise NotImplementedError(
                 f"the {self.backend} attention backend does not implement sliding-window masking"
             )
-        if batch.cu_seqlens_q is not None:
-            raise NotImplementedError("sliding-window attention needs one query row per token")
         # Device-owned positions are ordered by the runner's stream; the host
         # frontier lags them, as for unwindowed attention.
         if not isinstance(batch, DeviceKVMetadata):

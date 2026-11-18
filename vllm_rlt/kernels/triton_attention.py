@@ -529,6 +529,7 @@ def _fp8_store_kernel(
     FP8_MAX: tl.constexpr,
     INV_FP8_MAX: tl.constexpr,
     TINY: tl.constexpr,
+    FIXED_SCALE: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -549,13 +550,19 @@ def _fp8_store_kernel(
         # The same float32 operations as kv_cache_manager.quantize_fp8, in the same order.
         k = tl.load(K + row * k_row_stride + head * k_head_stride + dims, mask=valid, other=0.0)
         k = k.to(tl.float32)
-        k_scale = tl.maximum(tl.max(tl.abs(k), axis=0) * INV_FP8_MAX, TINY)
+        if FIXED_SCALE is None:
+            k_scale = tl.maximum(tl.max(tl.abs(k), axis=0) * INV_FP8_MAX, TINY)
+        else:
+            k_scale = tl.full((), FIXED_SCALE, tl.float32)
         k_codes = tl.minimum(tl.maximum(tl.div_rn(k, k_scale), -FP8_MAX), FP8_MAX)
         tl.store(K_CODES + codes_at, k_codes.to(K_CODES.dtype.element_ty), mask=valid)
         tl.store(K_SCALES + scale_at, k_scale)
         v = tl.load(V + row * v_row_stride + head * v_head_stride + dims, mask=valid, other=0.0)
         v = v.to(tl.float32)
-        v_scale = tl.maximum(tl.max(tl.abs(v), axis=0) * INV_FP8_MAX, TINY)
+        if FIXED_SCALE is None:
+            v_scale = tl.maximum(tl.max(tl.abs(v), axis=0) * INV_FP8_MAX, TINY)
+        else:
+            v_scale = tl.full((), FIXED_SCALE, tl.float32)
         v_codes = tl.minimum(tl.maximum(tl.div_rn(v, v_scale), -FP8_MAX), FP8_MAX)
         tl.store(V_CODES + codes_at, v_codes.to(V_CODES.dtype.element_ty), mask=valid)
         tl.store(V_SCALES + scale_at, v_scale)
@@ -574,6 +581,7 @@ def store_fp8(
     *,
     mask=None,
     active=None,
+    fixed_scale=None,
 ):
     """Quantize rows k, v [row, KV head, dim] and scatter codes and scales in one launch.
 
@@ -610,6 +618,7 @@ def store_fp8(
         FP8_MAX=fp8_max,
         INV_FP8_MAX=1.0 / fp8_max,
         TINY=torch.finfo(torch.float32).tiny,
+        FIXED_SCALE=fixed_scale,
         num_warps=1,
     )
 

@@ -19,7 +19,7 @@ from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.pd.config import PDConfig
-from vllm_rlt.pd.transport import kv_segments, partition_segments
+from vllm_rlt.pd.transport import NixlConnector, kv_segments, partition_segments
 from vllm_rlt.profiling import Profiler
 
 
@@ -53,35 +53,26 @@ def test_receive_publishes_all_depths_only_after_commit():
         c.mark_imported_prefix("a", 7)
 
 
-def test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths():
-    c = KVCacheManager(3, 2, 8, 24, 4, 4)
+@pytest.mark.parametrize("kv_dtype,scale", [("auto", None), ("fp8_e4m3", None), ("fp8_e4m3", 0.5)])
+def test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths(monkeypatch, kv_dtype, scale):
+    fake_nixl(monkeypatch)
+    c = KVCacheManager(3, 2, 8, 24, 4, 4, kv_cache_dtype=kv_dtype, fp8_scale=scale)
     c.allocate("a", 9)
-    k = c.key_cache
-    info = dict(
-        block_size=4,
-        num_blocks=24,
-        num_layers=3,
-        device=0,
-        block_bytes=k.stride(0) * 4,
-        layer_bytes=k.stride(1) * 4,
-        token_bytes=k.stride(2) * 4,
-        key_ptr=0,
-        value_ptr=10**9,
-    )
+    connector = NixlConnector("stage", c, torch.zeros(2, 16), PDConfig())
+    tensors = (c.key_cache, c.value_cache)
+    if kv_dtype == "fp8_e4m3" and scale is None:
+        tensors += (c.key_scale, c.value_scale)
+    assert {t.data_ptr() for t in tensors} <= {t.data_ptr() for t in connector.storage}
+    assert len(connector.storage) == len(tensors) + 1  # includes hidden state
     tables = c.plane_block_tables("a")
     expected = set()
     for table in tables:
         for token in range(2, 9):
             for layer in range(3):
-                for base in (0, 10**9):
-                    pos = (
-                        base
-                        + table[token // 4] * info["block_bytes"]
-                        + layer * info["layer_bytes"]
-                        + (token % 4) * info["token_bytes"]
-                    )
-                    expected.update(range(pos, pos + info["token_bytes"]))
-    segments = list(kv_segments(info, tables, 2, 9))
+                for tensor in tensors:
+                    row = tensor[table[token // 4], layer, token % 4]
+                    expected.update(range(row.data_ptr(), row.data_ptr() + row.nbytes))
+    segments = list(kv_segments(connector.info, tables, 2, 9))
     actual = set()
     for address, size, _ in segments:
         actual.update(range(address, address + size))
@@ -94,6 +85,13 @@ def test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths():
         for address, size, _ in src:
             covered.update(range(address, address + size))
     assert covered == expected
+
+
+def test_pd_rejects_mismatched_kv_dtypes_before_launching_workers():
+    from vllm_rlt.pd.engine import PDEngine
+
+    with pytest.raises(ValueError, match="same KV cache dtype"):
+        PDEngine(tiny_ouro_config(), prefill_cache_config=CacheConfig(kv_cache_dtype="fp8_e4m3"))
 
 
 def test_partition_merges_segments_contiguous_on_both_sides():
@@ -353,13 +351,22 @@ def create_pd(
     speculative=False,
     asynchronous=True,
     prefix_caching=False,
+    backend="triton",
+    kv_dtype="auto",
 ):
     pytest.importorskip("nixl")
     from vllm_rlt.pd.engine import PDEngine
 
     if torch.cuda.device_count() < (4 if multi else 2):
         pytest.skip("requires 2/4 visible GPUs")
+    if backend == "flash_attn_4":
+        pytest.importorskip("flash_attn.cute")
+        if any(torch.cuda.get_device_capability(i)[0] != 10 for i in (0, 1)):
+            pytest.skip("FA4 FP8 requires SM10x on both workers")
     config = tiny_ouro_config(head_dim=64)
+    cache = CacheConfig(
+        128, 4, layout, enable_prefix_caching=prefix_caching, kv_cache_dtype=kv_dtype
+    )
     return PDEngine(
         config,
         pd_config=PDConfig(
@@ -370,8 +377,8 @@ def create_pd(
             request_timeout=90,
             startup_timeout=90,
         ),
-        prefill_cache_config=CacheConfig(128, 4, layout, enable_prefix_caching=prefix_caching),
-        decode_cache_config=CacheConfig(128, 4, layout, enable_prefix_caching=prefix_caching),
+        prefill_cache_config=cache,
+        decode_cache_config=cache,
         prefill_scheduler_config=SchedulerConfig(
             mode=mode,
             max_num_seqs=2,
@@ -390,28 +397,35 @@ def create_pd(
             pad_to_power_of_two=graph,
             cuda_graphs=graph,
         ),
-        attention_backend="triton",
+        attention_backend=backend,
         seed=123,
     )
 
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
-    "graph,layout", [(False, "last_exited"), (True, "last_exited"), (False, "shared")]
+    "graph,layout,backend,kv_dtype",
+    [
+        (False, "last_exited", "triton", "auto"),
+        (True, "last_exited", "triton", "auto"),
+        (False, "shared", "triton", "auto"),
+        (False, "last_exited", "triton", "fp8_e4m3"),
+        (True, "last_exited", "flash_attn_4", "fp8_e4m3"),
+    ],
 )
-def test_pd_generation_refill_cancel_and_reuse_matches_local(graph, layout):
+def test_pd_generation_refill_cancel_and_reuse_matches_local(graph, layout, backend, kv_dtype):
     params = SamplingParams(max_tokens=4, min_loops=1, ignore_eos=True)
-    with create_pd(graph=graph, layout=layout) as e:
+    with create_pd(graph=graph, layout=layout, backend=backend, kv_dtype=kv_dtype) as e:
         torch.manual_seed(123)
         model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda:0", torch.bfloat16)
         reference = LLMEngine(
             model,
-            cache_config=CacheConfig(128, 4, layout),
+            cache_config=CacheConfig(128, 4, layout, kv_cache_dtype=kv_dtype),
             scheduler_config=SchedulerConfig(
                 max_num_seqs=2, max_num_batched_tokens=5, prefill_chunk_size=3
             ),
             exit_config=ExitConfig("trace", depths_by_request={"t": [4, 2, 3, 1] * 16}),
-            attention_backend="triton",
+            attention_backend=backend,
         )
         prompts = [[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3], [2] * 9]
         for i, prompt in enumerate(prompts):
@@ -825,8 +839,6 @@ def fake_nixl(monkeypatch):
 
 
 def test_ucx_backend_is_created_with_error_handling_none(monkeypatch):
-    from vllm_rlt.pd.transport import NixlConnector
-
     created = fake_nixl(monkeypatch)
     # No hidden switch: an obsolete environment variable cannot change the mode.
     monkeypatch.setenv("VLLM_RLT_NIXL_UCX_ERROR_HANDLING", "peer")
@@ -840,10 +852,17 @@ def test_ucx_backend_is_created_with_error_handling_none(monkeypatch):
 
 
 def test_non_ucx_backend_is_not_created_with_ucx_parameters(monkeypatch):
-    from vllm_rlt.pd.transport import NixlConnector
-
     created = fake_nixl(monkeypatch)
     cache = KVCacheManager(3, 2, 8, 24, 4, 4)
     NixlConnector("stage", cache, torch.zeros(2, 16), PDConfig(backend="GDS"))
     assert created["agent_config"] == {"backends": ["GDS"]}
     assert "backend" not in created
+
+
+def test_pd_handshake_rejects_different_fixed_scales(monkeypatch):
+    fake_nixl(monkeypatch)
+    cache = KVCacheManager(3, 2, 8, 24, 4, 4, kv_cache_dtype="fp8_e4m3", fp8_scale=0.5)
+    connector = NixlConnector("decode", cache, torch.zeros(2, 16), PDConfig())
+    assert torch.all(cache.key_scale == 0.5) and torch.all(cache.value_scale == 0.5)
+    with pytest.raises(ValueError, match="same calibrated FP8 scale"):
+        connector.connect(dict(connector.info, fp8_scale=1.0))

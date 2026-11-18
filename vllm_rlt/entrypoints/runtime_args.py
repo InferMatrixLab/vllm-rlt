@@ -49,7 +49,7 @@ def add_runtime_args(parser):
         "--kv-cache-dtype",
         choices=["auto", "fp8_e4m3"],
         default="auto",
-        help="fp8_e4m3 stores KV as FP8 with per-vector scales (Torch/Triton attention)",
+        help="FP8 KV: per-vector scales on Torch/Triton, startup calibration on FA4",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--kv-cache-memory-bytes", type=int)

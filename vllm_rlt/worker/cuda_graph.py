@@ -134,10 +134,9 @@ class _DeviceCache:
 
     def _attend_prepared(self, layer, batch, q, *, window=None):
         cache = self.cache
-        if window is not None:
+        scales = cache._layer_scales(layer)
+        if window is not None and batch.cu_seqlens_q is None:
             # The window is a kernel constant; lengths and tables stay graph inputs.
-            if batch.cu_seqlens_q is not None:
-                raise NotImplementedError("sliding-window attention needs one query row per token")
             return cache.attention.windowed(
                 q,
                 cache.key_cache[:, layer],
@@ -145,7 +144,7 @@ class _DeviceCache:
                 batch.block_tables,
                 batch.context_lengths,
                 window,
-                **cache._layer_scales(layer),
+                **scales,
             )
         if batch.cu_seqlens_q is not None:
             return cache.attention.prefill(
@@ -156,7 +155,8 @@ class _DeviceCache:
                 batch.context_lengths,
                 batch.cu_seqlens_q,
                 batch.max_seqlen_q,
-                **cache._layer_scales(layer),
+                **({"window": window} if window is not None else {}),
+                **scales,
             )
         return cache.attention(
             q,
@@ -164,7 +164,7 @@ class _DeviceCache:
             cache.value_cache[:, layer],
             batch.block_tables,
             batch.context_lengths,
-            **cache._layer_scales(layer),
+            **scales,
         )
 
 

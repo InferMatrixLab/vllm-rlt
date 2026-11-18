@@ -66,8 +66,9 @@ def test_storage_layout_and_byte_accounting():
         make_cache("int4")
 
 
-def test_attention_equals_attention_over_dequantized_values():
-    cache = make_cache()
+@pytest.mark.parametrize("fixed_scale", [None, 0.02])
+def test_attention_equals_attention_over_dequantized_values(fixed_scale):
+    cache = make_cache(fp8_scale=fixed_scale)
     reference = make_cache("auto")
     assert cache.allocate("r", 11) and reference.allocate("r", 11)
     fill(cache, "r", 11)
@@ -137,8 +138,9 @@ def test_torch_kernel_scales_multiply_each_token_vector():
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
-def test_finalize_copies_codes_and_scales_to_deeper_planes():
-    cache = make_cache()
+@pytest.mark.parametrize("fixed_scale", [None, 0.02])
+def test_finalize_copies_codes_and_scales_to_deeper_planes(fixed_scale):
+    cache = make_cache(fp8_scale=fixed_scale)
     assert cache.allocate("r", 6)
     fill(cache, "r", 5)
     fill(cache, "r", 6, depths=[0], seed=1)  # position 5 exists only at depth 0
@@ -150,8 +152,9 @@ def test_finalize_copies_codes_and_scales_to_deeper_planes():
             assert all(torch.equal(a, b) for a, b in zip(exited, deeper))
 
 
-def test_snapshot_restore_is_bitwise_and_checks_dtype():
-    cache = make_cache()
+@pytest.mark.parametrize("fixed_scale", [None, 0.02])
+def test_snapshot_restore_is_bitwise_and_checks_dtype(fixed_scale):
+    cache = make_cache(fp8_scale=fixed_scale)
     assert cache.allocate("r", 7)
     fill(cache, "r", 7)
     before = [cache.read(layer, "r", depth) for layer in range(2) for depth in range(4)]
@@ -166,128 +169,10 @@ def test_snapshot_restore_is_bitwise_and_checks_dtype():
     assert plain.allocate("r", 7)
     with pytest.raises(ValueError, match="dtype"):
         plain.restore("r", snapshot)
-
-
-def test_flash_fp8_kv_staging_matches_reference():
-    from vllm_rlt.kernels.flash_attention import FlashPagedAttention
-
-    torch.manual_seed(0)
-    blocks, block_size, heads, dim = 4, 2, 2, 8
-    key = torch.randn(blocks, block_size, heads, dim).to(torch.float8_e4m3fn)
-    value = torch.randn(blocks, block_size, heads, dim).to(torch.float8_e4m3fn)
-    key_scale = torch.rand(blocks, block_size, heads) + 0.5
-    value_scale = torch.rand(blocks, block_size, heads) + 0.5
-    tables = torch.tensor([[0, -1], [3, 2]], dtype=torch.int32)
-
-    staged_key, staged_value, mapped = FlashPagedAttention.dequantize_kv(
-        key, value, tables, key_scale, value_scale, torch.bfloat16
-    )
-
-    assert mapped.shape == tables.shape
-    for row in range(tables.shape[0]):
-        for column in range(tables.shape[1]):
-            old = int(tables[row, column])
-            if old < 0:
-                continue
-            new = int(mapped[row, column])
-            expected_key = (key[old].float() * key_scale[old].unsqueeze(-1)).to(torch.bfloat16)
-            expected_value = (value[old].float() * value_scale[old].unsqueeze(-1)).to(
-                torch.bfloat16
-            )
-            torch.testing.assert_close(staged_key[new], expected_key, rtol=0, atol=0)
-            torch.testing.assert_close(staged_value[new], expected_value, rtol=0, atol=0)
-
-
-@pytest.mark.gpu
-def test_flash2_paged_attention_stages_fp8_before_kernel():
-    from vllm_rlt.kernels.flash_attention import FlashPagedAttention
-
-    captured = {}
-
-    def kernel(q, k, v, **kwargs):
-        captured.update(k=k, v=v, **kwargs)
-        return torch.zeros_like(q)
-
-    attention = object.__new__(FlashPagedAttention)
-    attention.generation = 2
-    attention.kernel = kernel
-    attention.info = {}
-    q = torch.randn(3, 2, 8, device="cuda", dtype=torch.bfloat16)
-    key = torch.randn(4, 2, 2, 8, device="cuda").to(torch.float8_e4m3fn)
-    value = torch.randn(4, 2, 2, 8, device="cuda").to(torch.float8_e4m3fn)
-    key_scale = torch.rand(4, 2, 2, device="cuda") + 0.5
-    value_scale = torch.rand(4, 2, 2, device="cuda") + 0.5
-    tables = torch.tensor([[0, -1], [3, 2]], dtype=torch.int32, device="cuda")
-    lengths = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
-
-    attention(q, key, value, tables, lengths, key_scale=key_scale, value_scale=value_scale)
-
-    assert captured["k"].dtype == torch.bfloat16
-    assert captured["v"].dtype == torch.bfloat16
-    assert captured["block_table"].dtype == torch.int32
-    assert int(captured["block_table"].max()) < captured["k"].shape[0]
-
-
-@pytest.mark.gpu
-def test_flash4_paged_attention_stages_fp8_before_kernel():
-    from vllm_rlt.kernels.flash_attention import FlashPagedAttention
-
-    captured = {}
-
-    def kernel(q, k, v, **kwargs):
-        captured.update(k=k, v=v, **kwargs)
-        return torch.zeros_like(q)
-
-    attention = object.__new__(FlashPagedAttention)
-    attention.generation = 4
-    attention.kernel = kernel
-    attention.info = {}
-    q = torch.randn(3, 2, 8, device="cuda", dtype=torch.bfloat16)
-    key = torch.randn(4, 2, 2, 8, device="cuda").to(torch.float8_e4m3fn)
-    value = torch.randn(4, 2, 2, 8, device="cuda").to(torch.float8_e4m3fn)
-    key_scale = torch.rand(4, 2, 2, device="cuda") + 0.5
-    value_scale = torch.rand(4, 2, 2, device="cuda") + 0.5
-    tables = torch.tensor([[0, -1], [3, 2]], dtype=torch.int32, device="cuda")
-    lengths = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
-
-    attention(q, key, value, tables, lengths, key_scale=key_scale, value_scale=value_scale)
-
-    assert captured["k"].dtype == torch.bfloat16
-    assert captured["page_table"].dtype == torch.int32
-    assert int(captured["page_table"].max()) < captured["k"].shape[0]
-
-
-@pytest.mark.gpu
-def test_flash2_engine_matches_triton_with_fp8_kv():
-    pytest.importorskip("flash_attn")
-    from tests.helpers import tiny_ouro_config
-    from vllm_rlt.engine.llm_engine import LLMEngine
-    from vllm_rlt.models import OuroForCausalLM
-
-    torch.manual_seed(7)
-    model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
-
-    def run(backend):
-        engine = LLMEngine(
-            model,
-            cache_config=CacheConfig(num_blocks=64, block_size=256, kv_cache_dtype="fp8_e4m3"),
-            scheduler_config=SchedulerConfig(
-                max_num_seqs=2, max_num_batched_tokens=8, prefill_chunk_size=4
-            ),
-            execution_config=ExecutionConfig(),
-            exit_config=ExitConfig("ouro"),
-            attention_backend=backend,
-        )
-        engine.add_request("a", [2, 3, 4, 5], SamplingParams(max_tokens=4, ignore_eos=True))
-        engine.add_request("b", [6, 7], SamplingParams(max_tokens=3, ignore_eos=True))
-        done = {}
-        while engine.has_unfinished_requests():
-            for output in engine.step():
-                if output.finished:
-                    done[output.request_id] = list(output.token_ids)
-        return done
-
-    assert run("flash_attn_2") == run("triton")
+    different_scale = make_cache(fp8_scale=0.03)
+    assert different_scale.allocate("r", 7)
+    with pytest.raises(ValueError, match="scale policy"):
+        different_scale.restore("r", snapshot)
 
 
 def test_backends_without_fp8_support_are_rejected():
@@ -295,15 +180,6 @@ def test_backends_without_fp8_support_are_rejected():
     backend = AttentionBackend(torch_paged_attention, BackendCapabilities(), info)
     with pytest.raises(ValueError, match="FP8"):
         make_cache(attention=backend)
-    from vllm_rlt.pd.engine import PDEngine
-
-    torch.manual_seed(0)
-    with pytest.raises(ValueError, match="FP8"):
-        PDEngine(
-            OuroForCausalLM(tiny_ouro_config()),
-            prefill_cache_config=CacheConfig(kv_cache_dtype="fp8_e4m3"),
-            attention_backend="triton",
-        )
 
 
 def run_engine(model, kv_cache_dtype, prompts, params, exit_config):
@@ -426,7 +302,8 @@ def test_fp8_async_and_graph_paths_match_sync_eager(mode, graphs):
 
 
 @pytest.mark.gpu
-def test_triton_fp8_store_matches_quantize_fp8_bitwise():
+@pytest.mark.parametrize("fixed_scale", [None, 0.02])
+def test_triton_fp8_store_matches_quantize_fp8_bitwise(fixed_scale):
     from vllm_rlt.kernels.triton_attention import store_fp8
 
     torch.manual_seed(2)
@@ -450,23 +327,26 @@ def test_triton_fp8_store_matches_quantize_fp8_bitwise():
         blocks,
         offsets,
         FP8_E4M3_MAX,
+        fixed_scale=fixed_scale,
     )
     untouched = torch.ones(shape[:-1], dtype=torch.bool, device="cuda")
     untouched[blocks, layer, offsets] = False
     for x, code, scale in zip((k, v), codes, scales):
-        want_codes, want_scale = quantize_fp8(x)
+        want_codes, want_scale = quantize_fp8(x, fixed_scale)
         assert torch.equal(code[blocks, layer, offsets].float(), want_codes.float())
         assert torch.equal(scale[blocks, layer, offsets], want_scale)
         assert not code.float()[untouched].any() and bool((scale[untouched] == 1).all())
 
 
 @pytest.mark.gpu
-def test_triton_fp8_store_skips_masked_and_inactive_rows():
+@pytest.mark.parametrize("fixed_scale", [None, 0.02])
+@pytest.mark.parametrize("active", [0, 7, 10])
+def test_triton_fp8_store_skips_masked_and_inactive_rows(fixed_scale, active):
     # The device-masked writes used by speculative verification and bucketed CUDA graphs.
     from vllm_rlt.kernels.triton_attention import store_fp8
 
     torch.manual_seed(4)
-    pages, block, kv_heads, head_dim, rows, active = 6, 8, 2, 64, 10, 7
+    pages, block, kv_heads, head_dim, rows = 6, 8, 2, 64, 10
     shape = (pages, block, kv_heads, head_dim)
     codes = [torch.zeros(shape, device="cuda", dtype=torch.float8_e4m3fn) for _ in range(2)]
     scales = [torch.ones(shape[:-1], device="cuda") for _ in range(2)]
@@ -476,11 +356,22 @@ def test_triton_fp8_store_skips_masked_and_inactive_rows():
     v = torch.randn(rows, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     mask = torch.tensor([1, 0, 1, 1, 0, 1, 1, 1, 1, 1], device="cuda", dtype=torch.bool)
     count = torch.tensor(active, device="cuda", dtype=torch.int32)
-    store_fp8(k, v, *codes, *scales, blocks, offsets, FP8_E4M3_MAX, mask=mask, active=count)
+    store_fp8(
+        k,
+        v,
+        *codes,
+        *scales,
+        blocks,
+        offsets,
+        FP8_E4M3_MAX,
+        mask=mask,
+        active=count,
+        fixed_scale=fixed_scale,
+    )
     written = mask.clone()
     written[active:] = False
     for x, code, scale in zip((k, v), codes, scales):
-        want_codes, want_scale = quantize_fp8(x)
+        want_codes, want_scale = quantize_fp8(x, fixed_scale)
         assert torch.equal(code[blocks, offsets][written].float(), want_codes[written].float())
         assert torch.equal(scale[blocks, offsets][written], want_scale[written])
         assert not code[blocks, offsets][~written].float().any()
