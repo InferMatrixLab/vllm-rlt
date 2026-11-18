@@ -262,6 +262,32 @@ class StageClient:
         self.outputs.clear()
         return outputs
 
+    def get_weight_version(self):
+        return self._call("get_weight_version")
+
+    def pause_generation(self):
+        return self._call("pause_generation")
+
+    def resume_generation(self):
+        return self._call("resume_generation")
+
+    def reset_prefix_cache(self):
+        if self.has_unfinished_requests():
+            raise RuntimeError("Finish active requests before resetting cached KV")
+        return self._call("reset_prefix_cache")
+
+    def start_weight_update(self, version=None):
+        if self.has_unfinished_requests():
+            raise RuntimeError("Weight updates require an idle engine")
+        return self._call("start_weight_update", version=version)
+
+    def update_weights(self, weights):
+        weights = [(name, tensor.detach().cpu()) for name, tensor in weights]
+        return self._call("update_weights", weights=weights)
+
+    def finish_weight_update(self):
+        return self._call("finish_weight_update")
+
     def stats(self):
         return self.final_stats if self.stopped else self._call("stats")
 

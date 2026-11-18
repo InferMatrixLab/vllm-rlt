@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from secrets import randbits
 
 import torch
 
@@ -67,6 +68,12 @@ class Request:
     compute_released: bool = False
     finish_reason: FinishReason | None = None
     exit_trace: tuple[int, ...] = field(default=(), repr=False)
+    weight_version: int = 0
+    log_probs: list[torch.Tensor] = field(default_factory=list, repr=False)
+
+    def __post_init__(self):
+        if self.sampling_params.seed is None:
+            self.sampling_params = replace(self.sampling_params, seed=randbits(63))
 
     @staticmethod
     def prefill_boundaries(
@@ -204,6 +211,9 @@ class RequestOutput:
     finished: bool
     finish_reason: str | None = None
     text: str = ""
+    log_probs: list[float] | None = None
+    weight_version: int = 0
+    sampling_params: SamplingParams | None = None
 
     @classmethod
     def from_request(cls, request: Request):
@@ -216,4 +226,13 @@ class RequestOutput:
             finish_reason=request.finish_reason.value
             if request.finish_reason is not None
             else None,
+            log_probs=(
+                torch.stack(request.log_probs[: len(request.generated_token_ids)]).tolist()
+                if request.generated_token_ids
+                else []
+            )
+            if request.sampling_params.logprobs is not None
+            else None,
+            weight_version=request.weight_version,
+            sampling_params=request.sampling_params,
         )
