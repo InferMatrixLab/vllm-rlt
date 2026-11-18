@@ -1,16 +1,15 @@
 # Ouro on Ascend
 
 Run Ouro-1.4B on one Ascend NPU with BF16, greedy decoding and four recurrent
-loops. The `ascend_eager` backend uses eager ATen operations and HF-style
-attention rounding. The example enables the optional asynchronous engine plan.
+loops. The Python runtime uses Torch's `scaled_dot_product_attention` through
+the `ascend_eager` backend, matching HF's SDPA entry point. Torch-NPU selects
+the device kernel according to the input shape, mask and hardware.
+The example enables the optional asynchronous engine plan.
 
 ## Prepare the environment and model
 
 Install the project dependencies in a compatible Torch, Torch-NPU and CANN
-environment. Use the checkpoint's config and byte-level tokenizer. The native
-host plan builds a C++ extension on first use and requires a C++17 compiler,
-Ninja, PyTorch headers and a writable build cache. Set
-`VLLM_RLT_NATIVE_BUILD_DIR` to select the cache location.
+environment. Use the checkpoint's config and byte-level tokenizer.
 
 ```bash
 source /path/to/cann/set_env.sh
@@ -29,21 +28,20 @@ whole-cohort prefill, the chunk size must fit each prompt and the batched token
 budget must fit the sum of prompt lengths in the cohort.
 
 ```bash
-TASK_QUEUE_ENABLE=2 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MAX_JOBS=1 \
+TASK_QUEUE_ENABLE=2 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 python -m vllm_rlt.entrypoints.serve \
   --model "$MODEL" --tokenizer "$MODEL" --served-model-name ouro \
   --device npu --dtype bfloat16 --attention-backend ascend_eager \
   --mode refill --exit-mode ouro_delayed \
-  --async-scheduling --single-stream --no-uva --contiguous-kv \
-  --coalesce-fixed-prelude --native-eager-plan \
+  --async-scheduling --single-stream --no-uva \
+  --coalesce-fixed-prelude \
   --block-size 16 --num-blocks 2064 --max-num-seqs 32 \
   --max-num-batched-tokens 8192 --prefill-chunk-size 1024 \
   --max-prefill-batches-before-decode 32 --host 127.0.0.1 --port 8123
 ```
 
-Omit `--native-eager-plan` to use the Python eager executor without building
-an extension. For synchronous eager execution, also omit `--async-scheduling`,
-`--coalesce-fixed-prelude` and `--contiguous-kv`.
+For synchronous eager execution, omit `--async-scheduling` and
+`--coalesce-fixed-prelude`.
 
 Wait for `/health` to return HTTP 200, then send a completion. Add
 `"stream": true` for server-sent events.
@@ -63,15 +61,12 @@ curl --fail http://127.0.0.1:8123/v1/completions \
   in one submission. Competing prompt or recurrent work retains a scheduling
   opportunity. A full-depth PRELUDE counts as recurrent work for refill fairness.
 - **Reuse and batching.** Compatible batches reuse KV range and allocation plans,
-  token and hidden tensors, and attention masks. Greedy sampling, compatible
-  prefill and paged KV write indices are batched. Long continuation prefill can
-  preserve per-request PV matmul geometry for BF16 rounding.
-- **KV and host dispatch.** Owned KV uses `[batch, kv_head, token, head_dim]`,
-  which attention reads directly for uniform ranges. The optional C++ executor
-  dispatches individual eager operations, including separate Q/K/V and gate/up
-  projections, with the Python GIL released. Incompatible KV geometry can
-  materialize paged KV and use the Python executor. Materialization can
-  temporarily hold both layouts in memory.
+  hidden tensors, and attention masks. Greedy sampling, compatible
+  prefill and paged KV write indices are batched. Full prefill uses causal SDPA.
+  Cached chunks and ragged decode pass boolean masks to preserve each row's
+  visible KV range.
+- **Paged KV.** Each loop writes to the page pool using its own block table.
+  The Ascend backend gathers the visible KV rows for Torch SDPA.
 
 The example uses private, fully reserved `last_exited` KV. Keep graphs,
 static buffers, padding, prefix caching, incremental KV allocation, preemption,
@@ -82,14 +77,17 @@ and adaptive exit.
 <a id="8-profile-guided-high-batch-scheduling"></a>
 ## Performance and correctness
 
-A higher prefill quota can help keep stable cohorts aligned. In a 128-input,
-32-request decode profile with a 1024-token budget, changing the quota from 1 to
-32 kept KV lengths uniform. KV `index_select` calls fell from 192 to 0 and Python
-calls from 74,323 to 31,447 per decode iteration across the batch. The number of
-`linear` calls was 677 in both profiles. A higher quota can delay decode for
-existing requests. The scheduler default is 1.
+A higher prefill quota lets more requests reach decode together and can delay
+decode for existing requests. The scheduler default is 1.
 
 ### Full unified W1-W7 validation
+
+This historical run used the C++ host executor and explicit eager attention
+on both sides of the comparison. For the SDPA configuration above, compare
+against HF SDPA with the same weights, input IDs, output lengths and concurrency.
+Check the actual prefill and decode kernels on both sides with a short profile.
+Measure throughput, TTFT and TPOT with the profiler disabled. Separate
+synchronous and asynchronous vllm-rlt runs to measure the effect of scheduling.
 
 Runtime `7b4537f` used the same budget 8192, chunk 1024 and prefill quota 32 for
 all seven [unified execution workloads](../unified_execution.md#protocol-and-comparison-rules).
@@ -133,7 +131,7 @@ With an assigned NPU visible and `MODEL` set as above:
 ```bash
 VLLM_RLT_OURO_CHECKPOINT="$MODEL" python -m pytest -q --run-npu \
   tests/test_ascend_eager.py tests/test_ascend_kv.py \
-  tests/test_fixed_prelude.py tests/test_native_ouro_plan.py \
+  tests/test_fixed_prelude.py \
   tests/test_ascend_checkpoint.py tests/test_ascend_serving.py
 ```
 

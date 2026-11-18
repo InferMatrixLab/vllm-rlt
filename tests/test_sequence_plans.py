@@ -5,7 +5,7 @@ import torch
 
 from vllm_rlt.attention.backend import AttentionBackend, BackendCapabilities
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
-from vllm_rlt.kernels.ascend_eager import AscendEagerAttention
+from vllm_rlt.kernels.ascend_attention import AscendAttention
 from vllm_rlt.worker.metadata import MetadataBuilder, stage_range_metadata
 
 
@@ -13,7 +13,7 @@ def cache_for(device="cpu", *, incremental=False):
     device = torch.device(device)
     attention = (
         AttentionBackend(
-            AscendEagerAttention(),
+            AscendAttention(),
             BackendCapabilities(sequence_ranges=True),
             dict(selected_backend="torch", backend="torch"),
         )
@@ -183,7 +183,7 @@ def test_npu_cache_identity_never_resolves_raw_stream_handle(monkeypatch):
         type = "npu"
 
     device = Device()
-    assert AscendEagerAttention._stream_key(device) == 73
+    assert AscendAttention._stream_key(device) == 73
     plan = RangeTablePlan([[1]])
     sentinel = object()
     plan.tensors[device, 73] = sentinel

@@ -31,8 +31,6 @@ class BackendCapabilities:
     sliding_window: bool = False
     packed_sliding_window: bool = False
     sequence_ranges: bool = False
-    # Consume private, owned KV pairs in [batch, kv_head, token, head_dim] layout.
-    owned_contiguous_kv: bool = False
 
 
 @dataclass
@@ -75,9 +73,7 @@ class AttentionBackend:
 
 
 _TORCH_CAPABILITIES = BackendCapabilities(sliding_window=True)
-_ASCEND_CAPABILITIES = BackendCapabilities(
-    async_scheduling=True, sequence_ranges=True, owned_contiguous_kv=True
-)
+_ASCEND_CAPABILITIES = BackendCapabilities(async_scheduling=True, sequence_ranges=True)
 _TRITON_CAPABILITIES = BackendCapabilities(
     cuda_graphs=True, async_scheduling=True, device_context_lengths=True, sliding_window=True
 )
@@ -99,7 +95,11 @@ def backend_capabilities(implementation) -> BackendCapabilities:
     return implementation.capabilities
 
 
-def validate_backend_name(backend: str) -> None:
+def validate_backend_name(backend: str, *, device_type: str | None = None) -> None:
+    if device_type == "npu" and backend not in ("torch", "ascend_eager"):
+        raise ValueError(
+            "NPU execution requires explicit attention_backend='torch' or 'ascend_eager'"
+        )
     if backend not in {"auto", "torch", "triton", "ascend_eager", *FLASH_BACKENDS}:
         raise ValueError("unknown attention backend")
 
@@ -108,9 +108,9 @@ def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, pa
     if backend == "ascend_eager":
         if device.type != "npu" or dtype != torch.bfloat16:
             raise ValueError("ascend_eager requires an NPU and BF16")
-        from vllm_rlt.kernels.ascend_eager import AscendEagerAttention
+        from vllm_rlt.kernels.ascend_attention import AscendAttention
 
-        return AttentionBackend(AscendEagerAttention(), _ASCEND_CAPABILITIES, {"backend": backend})
+        return AttentionBackend(AscendAttention(), _ASCEND_CAPABILITIES, {"backend": backend})
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
@@ -166,7 +166,7 @@ def create_backend(
     reordering candidates; required packed prefill still rejects unsupported ones.
     A packed window shape opts into tile selection and keeps row attention available.
     """
-    validate_backend_name(backend)
+    validate_backend_name(backend, device_type=device.type)
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
     skipped = []
     if backend == "auto" and device.type != "cuda":
@@ -191,7 +191,6 @@ def create_backend(
                     "async_scheduling",
                     "device_context_lengths",
                     "sequence_ranges",
-                    "owned_contiguous_kv",
                     "sliding_window",
                     "packed_sliding_window",
                 )

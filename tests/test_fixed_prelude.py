@@ -96,7 +96,7 @@ def engine_for(model, planned, multi_stream=False, token_budget=128):
     return StageEngine(
         model,
         attention_backend="ascend_eager",
-        cache_config=CacheConfig(num_blocks=128, block_size=16, contiguous_kv=True),
+        cache_config=CacheConfig(num_blocks=128, block_size=16),
         scheduler_config=SchedulerConfig(
             max_num_seqs=3, max_num_batched_tokens=token_budget, prefill_chunk_size=128
         ),

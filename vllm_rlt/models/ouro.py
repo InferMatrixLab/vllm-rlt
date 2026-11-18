@@ -281,9 +281,55 @@ class OuroForCausalLM(nn.Module):
         batch = cache._prepare_batch(request_ids, depths, positions)
         return self.recurrent_prepared(hidden, batch, cache, compute_gate=compute_gate)
 
-    def recurrent_prepared(self, hidden, batch, cache, *, compute_gate=True):
+    @property
+    def recurrent_returns_owned_hidden(self):
+        if type(self) is not OuroForCausalLM or "recurrent_prepared" in self.__dict__:
+            return False
+        norm = self.model.norm
+        return (
+            type(norm) is RMSNorm
+            and not norm._forward_hooks
+            and not norm._forward_pre_hooks
+            and "forward" not in norm.__dict__
+        )
+
+    def prepare_recurrent(self):
+        """Keep RoPE reuse local to one forward, across loops with the same position view."""
+        recurrent = self.recurrent_prepared
+        if type(self) is not OuroForCausalLM or "recurrent_prepared" in self.__dict__:
+            return recurrent
+        position_key = position_embeddings = None
+
+        def run(hidden, batch, cache, *, compute_gate):
+            nonlocal position_key, position_embeddings
+            positions = batch.position_ids
+            key = (
+                positions.data_ptr(),
+                positions.shape,
+                positions.stride(),
+                positions.dtype,
+                positions.device,
+                hidden.dtype,
+            )
+            if key != position_key:
+                position_embeddings = self.model.rotary_emb(hidden, positions)
+                position_key = key
+            return recurrent(
+                hidden,
+                batch,
+                cache,
+                compute_gate=compute_gate,
+                position_embeddings=position_embeddings,
+            )
+
+        return run
+
+    def recurrent_prepared(
+        self, hidden, batch, cache, *, compute_gate=True, position_embeddings=None
+    ):
         """Run core with runner-owned metadata, including inactive padding rows."""
-        position_embeddings = self.model.rotary_emb(hidden, batch.position_ids)
+        if position_embeddings is None:
+            position_embeddings = self.model.rotary_emb(hidden, batch.position_ids)
         for layer in self.model.layers:
             hidden = layer(hidden, position_embeddings, batch, cache)
         # Norm is inside the recurrence in Ouro; this normalized state is the

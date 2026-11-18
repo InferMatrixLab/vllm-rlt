@@ -6,10 +6,8 @@ launching device work. Storage, transfers and completion belong to the callers.
 
 from __future__ import annotations
 
-import weakref
-from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -44,9 +42,8 @@ class KVMetadata:
     max_seqlen_q: int = 1
     # Compact plans use one table per sequence, not one duplicated table per
     # query. Only a backend declaring sequence_ranges may consume this form.
-    sequence_ranges: tuple[SequenceRange, ...] | UniformSequenceRanges | None = None
+    sequence_ranges: tuple[SequenceRange, ...] | None = None
     table_plan: RangeTablePlan | None = None
-    deferred_addresses: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,50 +58,12 @@ class SequenceRange:
         return self.start + self.count
 
 
-@dataclass(frozen=True, eq=False)
-class UniformSequenceRanges(Sequence):
-    """One owned cohort and scalar geometry; expand row objects only on demand."""
-
-    allocations: tuple
-    depth: int
-    start: int
-    query_count: int
-    _rows: object = field(default=None, init=False, compare=False, repr=False)
-
-    def __len__(self):
-        return len(self.allocations)
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return tuple(self)[index]
-        if self._rows is not None:
-            return self._rows[index]
-        _, allocation = self.allocations[index]
-        return SequenceRange(allocation, self.depth, self.start, self.query_count)
-
-    def __iter__(self):
-        if self._rows is None:
-            object.__setattr__(
-                self,
-                "_rows",
-                tuple(
-                    SequenceRange(a, self.depth, self.start, self.query_count)
-                    for _, a in self.allocations
-                ),
-            )
-        return iter(self._rows)
-
-
 class RangeRows(Sequence):
     """Immutable lazy compatibility view; fast consumers use the ranges."""
 
     def __init__(self, ranges):
-        self.ranges = ranges if isinstance(ranges, UniformSequenceRanges) else tuple(ranges)
-        self.width = (
-            ranges.query_count
-            if isinstance(ranges, UniformSequenceRanges)
-            else self.ranges[0].count
-        )
+        self.ranges = ranges
+        self.width = ranges[0].count
 
     def __len__(self):
         return len(self.ranges) * self.width
@@ -128,8 +87,7 @@ class RangeTablePlan:
     another stream. Position/write tensors remain submission-owned snapshots.
     """
 
-    def __init__(self, tables, *, max_context_tokens=None):
-        self.max_context_tokens = max_context_tokens
+    def __init__(self, tables):
         width = max(map(len, tables))
         self.host = np.full((len(tables), width), -1, dtype=np.int32)
         for i, table in enumerate(tables):
@@ -152,7 +110,7 @@ class RangeTablePlan:
 @dataclass(frozen=True)
 class RangeLayout:
     owner: KVCacheManager
-    ranges: tuple[SequenceRange, ...] | UniformSequenceRanges
+    ranges: tuple[SequenceRange, ...]
     allocations: tuple
     positions: np.ndarray
     offsets: np.ndarray
@@ -161,29 +119,9 @@ class RangeLayout:
     writable: bool
 
 
-def stage_range_metadata(layouts, stage, *, defer_addresses=False):
+def stage_range_metadata(layouts, stage):
     """Snapshot changing indices; stable page tables stay with their plan."""
     first = layouts[0]
-    if defer_addresses:
-        if not all(isinstance(x.ranges, UniformSequenceRanges) for x in layouts):
-            raise ValueError("deferred addresses require uniform owned KV ranges")
-        return tuple(
-            KVMetadata(
-                owner=x.owner,
-                rows=RangeRows(x.ranges),
-                allocations=x.allocations,
-                position_ids=None,
-                write_blocks=None,
-                write_offsets=None,
-                block_tables=None,
-                context_lengths=None,
-                writable=x.writable,
-                sequence_ranges=x.ranges,
-                table_plan=x.tables,
-                deferred_addresses=True,
-            )
-            for x in layouts
-        )
     n = len(first.positions)
     wide = stage(
         np.concatenate([first.positions, first.offsets, *(x.blocks for x in layouts)]),
@@ -264,9 +202,6 @@ class MetadataBuilder:
         self._relative_positions = None
         self._range_bound_allocation = None
         self._range_min_pages = None
-        self._position_layouts = OrderedDict()
-        self._position_bytes = 0
-        self._paged_bindings = weakref.WeakKeyDictionary()
         self.range_plan_builds = 0
         self.range_plan_reuses = 0
 
@@ -303,8 +238,7 @@ class MetadataBuilder:
                     cache._validate_depth(depth)
                 tables.append(
                     RangeTablePlan(
-                        [a.block_tables[cache._plane(d)] for (_, a), d in zip(allocations, depths)],
-                        max_context_tokens=min(a.max_tokens for _, a in allocations),
+                        [a.block_tables[cache._plane(d)] for (_, a), d in zip(allocations, depths)]
                     )
                 )
             # Publish only after preparation succeeds.
@@ -333,13 +267,9 @@ class MetadataBuilder:
         pages = (positions // cache.block_size).reshape(size, width)
         layouts = []
         for depths, table in zip(depths_key, self._range_tables):
-            ranges = (
-                UniformSequenceRanges(allocations, depths[0], starts[0], width)
-                if cache._contiguous is not None and len(set(depths)) == 1
-                else tuple(
-                    SequenceRange(a, depth, start, width)
-                    for (_, a), depth, start in zip(allocations, depths, starts)
-                )
+            ranges = tuple(
+                SequenceRange(allocation, depth, start, width)
+                for (_, allocation), depth, start in zip(allocations, depths, starts)
             )
             blocks = np.take_along_axis(table.host, pages, axis=1).reshape(-1)
             layouts.append(
@@ -348,86 +278,6 @@ class MetadataBuilder:
                 )
             )
         return tuple(layouts)
-
-    @staticmethod
-    def _stream_key(device):
-        if device.type == "npu":
-            return torch.npu.current_stream(device).stream_id
-        if device.type == "cuda":
-            return torch.cuda.current_stream(device).cuda_stream
-        return None
-
-    def _position_input(self, metadata):
-        ranges = metadata.sequence_ranges
-        rows, width, start = len(ranges), ranges.query_count, ranges.start
-        device = self.cache.device
-        stream = self._stream_key(device)
-        key = (device, stream, rows, "decode" if width == 1 else (start, width))
-        tensor = self._position_layouts.get(key)
-        required = max(start + width, metadata.table_plan.max_context_tokens or 0)
-        if tensor is None or (width == 1 and len(tensor) < required):
-            if tensor is not None:
-                self._position_bytes -= tensor.numel() * tensor.element_size()
-                del self._position_layouts[key]
-            if width == 1:
-                capacity = 1 << (required - 1).bit_length()
-                tensor = (
-                    torch.arange(capacity, dtype=torch.int64, device=device)[:, None]
-                    .expand(capacity, rows)
-                    .contiguous()
-                )
-            else:
-                tensor = torch.arange(
-                    start, start + width, dtype=torch.int64, device=device
-                ).repeat(rows)
-            size = tensor.numel() * tensor.element_size()
-            if size <= 64 * 1024 * 1024:
-                while self._position_layouts and (
-                    len(self._position_layouts) >= 8
-                    or self._position_bytes + size > 64 * 1024 * 1024
-                ):
-                    _, old = self._position_layouts.popitem(last=False)
-                    self._position_bytes -= old.numel() * old.element_size()
-                self._position_layouts[key] = tensor
-                self._position_bytes += size
-        elif key in self._position_layouts:
-            self._position_layouts.move_to_end(key)
-        return tensor[start] if width == 1 else tensor
-
-    def _bind_owned(self, metadata):
-        if metadata.owner is not self.cache:
-            raise ValueError("owned metadata belongs to a different cache")
-        return replace(metadata, position_ids=self._position_input(metadata))
-
-    def materialize_paged(self, metadata):
-        """Bind deferred addresses on the consuming stream before paged escape."""
-        if not metadata.deferred_addresses:
-            return metadata
-        stream = self._stream_key(self.cache.device)
-        bindings = self._paged_bindings.get(metadata)
-        if bindings is not None and stream in bindings:
-            return bindings[stream]
-        ranges = metadata.sequence_ranges
-        rows, width, start = len(ranges), ranges.query_count, ranges.start
-        positions = np.tile(np.arange(start, start + width, dtype=np.int64), rows)
-        pages = (positions // self.cache.block_size).reshape(rows, width)
-        blocks = np.take_along_axis(metadata.table_plan.host, pages, axis=1).reshape(-1)
-        device = self.cache.device
-        result = replace(
-            metadata,
-            write_blocks=torch.tensor(blocks, device=device, dtype=torch.int64),
-            write_offsets=torch.tensor(
-                positions % self.cache.block_size, device=device, dtype=torch.int64
-            ),
-            block_tables=metadata.table_plan.bind(device),
-            context_lengths=torch.tensor(positions + 1, device=device, dtype=torch.int32),
-            deferred_addresses=False,
-        )
-        if bindings is None:
-            bindings = {}
-            self._paged_bindings[metadata] = bindings
-        bindings[stream] = result
-        return result
 
     def prepare_device(
         self,
@@ -616,9 +466,6 @@ class MetadataBuilder:
     @staticmethod
     def bind(metadata, storage):
         """Bind a host-planned layout to its uploaded typed storage."""
-
-        if metadata.deferred_addresses:
-            return metadata.owner.metadata_builder._bind_owned(metadata)
 
         def view(tensor):
             return storage[tensor.dtype].as_strided(

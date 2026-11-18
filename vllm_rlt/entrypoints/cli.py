@@ -7,6 +7,7 @@ from dataclasses import asdict
 import torch
 
 from vllm_rlt import LLM, SamplingParams, SchedulerConfig
+from vllm_rlt.attention import validate_backend_name
 from vllm_rlt.entrypoints.runtime_args import (
     add_runtime_args,
     profile_config_from_args,
@@ -101,11 +102,10 @@ def main():
         parser.error("--toy uses built-in token ID prompts; omit --prompt")
     if not args.toy and not args.prompt:
         parser.error("provide --prompt or use --toy for a CPU smoke test")
-    if args.device.split(":", 1)[0] == "npu" and args.attention_backend not in (
-        "torch",
-        "ascend_eager",
-    ):
-        parser.error("NPU execution requires explicit --attention-backend torch or ascend_eager")
+    try:
+        validate_backend_name(args.attention_backend, device_type=args.device.split(":", 1)[0])
+    except ValueError as exc:
+        parser.error(str(exc))
     profiling = profile_config_from_args(args)
     if profiling is not None:
         profiling.resolve_activities(args.device)

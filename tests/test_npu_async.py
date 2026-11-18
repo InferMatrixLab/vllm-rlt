@@ -171,7 +171,7 @@ def test_npu_cancel_reuse_rejects_late_coda_and_eos_stops():
 
 @pytest.mark.npu
 def test_npu_batched_greedy_preserves_ties_and_padding():
-    from vllm_rlt.worker.ascend import AscendSampler
+    from vllm_rlt.worker.ascend_model_runner import AscendSampler
 
     device = resolve_device("npu:0")
     logits = torch.zeros((3, 49152), dtype=torch.bfloat16)
@@ -193,7 +193,7 @@ def test_npu_batched_greedy_preserves_ties_and_padding():
 def test_npu_hidden_gather_keeps_cross_stream_sources_alive():
     from types import SimpleNamespace
 
-    from vllm_rlt.worker.ascend import AscendModelRunner
+    from vllm_rlt.worker.ascend_model_runner import AscendModelRunner
 
     device = resolve_device("npu:0")
     torch.npu.set_device(device)

@@ -7,6 +7,7 @@ from functools import partial
 
 import torch
 
+from vllm_rlt.attention import validate_backend_name
 from vllm_rlt.config import SchedulerConfig
 from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.entrypoints.runtime_args import (
@@ -118,8 +119,10 @@ def main():
     limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
     if args.device == "cpu" and args.attention_backend not in ("auto", "torch"):
         parser.error("CPU execution requires --attention-backend torch or auto")
-    if args.device == "npu" and args.attention_backend not in ("torch", "ascend_eager"):
-        parser.error("NPU execution requires explicit --attention-backend torch or ascend_eager")
+    try:
+        validate_backend_name(args.attention_backend, device_type=args.device)
+    except ValueError as exc:
+        parser.error(str(exc))
     torch.set_num_threads(args.cpu_threads)
     logging.basicConfig(level=logging.INFO)
     app = create_app(

@@ -8,7 +8,7 @@ import torch
 from tests.helpers import make_cpu_cache, tiny_ouro_model
 from vllm_rlt import ExecutionConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.request import Request
-from vllm_rlt.worker.ascend import AscendModelRunner
+from vllm_rlt.worker.ascend_model_runner import AscendModelRunner
 from vllm_rlt.worker.model_runner import ModelRunner
 
 

@@ -1,9 +1,9 @@
-"""Causal/GQA semantics for the separately selected BF16 eager contract."""
+"""Causal/GQA semantics for Ascend SDPA over paged KV."""
 
 import pytest
 import torch
 
-from vllm_rlt.kernels.ascend_eager import AscendEagerAttention, _flat_kv_rows, _prefill_geometry
+from vllm_rlt.kernels.ascend_attention import AscendAttention, _flat_kv_rows, _prefill_geometry
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
@@ -14,7 +14,7 @@ def test_eager_groups_match_independent_causal_queries(kv_heads):
     q = torch.randn(7, 4, 64, dtype=torch.bfloat16)
     lengths = torch.tensor([0, 1, 15, 16, 17, 3, 31], dtype=torch.int32)
     tables = torch.tensor([[4, 1], [4, 1], [4, 1], [4, 1], [4, 1], [7, 2], [7, 2]])
-    actual = AscendEagerAttention()(q, keys, values, tables, lengths)
+    actual = AscendAttention()(q, keys, values, tables, lengths)
     expected = torch.zeros_like(q)
     for row, length in enumerate(lengths.tolist()):
         if not length:
@@ -162,29 +162,37 @@ def test_engine_matches_the_same_manual_prefill_chunks(chunk_size):
 
 @pytest.mark.parametrize("device_name", ["cpu", pytest.param("npu", marks=pytest.mark.npu)])
 @torch.inference_mode()
-def test_bf16_probability_rounding_is_part_of_the_eager_contract(device_name):
+def test_cached_continuation_passes_bool_mask_to_sdpa(device_name, monkeypatch):
     from vllm_rlt.device import resolve_device
-    from vllm_rlt.kernels.paged_attention import torch_paged_attention
 
     device = resolve_device(device_name)
     if device_name == "npu":
         torch.npu.set_device(0)
-    keys = torch.zeros(1, 16, 1, 64, dtype=torch.bfloat16, device=device)
+    keys = torch.zeros(1, 16, 2, 64, dtype=torch.bfloat16, device=device)
     values = torch.zeros_like(keys)
-    keys[0, 0].fill_(1.03125)
-    keys[0, 1].fill_(1)
-    values[0, 0].fill_(128)
-    values[0, 1].fill_(-128)
-    query = torch.ones(1, 1, 64, dtype=torch.bfloat16, device=device)
-    table = torch.tensor([[0]], dtype=torch.int32, device=device)
-    lengths = torch.tensor([2], dtype=torch.int32, device=device)
-    # QK/sqrt(64) is [8.25,8]. BF16 probabilities are [.5625,.4375],
-    # so their weighted value is exactly16. FP32 probabilities retain
-    # [.5621765,.4378235] and round the final value to15.9375 instead.
-    actual = AscendEagerAttention()(query, keys, values, table, lengths)
-    torch.testing.assert_close(actual, torch.full_like(actual, 16), atol=0, rtol=0)
-    old_contract = torch_paged_attention(query, keys, values, table, lengths)
-    assert not torch.equal(actual, old_contract)
+    for pos, value in enumerate((1, 3, 8)):
+        values[0, pos].fill_(value)
+    query = torch.ones(2, 2, 64, dtype=torch.bfloat16, device=device)
+    table = torch.tensor([[0], [0]], dtype=torch.int32, device=device)
+    lengths = torch.tensor([2, 3], dtype=torch.int32, device=device)
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    calls = []
+
+    def check_sdpa(q, k, v, *, attn_mask, is_causal):
+        calls.append(attn_mask)
+        assert not is_causal
+        assert q.shape == (1, 2, 2, 64) and k.shape == v.shape == (1, 2, 3, 64)
+        assert attn_mask.dtype == torch.bool
+        assert attn_mask.tolist() == [[True, True, False], [True, True, True]]
+        return sdpa(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", check_sdpa)
+    actual = AscendAttention()(query, keys, values, table, lengths)
+    # Equal scores average the visible values. The first query sees the cached
+    # prefix and itself, while only the second query can see the last value.
+    expected = torch.tensor([2, 4], device=device, dtype=query.dtype)[:, None, None]
+    torch.testing.assert_close(actual, expected.expand_as(actual), atol=0.016, rtol=0)
+    assert len(calls) == 1
 
 
 class _PreparedBatch:
@@ -265,10 +273,10 @@ def _batched_fixture(kind):
     ],
 )
 @torch.inference_mode()
-def test_batched_attention_paths_match_per_group_eager(kind, expected_prefill, expected_ragged):
-    """Batching may remove launches but must never change the arithmetic."""
+def test_batched_attention_paths_match_per_group_sdpa(kind, expected_prefill, expected_ragged):
+    """Keep query/result ordering and masks consistent when batching SDPA calls."""
     q, keys, values, batch = _batched_fixture(kind)
-    kernel = AscendEagerAttention()
+    kernel = AscendAttention()
     groups = kernel._plan(
         [(id(allocation), depth) for allocation, depth, _ in batch.rows],
         [position + 1 for _, _, position in batch.rows],

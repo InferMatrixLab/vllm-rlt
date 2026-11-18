@@ -75,17 +75,9 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
-        if parameter.device.type != "npu" and (
-            cache_config.contiguous_kv
-            or self.execution_config.coalesce_fixed_prelude
-            or self.execution_config.native_eager_plan
-        ):
+        if parameter.device.type != "npu" and self.execution_config.coalesce_fixed_prelude:
             raise ValueError("Ascend execution options require an NPU")
         if parameter.device.type == "npu":
-            if attention_backend not in ("torch", "ascend_eager"):
-                raise ValueError(
-                    "NPU execution requires explicit attention_backend='torch' or 'ascend_eager'"
-                )
             if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
                 raise ValueError("NPU currently supports Ouro with four loops")
             if parameter.dtype != torch.bfloat16:
@@ -243,26 +235,11 @@ class StageEngine:
                     and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
-                sequence_ranges=cache_config.contiguous_kv,
-                owned_contiguous_kv=cache_config.contiguous_kv,
                 sliding_window=sliding_window,
             ),
             prefer_packed_prefill=prefer_packed and not sliding_window,
             packed_window_shape=packed_window_shape,
         )
-        if self.execution_config.native_eager_plan and (
-            parameter.device.type != "npu"
-            or not cache_config.contiguous_kv
-            or attention.info["selected_backend"] != "ascend_eager"
-            or self.execution_config.cuda_graphs
-            or self.execution_config.static_buffers
-            or getattr(model, "requires_boundary_kv", False)
-            or speculative_config is not None
-        ):
-            raise ValueError(
-                "native eager plan requires Ascend eager owned KV "
-                "without graphs, static buffers or speculation"
-            )
         if self.execution_config.packed_prefill is None:
             supported = attention.capabilities.packed_prefill and (
                 not sliding_window or attention.capabilities.packed_sliding_window
@@ -293,7 +270,6 @@ class StageEngine:
             attention=attention,
             enable_prefix_caching=cache_config.enable_prefix_caching,
             incremental_allocation=cache_config.incremental_allocation,
-            contiguous_kv=cache_config.contiguous_kv,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
         )
@@ -327,7 +303,7 @@ class StageEngine:
         self.rng = RngRegistry()
         runner_type = ModelRunner
         if parameter.device.type == "npu":
-            from vllm_rlt.worker.ascend import AscendModelRunner
+            from vllm_rlt.worker.ascend_model_runner import AscendModelRunner
 
             runner_type = AscendModelRunner
         self.model_runner = runner_type(
@@ -996,12 +972,7 @@ class StageEngine:
             request_events=self.model_runner.events,
             signals=signals,
         )
-        for row in update.next_prelude:
-            batch.requests[row].request.input_token_tensor = ticket.device_values[row]
-        if self.model_runner.device.type == "npu":
-            self.model_runner._retain_device_tokens(
-                batch, ticket.device_values, update.next_prelude
-            )
+        self.model_runner.bind_sampled_tokens(batch, ticket.device_values, update.next_prelude)
         for row in update.retain_signal:
             self._pending_exit_signals[batch.requests[row].request.request_id] = SignalHandle(
                 ticket, row

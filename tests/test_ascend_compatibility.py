@@ -28,7 +28,7 @@ def test_backend_capability_positional_arguments_keep_their_meaning():
         "sliding_window",
     )
     caps = BackendCapabilities(False, False, False, False, False, True)
-    assert caps.sliding_window and not caps.sequence_ranges and not caps.owned_contiguous_kv
+    assert caps.sliding_window and not caps.sequence_ranges
 
 
 @pytest.mark.parametrize("hip", [None, "6.4"])
@@ -37,7 +37,7 @@ def test_cuda_and_rocm_stream_selection_never_loads_npu(monkeypatch, hip):
     original = builtins.__import__
 
     def guarded(name, *args, **kwargs):
-        if name == "torch_npu" or name.startswith("vllm_rlt.worker.ascend"):
+        if name == "torch_npu" or name.startswith("vllm_rlt.worker.ascend_model_runner"):
             pytest.fail("CUDA/ROCm selected an Ascend implementation")
         return original(name, *args, **kwargs)
 
@@ -68,7 +68,7 @@ def test_default_engine_keeps_upstream_runtime_and_sampler(monkeypatch):
     original = builtins.__import__
 
     def guarded(name, *args, **kwargs):
-        if name == "torch_npu" or name.startswith("vllm_rlt.worker.ascend"):
+        if name == "torch_npu" or name.startswith("vllm_rlt.worker.ascend_model_runner"):
             pytest.fail("default engine loaded Ascend worker code")
         return original(name, *args, **kwargs)
 
@@ -86,9 +86,8 @@ def test_default_engine_keeps_upstream_runtime_and_sampler(monkeypatch):
         engine.close()
 
 
-@pytest.mark.parametrize("flag", ["contiguous_kv", "coalesce_fixed_prelude", "native_eager_plan"])
-def test_ascend_options_fail_before_allocating_on_other_devices(flag):
-    cache = CacheConfig(num_blocks=128, **({flag: True} if flag == "contiguous_kv" else {}))
-    execution = ExecutionConfig(**({flag: True} if flag != "contiguous_kv" else {}))
+def test_ascend_options_fail_before_allocating_on_other_devices():
+    cache = CacheConfig(num_blocks=128)
+    execution = ExecutionConfig(coalesce_fixed_prelude=True)
     with pytest.raises(ValueError, match="Ascend execution options require an NPU"):
         StageEngine(tiny_ouro_model(), cache_config=cache, execution_config=execution)

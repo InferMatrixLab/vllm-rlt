@@ -19,7 +19,7 @@ from vllm_rlt.worker.buffers import (
 )
 from vllm_rlt.worker.cuda_graph import CodaGraphs, PreludeGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
-from vllm_rlt.worker.metadata import UniformSequenceRanges, stage_range_metadata
+from vllm_rlt.worker.metadata import stage_range_metadata
 from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
@@ -615,6 +615,11 @@ class ModelRunner:
         for request in requests:
             request.hidden_state = self.states[self.state_slots[request.request_id]]
 
+    def bind_sampled_tokens(self, batch, values, rows):
+        """Bind the scheduler-selected sample rows as the next prelude inputs."""
+        for row in rows:
+            batch.requests[row].request.input_token_tensor = values[row]
+
     def _gather(self, requests, workspace, size):
         if workspace is None:
             return torch.stack([r.hidden_state for r in requests])
@@ -825,12 +830,7 @@ class ModelRunner:
             [span.token_count for span in spans],
             [[span.depth + i for span in spans] for i in range(batch.loop_count)],
         )
-        deferred = (
-            self.device.type == "npu"
-            and self.cache_manager._contiguous is not None
-            and all(isinstance(x.ranges, UniformSequenceRanges) for x in layouts)
-        )
-        return stage_range_metadata(layouts, self._append_input, defer_addresses=deferred)
+        return stage_range_metadata(layouts, self._append_input)
 
     def _append_input(self, values, dtype):
         return self.input_buffers[dtype].append(values)
@@ -988,11 +988,6 @@ class ModelRunner:
             return replace(
                 prepared,
                 token_sources=sources,
-                token_ids=(
-                    self.token_batch.tokens
-                    if self.token_batch is not None and self.token_batch.matches(requests, sources)
-                    else None
-                ),
                 # Preserve the fixed decode path's gate work; its output has
                 # no consumer and is not copied back to the host.
                 forwards=(

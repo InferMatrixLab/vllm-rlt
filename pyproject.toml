@@ -53,6 +53,3 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
-
-[tool.setuptools.package-data]
-vllm_rlt = ["worker/csrc/*.cpp"]

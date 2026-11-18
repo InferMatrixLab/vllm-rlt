@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm_rlt.core.kv_cache_manager import KVCacheManager, _sequence_coverage, _WrittenPositions
-from vllm_rlt.kernels.ascend_eager import AscendEagerAttention, _flat_kv_rows
+from vllm_rlt.kernels.ascend_attention import AscendAttention, _flat_kv_rows
 
 
 @pytest.mark.parametrize(
@@ -89,7 +89,7 @@ def test_unwritten_nan_padding_is_never_consumed(padded):
     q = torch.randn(4 if padded else 3, 4, 128, device=cache.device, dtype=cache.dtype)[:, :, ::2]
     for layer in range(2):
         keys, values = cache.key_cache[:, layer], cache.value_cache[:, layer]
-        expected = _reference(AscendEagerAttention(), q, keys, values, batch)
+        expected = _reference(AscendAttention(), q, keys, values, batch)
         actual = cache._attend_prepared(layer, batch, q)
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -111,7 +111,7 @@ def test_layout_reuse_does_not_reuse_addresses_or_outputs():
             ["0", "1", "2"], [depth] * 3, [n - 1 for n in lengths], for_write=False
         )
         expected = _reference(
-            AscendEagerAttention(), q, cache.key_cache[:, 0], cache.value_cache[:, 0], batch
+            AscendAttention(), q, cache.key_cache[:, 0], cache.value_cache[:, 0], batch
         )
         actual = cache._attend_prepared(0, batch, q)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -197,7 +197,7 @@ def test_failed_plan_preparation_invalidates_the_previous_descriptor(kind, monke
     from tests.test_ascend_eager import _batched_fixture
 
     q, keys, values, first = _batched_fixture(kind)
-    kernel = AscendEagerAttention()
+    kernel = AscendAttention()
     expected = kernel.attend_metadata(q, keys, values, first).clone()
     second = copy(first)
     target = "_prepare_decode" if kind == "ragged_decode" else "_plan"
