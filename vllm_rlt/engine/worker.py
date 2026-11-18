@@ -194,9 +194,16 @@ class StageWorker:
                 and not self.channel.poll()
             ):
                 time.sleep(0.001)
+        graphs = getattr(getattr(self.engine, "speculative_runner", None), "graphs", None)
+        replays = dict(
+            graph_replays=getattr(graphs, "replays", 0),
+            sparse_graph_replays=getattr(graphs, "sparse_replays", 0),
+        )
         self.engine.close()
         metrics = self.connector.close() if self.connector is not None else {}
-        self.send("stopped", used_blocks=self.engine.cache_manager.num_used_blocks, **metrics)
+        self.send(
+            "stopped", used_blocks=self.engine.cache_manager.num_used_blocks, **replays, **metrics
+        )
 
 
 def worker_main(

@@ -212,13 +212,15 @@ class Harness:
         runner.runtime = SimpleNamespace(
             forward=lambda batch: SimpleNamespace(hidden=self.E[batch.tokens])
         )
-        runner._execute_recurrent_step = lambda hidden, positions, tables, depth, allocations: (
-            hidden if depth < 1 else hidden @ self.M
+        runner._execute_recurrent_step = (
+            lambda hidden, positions, tables, depth, allocations, reference_plan=None: (
+                hidden if depth < 1 else hidden @ self.M
+            )
         )
         runner._coda = lambda hidden: hidden @ self.W
         self.runner = runner
 
-    def run(self, specs):
+    def run(self, specs, *, leases=None):
         """specs: (SamplingParams, token_count, input_token, position) per item."""
         runner = self.runner
         items = []
@@ -234,7 +236,7 @@ class Harness:
         starts, tokens, hidden_blocks, q = runner._draft(plan, tables, None, u)
         target, p = runner._verify(plan, starts, hidden_blocks, tables, None)
         count = runner._accept_and_update_state(
-            plan, states, starts, tokens, target, buffer, u=u, q=q, p=p
+            plan, states, starts, tokens, target, buffer, u=u, q=q, p=p, leases=leases
         )
         return SimpleNamespace(
             plan=plan, u=u, tokens=tokens, target=target, count=count, buffer=buffer, q=q, p=p
@@ -395,3 +397,16 @@ def test_numerical_failure_keeps_old_slot_and_flags_only_that_request(monkeypatc
     assert result[count + 2 * n : count + 3 * n].tolist() == [1, 0, 0]
     assert h.runner.slot_values[0].tolist() == [7, 10]  # not advanced
     assert h.runner.slot_values[1, 1].item() > 20 and h.runner.slot_values[2, 1].item() > 30
+
+
+def test_sparse_reference_retirement_uses_final_acceptance(monkeypatch):
+    harness = Harness(monkeypatch, 123)
+    recorded = []
+    harness.runner.reference_store = SimpleNamespace(
+        accept=lambda leases, counts: recorded.append((leases, counts.clone()))
+    )
+    leases = (object(), object())
+    result = harness.run([(params(1.0), 4, 2, 7), (params(), 3, 4, 10)], leases=leases)
+    assert len(recorded) == 1
+    assert recorded[0][0] == leases
+    assert torch.equal(recorded[0][1], result.buffer.result[result.count : result.count + 2])

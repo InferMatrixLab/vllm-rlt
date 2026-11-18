@@ -5,6 +5,7 @@ from vllm_rlt.config import (
     ExecutionConfig,
     ExitConfig,
     SchedulerConfig,
+    SparseDecodeAttentionConfig,
     SpeculativeConfig,
 )
 from vllm_rlt.entrypoints.llm import LLM
@@ -19,6 +20,7 @@ __all__ = [
     "ExecutionConfig",
     "ExitConfig",
     "SchedulerConfig",
+    "SparseDecodeAttentionConfig",
     "SpeculativeConfig",
     "SamplingParams",
     "RequestOutput",

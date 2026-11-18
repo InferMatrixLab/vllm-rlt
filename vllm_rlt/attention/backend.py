@@ -31,6 +31,8 @@ class BackendCapabilities:
     fp8_kv_static: bool = False
     # Consume GPU-owned context lengths without a host read between submissions.
     device_context_lengths: bool = False
+    # Shared paged sparse-reference capture/correction dispatch is available.
+    sparse_decode: bool = False
     # Mask keys outside a per-layer sliding window (not storage reclamation).
     sliding_window: bool = False
     packed_sliding_window: bool = False
@@ -64,11 +66,14 @@ class AttentionBackend:
         return getattr(self.kernel, "generation", None)
 
 
-_TORCH_CAPABILITIES = BackendCapabilities(fp8_kv=True, fp8_kv_static=True, sliding_window=True)
+_TORCH_CAPABILITIES = BackendCapabilities(
+    sparse_decode=True, fp8_kv=True, fp8_kv_static=True, sliding_window=True
+)
 _TRITON_CAPABILITIES = BackendCapabilities(
     cuda_graphs=True,
     async_scheduling=True,
     device_context_lengths=True,
+    sparse_decode=True,
     fp8_kv=True,
     fp8_kv_static=True,
     sliding_window=True,
@@ -207,6 +212,7 @@ def create_backend(
                     "cuda_graphs",
                     "async_scheduling",
                     "device_context_lengths",
+                    "sparse_decode",
                     "fp8_kv",
                     "fp8_kv_static",
                     "sliding_window",

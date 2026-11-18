@@ -80,9 +80,9 @@ def test_round_layouts_align_partial_coda_rows_and_upload_once(monkeypatch):
 
         monkeypatch.setattr(buffer, "upload", counted)
 
-    def checked(batch):
+    def checked(batch, references=()):
         before = uploads.copy()
-        prepared = prepare(batch)
+        prepared = prepare(batch, references)
         assert all(uploads[dtype] == before[dtype] + 1 for dtype in uploads)
         for step in prepared.steps:
             recurrent = prepared.layouts[step.views[Operation.RECURRENT][0]]

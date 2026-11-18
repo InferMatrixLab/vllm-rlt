@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from vllm_rlt.attention.sparse import DENSE, reference_mode
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Operation, Request
 from vllm_rlt.worker.buffers import stage_metadata
@@ -128,6 +129,9 @@ class PipelineState:
     position: int
     tokens: list[PipelineToken]
     pending: bool = False
+    # Sparse decode: the request's reference slots and, per pipeline row, the
+    # index of the slot it reads inside that snapshot.
+    references: tuple | None = None
 
     def to(self, device):
         """Own hidden copies for suspension; never borrow graph/runner buffers."""
@@ -139,6 +143,9 @@ class PipelineState:
                 )
                 for token in self.tokens
             ],
+            references=None
+            if self.references is None
+            else (self.references[0].to(device), self.references[1]),
         )
 
 
@@ -194,6 +201,8 @@ class SpeculativeRunner:
         *,
         runtime=None,
         compute_stream=None,
+        reference_store=None,
+        sparse_decode=None,
     ):
         self.model, self.cache, self.config = model, cache, config
         self.boundary_kv = getattr(model, "requires_boundary_kv", False)
@@ -204,6 +213,9 @@ class SpeculativeRunner:
         self.pipeline_states: dict[str, PipelineState] = {}
         self.device = next(model.parameters()).device
         self.compute_stream = compute_stream
+        self.reference_store = reference_store
+        self.sparse_decode = sparse_decode
+        self.reference_generation = 0
         self.submissions = SubmissionQueue()
         self.input_buffers = {
             dtype: StagedInputTensor(dtype, self.device, use_uva=execution.use_uva)
@@ -223,6 +235,7 @@ class SpeculativeRunner:
         return (
             packed
             and not self.row_queries
+            and self.reference_store is None
             and capabilities.packed_prefill
             and capabilities.packed_matches_decode
         )
@@ -260,12 +273,14 @@ class SpeculativeRunner:
         indices = views.get(operation, ())
         return layouts[indices[0]] if indices else None
 
-    def _prepare_inputs(self, batch):
+    def _prepare_inputs(self, batch, references=()):
         """Plan every round input from one layout source, then upload once per dtype.
 
         The source covers all round rows (request order, then position) at
         every target depth. Each operation stages a row/depth selection of it;
         nothing is selected, uploaded or read back inside the execution loop.
+        With sparse decode, ``references`` holds each request's reserved slots;
+        recurrent layouts that read references get their plan after binding.
         """
         for buffer in self.input_buffers.values():
             buffer.reset()
@@ -302,13 +317,26 @@ class SpeculativeRunner:
         if self.boundary_kv:
             target_views[Operation.CODA] = self._view(source, None, (0,), layouts)
         uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
+        bound = [self.metadata.bind(metadata, uploaded) for _, metadata in layouts.values()]
+        if references:
+            # Draft step ``offset`` reads slot ``offset`` of each active request;
+            # verification reads every slot, request by request.
+            owners = [
+                [(references[i], offset) for i in step.requests]
+                for offset, step in enumerate(steps)
+            ]
+            owners.append([(lease, row) for lease in references for row in range(len(lease))])
+            views = [step.views[Operation.RECURRENT] for step in steps]
+            views.append(target_views[Operation.RECURRENT])
+            for indices, rows in zip(views, owners):
+                planned = self._reference_metadata([bound[index] for index in indices], rows)
+                for index, kv in zip(indices, planned):
+                    bound[index] = kv
         return PreparedRound(
             tokens=uploaded[tokens.dtype].as_strided(
                 tokens.shape, tokens.stride(), tokens.storage_offset()
             ),
-            layouts=tuple(
-                self.metadata.bind(metadata, uploaded) for _, metadata in layouts.values()
-            ),
+            layouts=tuple(bound),
             steps=tuple(steps),
             target=target_views,
         )
@@ -317,6 +345,20 @@ class SpeculativeRunner:
         return self.runtime.forward(
             ForwardBatch(Operation.PRELUDE, tokens=tokens, prelude_coda_kv_metadata=boundary)
         ).hidden
+
+    def _reference_metadata(self, layouts, owners):
+        result = []
+        for kv in layouts:
+            modes = [reference_mode(depth) for _, depth, _ in kv.rows]
+            if all(mode == DENSE for mode in modes):
+                result.append(kv)
+                continue
+            plan = self.reference_store.build_plan(
+                owners, modes, key_retention=self.sparse_decode.key_retention
+            )
+            self.reference_store.bind_positions(plan, kv.position_ids)
+            result.append(replace(kv, reference_plan=plan))
+        return tuple(result)
 
     def _recurrent(self, hidden, metadata):
         forward = ForwardBatch(
@@ -355,10 +397,32 @@ class SpeculativeRunner:
                 if self.compute_stream is not None
                 else nullcontext()
             ):
-                if self.config.mode == "pipeline":
-                    submission = self._submit_pipeline(batch)
-                else:
-                    submission = self._submit_round(batch, self._prepare_inputs(batch))
+                references = []
+                try:
+                    if self.reference_store is not None:
+                        self.reference_generation += 1
+                        for index, span in enumerate(batch.requests):
+                            references.append(
+                                self.reference_store.reserve(
+                                    span.request.request_id,
+                                    index,
+                                    span.token_count,
+                                    self.reference_generation,
+                                )
+                            )
+                    if self.config.mode == "pipeline":
+                        submission = self._submit_pipeline(batch)
+                    else:
+                        submission = self._submit_round(
+                            batch, self._prepare_inputs(batch, references)
+                        )
+                finally:
+                    if references:
+                        # Every candidate has finished its final recurrent read.
+                        # No reference survives this block round, including the
+                        # rejected suffix. Clear/reuse is ordered on core after
+                        # those readers, without waiting for host acceptance.
+                        self.reference_store.release(references)
                 self.submissions.complete(submission.event)
                 return submission
         except Exception:

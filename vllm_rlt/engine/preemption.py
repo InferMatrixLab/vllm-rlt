@@ -43,10 +43,18 @@ class PreemptionManager:
             pipeline = runner.snapshot_pipeline(victim, device)
         elif pipeline is not None:
             pipeline = pipeline.to(device)
+        # Sparse decode: a token past its reference loop owns a reference that
+        # its remaining loops read. It moves with the rest of the saved state.
+        references = previous.get("references") if previous is not None else None
+        if previous is None and e.reference_store is not None:
+            references = e.model_runner.snapshot_attention_reference(victim, device)
+        elif references is not None:
+            references = (references[0], references[1].to(device))
         # Build a new record before releasing resources. In particular, a failed
         # offload must leave the prior resident state available for resumption.
         snapshot = dict(
             pipeline=pipeline,
+            references=references,
             phase=phase,
             kv=cache.snapshot(victim.request_id) if offload_kv else None,
             hidden=None if hidden is None else hidden.to(device).clone(),
@@ -85,6 +93,8 @@ class PreemptionManager:
         )
         if self.engine.speculative_runner is not None:
             self.engine.speculative_runner.restore_pipeline(request, state.get("pipeline"))
+        if state.get("references") is not None:
+            self.engine.model_runner.restore_attention_reference(request, state["references"])
         # Resident copies completed before suspension released their runner slot.
         # Restored CPU buffers must be visible to every stream before resumption.
         if kv is not None and cache.device.type == "cuda":
