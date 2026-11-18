@@ -6,6 +6,9 @@ per (row, head, split) produces a partial softmax state and a second kernel
 merges the parts. A row's partition depends only on its own length, so its
 result does not depend on the batch it runs in. Without splitting, one long
 row serialized its whole context in one program and set the decode step time.
+
+FP8 e4m3 pools are read with one float32 scale per (block, token, KV head)
+vector; both kernels dequantize on load.
 """
 
 from functools import lru_cache, partial
@@ -33,6 +36,8 @@ def _paged_attention_kernel(
     PART_M,
     PART_L,
     PART_O,
+    KS,
+    VS,
     q_batch_stride: tl.constexpr,
     q_head_stride: tl.constexpr,
     q_dim_stride: tl.constexpr,
@@ -45,6 +50,10 @@ def _paged_attention_kernel(
     v_head_stride: tl.constexpr,
     v_dim_stride: tl.constexpr,
     table_stride: tl.constexpr,
+    s_block_stride: tl.constexpr,
+    s_token_stride: tl.constexpr,
+    s_head_stride: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HEAD_GROUPS: tl.constexpr,
     NUM_HEADS: tl.constexpr,
@@ -88,29 +97,40 @@ def _paged_attention_kernel(
         # Physical IDs fit in int32, but ID * block_stride can exceed 2**31
         # elements in a large KV pool. Promote BEFORE multiplying, for K and V.
         offsets = positions % PAGE_SIZE
-        keys = tl.load(
+        kv_mask = valid_tokens[:, None] & (dims[None, :] < HEAD_DIM)
+        key_pointers = (
             K
             + blocks[:, None] * k_block_stride
             + offsets[:, None] * k_token_stride
             + kv_head * k_head_stride
-            + dims[None, :] * k_dim_stride,
-            mask=valid_tokens[:, None] & (dims[None, :] < HEAD_DIM),
-            other=0,
-        ).to(tl.float32)
+            + dims[None, :] * k_dim_stride
+        )
+        if HAS_SCALE:
+            # An integer fill value cannot be cast to fp8: zero masked lanes after widening.
+            scale_offsets = (
+                blocks * s_block_stride + offsets * s_token_stride + kv_head * s_head_stride
+            )
+            keys = tl.where(kv_mask, tl.load(key_pointers, mask=kv_mask).to(tl.float32), 0.0)
+            keys = keys * tl.load(KS + scale_offsets, mask=valid_tokens, other=0.0)[:, None]
+        else:
+            keys = tl.load(key_pointers, mask=kv_mask, other=0).to(tl.float32)
         scores = tl.sum(keys * query[None, :], axis=1) * SCALE
         scores = tl.where(valid_tokens, scores, -float("inf"))
         next_maximum = tl.maximum(maximum, tl.max(scores, axis=0))
         correction = tl.exp(maximum - next_maximum)
         weights = tl.exp(scores - next_maximum)
-        values = tl.load(
+        value_pointers = (
             V
             + blocks[:, None] * v_block_stride
             + offsets[:, None] * v_token_stride
             + kv_head * v_head_stride
-            + dims[None, :] * v_dim_stride,
-            mask=valid_tokens[:, None] & (dims[None, :] < HEAD_DIM),
-            other=0,
-        ).to(tl.float32)
+            + dims[None, :] * v_dim_stride
+        )
+        if HAS_SCALE:
+            values = tl.where(kv_mask, tl.load(value_pointers, mask=kv_mask).to(tl.float32), 0.0)
+            values = values * tl.load(VS + scale_offsets, mask=valid_tokens, other=0.0)[:, None]
+        else:
+            values = tl.load(value_pointers, mask=kv_mask, other=0).to(tl.float32)
         accumulator = accumulator * correction + tl.sum(weights[:, None] * values, axis=0)
         normalizer = normalizer * correction + tl.sum(weights, axis=0)
         maximum = next_maximum
@@ -153,7 +173,16 @@ def _paged_attention_merge_kernel(
     )
 
 
-def paged_attention(q, key_cache, value_cache, block_tables, context_lengths, window=0):
+def paged_attention(
+    q,
+    key_cache,
+    value_cache,
+    block_tables,
+    context_lengths,
+    key_scale=None,
+    value_scale=None,
+    window=0,
+):
     """Launch split-KV parts over [row, head, split], then merge per [row, head].
 
     ``window`` masks each row to its last ``window`` keys (0 keeps the full
@@ -164,6 +193,11 @@ def paged_attention(q, key_cache, value_cache, block_tables, context_lengths, wi
     output = torch.empty_like(q)
     if q.shape[0] == 0:
         return output
+    has_scale = key_scale is not None
+    # Unused pointer arguments when the pool is not quantized.
+    key_scale = key_scale if has_scale else context_lengths
+    value_scale = value_scale if has_scale else context_lengths
+    scale_strides = key_scale.stride() if has_scale else (0, 0, 0)
     rows, heads = q.shape[0], q.shape[1]
     block_d = triton.next_power_of_2(q.shape[-1])
     part_m = torch.empty((rows, heads, NUM_SPLITS), device=q.device, dtype=torch.float32)
@@ -178,10 +212,14 @@ def paged_attention(q, key_cache, value_cache, block_tables, context_lengths, wi
         part_m,
         part_l,
         part_o,
+        key_scale,
+        value_scale,
         *q.stride(),
         *key_cache.stride(),
         *value_cache.stride(),
         block_tables.stride(0),
+        *scale_strides,
+        HAS_SCALE=has_scale,
         HEAD_DIM=q.shape[-1],
         HEAD_GROUPS=heads // key_cache.shape[2],
         NUM_HEADS=heads,
@@ -217,6 +255,8 @@ def _paged_prefill_kernel(
     LENGTHS,
     CU_Q,
     OUT,
+    KS,
+    VS,
     q_token_stride,
     q_head_stride,
     k_block_stride,
@@ -228,6 +268,10 @@ def _paged_prefill_kernel(
     table_stride,
     out_token_stride,
     out_head_stride,
+    s_block_stride,
+    s_token_stride,
+    s_head_stride,
+    HAS_SCALE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HEAD_GROUPS: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -277,15 +321,25 @@ def _paged_prefill_kernel(
             TABLES + seq * table_stride + keys_pos // PAGE_SIZE, mask=key_valid, other=0
         ).to(tl.int64)
         offsets = keys_pos % PAGE_SIZE
-        keys = tl.load(
+        kv_mask = key_valid[:, None] & dim_valid[None, :]
+        key_pointers = (
             K
             + blocks[:, None] * k_block_stride
             + offsets[:, None] * k_token_stride
             + kv_head * k_head_stride
-            + dims[None, :],
-            mask=key_valid[:, None] & dim_valid[None, :],
-            other=0.0,
+            + dims[None, :]
         )
+        if HAS_SCALE:
+            # Dequantize to the query dtype for tl.dot. Masked lanes are zeroed
+            # after widening: an unfilled fp8 lane may hold a NaN code.
+            scale_offsets = (
+                blocks * s_block_stride + offsets * s_token_stride + kv_head * s_head_stride
+            )
+            keys = tl.where(kv_mask, tl.load(key_pointers, mask=kv_mask).to(tl.float32), 0.0)
+            keys = keys * tl.load(KS + scale_offsets, mask=key_valid, other=0.0)[:, None]
+            keys = keys.to(Q.dtype.element_ty)
+        else:
+            keys = tl.load(key_pointers, mask=kv_mask, other=0.0)
         scores = tl.dot(query, tl.trans(keys), input_precision=PRECISION) * SCALE
         visible = key_valid[None, :] & (keys_pos[None, :] <= positions[:, None])
         if WINDOW:
@@ -296,15 +350,19 @@ def _paged_prefill_kernel(
         safe = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
         correction = tl.exp(maximum - safe)
         weights = tl.exp(scores - safe[:, None])
-        values = tl.load(
+        value_pointers = (
             V
             + blocks[:, None] * v_block_stride
             + offsets[:, None] * v_token_stride
             + kv_head * v_head_stride
-            + dims[None, :],
-            mask=key_valid[:, None] & dim_valid[None, :],
-            other=0.0,
+            + dims[None, :]
         )
+        if HAS_SCALE:
+            values = tl.where(kv_mask, tl.load(value_pointers, mask=kv_mask).to(tl.float32), 0.0)
+            values = values * tl.load(VS + scale_offsets, mask=key_valid, other=0.0)[:, None]
+            values = values.to(Q.dtype.element_ty)
+        else:
+            values = tl.load(value_pointers, mask=kv_mask, other=0.0)
         rounded = weights.to(values.dtype)
         partial = tl.dot(rounded, values, input_precision=PRECISION)
         if COMPENSATE:
@@ -333,6 +391,8 @@ def paged_prefill_attention(
     context_lengths,
     cu_seqlens_q,
     max_seqlen_q,
+    key_scale=None,
+    value_scale=None,
     *,
     window=0,
     compensate=False,
@@ -343,6 +403,7 @@ def paged_prefill_attention(
     cu_seqlens_q[s]:cu_seqlens_q[s + 1] and keys [0, context_lengths[s]) through
     block_tables[s]. Query i of a sequence sits at position
     context_length - query_length + i and attends keys up to that position.
+    FP8 pools pass per-vector scales [physical block, token, KV head].
     """
     output = torch.empty_like(q)
     sequences = block_tables.shape[0]
@@ -364,6 +425,8 @@ def paged_prefill_attention(
         cu_seqlens_q,
         output,
         max_seqlen_q,
+        key_scale=key_scale,
+        value_scale=value_scale,
         window=window,
         compensate=compensate,
     )
@@ -382,6 +445,8 @@ def _launch_paged_prefill(
     *,
     window,
     compensate,
+    key_scale=None,
+    value_scale=None,
     compile_only=False,
 ):
     block_m, block_n = _PACKED_WINDOW_TILE if compensate else (64, 64)
@@ -392,6 +457,11 @@ def _launch_paged_prefill(
         if compile_only
         else _paged_prefill_kernel[grid]
     )
+    has_scale = key_scale is not None
+    # Unused pointer arguments when the pool is not quantized.
+    key_scale = key_scale if has_scale else context_lengths
+    value_scale = value_scale if has_scale else context_lengths
+    scale_strides = key_scale.stride() if has_scale else (0, 0, 0)
     return launch(
         q,
         key_cache,
@@ -400,6 +470,8 @@ def _launch_paged_prefill(
         context_lengths,
         cu_seqlens_q,
         output,
+        key_scale,
+        value_scale,
         q.stride(0),
         q.stride(1),
         key_cache.stride(0),
@@ -411,6 +483,8 @@ def _launch_paged_prefill(
         block_tables.stride(0),
         output.stride(0),
         output.stride(1),
+        *scale_strides,
+        HAS_SCALE=has_scale,
         HEAD_DIM=q.shape[-1],
         HEAD_GROUPS=q.shape[1] // key_cache.shape[2],
         PAGE_SIZE=key_cache.shape[1],
@@ -425,6 +499,127 @@ def _launch_paged_prefill(
         max_q_blocks=q_blocks,
         num_warps=4,
         num_stages=1 if compensate else 2,
+    )
+
+
+@triton.jit
+def _fp8_store_kernel(
+    K,
+    V,
+    K_CODES,
+    V_CODES,
+    K_SCALES,
+    V_SCALES,
+    BLOCKS,
+    OFFSETS,
+    ACTIVE,
+    MASK,
+    k_row_stride,
+    k_head_stride,
+    v_row_stride,
+    v_head_stride,
+    c_block_stride,
+    c_token_stride,
+    c_head_stride,
+    s_block_stride,
+    s_token_stride,
+    s_head_stride,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    INV_FP8_MAX: tl.constexpr,
+    TINY: tl.constexpr,
+    FIXED_SCALE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    # Optional device-side row skipping: rows at or past *ACTIVE (bucketed graph
+    # padding) and rows whose MASK entry is false write neither codes nor scales.
+    enabled = row >= 0
+    if ACTIVE is not None:
+        enabled = enabled & (row < tl.load(ACTIVE))
+    if MASK is not None:
+        enabled = enabled & tl.load(MASK + row)
+    if enabled:
+        dims = tl.arange(0, BLOCK_D)
+        valid = dims < HEAD_DIM
+        block = tl.load(BLOCKS + row).to(tl.int64)
+        offset = tl.load(OFFSETS + row).to(tl.int64)
+        codes_at = block * c_block_stride + offset * c_token_stride + head * c_head_stride + dims
+        scale_at = block * s_block_stride + offset * s_token_stride + head * s_head_stride
+        # The same float32 operations as kv_cache_manager.quantize_fp8, in the same order.
+        k = tl.load(K + row * k_row_stride + head * k_head_stride + dims, mask=valid, other=0.0)
+        k = k.to(tl.float32)
+        if FIXED_SCALE is None:
+            k_scale = tl.maximum(tl.max(tl.abs(k), axis=0) * INV_FP8_MAX, TINY)
+        else:
+            k_scale = tl.full((), FIXED_SCALE, tl.float32)
+        k_codes = tl.minimum(tl.maximum(tl.div_rn(k, k_scale), -FP8_MAX), FP8_MAX)
+        tl.store(K_CODES + codes_at, k_codes.to(K_CODES.dtype.element_ty), mask=valid)
+        tl.store(K_SCALES + scale_at, k_scale)
+        v = tl.load(V + row * v_row_stride + head * v_head_stride + dims, mask=valid, other=0.0)
+        v = v.to(tl.float32)
+        if FIXED_SCALE is None:
+            v_scale = tl.maximum(tl.max(tl.abs(v), axis=0) * INV_FP8_MAX, TINY)
+        else:
+            v_scale = tl.full((), FIXED_SCALE, tl.float32)
+        v_codes = tl.minimum(tl.maximum(tl.div_rn(v, v_scale), -FP8_MAX), FP8_MAX)
+        tl.store(V_CODES + codes_at, v_codes.to(V_CODES.dtype.element_ty), mask=valid)
+        tl.store(V_SCALES + scale_at, v_scale)
+
+
+def store_fp8(
+    k,
+    v,
+    key_codes,
+    value_codes,
+    key_scale,
+    value_scale,
+    blocks,
+    offsets,
+    fp8_max,
+    *,
+    mask=None,
+    active=None,
+    fixed_scale=None,
+):
+    """Quantize rows k, v [row, KV head, dim] and scatter codes and scales in one launch.
+
+    Row i goes to (blocks[i], offsets[i]) of one layer's code pools
+    [physical block, token, KV head, dim] and scale pools [physical block, token, KV head].
+    Optional ``mask`` (bool [row]) and ``active`` (int32 scalar row count) skip rows
+    on the device, as the unquantized masked and graph KV writers do.
+    """
+    if k.shape[0] == 0:
+        return
+    k = k if k.stride(-1) == 1 else k.contiguous()
+    v = v if v.stride(-1) == 1 else v.contiguous()
+    if key_codes.stride() != value_codes.stride() or key_scale.stride() != value_scale.stride():
+        raise ValueError("FP8 key and value pools must share a layout")
+    _fp8_store_kernel[(k.shape[0], k.shape[1])](
+        k,
+        v,
+        key_codes,
+        value_codes,
+        key_scale,
+        value_scale,
+        blocks,
+        offsets,
+        active,
+        mask,
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        *key_codes.stride()[:3],
+        *key_scale.stride(),
+        HEAD_DIM=k.shape[-1],
+        BLOCK_D=triton.next_power_of_2(k.shape[-1]),
+        FP8_MAX=fp8_max,
+        INV_FP8_MAX=1.0 / fp8_max,
+        TINY=torch.finfo(torch.float32).tiny,
+        FIXED_SCALE=fixed_scale,
+        num_warps=1,
     )
 
 
@@ -443,7 +638,10 @@ def select_packed_window_tile(device, dtype, head_dim, block_size, shape):
 def _select_packed_window_tile(index, head_dim, block_size, shape):
     # Warmup only needs tensor metadata. Preserve the KV pool's interleaved layer strides.
     q = torch.empty((256, shape.query_heads, head_dim), device="meta", dtype=torch.bfloat16)
-    kv = q.new_empty((1, shape.kv_layers, block_size, shape.kv_heads, head_dim))[:, 0]
+    kv_shape = (1, shape.kv_layers, block_size, shape.kv_heads)
+    kv_dtype = torch.float8_e4m3fn if shape.fp8_kv else q.dtype
+    kv = q.new_empty((*kv_shape, head_dim), dtype=kv_dtype)[:, 0]
+    scale = q.new_empty(kv_shape, dtype=torch.float32)[:, 0] if shape.fp8_kv else None
     table = q.new_empty((1, 16), dtype=torch.int32)
     lengths = q.new_empty(1, dtype=torch.int32)
     offsets = q.new_empty(2, dtype=torch.int32)
@@ -463,6 +661,8 @@ def _select_packed_window_tile(index, head_dim, block_size, shape):
                     len(q),
                     window=window,
                     compensate=True,
+                    key_scale=scale,
+                    value_scale=scale,
                     compile_only=True,
                 )
                 if compiled.metadata.shared > limit:

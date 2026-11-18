@@ -139,6 +139,11 @@ Packed prefill uses `ExecutionConfig.packed_prefill` and the
 `--packed-prefill` / `--no-packed-prefill` flags. Input transfer is controlled
 independently by `use_uva`; see the [selection rules](docs/runtime.md#packed-prefill).
 
+FP8 KV defaults to per-vector scales on Torch/Triton. Experimental native FA4 FP8,
+including Dory sliding attention, uses `flash-attn-4==4.0.0b39` and calibrates
+a fixed scale at startup. See the
+[hardware and calibration requirements](docs/runtime.md#experimental-fa4-static-scale-adapter).
+
 ## Model Support
 
 

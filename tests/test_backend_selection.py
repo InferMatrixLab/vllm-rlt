@@ -17,7 +17,13 @@ from vllm_rlt.models import OuroForCausalLM
 def packages(monkeypatch):
     from vllm_rlt.kernels import flash_attention
 
-    installed = {"flash_attn", "flash_attn_3.flash_attn_interface", "flash_attn.cute", "triton"}
+    installed = {
+        "flash_attn",
+        "flash_attn_3.flash_attn_interface",
+        "flash_attn.cute",
+        "TensorwiseScales",
+        "triton",
+    }
     original_import = flash_attention.importlib.import_module
 
     def import_module(name):
@@ -28,14 +34,19 @@ def packages(monkeypatch):
         if name in ("flash_attn", "flash_attn_3.flash_attn_interface", "flash_attn.cute"):
             if name not in installed:
                 raise ImportError(f"{name} is not installed")
-            return SimpleNamespace(
+            result = SimpleNamespace(
                 flash_attn_with_kvcache=lambda *args, **kwargs: None,
                 flash_attn_varlen_func=lambda *args, **kwargs: None,
             )
+            if name == "flash_attn.cute" and "TensorwiseScales" in installed:
+                result.TensorwiseScales = SimpleNamespace
+            return result
         return original_import(name)
 
     monkeypatch.setattr(flash_attention.importlib, "import_module", import_module)
-    monkeypatch.setattr(flash_attention, "version", lambda name: "test")
+    monkeypatch.setattr(
+        flash_attention, "version", lambda name: "4.0.0b39" if name == "flash-attn-4" else "test"
+    )
     monkeypatch.setattr(torch.version, "hip", None)
     return installed
 
@@ -75,6 +86,94 @@ def test_sparse_auto_filters_flash_and_explicit_flash_fails(packages, monkeypatc
             16,
             required_capabilities=required,
         )
+
+
+@pytest.mark.parametrize(
+    "sm,dtype,head_dim,supported",
+    [
+        ((10, 3), torch.bfloat16, 128, True),
+        ((9, 0), torch.bfloat16, 128, False),
+        ((10, 3), torch.float16, 128, False),
+        ((10, 3), torch.bfloat16, 256, True),
+    ],
+)
+def test_fa4_static_fp8_selection(packages, monkeypatch, sm, dtype, head_dim, supported):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
+    args = ("flash_attn_4", torch.device("cuda"), dtype, head_dim, 16)
+    requirement = BackendCapabilities(fp8_kv_static=True)
+    if not supported:
+        with pytest.raises(ValueError, match="fp8_kv_static"):
+            create_backend(*args, required_capabilities=requirement)
+        return
+    selected = create_backend(*args, required_capabilities=requirement)
+    assert not selected.capabilities.packed_matches_decode
+    with pytest.raises(ValueError, match="fp8_kv"):
+        create_backend(*args, required_capabilities=BackendCapabilities(fp8_kv=True))
+    selected = create_backend("auto", *args[1:], required_capabilities=requirement)
+    assert selected.info["selected_backend"] == "flash_attn_4"
+
+
+def test_fa4_static_fp8_requires_public_scale_api(packages, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
+    packages.remove("TensorwiseScales")
+    args = ("flash_attn_4", torch.device("cuda"), torch.bfloat16, 128, 16)
+    assert create_backend(*args).info["selected_backend"] == "flash_attn_4"
+    with pytest.raises(ValueError, match="fp8_kv_static"):
+        create_backend(*args, required_capabilities=BackendCapabilities(fp8_kv_static=True))
+
+
+@pytest.mark.parametrize(
+    "name,sm,block_size",
+    [("flash_attn_2", (8, 9), 256), ("flash_attn_3", (9, 0), 16), ("flash_attn_4", (10, 3), 16)],
+)
+def test_flash_rejects_per_vector_fp8_without_staging(packages, monkeypatch, name, sm, block_size):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
+    with pytest.raises(ValueError, match="fp8_kv"):
+        create_backend(
+            name,
+            torch.device("cuda"),
+            torch.bfloat16,
+            128,
+            block_size,
+            required_capabilities=BackendCapabilities(fp8_kv=True),
+        )
+
+
+@pytest.mark.parametrize("calibrate", [False, True])
+def test_auto_static_fp8_keeps_graph_support_and_falls_back_if_scale_api_missing(
+    packages, monkeypatch, calibrate
+):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
+    args = ("auto", torch.device("cuda"), torch.bfloat16, 128, 16)
+    required = BackendCapabilities(fp8_kv=calibrate, fp8_kv_static=not calibrate, cuda_graphs=True)
+    options = dict(required_capabilities=required, allow_fp8_calibration=calibrate)
+    selected = create_backend(*args, **options)
+    assert selected.info["selected_backend"] == "flash_attn_4"
+    assert selected.capabilities.fp8_kv_static and selected.capabilities.cuda_graphs
+    assert not selected.capabilities.packed_matches_decode
+
+    packages.remove("TensorwiseScales")
+    selected = create_backend(*args, **options)
+    assert selected.info["selected_backend"] == "triton"
+    assert selected.capabilities.fp8_kv_static and selected.capabilities.cuda_graphs
+
+
+def test_dory_requirements_select_native_fa4_and_reject_old_hd256(packages, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
+    args = (torch.device("cuda"), torch.bfloat16, 256, 16)
+    required = BackendCapabilities(
+        sliding_window=True, fp8_kv_static=True, cuda_graphs=True, async_scheduling=True
+    )
+    selected = create_backend("auto", *args, required_capabilities=required)
+    assert selected.info["selected_backend"] == "flash_attn_4"
+    assert selected.capabilities.sliding_window
+    packages.remove("TensorwiseScales")
+    with pytest.raises(ValueError, match="sliding_window"):
+        create_backend("flash_attn_4", *args, required_capabilities=required)
+    assert (
+        create_backend("auto", *args, required_capabilities=required).info["selected_backend"]
+        == "triton"
+    )
 
 
 @pytest.mark.parametrize(
@@ -294,7 +393,15 @@ def test_cuda_engine_resolves_auto_before_profiling(packages, monkeypatch, execu
         pass
 
     def plan_cache(
-        model, cache, scheduler, execution, selected, *, speculative=None, staged_prefill=None
+        model,
+        cache,
+        scheduler,
+        execution,
+        selected,
+        *,
+        speculative=None,
+        staged_prefill=None,
+        fp8_scale=None,
     ):
         assert selected == "triton"  # FA2 cannot use the configured 16-token pages.
         assert staged_prefill is False

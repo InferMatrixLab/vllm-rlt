@@ -225,7 +225,7 @@ def test_context_bound_is_enforced_before_request_admission():
         e.close()
 
 
-@pytest.mark.parametrize("setting", ["graphs", "pipeline", "preemption", "shared"])
+@pytest.mark.parametrize("setting", ["graphs", "pipeline", "preemption", "shared", "fp8"])
 def test_unqualified_execution_modes_fail_explicitly(setting):
     options = {
         "graphs": dict(execution_config=ExecutionConfig(cuda_graphs=True)),
@@ -235,6 +235,9 @@ def test_unqualified_execution_modes_fail_explicitly(setting):
             scheduler_config=SchedulerConfig(enable_preemption=True),
         ),
         "shared": dict(cache_config=CacheConfig(512, 2, layout="shared")),
+        "fp8": dict(
+            cache_config=CacheConfig(512, 2, incremental_allocation=True, kv_cache_dtype="fp8_e4m3")
+        ),
     }[setting]
     with pytest.raises(ValueError, match="sparse decode attention"):
         engine(**options)
