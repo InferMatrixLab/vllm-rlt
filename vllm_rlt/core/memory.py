@@ -19,6 +19,83 @@ def budget_blocks(available_bytes, bytes_per_block):
     return blocks
 
 
+def measurement_budget(report):
+    """Driver free/total bytes and coverage gaps from a startup preparation report.
+
+    ``report`` is step 1 of RFC #192 (``StageEngine.prepare_runtime``): boundary
+    samples taken after draining, with the allocator cache retained. Only the
+    last sample sizes capacity, because it is the state after warmup and capture.
+    """
+    if not report:
+        raise ValueError("a measured KV plan requires a startup preparation report")
+    phases = report.get("phases") or ()
+    if not phases:
+        raise ValueError("the startup report contains no phase samples")
+    final = phases[-1]
+    free, total = final.get("driver_free_bytes"), final.get("device_total_bytes")
+    if type(free) is not int or type(total) is not int or total <= 0 or free < 0:
+        raise ValueError("the final startup phase lacks valid driver free/total bytes")
+    return free, total, tuple(report.get("coverage_gaps") or ())
+
+
+def measured_kv_capacity(
+    *,
+    report,
+    bytes_per_block,
+    useful_blocks,
+    gpu_memory_utilization,
+    transient_bytes,
+    safety_bytes,
+):
+    """Blocks to commit after warmup and capture, with every margin recorded.
+
+    The physical budget is the driver's remaining memory, which already excludes
+    weights, execution buffers, captured graphs and any live mapping, so none of
+    them is subtracted a second time. ``transient_bytes`` covers execution above
+    that persistent baseline and ``safety_bytes`` the fixed reserve.
+    """
+    for name, value in (
+        ("bytes_per_block", bytes_per_block),
+        ("useful_blocks", useful_blocks),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    for name, value in (
+        ("transient_bytes", transient_bytes),
+        ("safety_bytes", safety_bytes),
+    ):
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if not 0 < gpu_memory_utilization <= 1:
+        raise ValueError("gpu_memory_utilization must be in (0, 1]")
+    free, total, gaps = measurement_budget(report)
+    resident = total - free
+    # What the utilization cap still allows, bounded by measured free memory.
+    remaining = min(free, int(total * gpu_memory_utilization) - resident)
+    budget = remaining - transient_bytes - safety_bytes
+    if budget < bytes_per_block:
+        raise ValueError(
+            "no KV capacity fits the measured budget: "
+            f"remaining={remaining} transient={transient_bytes} "
+            f"safety={safety_bytes} block={bytes_per_block}"
+        )
+    blocks = min(budget // bytes_per_block, useful_blocks)
+    return blocks, dict(
+        source="measured_warmup",
+        bytes_per_block=bytes_per_block,
+        driver_free_bytes=free,
+        device_total_bytes=total,
+        resident_bytes=resident,
+        utilization_cap_bytes=int(total * gpu_memory_utilization),
+        remaining_instance_bytes=remaining,
+        transient_bytes=transient_bytes,
+        safety_bytes=safety_bytes,
+        kv_budget_bytes=budget,
+        max_useful_blocks=useful_blocks,
+        coverage_gaps=gaps,
+    )
+
+
 def graph_memory_reserve(model, scheduler, execution, speculative=None):
     """Headroom per pool plus retained speculative coda logits across all entries.
 
