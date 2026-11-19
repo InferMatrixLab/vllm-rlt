@@ -1,4 +1,4 @@
-"""Assigned-device regressions for native KV copies and descriptor lifetime."""
+"""Paged KV writes and descriptor lifetime on an assigned Ascend device."""
 
 import pytest
 import torch
@@ -12,19 +12,9 @@ pytestmark = pytest.mark.npu
 @pytest.mark.parametrize("rows", [1, 3])
 @pytest.mark.parametrize("backend", ["torch", "ascend_eager"])
 @torch.inference_mode()
-def test_native_scatter_preserves_inputs_other_layers_and_reused_ids(rows, backend, monkeypatch):
+def test_paged_kv_writes_preserve_inputs_layers_and_reused_ids(rows, backend):
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
-    import torch_npu
-
-    native = torch_npu.npu_scatter_nd_update_
-    calls = []
-
-    def observed(*args, **kwargs):
-        calls.append(True)
-        return native(*args, **kwargs)
-
-    monkeypatch.setattr(torch_npu, "npu_scatter_nd_update_", observed)
     cache = KVCacheManager(
         2, 2, 64, 32, 16, 4, device=device, dtype=torch.bfloat16, backend=backend
     )
@@ -62,4 +52,3 @@ def test_native_scatter_preserves_inputs_other_layers_and_reused_ids(rows, backe
     cache.free("b")
     assert cache.num_used_blocks == 0
     torch.npu.synchronize()
-    assert len(calls) == (6 if backend == "ascend_eager" else 0)

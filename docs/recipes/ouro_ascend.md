@@ -59,11 +59,12 @@ curl --fail http://127.0.0.1:8123/v1/completions \
   so the scheduler can select a new batch at each boundary.
 - **Reuse and batching.** Ascend uses the shared packed-prefill metadata by
   default with `ascend_eager`. Use `--no-packed-prefill` to select the per-query
-  layout. Greedy sampling, compatible prefill and paged KV write indices are
-  batched. Full prefill uses causal SDPA.
+  layout. Greedy sampling and compatible prefill are batched. Full prefill
+  uses causal SDPA.
   Cached chunks and ragged decode pass boolean masks to preserve each row's
   visible KV range.
-- **Paged KV.** Each loop writes to the page pool using its own block table.
+- **Paged KV.** Each loop writes to the page pool through PyTorch indexed
+  assignment using its own block table.
   The Ascend backend gathers the visible KV rows for Torch SDPA.
 
 The example uses private, fully reserved `last_exited` KV. Keep graphs,

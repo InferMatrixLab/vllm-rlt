@@ -876,21 +876,7 @@ class KVCacheManager:
         rows = len(batch.rows)
         if not rows:
             return
-        if self.device.type == "npu" and self.backend == "ascend_eager":
-            if not hasattr(self, "_npu_writer"):
-                from vllm_rlt.kernels.ascend_kv import AscendKVWriter
-
-                self._npu_writer = AscendKVWriter()
-            self._npu_writer.write(
-                self.key_cache,
-                self.value_cache,
-                layer,
-                batch,
-                k if len(k) == rows else k[:rows],
-                v if len(v) == rows else v[:rows],
-            )
-        else:
-            self._store_layer(layer, batch.write_blocks, batch.write_offsets, k[:rows], v[:rows])
+        self._store_layer(layer, batch.write_blocks, batch.write_offsets, k[:rows], v[:rows])
         if coverage is None:
             for allocation, depth, position in batch.rows:
                 allocation.written[self._plane(depth)][layer].add(position)
