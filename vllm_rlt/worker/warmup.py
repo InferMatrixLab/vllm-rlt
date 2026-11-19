@@ -54,6 +54,7 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
     queries, hits = cache.prefix_queries, cache.prefix_hits
     devices = [runner.device.index] if runner.device.type == "cuda" else []
     gaps = []
+    decode_workloads = set()
     extra = 2 + (2 * (speculation.config.num_speculative_tokens + 1) if speculation else 0)
     capacity = min(
         config.max_position_embeddings, cache.num_blocks // cache.storage_depths * cache.block_size
@@ -194,6 +195,7 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
                     )
                     execute(Operation.CODA, spans[:-1])
                     tickets[-1].collect()
+                    decode_workloads.add((1, length))
                 return
             output = execute(Operation.CODA, spans)
             for request, token in zip(requests, output.token_ids):
@@ -215,6 +217,7 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
                 output = execute(Operation.CODA, [StateSpan(r, position, 1, 0) for r in requests])
                 for request, token in zip(requests, output.token_ids):
                     request.generated_token_ids.append(token)
+                decode_workloads.add((count, position))
             if speculation is not None:
                 width = min(
                     speculation.config.num_speculative_tokens + 1,
@@ -347,7 +350,12 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
                 buffers.imports.clear()
     if owners:
         gaps.append("unplanned exact graph shapes retain bounded lazy capture and graph reserve")
-    gaps.append("contexts beyond the reported history retain the estimated transient reserve")
+    gaps.append(
+        "contexts and batch/history combinations beyond the reported workloads "
+        "retain the estimated transient reserve"
+    )
+    if speculation is not None and speculation.config.mode == "block":
+        gaps.append("random block speculation retains the estimated transient reserve")
     if runner.execution_config.async_scheduling and speculation is not None:
         gaps.append("mixed speculative/prompt overlap retains the estimated transient reserve")
     return dict(
@@ -355,6 +363,10 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
         decode_batches=sizes,
         history_tokens=history,
         decode_history_tokens=batch_history,
+        decode_workloads=tuple(
+            dict(batch_size=count, history_tokens=position)
+            for count, position in sorted(decode_workloads)
+        ),
         concurrent_batches=concurrent_batches,
         graph_coverage=coverage,
         coverage_gaps=tuple(dict.fromkeys(gaps)),

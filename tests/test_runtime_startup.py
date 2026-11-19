@@ -89,6 +89,89 @@ def test_small_kv_capacity_reports_reduced_coverage():
     assert engine.cache_manager.num_used_blocks == 0
 
 
+@pytest.mark.parametrize("blocks,staged", [(64, False), (64, True), (8, False), (4, False)])
+def test_warmup_reports_completed_decode_batch_history_pairs(blocks, staged, monkeypatch):
+    from vllm_rlt.request import Operation
+    from vllm_rlt.worker.warmup import prepare_runner
+
+    engine = make_engine(blocks=blocks, staged=staged)
+    runner = engine.model_runner
+    submit = runner.submit
+    observed = set()
+
+    def observe(*args, batch):
+        ticket = submit(*args, batch=batch)
+        if batch.operation == Operation.RECURRENT and batch.emit_gate:
+            observed.add((len(batch.spans), batch.spans[0].token_start))
+        return ticket
+
+    monkeypatch.setattr(runner, "submit", observe)
+    report = prepare_runner(runner, engine.scheduler.config)
+    assert {
+        (workload["batch_size"], workload["history_tokens"])
+        for workload in report["decode_workloads"]
+    } == observed
+    assert any("batch/history combinations" in gap for gap in report["coverage_gaps"])
+    assert not engine.cache_manager._allocations and not engine.rng.generators
+    engine.close()
+
+
+@pytest.mark.parametrize("mode", ["block", "pipeline"])
+@pytest.mark.parametrize(
+    "device,asynchronous",
+    [
+        ("cpu", False),
+        pytest.param("cuda", False, marks=pytest.mark.gpu),
+        pytest.param("cuda", True, marks=pytest.mark.gpu),
+    ],
+)
+def test_warmup_reports_unmeasured_random_block_speculation(
+    mode, device, asynchronous, monkeypatch
+):
+    from vllm_rlt import SpeculativeConfig
+    from vllm_rlt.worker.warmup import prepare_runner
+
+    engine = StageEngine(
+        OuroForCausalLM(tiny_ouro_config(head_dim=64)).to(device),
+        attention_backend="triton" if device == "cuda" else "torch",
+        cache_config=CacheConfig(128, 2),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=3, max_num_batched_tokens=8, prefill_chunk_size=4
+        ),
+        speculative_config=SpeculativeConfig(2, mode=mode),
+        execution_config=ExecutionConfig(
+            cuda_graphs=device == "cuda", async_scheduling=asynchronous
+        ),
+        _defer_runtime_preparation=True,
+    )
+    speculation = engine.speculative_runner
+    submit = speculation.submit
+    temperatures = []
+
+    def observe(batch):
+        temperatures.extend(span.request.sampling_params.temperature for span in batch.requests)
+        return submit(batch)
+
+    monkeypatch.setattr(speculation, "submit", observe)
+    report = prepare_runner(engine.model_runner, engine.scheduler.config, speculation)
+    assert temperatures and all(temperature == 0 for temperature in temperatures)
+    assert any("random block speculation" in gap for gap in report["coverage_gaps"]) == (
+        mode == "block"
+    )
+    assert not engine.cache_manager._allocations and not engine.rng.generators
+
+    if mode == "block":
+        engine.add_request(
+            "sampled",
+            [1, 2, 3],
+            SamplingParams(max_tokens=6, ignore_eos=True, seed=42, temperature=0.8),
+        )
+        while engine.has_unfinished_requests():
+            engine.step()
+        assert any(temperature > 0 for temperature in temperatures)
+    engine.close()
+
+
 def test_warmup_populates_history_across_sliding_window(monkeypatch):
     from tests.test_dory import tiny_dory_config
     from vllm_rlt.models import DoryForCausalLM
@@ -220,11 +303,14 @@ def test_async_startup_submits_independent_streams_before_collect(staged, monkey
     pending = []
     pairs = []
     decode_pairs = []
+    decode_workloads = set()
     submit, collect = engine.model_runner.submit, Submission.collect
 
     def submitted(*args, batch):
         ids = {span.request.request_id for span in batch.spans}
         ticket = submit(*args, batch=batch)
+        if batch.operation == Operation.RECURRENT and batch.emit_gate:
+            decode_workloads.add((len(batch.spans), batch.spans[0].token_start))
         if batch.operation == Operation.CODA:
             pairs.extend(
                 (other, ticket)
@@ -254,6 +340,10 @@ def test_async_startup_submits_independent_streams_before_collect(staged, monkey
     try:
         report = engine.prepare_runtime()
         assert pairs and decode_pairs
+        assert {
+            (workload["batch_size"], workload["history_tokens"])
+            for workload in report["decode_workloads"]
+        } == decode_workloads
         assert report["concurrent_batches"] == (1, 2)
         assert "concurrent" in [phase["name"] for phase in report["phases"]]
         assert not engine.cache_manager._allocations and not engine.rng.generators

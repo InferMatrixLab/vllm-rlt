@@ -103,7 +103,17 @@ device high-water mark. The report is published only after successful cleanup.
 
 Single-request history covers the configured prefill limit and crosses a sliding
 window when committed KV permits. Decode batch buckets also cross a KV page.
-Greedy and full-vocabulary top-p sampling use scratch request generators.
+`decode_workloads` pairs the `batch_size` and `history_tokens` of each completed
+recurrent decode traversal. History is the number of preceding tokens, excluding the
+decode input itself. Independent maximum batch and history fields do not imply
+that their combination was executed. Larger contexts and unreported batch/history
+combinations still need an estimated transient allowance, even when the KV pool
+could hold them.
+
+Greedy and full-vocabulary top-p sampling use scratch request generators. Block
+speculation is warmed with greedy requests; random block speculation retains its
+estimated transient allowance and is listed as a coverage gap. Pipeline speculation
+supports greedy requests only.
 Async multi-stream preparation additionally submits an independent prompt core
 and coda before collection, followed by a decode core/coda pair, within the
 request/token/KV limits. Its
