@@ -273,41 +273,18 @@ class KVCacheManager:
         self.backend = self.attention_info["selected_backend"]
         self._storage = storage
         self._watermark_ratio = watermark_ratio
-        if storage is not None and kv_cache_dtype != "auto":
-            raise ValueError("mapped KV storage does not carry FP8 scales yet")
-        capability = "fp8_kv" if fp8_scale is None else "fp8_kv_static"
-        if kv_cache_dtype != "auto" and not getattr(self.attention.capabilities, capability):
-            raise ValueError(
-                f"the {self.attention_info['backend']} backend does not read FP8 KV "
-                f"with {'per-vector' if fp8_scale is None else 'fixed'} scales"
-            )
-        shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
         if storage is None:
-            storage_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else dtype
-            self.key_cache = torch.empty(shape, device=self.device, dtype=storage_dtype)
-            self.value_cache = torch.empty_like(self.key_cache)
-            # One scale per stored vector; None for an unquantized pool.
-            self.key_scale = self.value_scale = None
-            if kv_cache_dtype == "fp8_e4m3":
-                # Imported fixed-scale pages use the same local scale as locally written pages.
-                scale = 1.0 if fp8_scale is None else fp8_scale
-                self.key_scale = torch.full(
-                    shape[:-1], scale, device=self.device, dtype=torch.float32
-                )
-                self.value_scale = torch.full_like(self.key_scale, scale)
-            # Keep the existing per-vector storage/lifecycle for this prototype. FA
-            # borrows the immutable scalar; Torch/Triton continue reading the scale pool.
-            self._fixed_scale = (
-                torch.tensor(fp8_scale, device=self.device, dtype=torch.float32)
-                if fp8_scale is not None
-                else None
+            self._open_torch_planes(
+                num_blocks=num_blocks,
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                kv_cache_dtype=kv_cache_dtype,
+                fp8_scale=fp8_scale,
             )
-            self.max_blocks = num_blocks
-            self.committed_blocks = num_blocks
         else:
-            self.key_cache, self.value_cache = self._attach_storage(storage, num_blocks)
-            self.key_scale = self.value_scale = None
-            self._fixed_scale = None
+            self._open_mapped_planes(storage, num_blocks)
         # Requests only ever receive published blocks, and publishing requires
         # committed physical memory, so published <= committed <= max holds.
         self.published_blocks = num_blocks
@@ -366,8 +343,55 @@ class KVCacheManager:
     def _watermark(self, blocks: int) -> int:
         return int(self._watermark_ratio * blocks) if self.incremental_allocation else 0
 
-    def _attach_storage(self, storage: KVCapacitySource, num_blocks: int):
-        """Take the K/V planes from a pre-reserved pool instead of allocating them."""
+    def _open_torch_planes(
+        self,
+        *,
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: str,
+        fp8_scale: float | None,
+    ) -> None:
+        """Allocate the K/V planes with the PyTorch allocator, including FP8 scales."""
+        capability = "fp8_kv" if fp8_scale is None else "fp8_kv_static"
+        if kv_cache_dtype != "auto" and not getattr(self.attention.capabilities, capability):
+            raise ValueError(
+                f"the {self.attention_info['backend']} backend does not read FP8 KV "
+                f"with {'per-vector' if fp8_scale is None else 'fixed'} scales"
+            )
+        shape = (num_blocks, self.num_layers, block_size, num_kv_heads, head_dim)
+        storage_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else dtype
+        self.key_cache = torch.empty(shape, device=self.device, dtype=storage_dtype)
+        self.value_cache = torch.empty_like(self.key_cache)
+        # One scale per stored vector; None for an unquantized pool.
+        self.key_scale = self.value_scale = None
+        if kv_cache_dtype == "fp8_e4m3":
+            # Imported fixed-scale pages use the same local scale as locally written pages.
+            scale = 1.0 if fp8_scale is None else fp8_scale
+            self.key_scale = torch.full(shape[:-1], scale, device=self.device, dtype=torch.float32)
+            self.value_scale = torch.full_like(self.key_scale, scale)
+        # Keep the existing per-vector storage/lifecycle for this prototype. FA
+        # borrows the immutable scalar; Torch/Triton continue reading the scale pool.
+        self._fixed_scale = (
+            torch.tensor(fp8_scale, device=self.device, dtype=torch.float32)
+            if fp8_scale is not None
+            else None
+        )
+        self.max_blocks = num_blocks
+        self.committed_blocks = num_blocks
+
+    def _open_mapped_planes(self, storage: KVCapacitySource, num_blocks: int) -> None:
+        """Bind the K/V planes to a pool that owns their physical mappings.
+
+        FP8 KV needs per-vector scales, which the pool does not carry yet, so it
+        is rejected here rather than writing unquantized bytes into a quantized
+        cache. Only the pool's backed blocks are exposed; publishing them is the
+        manager's decision, not the storage's.
+        """
+        if self.kv_cache_dtype != "auto":
+            raise ValueError("mapped KV storage does not carry FP8 scales yet")
         expected = kv_bytes_per_block(
             self.num_layers,
             self.block_size,
@@ -401,9 +425,11 @@ class KVCacheManager:
         for name, tensor in (("keys", keys), ("values", values)):
             if tensor.dtype != self.dtype or tuple(tensor.shape) != shape:
                 raise ValueError(f"storage {name} do not match the KV layout")
+        self.key_cache, self.value_cache = keys, values
+        self.key_scale = self.value_scale = None
+        self._fixed_scale = None
         self.max_blocks = storage.max_blocks
         self.committed_blocks = storage.committed_blocks
-        return keys, values
 
     def publish_capacity(self, blocks: int) -> int:
         """Grow the allocatable pool after the storage mapped more blocks.
