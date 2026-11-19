@@ -88,69 +88,6 @@ class AscendAttention:
         self.ragged_calls = 0
         self.fallback_calls = 0
         self.continuation_calls = 0
-        self._range_metadata = None
-        self._range_signature = None
-        self._range_mask = self._range_slots = None
-
-    def _prepare_ranges(self, q, batch):
-        ranges = batch.sequence_ranges
-        rows = len(ranges)
-        width, start = ranges[0].count, ranges[0].start
-        signature = (q.device, q.dtype, q.shape, self._stream_key(q.device))
-        if (
-            self._range_metadata is None
-            or self._range_metadata() is not batch
-            or self._range_signature != signature
-        ):
-            self._range_metadata = self._range_signature = None
-            self._range_slots = self._range_mask = None
-
-            def build():
-                positions = torch.arange(start + width, device=q.device)
-                return (positions[None, :] <= positions[start:, None],)
-
-            if start and width > 1:
-                self._range_mask = self._layout(
-                    ("range", q.device, signature[-1], start, width), build
-                )[0]
-            self._range_metadata = weakref.ref(batch)
-            self._range_signature = signature
-        return rows, width, start
-
-    def _range_attention(self, q, pair, geometry):
-        rows, width, start = geometry
-        key, value = pair
-        head_dim = q.shape[-1]
-        query = (
-            q.reshape(rows, q.shape[1], 1, head_dim)
-            if width == 1
-            else q.reshape(rows, width, q.shape[1], head_dim).transpose(1, 2)
-        )
-        output = _attend(query, key, value, self._range_mask, is_causal=start == 0 and width > 1)
-        if width == 1:
-            self.ragged_calls += 1
-            return output.squeeze(2)
-        self.batched_prefill_calls += 1
-        if start:
-            self.continuation_calls += 1
-        return output.transpose(1, 2).reshape_as(q)
-
-    def _attend_ranges(self, q, keys, values, batch):
-        geometry = self._prepare_ranges(q, batch)
-        rows, width, start = geometry
-        flat_rows = _flat_kv_rows(keys, values)
-        if flat_rows is None:
-            raise ValueError("compact Ascend ranges require regular paged KV storage")
-        flat_keys, flat_values, rows_per_block = flat_rows
-        if self._range_slots is None:
-            positions = torch.arange(start + width, device=q.device)
-            pages = positions // keys.shape[-3]
-            blocks = batch.block_tables[:, pages].to(torch.int64)
-            self._range_slots = (blocks * rows_per_block + positions % keys.shape[-3]).reshape(-1)
-        shape = (rows, start + width, keys.shape[-2], keys.shape[-1])
-        key = flat_keys.index_select(0, self._range_slots).reshape(shape).transpose(1, 2)
-        value = flat_values.index_select(0, self._range_slots).reshape(shape).transpose(1, 2)
-        return self._range_attention(q, (key, value), geometry)
 
     @staticmethod
     def _stream_key(device):
@@ -228,13 +165,13 @@ class AscendAttention:
         result[:rows].copy_(output)
         return result
 
-    def _plan(self, keys, lengths, device):
+    def _plan(self, sequence_keys, lengths, device, *, packed=False):
         grouped = {}
-        for row, (key, length) in enumerate(zip(keys, lengths, strict=True)):
+        for row, (key, length) in enumerate(zip(sequence_keys, lengths, strict=True)):
             if length:
                 grouped.setdefault(key, []).append(row)
         planned = []
-        for rows in grouped.values():
+        for sequence, rows in enumerate(grouped.values()):
             maximum = max(lengths[row] for row in rows)
             indices = torch.tensor(rows, dtype=torch.long, device=device)
             positions = torch.arange(maximum, device=device)
@@ -244,15 +181,18 @@ class AscendAttention:
             mask = (
                 positions[None, :] < row_lengths[:, None] if not initial and len(rows) > 1 else None
             )
-            planned.append((rows[0], indices, positions, mask, initial, row_lengths))
+            # Packed table rows follow sequence order. Query indices still
+            # address the flattened Q and output tensors.
+            table_row = sequence if packed else rows[0]
+            planned.append((table_row, indices, positions, mask, initial, row_lengths))
         return planned
 
     def _forward(self, q, keys, values, tables, groups, *, flat_rows=None, result=None):
         if result is None:
             result = torch.zeros_like(q)
         block_size = keys.shape[-3]
-        for first, indices, positions, mask, initial, _lengths in groups:
-            blocks = tables[first, positions // block_size]
+        for table_row, indices, positions, mask, initial, _lengths in groups:
+            blocks = tables[table_row, positions // block_size]
             offsets = positions % block_size
             if flat_rows is None:
                 k, v = keys[blocks, offsets], values[blocks, offsets]
@@ -306,7 +246,8 @@ class AscendAttention:
             positions = torch.arange(maximum, device=q.device)
             pages = positions // block_size
             offsets = positions % block_size
-            row_tables = tables.index_select(0, indices)
+            table_rows = torch.tensor([group[0] for group in groups], device=q.device)
+            row_tables = tables.index_select(0, table_rows)
             blocks = row_tables[:, pages].to(torch.int64)
             slots = (blocks * rows_per_block + offsets.to(torch.int64)).clamp(
                 0, flat_keys.shape[0] - 1
@@ -332,8 +273,7 @@ class AscendAttention:
         return self._forward(q, keys, values, tables, groups)
 
     def attend_metadata(self, q, keys, values, batch):
-        if batch.sequence_ranges is not None:
-            return self._attend_ranges(q, keys, values, batch)
+        packed = batch.cu_seqlens_q is not None
         flat_rows = _flat_kv_rows(keys, values)
         stream = self._stream_key(q.device)
         signature = (q.device, q.dtype, q.shape, keys.shape, keys.stride(), values.stride(), stream)
@@ -342,7 +282,7 @@ class AscendAttention:
             # pointing at partially replaced groups/addresses.
             self._metadata = None
             self._signature = None
-            self._geometry = _prefill_geometry(batch.rows)
+            self._geometry = _prefill_geometry(batch.rows) if len(q) == len(batch.rows) else None
             self._write_slots = None
             self._ragged_plan = None
             self._decode_plan = None
@@ -360,6 +300,7 @@ class AscendAttention:
                     [(id(allocation), depth) for allocation, depth, _ in batch.rows],
                     [position + 1 for _, _, position in batch.rows],
                     q.device,
+                    packed=packed,
                 )
             self._metadata = weakref.ref(batch)
             self._signature = signature

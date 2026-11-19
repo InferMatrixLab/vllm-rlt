@@ -138,6 +138,7 @@ def test_engine_matches_the_same_manual_prefill_chunks(chunk_size):
         ),
     )
     try:
+        assert engine.execution_config.packed_prefill
         engine.add_request(
             "engine",
             tokens,
@@ -196,7 +197,7 @@ def test_cached_continuation_passes_bool_mask_to_sdpa(device_name, monkeypatch):
 
 
 class _PreparedBatch:
-    sequence_ranges = None
+    cu_seqlens_q = None
 
     """Only the host metadata the two batched attention paths consume."""
 

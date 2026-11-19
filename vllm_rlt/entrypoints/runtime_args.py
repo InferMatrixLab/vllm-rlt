@@ -64,11 +64,6 @@ def add_runtime_args(parser):
     parser.add_argument("--lookahead-seed", type=int, default=0)
     parser.add_argument("--async-scheduling", action="store_true")
     parser.add_argument(
-        "--coalesce-fixed-prelude",
-        action="store_true",
-        help="Run fixed full-depth decode prelude and loops together (NPU eager)",
-    )
-    parser.add_argument(
         "--cuda-graphs",
         action="store_true",
         help="Capture decode/wavefront recurrent cores and speculative coda; sampling stays eager",
@@ -146,7 +141,6 @@ def runtime_configs(args):
             cuda_graph_max_graphs=args.cuda_graph_max_graphs,
             cuda_graph_memory_reserve_bytes=args.cuda_graph_memory_reserve_bytes,
             async_scheduling=args.async_scheduling,
-            coalesce_fixed_prelude=args.coalesce_fixed_prelude,
             multi_stream=not args.single_stream,
             static_buffers=args.static_buffers,
             pad_to_power_of_two=args.pad_to_power_of_two,

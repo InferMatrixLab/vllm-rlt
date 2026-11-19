@@ -123,27 +123,6 @@ class _PreparedCoverage:
     sequences: Sequence[_SequenceCoverage]
 
 
-class _LazyRangeCoverage(Sequence):
-    """Materialize row coverage only when the generic paged path needs it."""
-
-    def __init__(self, ranges, shared):
-        self.ranges, self.shared, self.sequences = ranges, shared, None
-
-    def __len__(self):
-        return len(self.ranges)
-
-    def __getitem__(self, index):
-        return tuple(self)[index]
-
-    def __iter__(self):
-        if self.sequences is None:
-            self.sequences = tuple(
-                _SequenceCoverage(r.allocation, 0 if self.shared else r.depth, ((r.start, r.end),))
-                for r in self.ranges
-            )
-        return iter(self.sequences)
-
-
 def _sequence_coverage(rows, plane):
     """Collapse query rows once, leaving written state owned by the allocation."""
     grouped = {}
@@ -309,7 +288,6 @@ class KVCacheManager:
             if self.device.type == "npu" and self.backend == "ascend_eager"
             else None
         )
-        self._validated_range_tables = weakref.WeakKeyDictionary()
         self.enable_prefix_caching = enable_prefix_caching
         self.incremental_allocation = incremental_allocation
         # Full allocation already reserves each request's maximum KV capacity.
@@ -816,12 +794,6 @@ class KVCacheManager:
     def _require_live_batch(self, batch: KVMetadata | DeviceKVMetadata):
         if isinstance(batch, KVMetadata) and batch.owner is not self:
             raise ValueError("prepared KV batch belongs to a different cache manager")
-        if (
-            isinstance(batch, KVMetadata)
-            and batch.sequence_ranges is not None
-            and not self.attention_capabilities.sequence_ranges
-        ):
-            raise ValueError("attention backend does not support compact sequence ranges")
         plan = None
         reusable = self._prepared_coverage is not None and isinstance(batch, KVMetadata)
         epoch = self._allocation_epoch
@@ -829,25 +801,14 @@ class KVCacheManager:
             plan = self._prepared_coverage.get(batch)
             if plan is not None and plan.allocation_epoch == epoch:
                 return plan
-        table_plan = batch.table_plan if reusable else None
-        validated = self._validated_range_tables.get(table_plan) if table_plan is not None else None
-        if validated is None or validated[0] != epoch or validated[1] is not batch.allocations:
-            for request_id, allocation in batch.allocations:
-                if self._allocations.get(request_id) is not allocation:
-                    raise RuntimeError(f"stale prepared KV batch for request {request_id!r}")
-            if table_plan is not None:
-                self._validated_range_tables[table_plan] = epoch, batch.allocations
+        for request_id, allocation in batch.allocations:
+            if self._allocations.get(request_id) is not allocation:
+                raise RuntimeError(f"stale prepared KV batch for request {request_id!r}")
         if reusable:
-            plan = _PreparedCoverage(
-                epoch,
-                (
-                    _LazyRangeCoverage(batch.sequence_ranges, self.layout == "shared")
-                    if batch.sequence_ranges is not None
-                    else _sequence_coverage(batch.rows, self._plane)
-                )
-                if plan is None
-                else plan.sequences,
+            sequences = (
+                _sequence_coverage(batch.rows, self._plane) if plan is None else plan.sequences
             )
+            plan = _PreparedCoverage(epoch, sequences)
             self._prepared_coverage[batch] = plan
         return plan
 
@@ -1061,24 +1022,13 @@ class KVCacheManager:
                 self._require_prefix(
                     sequence.allocation, layer, sequence.plane, sequence.ranges[-1][1]
                 )
-        if batch.cu_seqlens_q is not None:
-            return self.attention.prefill(
-                q,
-                self.key_cache[:, layer],
-                self.value_cache[:, layer],
-                batch.block_tables,
-                batch.context_lengths,
-                batch.cu_seqlens_q,
-                batch.max_seqlen_q,
-                **self._layer_scales(layer),
-                **({} if window is None else {"window": window}),
-            )
         return self.attention.attend_metadata(
             q,
             self.key_cache[:, layer],
             self.value_cache[:, layer],
             batch,
             **self._layer_scales(layer),
+            **({} if window is None else {"window": window}),
         )
 
     @torch.no_grad()

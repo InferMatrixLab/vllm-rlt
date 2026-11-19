@@ -11,23 +11,18 @@ from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.request import Request, RequestPhase
 
 
-def test_coalesced_submission_records_all_loops_and_preserves_trace():
-    scheduler = Scheduler(
-        SchedulerConfig(),
-        None,
-        total_ut_steps=4,
-        exit_mode="ouro_delayed",
-        coalesce_fixed_decode=True,
-    )
+def test_fixed_depth_decode_keeps_each_loop_schedulable():
+    scheduler = Scheduler(SchedulerConfig(), None, total_ut_steps=4, exit_mode="ouro_delayed")
     request = Request("a", [1], SamplingParams(min_loops=1, max_loops=4))
     request.phase = RequestPhase.RECURRENT
     scheduler.requests["a"] = request
-    item = ScheduledRequest(request, depth=0, phase=RequestPhase.RECURRENT)
-    assert scheduler._planned_loop_count([item]) == 4
-    scheduler.update_after_submission(SchedulerOutput(RequestPhase.RECURRENT, [item], 4))
-    assert request.loops_done == 4 and request.phase == RequestPhase.CODA
-    scheduler.exit_mode = "trace"
-    assert scheduler._planned_loop_count([item]) == 1
+    for depth in range(4):
+        assert request.phase == RequestPhase.RECURRENT
+        item = ScheduledRequest(request, depth=depth, phase=RequestPhase.RECURRENT)
+        assert scheduler._planned_loop_count([item]) == 1
+        scheduler.update_after_submission(SchedulerOutput(RequestPhase.RECURRENT, [item], 1))
+        assert request.loops_done == depth + 1
+    assert request.phase == RequestPhase.CODA
 
 
 def make_engine(model, asynchronous, multi_stream):
@@ -193,7 +188,7 @@ def test_npu_batched_greedy_preserves_ties_and_padding():
 def test_npu_hidden_gather_keeps_cross_stream_sources_alive():
     from types import SimpleNamespace
 
-    from vllm_rlt.worker.ascend_model_runner import AscendModelRunner
+    from vllm_rlt.worker.model_runner import ModelRunner
 
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
@@ -208,7 +203,8 @@ def test_npu_hidden_gather_keeps_cross_stream_sources_alive():
     consumer.synchronize()
     del warm
     pointer = source.data_ptr()
-    request = SimpleNamespace(hidden_state=source)
+    request = SimpleNamespace(request_id="a", hidden_state=source)
+    batch = SimpleNamespace(spans=[SimpleNamespace(request=request)])
     matrix = torch.ones((16384, 16384), dtype=torch.bfloat16, device=device)
     product = torch.empty_like(matrix)
     blocker.wait_stream(torch.npu.current_stream(device))
@@ -218,15 +214,11 @@ def test_npu_hidden_gather_keeps_cross_stream_sources_alive():
         gate = torch.npu.Event()
         gate.record(blocker)
     consumer.wait_event(gate)
-    runner = SimpleNamespace(
-        hidden_batch=None,
-        device=device,
-        device_ops=torch.npu,
-        execution_config=SimpleNamespace(multi_stream=True),
-    )
+    runner = SimpleNamespace(events={})
     try:
         with torch.npu.stream(consumer):
-            actual = AscendModelRunner._gather(runner, [request], None, 1)
+            ModelRunner._wait_for_requests(runner, batch, consumer)
+            actual = ModelRunner._gather(runner, [request], None, 1)
         request.hidden_state = None
         del source
         poisoned = []

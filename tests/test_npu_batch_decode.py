@@ -1,4 +1,4 @@
-"""Owned batch state and completion events preserve request lifetimes."""
+"""Decode scheduling and KV completion events preserve request lifetimes."""
 
 from contextlib import nullcontext
 
@@ -40,7 +40,6 @@ def test_cpu_keeps_copy_semantics():
     expected = reqs[0].hidden_state.clone()
     hidden.fill_(99)
     assert torch.equal(reqs[0].hidden_state, expected)
-    assert not hasattr(runner, "hidden_batch")
 
 
 class Event:
@@ -155,9 +154,8 @@ def test_partial_finalize_failure_drains_copies_before_cleanup():
 
 @pytest.mark.npu
 @pytest.mark.parametrize("multi_stream", [False, True])
-@pytest.mark.parametrize("coalesce", [False, True])
 @torch.inference_mode()
-def test_npu_owned_states_survive_future_tokens(multi_stream, coalesce):
+def test_npu_async_decode_matches_sync_when_reusing_request_ids(multi_stream):
     from tests.test_ascend import make_npu_model
     from tests.test_npu_async import drain, make_engine
     from vllm_rlt.device import resolve_device
@@ -173,90 +171,12 @@ def test_npu_owned_states_survive_future_tokens(multi_stream, coalesce):
     expected = drain(baseline)
     baseline.close()
     engine = make_engine(model, True, multi_stream)
-    engine.scheduler.coalesce_fixed_decode = coalesce
-    runner = engine.model_runner
-    save = runner._save_batch
-    gather = runner._gather
-    held = []
-    reuses = []
-
-    def capture(reqs, hidden, routing):
-        save(reqs, hidden, routing)
-        if runner.hidden_batch is not None:
-            held.append((reqs[0].hidden_state, reqs[0].hidden_state.clone()))
-
-    def load(reqs, workspace, size):
-        saved = runner.hidden_batch
-        result = gather(reqs, workspace, size)
-        if saved is not None and result is saved.hidden:
-            reuses.append(True)
-        return result
-
-    runner._save_batch = capture
-    runner._gather = load
     try:
         for repeat in range(2):
             for i, p in enumerate(prompts):
                 engine.add_request(str(i), p, params)
             assert drain(engine) == expected
-        assert held and reuses
-        for actual, reference in held:
-            assert torch.equal(actual, reference)
-        assert runner.hidden_batch is None
     finally:
-        engine.close()
-
-
-@pytest.mark.npu
-@torch.inference_mode()
-def test_npu_retained_batch_records_delayed_consumer():
-    from tests.test_ascend import make_npu_model
-    from tests.test_npu_async import make_engine
-    from vllm_rlt.device import resolve_device
-
-    device = resolve_device("npu:0")
-    torch.npu.set_device(device)
-    engine = make_engine(make_npu_model(device), True, True)
-    runner = engine.model_runner
-    producer = torch.npu.Stream(device=device)
-    consumer = torch.npu.Stream(device=device)
-    blocker = torch.npu.Stream(device=device)
-    reqs = requests()
-    with torch.npu.stream(producer):
-        source = torch.full((2, 256), 7.0, device=device, dtype=torch.bfloat16)
-    producer.synchronize()
-    pointer = source.data_ptr()
-    runner._save_batch(reqs, source, None)
-    matrix = torch.ones((16384, 16384), device=device, dtype=torch.bfloat16)
-    product = torch.empty_like(matrix)
-    blocker.wait_stream(torch.npu.current_stream(device))
-    with torch.npu.stream(blocker):
-        for _ in range(4):
-            torch.mm(matrix, matrix, out=product)
-        gate = torch.npu.Event()
-        gate.record(blocker)
-    consumer.wait_event(gate)
-    try:
-        with torch.npu.stream(consumer):
-            gathered = runner._gather(reqs, None, 2)
-            assert gathered is source
-            actual = gathered + 0
-        runner.hidden_batch = None
-        for r in reqs:
-            r.hidden_state = None
-        del source, gathered
-        with torch.npu.stream(producer):
-            poison = [
-                torch.full((2, 256), 99.0, device=device, dtype=torch.bfloat16) for _ in range(32)
-            ]
-        assert not gate.query(), "consumer delay expired before allocator probe"
-        assert all(t.data_ptr() != pointer for t in poison)
-        consumer.synchronize()
-        assert actual.cpu().tolist() == [[7.0] * 256] * 2
-    finally:
-        producer.synchronize()
-        consumer.synchronize()
-        blocker.synchronize()
         engine.close()
 
 

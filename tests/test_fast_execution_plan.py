@@ -1,7 +1,5 @@
 """Ownership and failure boundaries of Ascend recurrent execution."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -10,7 +8,6 @@ from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.device import resolve_device
 from vllm_rlt.request import Operation
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
-from vllm_rlt.worker.metadata import stage_range_metadata
 
 pytestmark = pytest.mark.npu
 
@@ -33,47 +30,11 @@ def cache_for(model):
 
 
 def metadata(cache, start, count):
-    layouts = cache.metadata_builder.build_ranges(["a"], [start], [count], [(d,) for d in range(4)])
-    batches = stage_range_metadata(
-        layouts, lambda values, dtype: torch.as_tensor(values, dtype=dtype, device="npu:0")
+    return cache._prepare_batches(
+        ["a"] * count,
+        [[depth] * count for depth in range(4)],
+        list(range(start, start + count)),
     )
-    return tuple(replace(b, block_tables=b.table_plan.bind(torch.device("npu:0"))) for b in batches)
-
-
-@torch.inference_mode()
-def test_position_plan_reuses_depths_and_expires_between_tokens():
-    resolve_device("npu")
-    torch.npu.set_device(0)
-    model = make_npu_model(torch.device("npu:0"))
-    expected = None
-    for reuse in [False, True]:
-        cache = cache_for(model)
-        runtime = ModelRuntime(
-            model, cache, prepare_recurrent=model.prepare_recurrent if reuse else None
-        )
-        observed = []
-        handle = model.model.rotary_emb.register_forward_hook(lambda *args: observed.append(1))
-        actual = []
-        try:
-            for start, ids in [(0, [3, 7, 11]), (3, [13])]:
-                hidden = model.prelude(torch.tensor(ids, device="npu:0"))
-                result = runtime.forward(
-                    ForwardBatch(
-                        Operation.RECURRENT,
-                        hidden=hidden,
-                        metadata=metadata(cache, start, len(ids)),
-                    )
-                )
-                actual.append(result.hidden.clone())
-            assert len(observed) == (2 if reuse else 8)
-            if expected is None:
-                expected = actual
-            else:
-                for a, b in zip(actual, expected):
-                    torch.testing.assert_close(a, b, atol=0, rtol=0)
-        finally:
-            handle.remove()
-            cache.free("a")
 
 
 @torch.inference_mode()
@@ -82,7 +43,7 @@ def test_failed_traversal_keeps_partial_layer_coverage_visible():
     torch.npu.set_device(0)
     model = make_npu_model(torch.device("npu:0"))
     cache = cache_for(model)
-    runtime = ModelRuntime(model, cache, prepare_recurrent=model.prepare_recurrent)
+    runtime = ModelRuntime(model, cache)
     batch = metadata(cache, 0, 3)[0]
 
     def fail(*args):
@@ -124,7 +85,7 @@ def test_paged_coverage_after_truncation_and_restore():
     torch.npu.set_device(0)
     model = make_npu_model(torch.device("npu:0"))
     cache = cache_for(model)
-    runtime = ModelRuntime(model, cache, prepare_recurrent=model.prepare_recurrent)
+    runtime = ModelRuntime(model, cache)
     hidden = model.prelude(torch.tensor([3, 7, 11], device="npu:0"))
     for batch in metadata(cache, 0, 3):
         runtime.forward(ForwardBatch(Operation.RECURRENT, hidden=hidden, metadata=(batch,)))

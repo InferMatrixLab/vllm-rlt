@@ -19,7 +19,6 @@ from vllm_rlt.worker.buffers import (
 )
 from vllm_rlt.worker.cuda_graph import CodaGraphs, PreludeGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
-from vllm_rlt.worker.metadata import stage_range_metadata
 from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
@@ -728,7 +727,9 @@ class ModelRunner:
     def _uses_packed_loop_inputs(self, batch):
         capabilities = self.cache_manager.attention_capabilities
         return (
-            batch.operation == Operation.PRELUDE
+            # PackedMetadataBuffer expands write addresses with a CUDA kernel.
+            self.device.type == "cuda"
+            and batch.operation == Operation.PRELUDE
             and batch.loop_count
             and self.cache_manager.layout != "shared"
             and capabilities.packed_prefill
@@ -739,23 +740,6 @@ class ModelRunner:
 
     def _prepare_loop_inputs(self, batch, packed_metadata=None):
         cache = self.cache_manager
-        if self._uses_range_plan(batch):
-            spans = batch.spans
-            metadata = self._stage_range_plan(batch)
-            tokens = [token for span in spans for token in span.input_tokens]
-            tensor = self.input_buffers[torch.int64].append(tokens)
-            end = 0
-            outputs = []
-            for span in spans:
-                end += span.token_count
-                outputs.append((end - 1, span.request))
-            return (
-                PreparedForward(
-                    ForwardBatch(Operation.PRELUDE, tokens=tensor, metadata=metadata),
-                    outputs=tuple(outputs),
-                    requests=tuple(span.request for span in spans),
-                ),
-            )
         if cache.layout == "shared":
             return self._prepare_shared_loop_inputs(batch)
         ids, positions, tokens, requests, outputs, depths = [], [], [], [], [], []
@@ -802,36 +786,6 @@ class ModelRunner:
         layouts = self.metadata.build(ids, depth_sets, positions, packed=packed)
         return stage_metadata(layouts, self._append_input, padded_rows=padded_rows)
 
-    def _uses_range_plan(self, batch):
-        cache = self.cache_manager
-        spans = batch.spans
-        return (
-            self.device.type == "npu"
-            and self.metadata.range_plans_enabled
-            and cache.attention_capabilities.sequence_ranges
-            and cache.layout == "last_exited"
-            and not cache.enable_prefix_caching
-            and not self.execution_config.static_buffers
-            and not self.execution_config.cuda_graphs
-            and not self.execution_config.pad_to_power_of_two
-            and not getattr(self.model, "requires_boundary_kv", False)
-            and bool(spans)
-            and len({span.request.request_id for span in spans}) == len(spans)
-            and len({span.token_start for span in spans}) == 1
-            and len({span.token_count for span in spans}) == 1
-            and (not batch.has_chunks or batch.operation == Operation.PRELUDE)
-        )
-
-    def _stage_range_plan(self, batch):
-        spans = batch.spans
-        layouts = self.metadata.build_ranges(
-            [span.request.request_id for span in spans],
-            [span.token_start for span in spans],
-            [span.token_count for span in spans],
-            [[span.depth + i for span in spans] for i in range(batch.loop_count)],
-        )
-        return stage_range_metadata(layouts, self._append_input)
-
     def _append_input(self, values, dtype):
         return self.input_buffers[dtype].append(values)
 
@@ -864,11 +818,7 @@ class ModelRunner:
             if prepared.packed_metadata is not None:
                 tokens, metadata = prepared.packed_metadata.upload()
             else:
-                tokens = (
-                    self._prepare_tokens(prepared, prepared.batch.num_rows)
-                    if self.device.type == "npu" and forward.tokens is None
-                    else input_view(forward.tokens)
-                )
+                tokens = input_view(forward.tokens)
                 metadata = tuple(self.metadata.bind(kv, uploaded) for kv in forward.metadata)
             kv_metadata = None
             hidden_buffer = None
@@ -908,10 +858,6 @@ class ModelRunner:
         metadata, boundary_metadata = (), None
         if batch.operation == Operation.RECURRENT:
             start = 1 if prepared.kv is not None else 0
-            if start == 0 and self._uses_range_plan(batch):
-                metadata = self._stage_range_plan(batch)
-                forward = ForwardBatch(batch.operation, metadata=metadata)
-                return replace(prepared, forwards=(PreparedForward(forward),))
             if start < batch.loop_count:
                 ids, depths, positions = batch.addresses()
                 metadata = self._stage_metadata(
@@ -961,41 +907,6 @@ class ModelRunner:
             )
         if batch.operation == Operation.CODA:
             prepared = replace(prepared, sampling_params=tuple(r.sampling_params for r in requests))
-        if (
-            self.device.type == "npu"
-            and batch.operation == Operation.PRELUDE
-            and batch.loop_count
-            and not batch.has_chunks
-            and all(span.input_tokens is None for span in batch.spans)
-        ):
-            # Decode sources can be preceding device samples not yet delivered
-            # to the CPU. Snapshot their identities before advancing requests.
-            if any(span.token_count != 1 for span in batch.spans):
-                raise ValueError("coalesced decode prelude requires one token per request")
-            sources = tuple(
-                r.input_token_tensor if r.input_token_tensor is not None else (r.input_token_id,)
-                for r in requests
-            )
-            if self._uses_range_plan(batch):
-                metadata = self._stage_range_plan(batch)
-            else:
-                ids, depths, positions = batch.addresses()
-                metadata = self._stage_metadata(
-                    ids,
-                    [[depth + offset for depth in depths] for offset in range(batch.loop_count)],
-                    positions,
-                )
-            return replace(
-                prepared,
-                token_sources=sources,
-                # Preserve the fixed decode path's gate work; its output has
-                # no consumer and is not copied back to the host.
-                forwards=(
-                    PreparedForward(
-                        ForwardBatch(Operation.PRELUDE, metadata=metadata, compute_gate=True)
-                    ),
-                ),
-            )
         if batch.operation == Operation.PRELUDE and batch.loop_count:
             packed_metadata = (
                 self.packed_metadata_buffers[self.submissions.slot]

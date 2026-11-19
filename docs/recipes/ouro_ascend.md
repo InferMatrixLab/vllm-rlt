@@ -34,14 +34,12 @@ python -m vllm_rlt.entrypoints.serve \
   --device npu --dtype bfloat16 --attention-backend ascend_eager \
   --mode refill --exit-mode ouro_delayed \
   --async-scheduling --single-stream --no-uva \
-  --coalesce-fixed-prelude \
   --block-size 16 --num-blocks 2064 --max-num-seqs 32 \
   --max-num-batched-tokens 8192 --prefill-chunk-size 1024 \
   --max-prefill-batches-before-decode 32 --host 127.0.0.1 --port 8123
 ```
 
-For synchronous eager execution, omit `--async-scheduling` and
-`--coalesce-fixed-prelude`.
+For synchronous eager execution, omit `--async-scheduling`.
 
 Wait for `/health` to return HTTP 200, then send a completion. Add
 `"stream": true` for server-sent events.
@@ -57,12 +55,12 @@ curl --fail http://127.0.0.1:8123/v1/completions \
 ## Fixed-depth asynchronous engine plan
 
 - **Scheduling.** Stream events track completion and protect buffer and request
-  lifetimes. A stable batch can run decode PRELUDE and all four recurrent loops
-  in one submission. Competing prompt or recurrent work retains a scheduling
-  opportunity. A full-depth PRELUDE counts as recurrent work for refill fairness.
-- **Reuse and batching.** Compatible batches reuse KV range and allocation plans,
-  hidden tensors, and attention masks. Greedy sampling, compatible
-  prefill and paged KV write indices are batched. Full prefill uses causal SDPA.
+  lifetimes. Decode PRELUDE and each recurrent loop are separate submissions,
+  so the scheduler can select a new batch at each boundary.
+- **Reuse and batching.** Ascend uses the shared packed-prefill metadata by
+  default with `ascend_eager`. Use `--no-packed-prefill` to select the per-query
+  layout. Greedy sampling, compatible prefill and paged KV write indices are
+  batched. Full prefill uses causal SDPA.
   Cached chunks and ragged decode pass boolean masks to preserve each row's
   visible KV range.
 - **Paged KV.** Each loop writes to the page pool using its own block table.
@@ -131,7 +129,7 @@ With an assigned NPU visible and `MODEL` set as above:
 ```bash
 VLLM_RLT_OURO_CHECKPOINT="$MODEL" python -m pytest -q --run-npu \
   tests/test_ascend_eager.py tests/test_ascend_kv.py \
-  tests/test_fixed_prelude.py \
+  tests/test_ascend_decode_scheduling.py \
   tests/test_ascend_checkpoint.py tests/test_ascend_serving.py
 ```
 

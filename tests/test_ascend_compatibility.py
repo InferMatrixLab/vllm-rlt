@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_model
-from vllm_rlt import CacheConfig, ExecutionConfig, SchedulerConfig
+from vllm_rlt import CacheConfig, SchedulerConfig
 from vllm_rlt.attention.backend import BackendCapabilities
 from vllm_rlt.device import stream_module
 from vllm_rlt.engine.stage_engine import StageEngine
@@ -29,10 +29,9 @@ def test_backend_capability_positional_arguments_keep_their_meaning():
         "device_context_lengths",
         "sliding_window",
         "packed_sliding_window",
-        "sequence_ranges",
     )
     caps = BackendCapabilities(False, False, False, False, False, True, False, True)
-    assert caps.sliding_window and caps.fp8_kv_static and not caps.sequence_ranges
+    assert caps.sliding_window and caps.fp8_kv_static
 
 
 @pytest.mark.parametrize("hip", [None, "6.4"])
@@ -88,10 +87,3 @@ def test_default_engine_keeps_upstream_runtime_and_sampler(monkeypatch):
         assert type(engine.model_runner.sampler) is Sampler
     finally:
         engine.close()
-
-
-def test_ascend_options_fail_before_allocating_on_other_devices():
-    cache = CacheConfig(num_blocks=128)
-    execution = ExecutionConfig(coalesce_fixed_prelude=True)
-    with pytest.raises(ValueError, match="Ascend execution options require an NPU"):
-        StageEngine(tiny_ouro_model(), cache_config=cache, execution_config=execution)

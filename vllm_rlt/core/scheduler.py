@@ -140,8 +140,6 @@ class Scheduler:
         total_ut_steps: int | None = None,
         eos_token_id=(),
         exit_mode: str = "ouro",
-        coalesce_fixed_decode: bool = False,
-        coalesce_fixed_prelude: bool = False,
     ):
         self.config = config
         self.cache_manager = cache_manager
@@ -156,8 +154,6 @@ class Scheduler:
         else:
             self.eos_token_ids = (eos_token_id,)
         self.exit_mode = exit_mode
-        self.coalesce_fixed_decode = coalesce_fixed_decode
-        self.coalesce_fixed_prelude = coalesce_fixed_prelude
         self.requests: dict[str, Request] = {}
         self.queues: dict[RequestPhase, deque[str]] = {s: deque() for s in RequestPhase}
         # Bound by Engine when preemption is enabled. These callbacks can copy
@@ -781,8 +777,6 @@ class Scheduler:
         )
         self.policy.record_batch(recorded)
         loop_count = self._planned_loop_count(scheduled_requests)
-        if self.coalesce_fixed_prelude and selected_phases == {RequestPhase.PRELUDE} and loop_count:
-            self.policy.record_batch(RequestPhase.RECURRENT)
         scheduled_requests = [
             replace(
                 item,
@@ -808,29 +802,6 @@ class Scheduler:
         if RequestPhase.SPECULATIVE in phases or RequestPhase.CODA in phases:
             return 0
         if RequestPhase.PRELUDE in phases:
-            if (
-                phases == {RequestPhase.PRELUDE}
-                and self.coalesce_fixed_prelude
-                # Full-depth PRELUDE skips RECURRENT, where refill gets a turn.
-                # Keep that boundary while other prompt/core work needs a turn.
-                and not (
-                    self.config.mode in ("refill", "mixed")
-                    and (
-                        self.queues[RequestPhase.WAITING]
-                        or self.has_ready(RequestPhase.RECURRENT)
-                        or any(self.has_ready(phase) for phase in self.policy.PREFILL_PHASES)
-                    )
-                )
-                and self.speculative_config is None
-                and self.exit_mode != "trace"
-                and all(
-                    item.request.sampling_params.min_loops == self.total_ut_steps
-                    and (item.request.sampling_params.max_loops or self.total_ut_steps)
-                    == self.total_ut_steps
-                    for item in scheduled_requests
-                )
-            ):
-                return self.total_ut_steps
             return 0
         if self.wavefront_chunked_prefill:
             return 1 if RequestPhase.PREFILLING_RECURRENT in phases else 0
@@ -848,25 +819,6 @@ class Scheduler:
                 return 1
             return min(self._max_contiguous_prefill_loops(item) for item in scheduled_requests)
         if RequestPhase.RECURRENT in phases:
-            # Fixed-depth requests have no intervening host exit decision.
-            # Trace and adaptive policies retain their per-loop boundaries.
-            depths = {item.depth for item in scheduled_requests}
-            if (
-                self.coalesce_fixed_decode
-                and self.exit_mode != "trace"
-                and len(depths) == 1
-                and all(
-                    item.request.sampling_params.exit_threshold == 1.0
-                    for item in scheduled_requests
-                )
-            ):
-                depth = next(iter(depths)) or 0
-                room = min(
-                    (item.request.sampling_params.max_loops or self.total_ut_steps) - depth
-                    for item in scheduled_requests
-                )
-                if room > 0:
-                    return room
             return 1
         raise ValueError(f"cannot derive recurrent boundary for phases: {phases}")
 
@@ -1362,15 +1314,12 @@ class Scheduler:
             ):
                 continue
             if phase == RequestPhase.PRELUDE:
-                request.loops_done = loop_count if self.coalesce_fixed_prelude else 0
+                request.loops_done = 0
                 request.remaining_probability = 1.0
                 request.pending_exit_depth = None
-                complete = self.coalesce_fixed_prelude and loop_count == self.total_ut_steps
-                if complete:
-                    update.exited.append(request)
-                self.enqueue(request, RequestPhase.CODA if complete else RequestPhase.RECURRENT)
+                self.enqueue(request, RequestPhase.RECURRENT)
             elif phase == RequestPhase.RECURRENT:
-                request.loops_done += max(1, loop_count) if self.coalesce_fixed_decode else 1
+                request.loops_done += 1
                 if self.exit_mode == "trace":
                     should_exit = self._trace_exit(request)
                 else:
@@ -1482,13 +1431,10 @@ class Scheduler:
             ):
                 continue
             if phase == RequestPhase.PRELUDE:
-                request.loops_done = loop_count if self.coalesce_fixed_prelude else 0
+                request.loops_done = 0
                 request.remaining_probability = 1.0
                 request.pending_exit_depth = None
-                complete = self.coalesce_fixed_prelude and loop_count == self.total_ut_steps
-                if complete:
-                    update.exited.append(request)
-                self.enqueue(request, RequestPhase.CODA if complete else RequestPhase.RECURRENT)
+                self.enqueue(request, RequestPhase.RECURRENT)
             elif phase == RequestPhase.CODA:
                 request.num_output_placeholders += 1
                 if request.num_scheduled_outputs < request.sampling_params.max_tokens:
@@ -1508,7 +1454,7 @@ class Scheduler:
                     and request.sampling_params.exit_threshold < 1
                     and self.needs_exit_signal(request)
                 )
-                request.loops_done += max(1, loop_count) if self.coalesce_fixed_decode else 1
+                request.loops_done += 1
                 should_exit = (
                     self._trace_exit(request)
                     if self.exit_mode == "trace"

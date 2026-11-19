@@ -1,4 +1,4 @@
-"""Fixed decode plans keep device inputs and preserve result retirement boundaries."""
+"""Ascend decode scheduling, refill and asynchronous result delivery."""
 
 import pytest
 import torch
@@ -13,41 +13,31 @@ from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.request import Request, RequestPhase
 
 
-@pytest.mark.parametrize(
-    "exit_mode,min_loops,expected",
-    [("ouro_delayed", 4, 4), ("ouro_delayed", 1, 0), ("trace", 4, 0)],
-)
-def test_fixed_prelude_planning_and_submission_progress(exit_mode, min_loops, expected):
-    scheduler = Scheduler(
-        SchedulerConfig(), None, total_ut_steps=4, exit_mode=exit_mode, coalesce_fixed_prelude=True
-    )
-    request = Request("a", [1], SamplingParams(min_loops=min_loops, max_loops=4))
+def test_decode_prelude_leaves_recurrent_work_to_scheduler():
+    scheduler = Scheduler(SchedulerConfig(), None, total_ut_steps=4, exit_mode="ouro_delayed")
+    request = Request("a", [1], SamplingParams(min_loops=4, max_loops=4))
     request.phase = RequestPhase.PRELUDE
     scheduler.requests["a"] = request
     item = ScheduledRequest(request, phase=RequestPhase.PRELUDE)
-    assert scheduler._planned_loop_count([item]) == expected
-    update = scheduler.update_after_submission(
-        SchedulerOutput(RequestPhase.PRELUDE, [item], expected)
-    )
-    assert request.loops_done == expected
-    assert request.phase == (RequestPhase.CODA if expected else RequestPhase.RECURRENT)
-    assert update.exited == ([request] if expected else [])
+    assert scheduler._planned_loop_count([item]) == 0
+    batch = SchedulerOutput(RequestPhase.PRELUDE, [item], 0)
+    update = scheduler.update_after_submission(batch)
+    assert request.loops_done == 0
+    assert request.phase == RequestPhase.RECURRENT
+    assert update.exited == []
     request.phase = RequestPhase.PRELUDE
     scheduler.requests.pop("a")
-    scheduler.update_after_submission(SchedulerOutput(RequestPhase.PRELUDE, [item], expected))
-    assert request.phase == RequestPhase.PRELUDE  # Stale submissions cannot advance a reused ID.
+    scheduler.update_after_submission(batch)
+    assert request.phase == RequestPhase.PRELUDE  # A stale submission cannot advance a request.
 
 
-@pytest.mark.parametrize("coalesced", [False, True])
 @pytest.mark.parametrize("late_arrival", [False, True])
-def test_fixed_prelude_preserves_refill_opportunity(coalesced, late_arrival):
+def test_decode_preserves_refill_opportunity(late_arrival):
     scheduler = Scheduler(
         SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=3, prefill_chunk_size=3),
         make_cpu_cache(tiny_ouro_config(), blocks=128),
         total_ut_steps=4,
         exit_mode="ouro_delayed",
-        coalesce_fixed_prelude=coalesced,
-        coalesce_fixed_decode=True,
     )
     params = SamplingParams(max_tokens=16, min_loops=4, max_loops=4, ignore_eos=True)
     first = Request("a", [1, 2, 3], params)
@@ -67,7 +57,7 @@ def test_fixed_prelude_preserves_refill_opportunity(coalesced, late_arrival):
     assert second.phase == (RequestPhase.WAITING if late_arrival else RequestPhase.PREFILL)
 
     # Every prompt consumes a complete token budget. Refill must still get a
-    # turn before the first generation ends, with or without prelude coalescing.
+    # turn before the first generation ends.
     for _ in range(8):
         batch = scheduler.schedule()
         assert batch is not None
@@ -92,7 +82,7 @@ def test_fixed_prelude_preserves_refill_opportunity(coalesced, late_arrival):
         pytest.fail("refilled decode starved the existing recurrent request")
 
 
-def engine_for(model, planned, multi_stream=False, token_budget=128):
+def engine_for(model, multi_stream=False, token_budget=128):
     return StageEngine(
         model,
         attention_backend="ascend_eager",
@@ -104,20 +94,18 @@ def engine_for(model, planned, multi_stream=False, token_budget=128):
             async_scheduling=True,
             multi_stream=multi_stream,
             use_uva=False,
-            coalesce_fixed_prelude=planned,
         ),
         exit_config=ExitConfig("ouro_delayed"),
     )
 
 
-@pytest.mark.parametrize("coalesced,waiting", [(True, False), (False, False), (True, True)])
-def test_fixed_prelude_accounts_for_recurrent_fairness(coalesced, waiting):
+@pytest.mark.parametrize("waiting", [False, True])
+def test_decode_prelude_keeps_recurrent_due(waiting):
     scheduler = Scheduler(
         SchedulerConfig(max_num_seqs=2, max_prefill_batches_before_decode=4),
         make_cpu_cache(tiny_ouro_config(), blocks=128),
         total_ut_steps=4,
         exit_mode="ouro_delayed",
-        coalesce_fixed_prelude=coalesced,
     )
     params = SamplingParams(max_tokens=8, min_loops=4, max_loops=4, ignore_eos=True)
     scheduler.add_request(Request("a", [1, 2, 3], params))
@@ -132,109 +120,95 @@ def test_fixed_prelude_accounts_for_recurrent_fairness(coalesced, waiting):
     assert scheduler.policy.decode_due
     batch = scheduler.schedule()
     assert batch.phase == RequestPhase.PRELUDE
-    assert bool(batch.loop_count) == (coalesced and not waiting)
-    # A coalesced decode submission actually runs recurrent work. Embedding-only
-    # PRELUDE must retain the pending prefill budget until its core is selected.
-    assert scheduler.policy.decode_due == (not coalesced or waiting)
+    assert batch.loop_count == 0
+    assert scheduler.policy.decode_due
 
 
 @pytest.mark.npu
 @torch.inference_mode()
 @pytest.mark.parametrize("multi_stream", [False, True])
-def test_fixed_prelude_refills_during_generation(multi_stream):
+def test_ascend_decode_refills_during_generation(multi_stream):
     resolve_device("npu")
     torch.npu.set_device(0)
     model = make_npu_model(torch.device("npu:0"))
     params = SamplingParams(max_tokens=8, min_loops=4, max_loops=4, ignore_eos=True)
-    expected = None
-    for planned in [False, True]:
-        engine = engine_for(model, planned, multi_stream, token_budget=3)
-        try:
-            for name, prompt in [("a", [3, 7, 11]), ("b", [13, 17, 19])]:
-                engine.add_request(name, prompt, params)
-            actual, first_finished, second_started = {}, False, False
-            first_tokens_at_second_start = None
-            first_tokens, first_advanced = 0, False
-            for _ in range(128):
-                if not engine.has_unfinished_requests():
-                    break
-                for out in engine.step():
-                    if out.request_id == "b" and not second_started:
-                        assert not first_finished
-                        second_started = True
-                        first_tokens_at_second_start = first_tokens
+    engine = engine_for(model, multi_stream, token_budget=3)
+    try:
+        for name, prompt in [("a", [3, 7, 11]), ("b", [13, 17, 19])]:
+            engine.add_request(name, prompt, params)
+        actual, first_finished, second_started = {}, False, False
+        first_tokens_at_second_start = None
+        first_tokens, first_advanced = 0, False
+        for _ in range(128):
+            if not engine.has_unfinished_requests():
+                break
+            for out in engine.step():
+                if out.request_id == "b" and not second_started:
+                    assert not first_finished
+                    second_started = True
+                    first_tokens_at_second_start = first_tokens
+                if out.request_id == "a":
+                    first_tokens = len(out.token_ids)
+                    if second_started and "b" not in actual:
+                        first_advanced |= first_tokens > first_tokens_at_second_start
+                if out.finished:
+                    actual[out.request_id] = (
+                        list(out.token_ids),
+                        list(out.exit_depths),
+                        out.finish_reason,
+                    )
                     if out.request_id == "a":
-                        first_tokens = len(out.token_ids)
-                        if second_started and "b" not in actual:
-                            first_advanced |= first_tokens > first_tokens_at_second_start
-                    if out.finished:
-                        actual[out.request_id] = (
-                            list(out.token_ids),
-                            list(out.exit_depths),
-                            out.finish_reason,
-                        )
-                        if out.request_id == "a":
-                            first_finished = True
-            else:
-                pytest.fail("refill did not drain in 128 steps")
-            assert second_started and first_advanced
-            assert set(actual) == {"a", "b"}
-            if expected is None:
-                expected = actual
-            else:
-                assert actual == expected
-            assert engine.cache_manager.num_used_blocks == 0
-        finally:
-            engine.close()
+                        first_finished = True
+        else:
+            pytest.fail("refill did not drain in 128 steps")
+        assert second_started and first_advanced
+        assert set(actual) == {"a", "b"}
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
 
 
 @pytest.mark.npu
 @torch.inference_mode()
 @pytest.mark.parametrize("multi_stream", [False, True])
-def test_fixed_prelude_preserves_generation_cancel_reuse_and_eos(multi_stream):
+def test_ascend_decode_preserves_cancel_reuse_and_eos(multi_stream):
     resolve_device("npu")
     torch.npu.set_device(0)
     model = make_npu_model(torch.device("npu:0"))
     params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
-    expected = None
-    for planned in [False, True]:
-        engine = engine_for(model, planned, multi_stream)
-        try:
-            for i, prompt in enumerate([[3, 7, 11], [13, 17, 19]]):
-                engine.add_request(str(i), prompt, params)
-            actual = drain(engine)
-            if expected is None:
-                expected = actual
-            else:
-                assert actual == expected
-            assert engine.cache_manager._key_cache is None
-            engine.add_request("0", [2, 5, 9], params)
-            engine.add_request("1", [13, 17, 19], params)
-            engine.step()
-            engine.step()
-            engine.step()
-            engine.abort_request("0")
-            engine.add_request("0", [3, 7, 11], params)
-            assert drain(engine) == expected
-            eos = model.config.eos_token_id
-            engine.model_runner.sampler.sample_batch = lambda logits, options, generators: (
-                logits.new_full((len(options),), eos, dtype=torch.long)
-            )
-            engine.add_request(
-                "eos", [3, 7, 11], SamplingParams(max_tokens=4, min_loops=4, max_loops=4)
-            )
-            assert drain(engine)["eos"] == ([eos], [4], "stop")
-        finally:
-            engine.close()
+    engine = engine_for(model, multi_stream)
+    try:
+        for i, prompt in enumerate([[3, 7, 11], [13, 17, 19]]):
+            engine.add_request(str(i), prompt, params)
+        expected = drain(engine)
+        assert engine.cache_manager.num_used_blocks == 0
+        engine.add_request("0", [2, 5, 9], params)
+        engine.add_request("1", [13, 17, 19], params)
+        engine.step()
+        engine.step()
+        engine.step()
+        engine.abort_request("0")
+        engine.add_request("0", [3, 7, 11], params)
+        assert drain(engine) == expected
+        eos = model.config.eos_token_id
+        engine.model_runner.sampler.sample_batch = lambda logits, options, generators: (
+            logits.new_full((len(options),), eos, dtype=torch.long)
+        )
+        engine.add_request(
+            "eos", [3, 7, 11], SamplingParams(max_tokens=4, min_loops=4, max_loops=4)
+        )
+        assert drain(engine)["eos"] == ([eos], [4], "stop")
+    finally:
+        engine.close()
 
 
 @pytest.mark.npu
 @torch.inference_mode()
-def test_fixed_prelude_uses_device_sample_before_coda_delivery():
+def test_ascend_prelude_uses_device_sample_before_coda_delivery():
     resolve_device("npu")
     torch.npu.set_device(0)
     model = make_npu_model(torch.device("npu:0"))
-    engine = engine_for(model, True)
+    engine = engine_for(model)
 
     class HeldEvent:
         def query(self):
@@ -255,9 +229,9 @@ def test_fixed_prelude_uses_device_sample_before_coda_delivery():
         try:
             engine.step()
             assert engine.last_schedule.phase == RequestPhase.PRELUDE
-            assert engine.last_schedule.loop_count == 4
+            assert engine.last_schedule.loop_count == 0
             request = engine.scheduler.requests["a"]
-            assert request.loops_done == 4 and request.generated_token_ids == []
+            assert request.loops_done == 0 and request.generated_token_ids == []
         finally:
             ticket.event = actual_event
         assert drain(engine)["a"][1] == [4, 4, 4]

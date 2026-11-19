@@ -75,8 +75,6 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
-        if parameter.device.type != "npu" and self.execution_config.coalesce_fixed_prelude:
-            raise ValueError("Ascend execution options require an NPU")
         if parameter.device.type == "npu":
             if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
                 raise ValueError("NPU currently supports Ouro with four loops")
@@ -87,7 +85,6 @@ class StageEngine:
             if (
                 self.execution_config.cuda_graphs
                 or (self.execution_config.async_scheduling and self.execution_config.static_buffers)
-                or self.execution_config.packed_prefill
                 or speculative_config is not None
                 or self.stage_config.role != "prefill_decode"
                 or scheduler_config.enable_preemption
@@ -290,16 +287,6 @@ class StageEngine:
             kv_cache_dtype=cache_config.kv_cache_dtype,
             fp8_scale=fp8_scale,
         )
-        if self.execution_config.coalesce_fixed_prelude and (
-            parameter.device.type != "npu"
-            or not self.execution_config.async_scheduling
-            or self.execution_config.static_buffers
-            or self.execution_config.cuda_graphs
-            or getattr(model, "requires_boundary_kv", False)
-            or attention.info["selected_backend"] != "ascend_eager"
-            or speculative_config is not None
-        ):
-            raise ValueError("fixed decode prelude requires asynchronous Ascend eager execution")
         self.scheduler = Scheduler(
             scheduler_config,
             self.cache_manager,
@@ -308,10 +295,6 @@ class StageEngine:
             total_ut_steps=config.total_ut_steps,
             eos_token_id=config.eos_token_id,
             exit_mode=self.exit_config.mode,
-            coalesce_fixed_decode=(
-                parameter.device.type == "npu" and self.execution_config.async_scheduling
-            ),
-            coalesce_fixed_prelude=self.execution_config.coalesce_fixed_prelude,
         )
         self.connector = connector
         # One RNG registry per engine, shared by both runners: the CODA and

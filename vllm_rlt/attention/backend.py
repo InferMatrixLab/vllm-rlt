@@ -34,7 +34,6 @@ class BackendCapabilities:
     # Mask keys outside a per-layer sliding window (not storage reclamation).
     sliding_window: bool = False
     packed_sliding_window: bool = False
-    sequence_ranges: bool = False
 
 
 @dataclass
@@ -49,14 +48,21 @@ class AttentionBackend:
         return self.kernel(*args, **kwargs)
 
     def attend_metadata(self, q, keys, values, batch, **kwargs):
-        """Borrow validated host metadata when supported; retain the legacy tensor API.
-
-        Metadata-aware kernels can reuse host planning across layers without
-        reading device tables or lengths back to the host.
-        """
+        """Use the prepared batch for packed or per-query attention."""
         method = getattr(self.kernel, "attend_metadata", None)
         if method is not None:
             return method(q, keys, values, batch, **kwargs)
+        if batch.cu_seqlens_q is not None:
+            return self.prefill(
+                q,
+                keys,
+                values,
+                batch.block_tables,
+                batch.context_lengths,
+                batch.cu_seqlens_q,
+                batch.max_seqlen_q,
+                **kwargs,
+            )
         return self(q, keys, values, batch.block_tables, batch.context_lengths, **kwargs)
 
     def prefill(self, *args, **kwargs):
@@ -77,7 +83,6 @@ class AttentionBackend:
 
 
 _TORCH_CAPABILITIES = BackendCapabilities(fp8_kv=True, fp8_kv_static=True, sliding_window=True)
-_ASCEND_CAPABILITIES = BackendCapabilities(async_scheduling=True, sequence_ranges=True)
 _TRITON_CAPABILITIES = BackendCapabilities(
     cuda_graphs=True,
     async_scheduling=True,
@@ -127,7 +132,8 @@ def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, pa
             raise ValueError("ascend_eager requires an NPU and BF16")
         from vllm_rlt.kernels.ascend_attention import AscendAttention
 
-        return AttentionBackend(AscendAttention(), _ASCEND_CAPABILITIES, {"backend": backend})
+        capabilities = BackendCapabilities(packed_prefill=packed, async_scheduling=True)
+        return AttentionBackend(AscendAttention(), capabilities, {"backend": backend})
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
@@ -232,7 +238,6 @@ def create_backend(
                     "device_context_lengths",
                     "fp8_kv",
                     "fp8_kv_static",
-                    "sequence_ranges",
                     "sliding_window",
                     "packed_sliding_window",
                 )

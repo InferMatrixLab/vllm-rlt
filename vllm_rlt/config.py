@@ -160,8 +160,6 @@ class ExecutionConfig:
     # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
     # support and compatible synchronous eager execution; off otherwise.
     packed_prefill: bool | None = None
-    # Run embedding and the fixed full recurrent depth in one decode submission.
-    coalesce_fixed_prelude: bool = False
 
     def __post_init__(self):
         if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
@@ -173,7 +171,6 @@ class ExecutionConfig:
             "static_buffers",
             "pad_to_power_of_two",
             "cuda_graphs",
-            "coalesce_fixed_prelude",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")

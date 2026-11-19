@@ -139,10 +139,9 @@ class ForwardResult:
 
 
 class ModelRuntime:
-    def __init__(self, model, cache, *, prepare_recurrent=None):
+    def __init__(self, model, cache):
         self.model = model
         self.cache = cache
-        self.prepare_recurrent = prepare_recurrent
 
     def prepare(self, batch: ForwardBatch) -> ForwardBatch:
         """Choose graph/fallback for every call before execution.
@@ -210,7 +209,6 @@ class ModelRuntime:
                 raise ValueError(f"unsupported operation {batch.operation}")
             if hidden is None:
                 raise ValueError("RECURRENT requires hidden state")
-            recurrent = None
             for index, kv in enumerate(batch.metadata):
                 if batch.graphs is not None:
                     call = batch.graph_calls[index]
@@ -218,13 +216,7 @@ class ModelRuntime:
                         batch.graphs.prepare_inputs(call, hidden)
                     hidden, gate = batch.graphs.execute(call, hidden)
                 else:
-                    if recurrent is None:
-                        recurrent = (
-                            self.prepare_recurrent()
-                            if self.prepare_recurrent is not None
-                            else self.model.recurrent_prepared
-                        )
-                    hidden, gate = recurrent(
+                    hidden, gate = self.model.recurrent_prepared(
                         hidden, kv, self.cache, compute_gate=batch.compute_gate
                     )
             return ForwardResult(hidden, gate)
