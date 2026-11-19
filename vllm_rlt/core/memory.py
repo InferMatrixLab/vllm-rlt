@@ -46,13 +46,20 @@ def measured_kv_capacity(
     gpu_memory_utilization,
     transient_bytes,
     safety_bytes,
+    existing_blocks=0,
+    reservation_blocks=None,
 ):
-    """Blocks to commit after warmup and capture, with every margin recorded.
+    """Total blocks the pool may hold after warmup and capture.
 
-    The physical budget is the driver's remaining memory, which already excludes
-    weights, execution buffers, captured graphs and any live mapping, so none of
-    them is subtracted a second time. ``transient_bytes`` covers execution above
-    that persistent baseline and ``safety_bytes`` the fixed reserve.
+    ``free`` memory already excludes weights, execution buffers, captured graphs
+    and anything already mapped, including ``existing_blocks`` (the bootstrap
+    prefix). The measured capacity is therefore additional, and the cumulative
+    ``commit(total)`` of a storage maps only the new part.
+
+    ``transient_bytes`` covers execution above that persistent baseline and
+    ``safety_bytes`` the fixed reserve. The result is clamped by the logical
+    ``useful_blocks`` and, when the pool cannot grow that far, by
+    ``reservation_blocks``; the binding limit and every margin are recorded.
     """
     for name, value in (
         ("bytes_per_block", bytes_per_block),
@@ -63,24 +70,43 @@ def measured_kv_capacity(
     for name, value in (
         ("transient_bytes", transient_bytes),
         ("safety_bytes", safety_bytes),
+        ("existing_blocks", existing_blocks),
     ):
         if type(value) is not int or value < 0:
             raise ValueError(f"{name} must be a nonnegative integer")
+    if reservation_blocks is not None and (
+        type(reservation_blocks) is not int or reservation_blocks < 1
+    ):
+        raise ValueError("reservation_blocks must be a positive integer")
     if not 0 < gpu_memory_utilization <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     free, total, gaps = measurement_budget(report)
+    if gaps and not transient_bytes:
+        # The preparation reported paths it did not exercise. Sizing them as if
+        # measured would publish a pool that cannot serve them.
+        raise ValueError(f"coverage gaps require an explicit transient allowance: {gaps[0]}")
     resident = total - free
     # What the utilization cap still allows, bounded by measured free memory.
     remaining = min(free, int(total * gpu_memory_utilization) - resident)
     budget = remaining - transient_bytes - safety_bytes
-    if budget < bytes_per_block:
+    additional = max(0, budget // bytes_per_block)
+    capacity = existing_blocks + additional
+    if capacity < 1:
         raise ValueError(
             "no KV capacity fits the measured budget: "
             f"remaining={remaining} transient={transient_bytes} "
             f"safety={safety_bytes} block={bytes_per_block}"
         )
-    blocks = min(budget // bytes_per_block, useful_blocks)
-    return blocks, dict(
+    limit = "budget"
+    if capacity > useful_blocks:
+        capacity, limit = useful_blocks, "useful_blocks"
+    if reservation_blocks is not None and capacity > reservation_blocks:
+        capacity, limit = reservation_blocks, "reservation"
+        gaps = (
+            *gaps,
+            "measured capacity exceeds the reservation; committed capacity truncated",
+        )
+    return capacity, dict(
         source="measured_warmup",
         bytes_per_block=bytes_per_block,
         driver_free_bytes=free,
@@ -91,7 +117,11 @@ def measured_kv_capacity(
         transient_bytes=transient_bytes,
         safety_bytes=safety_bytes,
         kv_budget_bytes=budget,
+        existing_blocks=existing_blocks,
+        additional_blocks=additional,
         max_useful_blocks=useful_blocks,
+        reservation_blocks=reservation_blocks,
+        limited_by=limit,
         coverage_gaps=gaps,
     )
 

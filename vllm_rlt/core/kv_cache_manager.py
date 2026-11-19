@@ -392,6 +392,11 @@ class KVCacheManager:
         """
         if self.kv_cache_dtype != "auto":
             raise ValueError("mapped KV storage does not carry FP8 scales yet")
+        if storage.committed_blocks > storage.max_blocks:
+            raise ValueError(
+                f"storage reports {storage.committed_blocks} committed blocks but "
+                f"reserves only {storage.max_blocks}"
+            )
         expected = kv_bytes_per_block(
             self.num_layers,
             self.block_size,

@@ -241,3 +241,60 @@ def test_storage_must_cover_the_requested_blocks_and_layout():
     wrong_dtype = FakeStorage(max_blocks=10, committed=10, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="do not match the KV layout"):
         make_cache(wrong_dtype, num_blocks=4)
+
+
+def test_existing_bootstrap_blocks_are_counted_once_in_the_total():
+    # The bootstrap prefix is already mapped, so it sits outside `free` and must
+    # extend the measured delta rather than being sized from free again.
+    capacity, record = plan(existing_blocks=100)
+    assert record["additional_blocks"] == 16298
+    assert capacity == 16398
+    assert record["existing_blocks"] == 100
+    # Only the new part spends budget.
+    assert (capacity - 100) * record["bytes_per_block"] <= record["kv_budget_bytes"]
+
+
+def test_bootstrap_only_capacity_is_usable_without_growth():
+    capacity, record = plan(
+        report=report(free=8 * MIB, total=80 * GIB),
+        existing_blocks=8,
+        transient_bytes=0,
+        safety_bytes=0,
+    )
+    assert capacity == 8
+    assert record["additional_blocks"] == 0
+    assert record["limited_by"] == "budget"
+
+
+def test_the_reservation_truncates_the_measured_capacity():
+    capacity, record = plan(reservation_blocks=1000)
+    assert capacity == 1000
+    assert record["limited_by"] == "reservation"
+    assert any("exceeds the reservation" in gap for gap in record["coverage_gaps"])
+
+
+def test_the_useful_block_cap_binds_before_the_reservation():
+    capacity, record = plan(useful_blocks=100, reservation_blocks=1000)
+    assert capacity == 100
+    assert record["limited_by"] == "useful_blocks"
+    assert not any("exceeds the reservation" in gap for gap in record["coverage_gaps"])
+
+
+def test_coverage_gaps_reject_a_zero_transient_allowance():
+    gaps = ("random block speculation retains the estimated transient reserve",)
+    with pytest.raises(ValueError, match="coverage gaps require an explicit transient"):
+        plan(
+            report=report(free=60 * GIB, total=80 * GIB, gaps=gaps),
+            transient_bytes=0,
+            safety_bytes=0,
+        )
+    # The same report is accepted once an allowance is stated, and the gap travels with it.
+    _, record = plan(report=report(free=60 * GIB, total=80 * GIB, gaps=gaps))
+    assert record["coverage_gaps"] == gaps
+
+
+def test_storage_may_not_report_more_committed_blocks_than_it_reserves():
+    storage = FakeStorage(max_blocks=4, committed=4)
+    storage.committed_blocks = 5  # a storage-side accounting bug
+    with pytest.raises(ValueError, match="reserves only"):
+        make_cache(storage, num_blocks=4)
