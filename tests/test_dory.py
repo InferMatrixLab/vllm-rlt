@@ -3,6 +3,7 @@
 
 import json
 import math
+from collections import Counter
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from vllm_rlt.attention.backend import AttentionBackend
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.kernels.paged_attention import torch_paged_attention
+from vllm_rlt.layers import RotaryEmbedding
 from vllm_rlt.models import AutoModelForCausalLM, DoryConfig, DoryForCausalLM
 
 ARTIFACT_PAIRS = 36
@@ -383,6 +385,94 @@ def test_batched_positions_match_reference_for_per_loop_kv(model):
     assert_matches_reference(actual, expected)
     cache.free("request")
     assert cache.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("kv_mode", ["per_loop", "last_loop"])
+def test_rotary_embeddings_are_reused_only_within_each_traversal(monkeypatch, dtype, kv_mode):
+    # Every stage contains repeated sliding and full attention layers.
+    layer_types = ("sliding_attention", "mlp", "full_attention", "mlp") * 6
+    config = tiny_dory_config(
+        num_hidden_layers=24,
+        n_input_layers=8,
+        n_recurrent_layers=8,
+        n_output_layers=8,
+        layer_types=layer_types,
+        recurrent_kv_cache_mode=kv_mode,
+    )
+    model = DoryForCausalLM(config).to(dtype=dtype).eval()
+    cache = make_cache(model)
+    assert cache.allocate("request", 2)
+    calls = Counter()
+    original = RotaryEmbedding.forward
+
+    def record(module, hidden, positions):
+        calls[module.rope_theta] += 1
+        return original(module, hidden, positions)
+
+    monkeypatch.setattr(RotaryEmbedding, "forward", record)
+    with torch.inference_mode():
+        for position in range(2):
+            batch = cache._prepare_batch(["request"], [0], [position])
+            calls.clear()
+            hidden = model.prelude_prepared(torch.tensor([4 + position]), batch, cache)
+            assert calls == {1e4: 1, 1e7: 1}
+            for depth in range(config.total_ut_steps):
+                core = cache._prepare_batch(["request"], [depth], [position])
+                calls.clear()
+                hidden, _ = model.recurrent_prepared(hidden, core, cache)
+                assert calls == {1e4: 1, 1e7: 1}
+            calls.clear()
+            model.coda_prepared(hidden, batch, cache)
+            assert calls == {1e4: 1, 1e7: 1}
+    cache.free("request")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("kv_mode", ["per_loop", "last_loop"])
+def test_reused_rotary_matches_per_layer_recomputation(monkeypatch, dtype, kv_mode):
+    config = tiny_dory_config(
+        num_hidden_layers=24,
+        n_input_layers=8,
+        n_recurrent_layers=8,
+        n_output_layers=8,
+        layer_types=("sliding_attention", "mlp", "full_attention", "mlp") * 6,
+        recurrent_kv_cache_mode=kv_mode,
+    )
+    model = DoryForCausalLM(config).to(dtype=dtype)
+    tokens = torch.tensor([4, 7, 9, 3, 12, 5])
+    with torch.inference_mode():
+        actual, cache = run_one_token_per_step(model, tokens)
+
+        def per_layer(backbone, hidden, batch, cache, layers):
+            for index in layers:
+                layer = backbone.layers[index]
+                embeddings = (
+                    layer.mixer.rotary_emb(hidden, batch.position_ids)
+                    if layer.is_attention
+                    else None
+                )
+                hidden = layer(hidden, embeddings, batch, cache)
+            return hidden
+
+        monkeypatch.setattr(type(model.backbone), "forward", per_layer)
+        expected, reference_cache = run_one_token_per_step(model, tokens)
+    torch.testing.assert_close(actual["logits"], expected["logits"], atol=0, rtol=0)
+    for actual_loop, expected_loop in zip(actual["loops"], expected["loops"]):
+        torch.testing.assert_close(actual_loop, expected_loop, atol=0, rtol=0)
+    for layer in model.config.attention_layer_ids:
+        kv_layer = model.config.kv_layer_index(layer)
+        depths = (
+            range(model.config.total_ut_steps) if kv_layer in model.recurrent_kv_layers else (0,)
+        )
+        for depth in depths:
+            for actual_kv, expected_kv in zip(
+                cache.read(kv_layer, "request", depth),
+                reference_cache.read(kv_layer, "request", depth),
+            ):
+                torch.testing.assert_close(actual_kv, expected_kv, atol=0, rtol=0)
+    cache.free("request")
+    reference_cache.free("request")
 
 
 def test_recurrent_kv_is_laid_out_per_loop_plane(model):
