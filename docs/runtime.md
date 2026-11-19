@@ -116,9 +116,23 @@ This preparation does not replace automatic KV sizing. The report describes the
 existing allocated KV pool, including FP8 scale storage when configured, and
 sizing still uses the current estimates and reserves. The graph and workspace
 allocations remain resident; the KV pool itself is not a transient workspace.
-Future storage integration must preserve captured pointers, views and strides,
-and validate replay after physical commitment before publishing readiness. Small explicit pools can reduce warmup coverage. Unseen exact graph
-shapes retain bounded lazy capture. Longer contexts and mixed speculative/prompt
+The report is a snapshot of preparation. Repeated `prepare_runtime()` calls return
+that snapshot; they do not measure or validate later storage changes. With ordinary
+KV tensors, `kv_bytes` is the usable payload including FP8 scales. Future VMM
+integration must report physical mapping bytes separately, including alignment
+overhead; PyTorch allocator counters do not include those mappings.
+
+Future storage integration must keep the full reserved tensor shape, pointers,
+views and strides stable for captured graphs, while exposing only physically
+backed blocks to the allocator. Capturing a view limited to the bootstrap blocks
+can retain that smaller indexing bound after commitment. Never initialize the
+unmapped part of a reservation with whole-tensor operations. Validate replay on
+newly committed blocks before publishing readiness; this is a separate step from
+the idempotent preparation call. PD/NIXL must retain ordinary storage until the
+mapping and registration requirements are supported.
+
+Small explicit pools can reduce warmup coverage. Unseen exact graph shapes retain
+bounded lazy capture. Longer contexts and mixed speculative/prompt
 overlap retain estimated transient allowances. Pipeline preparation reaches
 target verification before releasing its scratch state. The report is a lifecycle
 boundary for subsequent memory-planning integration, not a guarantee that every
