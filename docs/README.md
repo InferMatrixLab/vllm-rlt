@@ -30,6 +30,7 @@ an environment to receiving the first generated response. The
 | [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
 | [Ouro-Thinking recipe](recipes/ouro_thinking.md) | Shared 1.4B/2.6B setup, JSON/SSE client, budgets and validation limits |
 | [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |
+| [Validation and reproducibility index](validation.md) | Ouro-1.4B and Nanbeige4.2-3B reference checks, historical results, public artifacts, reproduction commands and evidence gaps |
 
 Earlier measurements and known limitations are retained in the
 [historical validation record](runtime-history.md); they do not qualify the current revision.

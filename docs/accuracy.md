@@ -1,5 +1,9 @@
 # Ouro GSM8K-87 accuracy regression case
 
+For source revisions, public artifact availability and missing per-example
+evidence, see the [Ouro/Nanbeige validation index](validation.md). The results
+below are historical measurements, not a fresh run of the current checkout.
+
 The default case uses **87 fixed questions from GSM8K `main`/`test`**. Its measured
 original Hugging Face Transformers baseline is **59/87 (67.82%)**. Native vllm-rlt
 also scored **59/87**, with identical per-question correctness on this case.
@@ -59,6 +63,8 @@ pip install -r benchmarks/requirements-accuracy.txt
 hf download ByteDance/Ouro-1.4B \
   --revision 574fa66cb8bf5abdc979642d01cf2b79b16bfab1 --local-dir /path/to/ouro
 python -m benchmarks.gsm8k prepare --model /path/to/ouro \
+  --model-repo ByteDance/Ouro-1.4B \
+  --model-revision 574fa66cb8bf5abdc979642d01cf2b79b16bfab1 \
   --output /path/to/gsm8k-87-protocol.json
 ```
 
