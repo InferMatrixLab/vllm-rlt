@@ -43,7 +43,10 @@ license-files = ["LICENSE", "NOTICE"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-markers = ["gpu: requires an explicitly selected CUDA device and --run-gpu"]
+markers = [
+    "gpu: requires an explicitly selected CUDA device and --run-gpu",
+    "npu: requires an assigned Ascend device and torch-npu/CANN",
+]
 
 [tool.ruff]
 line-length = 100

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
+from vllm_rlt.device import resolve_device
 from vllm_rlt.kernels import silu_and_mul
 from vllm_rlt.layers import (
     RMSNorm,
@@ -309,6 +310,7 @@ class OuroForCausalLM(nn.Module):
         """
         from safetensors import safe_open
 
+        device = resolve_device(device)
         if dtype not in (torch.float32, torch.float16, torch.bfloat16):
             raise ValueError("dtype must be float32, float16, or bfloat16")
         folder = Path(path_or_repo).expanduser()
