@@ -969,6 +969,7 @@ class ModelRunner:
             prepared = replace(prepared, kv=kv)
         return prepared
 
+    @torch.inference_mode()
     def prepare_on_gpu(self, prepared):
         """Prepare all model inputs before forward on the selected execution streams."""
         batch = prepared.batch

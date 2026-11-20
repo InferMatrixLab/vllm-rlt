@@ -1501,8 +1501,9 @@ def test_cuda_split_prefill_survives_decode_graph_capture_and_replay():
     assert eager[1]["static_buffer_bytes"] == eager[2] > 0
     assert graphed[1]["static_buffer_bytes"] == graphed[2] > 0
     before_resume, after_resume = graphed[3]
-    assert before_resume == (1, 2, 0)
-    assert after_resume == (1, 4, 0)
+    assert before_resume[0] > 0  # Planned decode entries already exist at startup.
+    assert before_resume[1:] == (2, 0)
+    assert after_resume == (before_resume[0], 4, 0)
 
 
 @pytest.mark.gpu

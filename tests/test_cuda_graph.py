@@ -506,7 +506,9 @@ def test_triton_graph_fuses_unmasked_key_and_value_writes(dtype):
 
     keys = torch.full((5, 2, 4, 3, 9), -1, dtype=dtype, device="cuda")
     values = torch.full_like(keys, -2)
-    proxy = _DeviceCache(SimpleNamespace(key_cache=keys, value_cache=values, backend="triton"))
+    proxy = _DeviceCache(
+        SimpleNamespace(key_cache=keys, value_cache=values, key_scale=None, backend="triton")
+    )
     batch = SimpleNamespace(
         active_rows=None,
         write_mask=None,

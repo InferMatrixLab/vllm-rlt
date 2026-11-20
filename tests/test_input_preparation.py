@@ -48,6 +48,8 @@ def test_loop_preparation_reuses_growing_storage_and_only_saves_final_hidden(
         exit_config=ExitConfig("ouro"),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
         attention_backend=backend,
+        # Exercise lazy buffer growth independently of startup preallocation.
+        _defer_runtime_preparation=True,
     )
     runner = engine.model_runner
     cpu_prepare, gpu_prepare = runner.prepare_on_cpu, runner.prepare_on_gpu

@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
@@ -57,6 +58,7 @@ class StageEngine:
         speculative_config=None,
         stage_config=None,
         connector: StageConnector | None = None,
+        _defer_runtime_preparation=False,
     ):
         self.model = model
         self.stage_config = stage_config or StageConfig()
@@ -359,6 +361,71 @@ class StageEngine:
         if scheduler_config.enable_preemption:
             self.scheduler.suspend_callback = self.preemption.suspend
             self.scheduler.resume_callback = self.preemption.resume
+        self.startup_report = None
+        if not _defer_runtime_preparation:
+            self.prepare_runtime()
+
+    def prepare_runtime(self):
+        """Prepare serving execution before readiness; KV sizing remains estimate-based.
+
+        Workers defer this boundary until connector-owned buffers are initialized.
+        The report is a handoff for measured sizing, not a new capacity estimate.
+        """
+        if self.startup_report is not None:
+            return self.startup_report
+        from vllm_rlt.worker.warmup import drain, prepare_runner
+
+        runner = self.model_runner
+        report = dict(capacity_source=self.memory_plan["source"], phases=[])
+        if runner.device.type != "cuda":
+            report["status"] = "cpu"
+        else:
+            started = time.perf_counter()
+
+            def phase(name):
+                drain(runner, self.speculative_runner)
+                free, total = torch.cuda.mem_get_info(runner.device)
+                report["phases"].append(
+                    dict(
+                        name=name,
+                        elapsed_seconds=time.perf_counter() - started,
+                        driver_free_bytes=free,
+                        device_total_bytes=total,
+                        allocated_bytes=torch.cuda.memory_allocated(runner.device),
+                        reserved_bytes=torch.cuda.memory_reserved(runner.device),
+                        peak_allocated_bytes=torch.cuda.max_memory_allocated(runner.device),
+                        peak_reserved_bytes=torch.cuda.max_memory_reserved(runner.device),
+                    )
+                )
+                torch.cuda.reset_peak_memory_stats(runner.device)
+
+            phase("initialized")
+            try:
+                report.update(
+                    prepare_runner(
+                        runner, self.scheduler.config, self.speculative_runner, phase=phase
+                    )
+                )
+            except BaseException:
+                drain(runner, self.speculative_runner)
+                # Partial entries can retain pool outputs after a failed capture.
+                from vllm_rlt.worker.warmup import graph_owners
+
+                for owner in graph_owners(runner, self.speculative_runner):
+                    owner.entries.clear()
+                    owner.last_event = None
+                raise
+            phase("cleaned")
+            report.update(
+                status="prepared",
+                sizing="estimated",
+                allocator_cache_policy="retain",
+                kv_bytes=self.cache_manager.num_blocks * self.memory_plan["bytes_per_block"],
+                num_blocks=self.cache_manager.num_blocks,
+            )
+            logger.info("Runtime startup preparation: %s", report)
+        self.startup_report = report
+        return report
 
     @property
     def connector(self):

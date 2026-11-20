@@ -373,9 +373,6 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             if execution.cuda_graphs
             else None
         )
-        if self.graphs is not None:
-            self.graphs.prepare()
-            self.coda_graphs.prepare()
         self.compute_stream = compute_stream
         self.copy_stream = copy_stream
         self.compute_stream.wait_stream(torch.cuda.current_stream(self.device))
