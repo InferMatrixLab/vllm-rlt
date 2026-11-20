@@ -141,17 +141,16 @@ a fixed scale at startup. See the
 
 ## Model Support
 
-| Checkpoint | Implementation | Platforms | Documented validation scope | Guide |
-| --- | --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | NVIDIA CUDA<br>Huawei Ascend NPU (`main`) | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. | [Runtime](docs/runtime.md), [Ascend recipe](docs/recipes/ouro_ascend.md) |
-| Ouro-2.6B | Shared Ouro | NVIDIA CUDA | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
-| Ouro-1.4B-Thinking | Reuses Ouro | NVIDIA CUDA | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
-| Ouro-2.6B-Thinking | Reuses Ouro | NVIDIA CUDA | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
-| Nanbeige4.2-3B | Native Nanbeige | NVIDIA CUDA | Fixed two-loop inference | [Runtime](docs/runtime.md), [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |
-| Huginn-0125 | Native Huginn | NVIDIA CUDA | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/runtime.md) |
-| NVIDIA-Nemotron-Labs-Dory1.0-4B | Native Dory | NVIDIA CUDA | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified | [Dory baseline](docs/dory.md) |
+| Checkpoint | Implementation | Platforms | Documented validation scope |
+| --- | --- | --- | --- |
+| Ouro-1.4B | Native Ouro | [CUDA](docs/launching.md)<br>[Ascend](docs/recipes/ouro_ascend.md) | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. |
+| Ouro-2.6B | Shared Ouro | [CUDA](docs/launching.md) | Shares the Ouro implementation. [Separate quality and performance qualification](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) remains open. |
+| [Ouro-1.4B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
+| [Ouro-2.6B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
+| Nanbeige4.2-3B | Native Nanbeige | [CUDA](docs/launching.md) | Fixed two-loop inference. [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |
+| Huginn-0125 | Native Huginn | [CUDA](docs/launching.md) | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda |
+| [NVIDIA-Nemotron-Labs-Dory1.0-4B](docs/dory.md) | Native Dory | [CUDA](docs/launching.md) | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified |
 
-The linked guides cover each checkpoint's validation scope and feature limits.
 The broader model roadmap is in [RFC #69](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
 
 Huginn uses native checkpoint loading and depth-aware KV for its recurrent
