@@ -8,11 +8,42 @@ The example enables the optional asynchronous engine plan.
 
 ## Prepare the environment and model
 
-Use `main`, which includes Ascend support added after `v0.2.0`. Match the PyTorch
-package (`torch`) and the Ascend extension package (`torch-npu`, imported as
-`torch_npu`) to your CANN version using the
+Use `main`, which includes Ascend support added after `v0.2.0`. Install CANN and
+the matching driver and firmware for your Ascend hardware first.
+
+### Install PyTorch and Torch-NPU
+
+The following commands use CANN 9.0.0 with PyTorch 2.10.0 and Torch-NPU 2.10.0.
+For other versions, consult the
 [Ascend compatibility table](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md#torchnpu-version-mapping-table).
-For example, CANN 9.0.0 pairs `torch==2.10.0` with `torch-npu==2.10.0`.
+Activate your Python environment and load the CANN environment.
+
+```bash
+source /path/to/npu-environment/bin/activate
+source /path/to/cann/set_env.sh
+```
+
+On x86-64, install PyTorch from the CPU wheel index.
+
+```bash
+python -m pip install 'torch==2.10.0+cpu' --index-url https://download.pytorch.org/whl/cpu
+```
+
+On Arm64 (`aarch64`), use the following PyTorch command.
+
+```bash
+python -m pip install 'torch==2.10.0'
+```
+
+On either architecture, install `torch-npu` and check that PyTorch can see the NPU.
+The package is imported as `torch_npu` in Python.
+
+```bash
+python -m pip install 'torch-npu==2.10.0' pyyaml setuptools
+python -c 'import torch, torch_npu; assert torch.npu.is_available(), "Ascend NPU unavailable"'
+```
+
+### Install vllm-rlt and set the checkpoint path
 
 Install the project dependencies in that environment. Use the checkpoint's
 config and byte-level tokenizer.
@@ -20,8 +51,6 @@ config and byte-level tokenizer.
 ```bash
 git clone --branch main https://github.com/InferMatrixLab/vllm-rlt.git
 cd vllm-rlt
-source /path/to/cann/set_env.sh
-source /path/to/npu-environment/bin/activate
 python -m pip install --no-deps --no-build-isolation -e .
 export MODEL=/path/to/prepared/Ouro-1.4B
 export ASCEND_RT_VISIBLE_DEVICES=0  # Replace 0 with your assigned NPU.

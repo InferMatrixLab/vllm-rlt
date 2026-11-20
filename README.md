@@ -108,7 +108,7 @@ Requires **Python 3.10+** and **PyTorch 2.5+**. The commands below install
 `v0.2.0` for CPU or NVIDIA CUDA. CUDA inference requires Linux, an NVIDIA GPU,
 and compatible CUDA-enabled PyTorch.
 
-For Ascend NPU on `main`, follow the [Ascend setup guide](docs/recipes/ouro_ascend.md).
+For Ascend NPU on `main`, follow the [PyTorch and Torch-NPU installation steps](docs/recipes/ouro_ascend.md#install-pytorch-and-torch-npu).
 
 ```bash
 # Activate your Python environment first.
@@ -144,13 +144,13 @@ a fixed scale at startup. See the
 
 | Checkpoint | Implementation | Platforms | Documented validation scope | Guide |
 | --- | --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | CPU, NVIDIA CUDA, Huawei Ascend NPU (`main`) | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. | [Runtime](docs/runtime.md), [Ascend recipe](docs/recipes/ouro_ascend.md) |
-| Ouro-2.6B | Shared Ouro | CPU and NVIDIA CUDA via the shared runtime | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
-| Ouro-1.4B-Thinking | Reuses Ouro | CPU (reference), NVIDIA CUDA | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
-| Ouro-2.6B-Thinking | Reuses Ouro | CPU (reference), NVIDIA CUDA | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
-| Nanbeige4.2-3B | Native Nanbeige | CPU, NVIDIA CUDA | Fixed two-loop inference | [Runtime](docs/runtime.md), [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |
-| Huginn-0125 | Native Huginn | CPU, NVIDIA CUDA | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/runtime.md) |
-| NVIDIA-Nemotron-Labs-Dory1.0-4B | Native Dory | CPU, NVIDIA CUDA | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified | [Dory baseline](docs/dory.md) |
+| Ouro-1.4B | Native Ouro | CPU<br>NVIDIA CUDA<br>Huawei Ascend NPU (`main`) | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. | [Runtime](docs/runtime.md), [Ascend recipe](docs/recipes/ouro_ascend.md) |
+| Ouro-2.6B | Shared Ouro | CPU<br>NVIDIA CUDA | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
+| Ouro-1.4B-Thinking | Reuses Ouro | CPU<br>NVIDIA CUDA | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
+| Ouro-2.6B-Thinking | Reuses Ouro | CPU<br>NVIDIA CUDA | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
+| Nanbeige4.2-3B | Native Nanbeige | CPU<br>NVIDIA CUDA | Fixed two-loop inference | [Runtime](docs/runtime.md), [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |
+| Huginn-0125 | Native Huginn | CPU<br>NVIDIA CUDA | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/runtime.md) |
+| NVIDIA-Nemotron-Labs-Dory1.0-4B | Native Dory | CPU<br>NVIDIA CUDA | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified | [Dory baseline](docs/dory.md) |
 
 CPU entries refer to the Torch reference path. See the linked guides for each
 checkpoint's validation scope and feature limits. See
