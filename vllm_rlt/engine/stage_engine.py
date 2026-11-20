@@ -88,9 +88,16 @@ class StageEngine:
             preemption=scheduler_config.enable_preemption,
         )
         if getattr(model, "requires_boundary_kv", False):
-            if staged_prefill:
+            if staged_prefill and (
+                self.execution_config.async_scheduling
+                or self.execution_config.cuda_graphs
+                or scheduler_config.enable_preemption
+                or speculative_config is not None
+                or not self.stage_config.produces_tokens
+            ):
                 raise ValueError(
-                    "boundary-KV models do not support staged prefill required by this scheduler"
+                    "boundary-KV staged prefill requires synchronous eager generation "
+                    "without speculation or preemption"
                 )
             if self.execution_config.async_scheduling and not getattr(
                 model, "supports_async_scheduling", False
@@ -269,6 +276,7 @@ class StageEngine:
             speculative_config,
             produces_tokens=self.stage_config.produces_tokens,
             total_ut_steps=config.total_ut_steps,
+            requires_prefill_coda=getattr(model, "requires_prefill_coda", False),
             eos_token_id=config.eos_token_id,
             exit_mode=self.exit_config.mode,
         )
@@ -387,7 +395,10 @@ class StageEngine:
                     "min_loops and max_loops must match the fixed target_loops when specified, "
                     "except the min_loops default"
                 )
-            if target_loops != model_depth:
+            if target_loops != model_depth and not (
+                self.scheduler.staged_prefill
+                and getattr(self.model, "requires_prefill_coda", False)
+            ):
                 raise ValueError(
                     "target_loops below total_ut_steps requires per-request prefill support"
                 )
@@ -471,10 +482,13 @@ class StageEngine:
                 list(prompt_token_ids),
                 params,
                 exit_trace=trace,
-                # Prefill always runs the model's full depth, whatever decode
-                # loop bound the request asks for.
                 prefill_depth_ranges=Request.prefill_boundaries(
-                    len(prompt_token_ids), config.total_ut_steps
+                    len(prompt_token_ids),
+                    target_loops
+                    if fixed_loop_count
+                    and self.scheduler.staged_prefill
+                    and target_loops is not None
+                    else config.total_ut_steps,
                 ),
                 _target_loops=(
                     target_loops if fixed_loop_count and self.exit_config.mode != "trace" else None

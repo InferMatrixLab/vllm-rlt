@@ -761,7 +761,10 @@ restrictions still apply. Speculative generation requires refill.
 chunk runs its prelude and all recurrent depths locally in one submission.
 Mixed mode inserts a boundary when ready decode work can join prompt recurrent
 work, and it returns after every depth in such a mixed batch. With no ready
-decode work, the prompt batch can run through its remaining depths. WCPB always
+decode work, a prompt batch can run through its remaining depths. Models with
+attention-bearing prompt CODA stage the prelude separately and run CODA after
+the required recurrent depths; their final prompt row also produces the first
+sampled token. WCPB always
 returns after one depth to regroup ready chunks. Chunk size and loop submission
 size are distinct choices; WCPB retains up to one staged chunk per model depth.
 Ordinary prompt chunks already end at the scheduler's configured chunk boundary,

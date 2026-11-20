@@ -159,16 +159,19 @@ Huginn uses native checkpoint loading and depth-aware KV for its recurrent
 core, with separate prelude and coda KV. It supports synchronous fixed-depth
 inference and CUDA Graphs for the recurrent core and decode coda.
 
-Huginn does **not** currently support WCPB/mixed staged prefill, asynchronous
-execution, self-speculation, or PD. Feature availability is not equivalent to
-validation of every model/backend/workload combination.
+Huginn supports synchronous eager WCPB and mixed staged prefill with per-loop KV.
+Asynchronous staged execution, self-speculation, prefix reuse, and PD are not
+supported. Feature availability is not equivalent to validation of every
+model/backend/workload combination.
 
 Dory runs the native normalized-GPT stack with attention-bearing input and
 output stages, so its boundary stages own their own KV. Synchronous
 fixed-loop execution is supported for both `per_loop` and `last_loop` KV
-modes. Sliding-window masking exists only in the Torch reference attention
-backend, and WCPB, CUDA Graphs, asynchronous execution, self-speculation,
-prefix reuse and PD are rejected. See the
+modes. Sliding-window masking is available in Torch and supported GPU attention
+backends. Synchronous eager WCPB and mixed staged prefill support per-request
+fixed loop counts with per-loop KV. Ordinary Graphs, asynchronous execution and
+synchronous self-speculation have separate configuration restrictions; staged
+Graphs/async, prefix reuse and PD are not supported. See the
 [Dory baseline notes](docs/dory.md) for the exact qualified scope.
 
 ## Documentation

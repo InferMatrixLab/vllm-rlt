@@ -15,6 +15,7 @@ class RequestPhase(str, Enum):
     PREFILL = "prefill"
     PREFILLING_PRELUDE = "prefilling_prelude"
     PREFILLING_RECURRENT = "prefilling_recurrent"
+    PREFILLING_CODA = "prefilling_coda"
     PRELUDE = "prelude"
     RECURRENT = "recurrent"
     SPECULATIVE = "speculative"
@@ -47,6 +48,7 @@ class Request:
     num_speculative_rounds: int = 0
     input_token_tensor: torch.Tensor | None = field(default=None, repr=False)
     num_prefilled_tokens: int = 0
+    num_recurrent_prefilled_tokens: int = 0
     # Split prefill: [num_prefilled_tokens, num_preluded_tokens) has resident
     # hidden states; wavefront keeps multiple chunks at distinct depths here.
     num_preluded_tokens: int = 0
@@ -55,7 +57,7 @@ class Request:
     # Wavefront chunk slots are assigned relative to this cached-prefix origin.
     prefill_window_origin: int = 0
     # End of the completed prefix and start of the oldest resident chunk. Advance
-    # only after final-depth completion releases that chunk's hidden-state slot.
+    # only after its final required stage releases the hidden-state slot.
     prefill_reclaimable_tokens: int = 0
     # Host-side decode progress; ModelRunner events track pending device work.
     loops_done: int = 0
@@ -147,6 +149,7 @@ class StateSpan:
     # Row offset in the request's prefill hidden-state buffer. None lets the runner
     # derive token_start - chunk_start.
     prefill_hidden_row_offset: int | None = None
+    compute_logits: bool = True
 
 
 @dataclass(frozen=True)

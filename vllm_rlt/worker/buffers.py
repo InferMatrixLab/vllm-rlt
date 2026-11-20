@@ -54,7 +54,7 @@ def execution_buffer_bytes(
     total += scheduler.max_num_seqs * stage_rows * hidden
     # Split recurrent batches gather staged rows into a contiguous model input.
     if stage_rows:
-        total += rows * hidden
+        total += MAX_CONCURRENT_SUBMISSIONS * rows * hidden
         span_capacity = rows if scheduler.wavefront_chunked_prefill else scheduler.max_num_seqs
         total += MAX_CONCURRENT_SUBMISSIONS * (
             span_capacity * (5 + 4 * 8) * 8 + max(rows, scheduler.prefill_chunk_size) * 8

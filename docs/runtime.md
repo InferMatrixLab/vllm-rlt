@@ -63,7 +63,15 @@ if __name__ == "__main__":
 
 The default exit mode remains `ouro`, with the original cumulative hazard policy. For random lookahead, sigmoid is a direct score for exiting after one more loop, not a hazard/CDF. `SamplingParams.exit_threshold` compares this score directly. Threshold 1 disables adaptive exit; `max_loops` always caps execution. Adaptive lookahead cannot exit before round 2, although an explicitly configured hard maximum of 1 is honored. All prompt tokens still run the model's full depth.
 
-Fixed-loop models accept the request-level `SamplingParams.target_loops` field (offline CLI: `--request-target-loops`). An omitted target defaults to `total_ut_steps`; an explicit target must be between one and the model depth. If `max_loops` is provided, it must match the fixed target. For compatibility with the default, `min_loops=2` is accepted, as is `min_loops` equal to the target; the fixed target determines the exit depth. Targets below the model depth are rejected until per-request prompt prefill is enabled; they are never silently run at full prompt depth. Dynamic-exit models do not accept this field and retain their existing loop-bound and exit-threshold behavior.
+Fixed-loop models accept the request-level `SamplingParams.target_loops` field (offline CLI: `--request-target-loops`). An omitted target defaults to `total_ut_steps`; an explicit target must be between one and the model depth. If `max_loops` is provided, it must match the fixed target. For compatibility with the default, `min_loops=2` is accepted, as is `min_loops` equal to the target; the fixed target determines the exit depth. Dory accepts shorter request targets for synchronous eager staged prefill with per-loop KV; ordinary atomic prefill still rejects shorter targets. Dynamic-exit models do not accept this field and retain their existing loop-bound and exit-threshold behavior.
+
+Huginn initializes its recurrent state one token at a time using the request's
+generator. This keeps seeded state independent of chunk sizes and batch grouping,
+including when prelude work is mixed with decoding. Relative to earlier versions
+that initialized a whole span at once, the same seed can produce different
+outputs; GPU performance of this per-token initialization has not been measured.
+Some PyTorch implementations of truncated-normal initialization synchronize
+the device during rejection sampling, making that cost potentially significant.
 
 For dynamic-exit models, ordinary asynchronous execution requires `ouro_delayed`, `random_lookahead` or `trace`; fixed-loop models do not need an exit signal. Speculative execution has the separate constraints below. Asynchronous execution automatically enables reusable static inputs to avoid blocking device metadata transfers. CPU supports the same scheduling state machine for tests, with immediately completed operations; it does not simulate GPU parallel execution. `multi_stream` is an independent CUDA execution feature: `False` uses one stream for core, boundary and copies; `True` separates those streams, with or without async scheduling.
 
@@ -383,8 +391,8 @@ because the runtime window includes the current token. Full-attention layers
 keep their causal mask. Packed prompt chunks retain bottom-right alignment
 against an existing prefix. Both `per_loop` and `last_loop` KV modes, using
 their required layouts, support asynchronous scheduling and CUDA Graphs in
-the input, recurrent and output stages. Dory's existing rejection of mixed
-scheduling and boundary-KV prefix caching remains in effect.
+the input, recurrent and output stages. Dory's staged path has separate
+eager/per-loop restrictions, and boundary-KV prefix caching remains rejected.
 
 Validation on B300 with FA4 4.0.0b39 covers 69 GPU cases across kernel,
 end-to-end and regression checks: head dimensions 64/128/256, packed sliding

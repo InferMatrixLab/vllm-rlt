@@ -8,11 +8,11 @@ uneven, without making chunks larger and reducing scheduling opportunities.
 
 ![Split prefill compared with wavefront chunked prefill](assets/Split-prefill-vs-wavefront-chunked-prefill.png)
 
-The current runner requires one operation per batch: PRELUDE ranges and RECURRENT
-ranges are submitted separately. Ordinary prefill can also execute its selected range
-through all recurrent depths in one plan. Actual submission counts depend on scheduler
-mode, token budget, and ready work; the numbered batches in the figure should not be
-read as measured latency or a fixed runtime schedule.
+The current runner requires one operation per batch: PRELUDE, RECURRENT and
+CODA ranges are submitted separately. Ordinary prefill can also execute its
+selected range through all recurrent depths in one plan. Actual submission
+counts depend on scheduler mode, token budget, and ready work; the numbered batches
+in the figure should not be read as measured latency or a fixed runtime schedule.
 
 ## Execution model
 
@@ -22,12 +22,24 @@ scheduler may choose a shorter execution boundary when ready decode work needs a
 depth decision. `ExecutionBatch.loop_count` records the recurrent work in that
 submission.
 
-With `wavefront_chunked_prefill=True`, prompt work is scheduled in two phases:
+With `wavefront_chunked_prefill=True`, prompt work uses these phases:
 
 | Phase | Work | Recurrent loops in the submission |
 | --- | --- | ---: |
 | `PREFILLING_PRELUDE` | Embed staged prompt ranges and prepare inputs | 0 |
 | `PREFILLING_RECURRENT` | Run ready prompt ranges at their selected recurrent depths | 1 |
+| `PREFILLING_CODA` | Run attention-bearing output layers on ready prompt ranges, when required by the model | 0 |
+
+Huginn and Dory require the CODA phase to populate their output-attention KV.
+All prompt rows run the output layers; only the last prompt row projects logits
+and samples the first output. This phase is currently scheduled separately from
+ordinary decode CODA. Ouro does not require prompt CODA.
+
+Staged CODA passes a row-aligned boolean `ForwardBatch.compute_logits` mask:
+only a final prompt row or a mixed decode row is selected for projection and
+sampling. Sparse samples are mapped back to their request spans. Uniform boolean
+values remain supported for the existing atomic and CUDA Graph paths; automatic
+mixing of prompt and decode CODA is a separate scheduling change.
 
 The scheduler can include several ranges from different chunks, requests, and
 depths in one recurrent batch. It obeys the shared token budget, request-owner
@@ -52,22 +64,24 @@ Progress belongs to the request rather than to a persistent task table:
 
 - `num_preluded_tokens` tracks the prompt range whose prelude has been staged.
 - `prefill_depth_ranges` tracks the ready range at each recurrent depth.
-- `num_prefilled_tokens` tracks prompt progress at the final depth, including
-  progress within a chunk.
+- For attention-bearing CODA, `num_recurrent_prefilled_tokens` tracks the final
+  recurrent frontier; `num_prefilled_tokens` tracks completed prompt CODA.
+  For other models, `num_prefilled_tokens` tracks the final recurrent frontier.
 - `prefill_reclaimable_tokens` marks the oldest resident chunk boundary. It
-  advances only after that chunk completes its final depth and its ring slot
-  can be reused.
+  advances after the chunk's final required stage completes: CODA for Huginn and
+  Dory, otherwise the final recurrent depth.
 
 This separation prevents a prelude or partial chunk from advancing the
-reclaimable boundary. Prefix publication, prompt completion, and CODA follow
-the completed final-depth frontier.
+reclaimable boundary. For models with prompt CODA, the CODA frontier cannot
+overtake the final recurrent frontier and each chunk remains resident until
+CODA consumes it.
 
 ## Hidden-state ring
 
 Each request reserves `prefill_chunk_size * total_ut_steps` rows for staged
 prompt hidden states. A chunk uses a ring slot derived from its index relative
-to the cached-prefix origin. For a chunk-local offset `j` and slot `s`, its row
-offset is:
+to the cached-prefix origin and the request's prefill loop count. For a
+chunk-local offset `j` and slot `s`, its row offset is:
 
 ```text
 prefill_hidden_row_offset = s * prefill_chunk_size + j
@@ -75,9 +89,10 @@ prefill_hidden_row_offset = s * prefill_chunk_size + j
 
 `ScheduledRequest` and `StateSpan` carry this row offset. When it is `None`, the
 runner derives the row from `token_start - chunk_start`. Intermediate outputs
-are scattered to the ring for later depths; after final-depth completion, the
-chunk's intermediate state is no longer needed. Asynchronous submissions keep
-the backing rows alive until dependent reads complete.
+are scattered to the ring for later depths or prompt CODA. Batch-local gathered
+hidden scratch rotates with the submission's input descriptors and is reused
+only after its last device consumer. Request events also protect ring rows from
+reuse before dependent reads finish.
 
 ## Scheduling and recovery
 
@@ -94,8 +109,12 @@ Preemption rewinds staged work to the request's completed prompt frontier and
 recomputes unfinished work after resume. PD transfer progress is reported for
 completed chunks, and imported prompt state initializes the same frontiers.
 Speculative execution is supported with compatible refill scheduling; mixed
-mode rejects speculative configuration. CUDA graph and asynchronous paths use
-the existing runner machinery.
+mode rejects speculative configuration. For Huginn and Dory, staged prefill
+currently requires synchronous eager generation without preemption, speculation,
+prefix reuse, or PD; the separate CUDA streams remain event-ordered. Tiny-model
+CPU and A100 CUDA regressions cover these staged paths. A short real Dory
+checkpoint check compares mixed and WCPB prefill with atomic prefill; longer
+contexts and broader backend qualification remain outstanding.
 
 `SHARED` KV is rejected for WCPB. Its position-major dependencies do not permit
 the same cross-chunk/depth ordering as `LAST_EXITED` without a different

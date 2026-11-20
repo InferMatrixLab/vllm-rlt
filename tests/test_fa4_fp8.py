@@ -420,19 +420,20 @@ def test_dory_fa4_fp8_execution_modes_match_eager(kv_mode, loops, mode):
     assert actual == expected
 
 
-def test_dory_fp8_preserves_mixed_scheduler_rejection():
+def test_dory_fp8_staged_prefill_rejects_graphs():
     from tests.test_dory import tiny_dory_config
-    from vllm_rlt import SchedulerConfig
+    from vllm_rlt import ExecutionConfig, SchedulerConfig
     from vllm_rlt.engine.llm_engine import LLMEngine
     from vllm_rlt.models import DoryForCausalLM
 
     model = DoryForCausalLM(tiny_dory_config(head_dim=256))
-    with pytest.raises(ValueError, match="boundary-KV models do not support staged prefill"):
+    with pytest.raises(ValueError, match="staged prefill requires synchronous eager"):
         LLMEngine(
             model,
             attention_backend="flash_attn_4",
             cache_config=CacheConfig(kv_cache_dtype="fp8_e4m3"),
             scheduler_config=SchedulerConfig(mode="mixed"),
+            execution_config=ExecutionConfig(cuda_graphs=True),
         )
 
 

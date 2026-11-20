@@ -26,6 +26,7 @@ from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import DoryForCausalLM, load_tokenizer
+from vllm_rlt.request import RequestPhase
 
 CHECKPOINT = os.environ.get("DORY_CHECKPOINT")
 
@@ -222,4 +223,102 @@ def test_real_checkpoint_generation_stops_on_eos_or_limit():
             assert len(finished.token_ids) == GENERATED_TOKENS
     finally:
         del model
+        torch.cuda.empty_cache()
+
+
+def test_real_checkpoint_staged_mixed_depths_match_atomic():
+    tokens, _ = prompt_tokens()
+    prompts = {"shallow": tokens.tolist(), "full": tokens.tolist() * 2}
+    targets = {"shallow": 1, "full": 2}
+    shallow = load("cuda", torch.bfloat16, 1)
+    full = load("cuda", torch.bfloat16, 2)
+
+    def run(model, request_ids, *, staged, wavefront=False):
+        engine = LLMEngine(
+            model,
+            attention_backend="triton",
+            cache_config=CacheConfig(num_blocks=64, block_size=16),
+            scheduler_config=SchedulerConfig(
+                mode="mixed" if staged else "refill",
+                wavefront_chunked_prefill=wavefront,
+                max_num_seqs=2,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=2,
+            ),
+        )
+        first_logits = {}
+        coda = model.coda_prepared
+
+        def capture(hidden, batch, cache, *, compute_logits=True):
+            logits = coda(hidden, batch, cache, compute_logits=compute_logits)
+            if logits is not None:
+                scheduled = engine.last_schedule
+                producing = [
+                    item
+                    for item in scheduled.requests
+                    if scheduled.phase_for(item) == RequestPhase.CODA
+                    or (
+                        scheduled.phase_for(item) == RequestPhase.PREFILLING_CODA
+                        and item.completes_prompt
+                    )
+                ]
+                for item, row in zip(producing, logits):
+                    first_logits.setdefault(item.request.request_id, row.detach().float().clone())
+            return logits
+
+        model.coda_prepared = capture
+        try:
+            for request_id in request_ids:
+                engine.add_request(
+                    request_id,
+                    prompts[request_id],
+                    SamplingParams(max_tokens=3, target_loops=targets[request_id], ignore_eos=True),
+                )
+            outputs = {}
+            mixed_depths = False
+            while engine.has_unfinished_requests():
+                for output in engine.step():
+                    if output.finished:
+                        outputs[output.request_id] = (output.token_ids, output.exit_depths)
+                batch = engine.last_schedule
+                if batch is not None:
+                    recurrent = [
+                        item
+                        for item in batch.requests
+                        if batch.phase_for(item) == RequestPhase.PREFILLING_RECURRENT
+                    ]
+                    mixed_depths |= len({item.request.target_loops for item in recurrent}) > 1
+            assert engine.cache_manager.num_used_blocks == 0
+            assert set(first_logits) == set(request_ids)
+            return outputs, mixed_depths, first_logits
+        finally:
+            model.coda_prepared = coda
+            engine.close()
+
+    try:
+        shallow_output, _, shallow_logits = run(shallow, ("shallow",), staged=False)
+        full_output, _, full_logits = run(full, ("full",), staged=False)
+        expected = shallow_output | full_output
+        expected_logits = shallow_logits | full_logits
+        for wavefront in (False, True):
+            actual, mixed_depths, logits = run(
+                full, ("shallow", "full"), staged=True, wavefront=wavefront
+            )
+            assert mixed_depths
+            assert actual == expected
+            for request_id in prompts:
+                reference = expected_logits[request_id]
+                top_ids = reference.topk(TOP_K).indices
+                actual_top = logits[request_id].topk(TOP_K).indices
+                overlap = len(set(top_ids.tolist()) & set(actual_top.tolist()))
+                deviation = (logits[request_id][top_ids] - reference[top_ids]).abs().max().item()
+                print(
+                    f"wavefront={wavefront} request={request_id} output={actual[request_id]} "
+                    f"top{TOP_K}_overlap={overlap}/{TOP_K} max|dlogit|={deviation:.4f}",
+                    flush=True,
+                )
+                assert overlap >= TOP_K - 2
+                assert deviation <= MAX_TOP_DEVIATION
+    finally:
+        del shallow, full
         torch.cuda.empty_cache()

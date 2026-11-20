@@ -40,15 +40,15 @@ Supported models are Ouro-1.4B, Nanbeige4.2-3B, Huginn-0125 and
 NVIDIA-Nemotron-Labs-Dory1.0-4B. See the
 [checkpoint support matrix](../README.md#model-support) and the
 [Thinking recipe](recipes/ouro_thinking.md) for model-specific coverage.
-Huginn currently uses synchronous execution, LAST_EXITED KV, and fixed
-recurrent depth; prefix caching, asynchronous execution, and speculative
-decoding are rejected, as are mixed/WCPB staged prefill and PD. Its CUDA Graphs capture the recurrent decode core
-and coda, including the LM head.
-The [Dory baseline notes](dory.md) list the narrower scope qualified for Dory:
-synchronous fixed-loop execution with boundary KV in both KV modes, sliding-window
-masking on the Torch and Triton backends, and BF16 agreement with the pinned
-checkpoint at 1/2/4 loops; Graphs, WCPB, async, speculation, prefix reuse and PD
-remain out of scope.
+Huginn supports synchronous fixed-depth execution, LAST_EXITED KV, and eager
+mixed/WCPB staged prefill; prefix caching, asynchronous execution, speculative
+decoding and PD are rejected. Its ordinary CUDA Graphs capture the recurrent
+decode core and coda, including the LM head.
+The [Dory notes](dory.md) describe the supported execution modes and their
+validation scope. Eager staged prefill with per-request fixed depths is separate
+from the already supported ordinary Graph, async and synchronous speculative
+paths. Tiny-model CUDA regressions and a short real-checkpoint differential
+check cover A100; broader staged qualification remains outstanding.
 CPU execution provides a Torch reference backend. FlashAttention hardware validation is currently documented
 for FA4 on B300; FA2/FA3 require validation on their target devices. Disaggregated
 serving currently targets multiple GPUs on a single host.

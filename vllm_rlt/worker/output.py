@@ -34,5 +34,6 @@ class ModelRunnerOutput:
     completion: object = None
     depths: tuple[int, ...] = ()
     output_indices: tuple[int, ...] = ()
+    output_rows: tuple[int, ...] | None = None
     speculative: list[SpeculativeResult] | None = None
     frontiers: list[int] | None = None
