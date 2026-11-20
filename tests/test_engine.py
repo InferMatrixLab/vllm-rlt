@@ -342,6 +342,13 @@ def test_invalid_request_id_does_not_poison_admission(request_id):
     assert drain(engine)[0]["valid"].finished
 
 
+def test_cache_config_preserves_existing_positional_arguments():
+    config = CacheConfig(64, 2, "last_exited", 0.9, None, 256 * 1024 * 1024, False, True, 0.25)
+    assert config == CacheConfig(
+        num_blocks=64, block_size=2, incremental_allocation=True, watermark_ratio=0.25
+    )
+
+
 @pytest.mark.parametrize("invalid", [1.5, float("nan"), float("inf"), True, 0])
 def test_integer_limits_rejected_before_scheduling(invalid):
     for constructor, name in [

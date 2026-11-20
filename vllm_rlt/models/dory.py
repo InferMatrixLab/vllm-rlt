@@ -490,6 +490,9 @@ class DoryForCausalLM(nn.Module):
     # Synchronous self-speculation with per-loop KV: a draft's loops are the
     # target's first loops, and boundary KV is committed by the target pass.
     supports_self_speculation = True
+    # Complete-state prefix reuse: boundary KV is published from depth 0 and
+    # recurrent KV from every depth (per_loop) or the final loop (last_loop).
+    supports_boundary_prefix_caching = True
 
     def __init__(self, config: DoryConfig) -> None:
         super().__init__()
@@ -511,6 +514,12 @@ class DoryForCausalLM(nn.Module):
         self.coda_kv_layers = tuple(
             config.kv_layer_index(index) for index in config.attention_layers("output")
         )
+        self.kv_layer_windows = {
+            config.kv_layer_index(index): (
+                config.sliding_window if config.layer_types[index] == "sliding_attention" else None
+            )
+            for index in config.attention_layer_ids
+        }
         self.apply(self._initialize)
         self.requires_grad_(False)
         self.eval()
