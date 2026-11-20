@@ -60,9 +60,23 @@ def test_npu_requires_bf16_kv_before_allocation(backend):
 def test_npu_does_not_use_cpu_default_memory_budget():
     model = npu_model_stub()
     with pytest.raises(ValueError, match="explicit num_blocks"):
-        plan_cache(model, CacheConfig(), SchedulerConfig(), ExecutionConfig(), "torch")
+        plan_cache(
+            model,
+            CacheConfig(),
+            SchedulerConfig(),
+            ExecutionConfig(),
+            "torch",
+            layer_windows=None,
+            reclaim_swa=False,
+        )
     blocks, info = plan_cache(
-        model, CacheConfig(num_blocks=17), SchedulerConfig(), ExecutionConfig(), "torch"
+        model,
+        CacheConfig(num_blocks=17),
+        SchedulerConfig(),
+        ExecutionConfig(),
+        "torch",
+        layer_windows=None,
+        reclaim_swa=False,
     )
     assert blocks == 17 and info["source"] == "blocks"
 

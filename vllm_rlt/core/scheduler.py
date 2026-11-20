@@ -377,7 +377,7 @@ class Scheduler:
             tokens = len(request.prompt_token_ids)
             if reserve_outputs:
                 tokens += request.sampling_params.max_tokens - 1
-            allocated = 0 if independent_budget else cache.allocated_blocks(request.request_id)
+            allocated = 0 if independent_budget else cache.charged_blocks(request.request_id)
             reserved += max(0, cache.required_blocks(tokens) - allocated)
         return max(0, reserved - cache.num_used_blocks) if independent_budget else reserved
 
@@ -397,7 +397,9 @@ class Scheduler:
         prefix = cache.lookup_prefix(request.prompt_token_ids)
         cached_tokens = len(prefix) * cache.block_size
         chunk_size = (
-            cache.max_submission_tokens if cache.reclaim_swa else self.config.prefill_chunk_size
+            cache.max_submission_tokens
+            if cache.submission_bounded
+            else self.config.prefill_chunk_size
         )
         initial_tokens = (
             min(len(request.prompt_token_ids), cached_tokens + chunk_size)
@@ -412,7 +414,8 @@ class Scheduler:
         )
         # SWA sharers can retire the same page at different times. Budget each
         # request's peak independently so sharing cannot leave growth underfunded.
-        independent_budget = cache.reclaim_swa and cache.enable_prefix_caching
+        # Preallocation already reserves each whole peak.
+        independent_budget = cache.submission_bounded and cache.enable_prefix_caching
         required = cache.required_blocks(budget_tokens)
         cached_claim = 0
         if not independent_budget:

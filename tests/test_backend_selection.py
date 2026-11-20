@@ -379,6 +379,7 @@ def test_cuda_engine_resolves_auto_before_profiling(packages, monkeypatch, execu
         staged_prefill=None,
         fp8_scale=None,
         layer_windows=None,
+        reclaim_swa=False,
     ):
         assert selected == "triton"  # FA2 cannot use the configured 16-token pages.
         assert staged_prefill is False

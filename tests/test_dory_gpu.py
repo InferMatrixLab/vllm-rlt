@@ -170,7 +170,15 @@ def test_plan_cache_profiles_dory_on_cuda():
     model = make_gpu_model()
     cache = CacheConfig(block_size=2, memory_reserve_bytes=0)
     scheduler = SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8)
-    blocks, plan = plan_cache(model, cache, scheduler, ExecutionConfig(), "triton")
+    blocks, plan = plan_cache(
+        model,
+        cache,
+        scheduler,
+        ExecutionConfig(),
+        "triton",
+        layer_windows=model.kv_layer_windows,
+        reclaim_swa=False,
+    )
     assert blocks > 0
     # The probe ran the real staged path, including windowed boundary attention.
     assert plan["source"] == "cuda_profile"
@@ -666,7 +674,6 @@ def test_grouped_swa_reclamation_uses_cuda_completion_and_reuses_pages(kv_mode, 
             block_size=2,
             layout=model.kv_cache_layout,
             incremental_allocation=True,
-            reclaim_swa=True,
         ),
         # One token per chunk preserves last_loop's token-then-loop ordering.
         scheduler_config=SchedulerConfig(
@@ -736,7 +743,6 @@ def test_deferred_prefix_publication_survives_swa_reclamation(kv_mode, monkeypat
             layout=model.kv_cache_layout,
             incremental_allocation=True,
             enable_prefix_caching=True,
-            reclaim_swa=True,
         ),
         # Six-token submissions expire pages of the window-4 layers before they end.
         scheduler_config=SchedulerConfig(

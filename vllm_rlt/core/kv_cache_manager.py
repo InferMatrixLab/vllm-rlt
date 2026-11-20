@@ -270,8 +270,8 @@ class KVCacheManager:
             raise ValueError("reclaim_swa must be a boolean")
         if type(max_submission_tokens) is not int or max_submission_tokens <= 0:
             raise ValueError("max_submission_tokens must be a positive integer")
-        if reclaim_swa and (not self.grouped or not incremental_allocation):
-            raise ValueError("SWA reclamation requires grouped incremental allocation")
+        if reclaim_swa and not self.grouped:
+            raise ValueError("SWA reclamation requires grouped storage")
         self.reclaim_swa = reclaim_swa
         self.max_submission_tokens = max_submission_tokens
         self.groups = ()
@@ -379,6 +379,11 @@ class KVCacheManager:
         )
 
     @property
+    def submission_bounded(self) -> bool:
+        """Whether SWA pages stay within the window plus one submission."""
+        return self.reclaim_swa and self.incremental_allocation
+
+    @property
     def num_used_blocks(self) -> int:
         return self.num_blocks - self.num_free_blocks
 
@@ -397,7 +402,7 @@ class KVCacheManager:
         if not isinstance(max_tokens, Integral) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
         pages = (max_tokens + self.block_size - 1) // self.block_size
-        if self.reclaim_swa:
+        if self.submission_bounded:
             # W-1 retained keys plus one append S, including worst page alignment.
             return sum(
                 min(
@@ -587,34 +592,17 @@ class KVCacheManager:
         if initial_tokens is None:
             initial_tokens = (
                 min(max_tokens, cached_tokens + self.max_submission_tokens)
-                if self.reclaim_swa
+                if self.submission_bounded
                 else max_tokens
             )
-        if self.reclaim_swa and initial_tokens - cached_tokens > self.max_submission_tokens:
+        if self.submission_bounded and initial_tokens - cached_tokens > self.max_submission_tokens:
             raise ValueError("uncached initial KV exceeds the configured submission bound")
         if not 0 < initial_tokens <= max_tokens:
             raise ValueError("invalid initial KV frontier")
         if cached_tokens > initial_tokens:
             raise ValueError("prefix exceeds initial KV frontier")
         pages = (initial_tokens + self.block_size - 1) // self.block_size
-        retired_pages = [
-            [self._expired_swa_pages(group, cached_tokens) if self.reclaim_swa else 0]
-            * group.planes
-            for group in self.groups
-        ]
-        if self.grouped and prefix:
-            cached_tables = self._group_prefix_tables(prefix, retired_pages)
-            claimed = [
-                b
-                for planes in cached_tables
-                for table in planes
-                for bundle in table
-                if bundle is not None
-                for b in bundle
-            ]
-        else:
-            cached_tables = ()
-            claimed = [b for bundle in prefix for b in bundle]
+        retired_pages, cached_tables, claimed = self._prefix_claim(prefix)
         for b in claimed:
             self._refs[b] += 1
         tail = pages - len(prefix)
@@ -801,6 +789,22 @@ class KVCacheManager:
             )
         return len(allocation.block_tables[0]) * self.storage_depths
 
+    def charged_blocks(self, request_id: str) -> int:
+        """Blocks already spent against this request's ``required_blocks`` peak.
+
+        A window-bounded peak covers resident pages only. A full peak also
+        covers retired SWA pages: they went back to the pool and are never
+        needed again, so they are not future growth.
+        """
+        if not self.grouped or self.submission_bounded:
+            return self.allocated_blocks(request_id)
+        allocation = self._get_allocation(request_id)
+        return sum(
+            len(table) * len(group.layers)
+            for group_id, group in enumerate(self.groups)
+            for table in allocation.group_tables[group_id]
+        )
+
     def get_block_table(self, request_id: str, depth: int) -> tuple[int, ...]:
         self._require_legacy()
         self._validate_depth(depth)
@@ -820,13 +824,15 @@ class KVCacheManager:
         return bool(self._get_allocation(request_id).transfer_leases)
 
     def exclusive_prefix_blocks(self, prefix: Sequence[Sequence[int]]) -> int:
-        """How many blocks of a prefix hit are held only by the prefix cache.
+        """How many blocks a prefix hit claims that only the prefix cache holds.
 
         ``num_free_blocks`` counts those blocks as free because they could be
         evicted. Claiming them makes them non-evictable, so admission has to
-        budget them on top of the fresh blocks it needs.
+        budget them on top of the fresh blocks it needs. Expired SWA pages the
+        hit does not attach stay evictable.
         """
-        return sum(self._refs[b] == 1 for group in prefix for b in group)
+        _, _, claimed = self._prefix_claim(prefix)
+        return sum(self._refs[b] == 1 for b in claimed)
 
     def token_written(self, request_id: str, position: int, depth: int) -> bool:
         """Whether every layer has written KV for ``position`` at ``depth``."""
@@ -947,6 +953,31 @@ class KVCacheManager:
                 self.key_scale[block].copy_(snapshot.key_scales[row])
                 self.value_scale[block].copy_(snapshot.value_scales[row])
         allocation.written = deepcopy(snapshot.written)
+
+    def _prefix_claim(self, prefix):
+        """Expired pages per group plane, the tables a hit attaches, and its blocks.
+
+        A hit skips the leading SWA pages its next token cannot read, so it
+        takes no references to them.
+        """
+        cached_tokens = len(prefix) * self.block_size
+        retired_pages = [
+            [self._expired_swa_pages(group, cached_tokens) if self.reclaim_swa else 0]
+            * group.planes
+            for group in self.groups
+        ]
+        if not (self.grouped and prefix):
+            return retired_pages, (), [b for bundle in prefix for b in bundle]
+        tables = self._group_prefix_tables(prefix, retired_pages)
+        claimed = [
+            b
+            for planes in tables
+            for table in planes
+            for bundle in table
+            if bundle is not None
+            for b in bundle
+        ]
+        return retired_pages, tables, claimed
 
     def _group_prefix_tables(self, prefix, retired_pages):
         """Attach only the cached pages each group can still read."""

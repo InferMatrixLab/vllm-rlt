@@ -135,16 +135,15 @@ def plan_cache(
     speculative=None,
     staged_prefill=None,
     fp8_scale=None,
-    layer_windows=...,
+    layer_windows,
+    reclaim_swa,
 ):
     parameter = next(model.parameters())
     config, device = model.config, parameter.device
     # Models whose physical stack mixes KV-owning and KV-free sublayers (Dory)
     # expose the compact count; everything else keeps the layer count.
     kv_layers = getattr(config, "num_kv_layers", config.num_hidden_layers)
-    # Omitted uses the model policy; explicit None forces all-layer blocks.
-    if layer_windows is ...:
-        layer_windows = getattr(model, "kv_layer_windows", None)
+    # The engine picks the layout: grouped windows, or None for all-layer blocks.
     native = layer_windows is not None
     unit = "physical_layer_page" if native else "all_layer_block"
     recurrent = set(getattr(model, "recurrent_kv_layers", range(kv_layers)))
@@ -265,7 +264,7 @@ def plan_cache(
     )
     # More blocks than all concurrent full-context requests can use only waste
     # memory, particularly for tiny-model GPU tests with very small pages.
-    if native and cache.reclaim_swa:
+    if reclaim_swa and cache.incremental_allocation:
         submission = min(scheduler.prefill_chunk_size, scheduler.max_num_batched_tokens)
         pages = math.ceil(config.max_position_embeddings / cache.block_size)
         useful_blocks = (
