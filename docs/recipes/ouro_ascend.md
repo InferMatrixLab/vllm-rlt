@@ -8,10 +8,13 @@ The example enables the optional asynchronous engine plan.
 
 ## Prepare the environment and model
 
-Install the project dependencies in a compatible Torch, Torch-NPU and CANN
-environment. Use the checkpoint's config and byte-level tokenizer.
+Use `main`, which includes Ascend support added after `v0.2.0`. Install the
+project dependencies in a compatible Torch, Torch-NPU and CANN environment.
+Use the checkpoint's config and byte-level tokenizer.
 
 ```bash
+git clone --branch main https://github.com/InferMatrixLab/vllm-rlt.git
+cd vllm-rlt
 source /path/to/cann/set_env.sh
 source /path/to/npu-environment/bin/activate
 python -m pip install --no-deps --no-build-isolation -e .

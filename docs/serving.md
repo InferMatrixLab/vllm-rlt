@@ -5,9 +5,14 @@ environment. The `vllm-rlt-serve` entrypoint (or `python -m
 vllm_rlt.entrypoints.serve`) serves one resident model on one device. Bind defaults
 to `127.0.0.1:8000`; this benchmark frontend has no authentication or TLS.
 
+## Device setup
+
+For Huawei Ascend NPU on `main`, follow the [Ascend serving setup](recipes/ouro_ascend.md)
+for the Torch-NPU and CANN environment and the launch command.
+
 Prepare the Ouro checkpoint and tokenizer separately. The official model ID
 pins revision `574fa66cb8bf5abdc979642d01cf2b79b16bfab1`; local paths are supported.
-Select an available GPU explicitly; a scheduler is optional:
+For NVIDIA CUDA, select an available GPU explicitly.
 
 ```bash
 nvidia-smi
@@ -18,12 +23,15 @@ CUDA_VISIBLE_DEVICES=<available-id> \
   --num-blocks 512 --max-num-seqs 8
 ```
 
+For CPU reference execution, use `--device cpu --attention-backend torch` in the
+command above and omit `CUDA_VISIBLE_DEVICES`.
+
 BF16 weights, ordinary activations and KV are this frontend's primary target,
 as described in the [precision policy](precision-policy.md).
 The current model uses FP32 RMSNorm/RoPE intermediates and gate/sampling
 probabilities; Triton attention uses FP32 internal accumulation. Record the
 matrix multiplication backend/reduction flags separately. `--dtype float32`
-is available for diagnostics. CPU execution requires `--attention-backend torch`.
+is available for diagnostics.
 
 `GET /health` returns 503 during initialization, shutdown or engine failure, and
 200 only after model, tokenizer and engine initialization finish. Tokenization

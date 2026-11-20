@@ -104,8 +104,15 @@ in mixed prefill/decode batches.
 
 ## Getting Started
 
-Requires **Python 3.10+** and **PyTorch 2.5+**. For GPU inference, use Linux and
-an NVIDIA GPU with a compatible CUDA-enabled PyTorch installation.
+Requires **Python 3.10+** and **PyTorch 2.5+**. Choose the setup for your device.
+
+| Platform | Setup and support |
+| --- | --- |
+| CPU | Torch reference execution. See [CPU serving options](docs/serving.md#device-setup). |
+| NVIDIA CUDA | Linux, an NVIDIA GPU, and compatible CUDA-enabled PyTorch. Follow the [first-run guide](docs/launching.md). |
+| Huawei Ascend NPU | Ouro-1.4B on one NPU, with BF16, four fixed loops, and greedy decoding. Use `main` with compatible Torch, Torch-NPU, and CANN. Support landed after `v0.2.0`. Follow the [Ascend setup](docs/recipes/ouro_ascend.md). |
+
+These CPU and CUDA installation commands pin `v0.2.0`.
 
 ```bash
 # Activate your Python environment first.
@@ -141,18 +148,18 @@ a fixed scale at startup. See the
 ## Model Support
 
 
-| Checkpoint | Implementation | Documented validation scope | Guide |
-| --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. | [Runtime](docs/runtime.md), [Ascend recipe](docs/recipes/ouro_ascend.md#6-fixed-depth-asynchronous-engine-plan) |
-| Ouro-2.6B | Shared Ouro | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
-| Ouro-1.4B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
-| Ouro-2.6B-Thinking | Reuses Ouro | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
-| Nanbeige4.2-3B | Native Nanbeige | Fixed two-loop inference | [Runtime](docs/runtime.md) |
-| Huginn-0125 | Native Huginn | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/runtime.md) |
-| NVIDIA-Nemotron-Labs-Dory1.0-4B | Native Dory | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified | [Dory baseline](docs/dory.md) |
+| Checkpoint | Implementation | Platforms | Documented validation scope | Guide |
+| --- | --- | --- | --- | --- |
+| Ouro-1.4B | Native Ouro | CPU, NVIDIA CUDA, Huawei Ascend NPU (`main`) | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. | [Runtime](docs/runtime.md), [Ascend recipe](docs/recipes/ouro_ascend.md) |
+| Ouro-2.6B | Shared Ouro | CPU and NVIDIA CUDA via the shared runtime | Shares the Ouro implementation; not separately qualified, and 1.4B quality/performance results are not inherited | [Scope notes](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) |
+| Ouro-1.4B-Thinking | Reuses Ouro | CPU (reference), NVIDIA CUDA | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
+| Ouro-2.6B-Thinking | Reuses Ouro | CPU (reference), NVIDIA CUDA | Bounded BF16, fixed-four-loop synchronous basic integration | [Shared recipe](docs/recipes/ouro_thinking.md) |
+| Nanbeige4.2-3B | Native Nanbeige | CPU, NVIDIA CUDA | Fixed two-loop inference | [Runtime](docs/runtime.md), [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |
+| Huginn-0125 | Native Huginn | CPU, NVIDIA CUDA | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda | [Runtime](docs/runtime.md) |
+| NVIDIA-Nemotron-Labs-Dory1.0-4B | Native Dory | CPU, NVIDIA CUDA | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified | [Dory baseline](docs/dory.md) |
 
-Shared implementation does not qualify every checkpoint/feature combination;
-see the linked guides for validation scope and limitations. See
+CPU entries refer to the Torch reference path. See the linked guides for each
+checkpoint's validation scope and feature limits. See
 [RFC #69](https://github.com/InferMatrixLab/vllm-rlt/issues/69) for the broader roadmap.
 
 Huginn uses native checkpoint loading and depth-aware KV for its recurrent
