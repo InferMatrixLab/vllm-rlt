@@ -104,22 +104,17 @@ class StageEngine:
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
         sliding_window = getattr(model, "requires_sliding_window", False)
-        # Grouped SWA reclamation records consumed history per row. Reject an
-        # explicit request before backend probing; never auto-select packing.
-        if cache_config.reclaim_swa and self.execution_config.packed_prefill:
-            raise ValueError("SWA reclamation requires unpacked prefill")
-        prefer_packed = (
-            packed_prefill_eligible(
-                self.execution_config,
-                device_type=parameter.device.type,
-                layout=cache_config.layout,
-                staged_prefill=staged_prefill,
-                sliding_window=sliding_window,
-                stage_role=self.stage_config.role,
-                speculative=speculative_config is not None,
-                preemption=scheduler_config.enable_preemption,
-            )
-            and not cache_config.reclaim_swa
+        # Automatic packed prefill wins where supported; it needs all-layer
+        # blocks, so packed_prefill=False keeps grouped storage and reclamation.
+        prefer_packed = packed_prefill_eligible(
+            self.execution_config,
+            device_type=parameter.device.type,
+            layout=cache_config.layout,
+            staged_prefill=staged_prefill,
+            sliding_window=sliding_window,
+            stage_role=self.stage_config.role,
+            speculative=speculative_config is not None,
+            preemption=scheduler_config.enable_preemption,
         )
         if getattr(model, "requires_boundary_kv", False):
             if staged_prefill:
@@ -241,10 +236,6 @@ class StageEngine:
             if prefer_packed and sliding_window
             else None
         )
-        if cache_config.reclaim_swa and (
-            not getattr(model, "fixed_loop_count", False) or self.exit_config.mode != "ouro"
-        ):
-            raise ValueError("SWA reclamation requires ordinary fixed-loop ouro execution")
         attention = create_backend(
             attention_backend,
             parameter.device,
@@ -281,23 +272,24 @@ class StageEngine:
                 self.execution_config, packed_prefill=prefer_packed and supported
             )
         layer_windows = getattr(model, "kv_layer_windows", None)
+        # Graph, async, packed, speculative, FP8 and preemption paths keep
+        # all-layer blocks: their metadata, rollback, scales or CPU offload have
+        # no grouped support yet.
         if layer_windows is not None and (
             self.execution_config.cuda_graphs
             or self.execution_config.async_scheduling
             or self.execution_config.packed_prefill
             or speculative_config is not None
             or cache_config.kv_cache_dtype != "auto"
+            or scheduler_config.enable_preemption
         ):
-            # Graph, async, packed, speculative and FP8 paths require all-layer
-            # block tables until they support grouped pages.
-            if cache_config.reclaim_swa:
-                raise ValueError(
-                    "SWA reclamation requires synchronous eager execution without "
-                    "speculation, packed prefill or FP8 KV"
-                )
             layer_windows = None
-        if layer_windows is not None and scheduler_config.enable_preemption:
-            raise NotImplementedError("grouped KV does not support preemption snapshots")
+        # Grouped pages expire only when every token runs all loops in ouro order.
+        reclaim_swa = (
+            layer_windows is not None
+            and getattr(model, "fixed_loop_count", False)
+            and self.exit_config.mode == "ouro"
+        )
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -308,6 +300,7 @@ class StageEngine:
             staged_prefill=staged_prefill,
             fp8_scale=fp8_scale,
             layer_windows=layer_windows,
+            reclaim_swa=reclaim_swa,
         )
         self.cache_manager = KVCacheManager(
             num_layers=kv_layers,
@@ -328,7 +321,7 @@ class StageEngine:
             kv_cache_dtype=cache_config.kv_cache_dtype,
             fp8_scale=fp8_scale,
             layer_windows=layer_windows,
-            reclaim_swa=cache_config.reclaim_swa,
+            reclaim_swa=reclaim_swa,
             max_submission_tokens=min(
                 scheduler_config.prefill_chunk_size, scheduler_config.max_num_batched_tokens
             ),

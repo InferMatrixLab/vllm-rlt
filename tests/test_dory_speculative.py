@@ -101,17 +101,18 @@ def test_prefix_hits_keep_speculative_outputs_on_all_layer_kv(mode):
 
 
 @pytest.mark.parametrize("mode", ["block", "pipeline"])
-def test_speculation_rejects_swa_reclamation(mode):
-    with pytest.raises(ValueError, match="without speculation"):
-        engine(
-            dory(2),
-            2,
-            1,
-            mode,
-            cache_config=CacheConfig(
-                num_blocks=256, block_size=2, incremental_allocation=True, reclaim_swa=True
-            ),
-        )
+def test_speculation_uses_all_layer_kv_instead_of_grouped_reclamation(mode):
+    e = engine(
+        dory(2),
+        2,
+        1,
+        mode,
+        cache_config=CacheConfig(num_blocks=256, block_size=2, incremental_allocation=True),
+    )
+    try:
+        assert not e.cache_manager.grouped and not e.cache_manager.reclaim_swa
+    finally:
+        e.close()
 
 
 def test_round_layouts_align_partial_coda_rows_and_upload_once(monkeypatch):

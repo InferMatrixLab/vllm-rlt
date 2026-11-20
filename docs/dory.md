@@ -63,12 +63,16 @@ count (`DoryConfig.num_kv_layers`), not by all 72 physical sublayers, and
 declares one. Attention layers therefore reach the cache through a packed
 layer id rather than their physical sublayer index.
 
-## Grouped storage and optional SWA reclamation
+## Grouped storage and SWA reclamation
 
 Dory's ordinary synchronous eager execution uses one pool of attention-layer
-pages, grouped by window policy and boundary/recurrent plane domain.
-`reclaim_swa` defaults to `False`. To return expired sliding-window pages to the
-pool, enable it together with incremental allocation on an already loaded model:
+pages, grouped by window policy and boundary/recurrent plane domain. The engine
+selects this grouped storage automatically and returns expired sliding-window
+pages to the pool as it runs; no cache flag turns reclamation on. Reclamation
+needs fixed-loop `ouro` exits; other exit modes keep grouped pages resident.
+The engine keeps all-layer blocks for the execution modes listed below. Packed
+prefill also stores all layers together and is preferred where a backend
+supports it; pass `packed_prefill=False` to keep grouped storage.
 
 ```python
 from vllm_rlt import CacheConfig
@@ -78,29 +82,30 @@ from vllm_rlt.engine.llm_engine import LLMEngine
 engine = LLMEngine(
     model,
     attention_backend="torch",
-    execution_config=ExecutionConfig(use_uva=False),
+    execution_config=ExecutionConfig(use_uva=False, packed_prefill=False),
     cache_config=CacheConfig(
         num_blocks=256,
         layout=model.kv_cache_layout,
         incremental_allocation=True,
-        reclaim_swa=True,
     ),
 )
 ```
 
 `num_blocks` preserves the existing all-layer KV byte budget: the native pool
 converts it to `num_blocks * model.config.num_kv_layers` single-layer pages.
-Reclamation supports ordinary synchronous fixed-loop `ouro` execution. Each
-`per_loop` plane advances independently; shared recurrent history in
+Each `per_loop` plane advances independently; shared recurrent history in
 `last_loop` advances only after the token's final loop. Pages retire only after
 all layers in their group have consumed the range and the submission completes.
-Full-attention history remains resident.
+Full-attention history remains resident. Incremental allocation bounds the
+resident pages to the window plus one submission; preallocation reserves each
+request's full peak and still returns expired pages to the pool.
 
 CUDA Graphs and asynchronous scheduling borrow device-owned KV metadata;
 self-speculation needs suffix truncation after a rejection; packed prefill does
-not record which SWA positions it read; FP8 KV keeps per-layer scales. Grouped
-pages do not support these yet. In all five cases the engine uses all-layer
-blocks, including for prefix caching, and rejects `reclaim_swa`.
+not record which SWA positions it read; FP8 KV keeps per-layer scales;
+preemption may offload KV to a CPU snapshot. Grouped pages do not support these
+yet. In all six cases the engine uses all-layer blocks, including for prefix
+caching, and reclamation is off.
 
 Native SWA attention stages only the needed page-aligned read span. Logical token
 positions, write addresses and public layer maps remain absolute; the backend's
@@ -125,7 +130,7 @@ owned (group, plane, layer) page, ordered as the allocator splits a claim.
 The entry takes its own reference, so the publishing request can finish or
 release its pages without freeing the cached ones. Publication stops at the
 first token page with any owned page missing; each step publishes its prompt
-pages before retiring expired ones. With `reclaim_swa`, a hit takes
+pages before retiring expired ones. When reclamation is active, a hit takes
 request references only to SWA pages still within the next token's window.
 The prefix cache can hold older pages for reuse by shorter hits. Each request
 is budgeted for its own peak KV use so sharing does not reserve less memory
@@ -219,24 +224,25 @@ These fail fast rather than degrade silently:
 - WCPB, mixed or staged prefill, and PD.
 - Prefix caching in `last_loop` mode with CUDA Graphs or asynchronous
   scheduling.
-- Preemption and snapshot/restore with grouped KV.
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
-  preemption, `reclaim_swa` or `last_loop` KV, and sampled token-pipeline
+  preemption or `last_loop` KV, and sampled token-pipeline
   speculation. The synchronous eager form is supported; see below.
 - Per-request loop counts other than the configured full depth: Dory has no
   trained exit gate, so the runtime refuses to invent one, including via
   `min_loops` with `exit_threshold=0`.
 
-For ordinary decoding, the all-layer fallback used with CUDA Graphs or
-asynchronous scheduling accepts `enable_preemption`. Dory preemption in these
-modes has not been qualified on GPU.
+`enable_preemption` selects the all-layer fallback, so suspend, CPU offload and
+restore work, with or without prefix caching, in execution modes that accept
+preemption (self-speculation does not). Dory preemption has not been qualified
+on GPU.
 
 Sliding-window masking exists in the Torch reference backend and in the Triton
 decode kernel (`window=` on `KVCacheManager.attend`). Backend selection requires
 the `sliding_window` capability, so a Flash-backed Dory engine fails at
 construction instead of attending full history. Masking accepts host-planned,
 graph-private and device-owned metadata. Physical reclamation of out-of-window
-pages is the optional grouped path described above.
+pages happens on grouped storage, which the engine selects automatically as
+described above.
 
 ## Synchronous self-speculation
 
@@ -334,9 +340,9 @@ async Graph modes. The checks above are `per_loop`. `last_loop` checks the
 cache-hit logits against the oracle on both storages, and block-aligned,
 diverging and concurrent requests after a hit against the cold greedy tokens,
 with prefill chunks of 3 and 4 tokens; on CUDA with Triton, a hit and a
-diverging branch match the oracle with chunks of 3 and 16. With `reclaim_swa`,
-in both modes, hits of 2 and 8 tokens match the oracle logits and reclamation
-advances past the hit, including submissions longer than the window.
+diverging branch match the oracle with chunks of 3 and 16. With grouped
+reclamation, in both modes, hits of 2 and 8 tokens match the oracle logits and
+reclamation advances past the hit, including submissions longer than the window.
 
 Real checkpoint, one L20, two loops, 16 greedy tokens, `prefill_chunk_size=256`,
 prompts cut from the model card. Each cell compares prefix caching on and off in

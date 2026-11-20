@@ -244,8 +244,15 @@ def test_native_planner_preserves_configured_all_layer_byte_budget():
     native = native_cache(model)
     page_bytes = 2 * 2 * 2 * 8 * 4
     assert native.bytes_per_block == page_bytes
+    windows = model.kv_layer_windows
     blocks, plan = plan_cache(
-        model, CacheConfig(num_blocks=3, block_size=2), scheduler, execution, "torch"
+        model,
+        CacheConfig(num_blocks=3, block_size=2),
+        scheduler,
+        execution,
+        "torch",
+        layer_windows=windows,
+        reclaim_swa=False,
     )
     assert model.config.num_kv_layers == 4 < model.config.num_hidden_layers
     assert blocks == 3 * model.config.num_kv_layers
@@ -257,9 +264,19 @@ def test_native_planner_preserves_configured_all_layer_byte_budget():
         scheduler,
         execution,
         "torch",
+        layer_windows=windows,
+        reclaim_swa=False,
     )
     assert blocks == 24 and plan["bytes_per_block"] == page_bytes
-    blocks, _ = plan_cache(model, CacheConfig(block_size=2), scheduler, execution, "torch")
+    blocks, _ = plan_cache(
+        model,
+        CacheConfig(block_size=2),
+        scheduler,
+        execution,
+        "torch",
+        layer_windows=windows,
+        reclaim_swa=False,
+    )
     assert blocks == 256 * 4
 
 
@@ -333,15 +350,53 @@ def test_grouped_static_buffers_with_three_padded_rows_match_dense_reference(mod
         engine.close()
 
 
-def test_native_engine_refuses_preemption_before_running(monkeypatch):
-    def unexpected_plan(*args, **kwargs):
-        pytest.fail("unsupported preemption must be rejected before cache planning")
-
-    monkeypatch.setattr("vllm_rlt.engine.stage_engine.plan_cache", unexpected_plan)
+def test_preemption_selects_all_layer_kv_and_restores_a_prefix_hit():
     model = DoryForCausalLM(tiny_dory_config()).eval()
-    with pytest.raises(NotImplementedError, match="preemption snapshots"):
-        LLMEngine(
-            model,
-            cache_config=CacheConfig(block_size=2),
-            scheduler_config=SchedulerConfig(enable_preemption=True),
-        )
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=64, block_size=2, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(enable_preemption=True),
+    )
+    cache = engine.cache_manager
+    greedy = SamplingParams(max_tokens=6, temperature=0, ignore_eos=True)
+    prompt = [3, 1, 4, 1, 5, 9, 2, 6, 5]
+
+    def finish():
+        outputs = {}
+        while engine.has_unfinished_requests():
+            for output in engine.step():
+                outputs[output.request_id] = output.token_ids
+        return outputs
+
+    try:
+        assert not cache.grouped
+        engine.add_request("cold", prompt, greedy)
+        cold = finish()["cold"]
+        engine.add_request("hit", prompt, greedy)
+        hit = engine.scheduler.requests["hit"]
+        while len(hit.generated_token_ids) < 2:
+            engine.step()
+        assert cache.prefix_hits > 0
+        engine.add_request("other", [7], SamplingParams(max_tokens=1))
+        assert engine.scheduler.preempt(engine.scheduler.requests["other"])
+        assert engine.preemption.snapshots["hit"]["kv"] is not None
+        assert finish()["hit"] == cold
+        assert engine.preemption.resumptions == 1
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+def test_non_ouro_exit_keeps_grouped_storage_without_reclamation():
+    from vllm_rlt.config import ExitConfig
+
+    model = DoryForCausalLM(tiny_dory_config()).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=64, block_size=2),
+        exit_config=ExitConfig(mode="ouro_delayed"),
+    )
+    try:
+        assert engine.cache_manager.grouped and not engine.cache_manager.reclaim_swa
+    finally:
+        engine.close()

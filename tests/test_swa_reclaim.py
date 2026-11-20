@@ -43,7 +43,6 @@ def test_reclaim_continues_after_prefix_hit(monkeypatch, mode, hit_tokens, submi
             layout=model.kv_cache_layout,
             incremental_allocation=True,
             enable_prefix_caching=True,
-            reclaim_swa=True,
         ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=1, max_num_batched_tokens=submission, prefill_chunk_size=6
@@ -116,7 +115,6 @@ def test_reclaim_engine_crosses_chunks_and_matches_dense_logits(monkeypatch, mod
             block_size=2,
             layout=model.config.kv_cache_layout,
             incremental_allocation=True,
-            reclaim_swa=True,
         ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=1, max_num_batched_tokens=3, prefill_chunk_size=5
@@ -256,9 +254,7 @@ def test_window_one_page_one_finalization_and_swa_occupancy_plateau(monkeypatch)
     model = DoryForCausalLM(tiny_dory_config(sliding_window=1)).eval()
     engine = LLMEngine(
         model,
-        cache_config=CacheConfig(
-            num_blocks=9, block_size=1, incremental_allocation=True, reclaim_swa=True
-        ),
+        cache_config=CacheConfig(num_blocks=9, block_size=1, incremental_allocation=True),
         scheduler_config=SchedulerConfig(
             max_num_seqs=1, max_num_batched_tokens=3, prefill_chunk_size=5
         ),
@@ -393,7 +389,6 @@ def test_reclaim_multi_request_abort_and_reuse(monkeypatch, mode):
             block_size=2,
             layout=model.config.kv_cache_layout,
             incremental_allocation=True,
-            reclaim_swa=True,
         ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=2,
@@ -521,21 +516,6 @@ def test_reclaim_multi_request_abort_and_reuse(monkeypatch, mode):
     assert cache.num_used_blocks == 0 and cache.num_free_blocks == cache.num_blocks
 
 
-def test_reclaim_rejects_fp8_kv():
-    model = DoryForCausalLM(tiny_dory_config()).eval()
-    with pytest.raises(ValueError, match="SWA reclamation requires"):
-        LLMEngine(
-            model,
-            cache_config=CacheConfig(
-                num_blocks=8,
-                block_size=2,
-                incremental_allocation=True,
-                reclaim_swa=True,
-                kv_cache_dtype="fp8_e4m3",
-            ),
-        )
-
-
 def test_fp8_kv_falls_back_to_all_layer_blocks():
     model = DoryForCausalLM(tiny_dory_config()).eval()
     engine = LLMEngine(
@@ -547,25 +527,7 @@ def test_fp8_kv_falls_back_to_all_layer_blocks():
     assert not engine.cache_manager.grouped
 
 
-def test_reclaim_rejects_explicit_packed_prefill_before_backend_selection(monkeypatch):
-    from vllm_rlt import ExecutionConfig
-
-    def unexpected_backend(*args, **kwargs):
-        pytest.fail("packed prefill with SWA reclamation must be rejected before backend probing")
-
-    monkeypatch.setattr("vllm_rlt.engine.stage_engine.create_backend", unexpected_backend)
-    with pytest.raises(ValueError, match="unpacked prefill"):
-        LLMEngine(
-            DoryForCausalLM(tiny_dory_config()).eval(),
-            cache_config=CacheConfig(
-                num_blocks=8, block_size=2, incremental_allocation=True, reclaim_swa=True
-            ),
-            execution_config=ExecutionConfig(packed_prefill=True),
-        )
-
-
-@pytest.mark.parametrize("reclaim", [True, False], ids=["reclaim", "packed_off"])
-def test_grouped_prefill_ignores_advertised_packing(monkeypatch, reclaim):
+def test_grouped_prefill_ignores_advertised_packing(monkeypatch):
     """A natively packing backend must not get packed metadata for grouped pages."""
     from dataclasses import replace
 
@@ -590,11 +552,10 @@ def test_grouped_prefill_ignores_advertised_packing(monkeypatch, reclaim):
         cache_config=CacheConfig(
             num_blocks=64,
             block_size=2,
-            incremental_allocation=reclaim,
-            reclaim_swa=reclaim,
+            incremental_allocation=True,
         ),
         scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=16),
-        execution_config=ExecutionConfig(packed_prefill=None if reclaim else False),
+        execution_config=ExecutionConfig(packed_prefill=False),
     )
     assert engine.cache_manager.grouped
     assert engine.cache_manager.attention_capabilities.packed_prefill
@@ -653,4 +614,88 @@ def test_shared_fp8_prefix_hits_ignore_advertised_packing(monkeypatch):
     hits = run_engine(engine, [(f"hit-{rid}", prompt) for rid, prompt in requests], params)
     assert {rid: hits[f"hit-{rid}"] for rid, _ in requests} == cold
     assert cache.prefix_hits > 0
+    assert cache.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("mode", ["per_loop", "last_loop"])
+def test_preallocation_returns_expired_swa_pages(monkeypatch, mode):
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode=mode)).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=16, block_size=2, layout=model.kv_cache_layout),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=3, prefill_chunk_size=3
+        ),
+    )
+    cache = engine.cache_manager
+    assert cache.grouped and cache.reclaim_swa and not cache.incremental_allocation
+    prompt = [4, 7, 9, 3, 12, 5, 6, 8, 11, 13, 14, 15]
+    params = SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True)
+    frontiers = []
+    finish = cache.finish_submission
+
+    def record(event=None):
+        finish(event)
+        if cache.has_allocation("request"):
+            allocation = cache._allocations["request"]
+            frontiers.append(max(v for planes in allocation.retired_pages for v in planes))
+
+    monkeypatch.setattr(cache, "finish_submission", record)
+    reserved = []
+    step = engine.step
+
+    def record_reserved():
+        outputs = step()
+        reserved.append(engine.scheduler._reserved_growth_blocks(reserve_outputs=False))
+        return outputs
+
+    monkeypatch.setattr(engine, "step", record_reserved)
+    tokens = list(prompt)
+    for _ in range(4):
+        logits = dense_dory_reference(model, torch.tensor(tokens))["logits"]
+        tokens.append(int(logits[-1].argmax()))
+    assert run_engine(engine, [("request", prompt)], params)["request"] == tokens[len(prompt) :]
+    assert frontiers[0] == 0 and frontiers[-1] > 0
+    # Retired pages are not budgeted again as growth.
+    assert set(reserved) == {0}
+    assert cache.num_used_blocks == 0
+
+
+@pytest.mark.parametrize(("mode", "blocks"), [("per_loop", 17), ("last_loop", 11)])
+def test_prefix_hit_admission_skips_expired_cached_pages(mode, blocks):
+    # A hit attaches only in-window SWA pages; expired cached pages stay
+    # evictable, so admission must not charge them.
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode=mode)).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(
+            num_blocks=blocks,
+            block_size=2,
+            layout=model.kv_cache_layout,
+            enable_prefix_caching=True,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=4, prefill_chunk_size=4
+        ),
+    )
+    cache = engine.cache_manager
+    params = SamplingParams(max_tokens=2, min_loops=2, max_loops=2, ignore_eos=True)
+    publisher = list(range(3, 23))
+    run_engine(engine, [("publisher", publisher)], params)
+    # Leave only prefix-only pages free: enough for the hit, not for the
+    # hit plus its expired cached pages.
+    entries = len(cache._prefixes)
+    occupied = cache._claim(len(cache._free_blocks))
+    assert len(cache._prefixes) == entries
+    prompt = publisher[:16] + [30, 31]
+    actual = run_engine(engine, [("hit", prompt)], params)["hit"]
+    tokens = list(prompt)
+    for _ in range(2):
+        logits = dense_dory_reference(model, torch.tensor(tokens))["logits"]
+        tokens.append(int(logits[-1].argmax()))
+    assert actual == tokens[len(prompt) :]
+    assert cache.prefix_hits == 16
+    cache._drop_refs(occupied)
     assert cache.num_used_blocks == 0

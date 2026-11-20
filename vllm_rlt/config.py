@@ -23,15 +23,11 @@ class CacheConfig:
     # "auto" stores KV in the model dtype; "fp8_e4m3" stores float8 e4m3 codes with
     # scales chosen by the engine for the selected attention backend.
     kv_cache_dtype: str = "auto"
-    # Ordinary fixed-loop grouped KV only; return expired SWA pages to the pool.
-    reclaim_swa: bool = False
 
     def __post_init__(self):
-        for name in ("enable_prefix_caching", "incremental_allocation", "reclaim_swa"):
+        for name in ("enable_prefix_caching", "incremental_allocation"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
-        if self.reclaim_swa and not self.incremental_allocation:
-            raise ValueError("reclaim_swa requires incremental_allocation")
         if not 0 <= self.watermark_ratio < 1:
             raise ValueError("watermark_ratio must be in [0, 1)")
         if self.num_blocks is not None:
