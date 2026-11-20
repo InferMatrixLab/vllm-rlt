@@ -82,6 +82,7 @@ def main():
     parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--max-loops", type=int, default=None)
+    parser.add_argument("--request-target-loops", type=int, default=None)
     parser.add_argument("--min-loops", type=int, default=None)
     parser.add_argument("--exit-threshold", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -144,6 +145,7 @@ def main():
     params = SamplingParams(
         max_tokens=args.max_tokens,
         max_loops=args.max_loops,
+        target_loops=args.request_target_loops,
         min_loops=min_loops,
         exit_threshold=args.exit_threshold,
         temperature=args.temperature,

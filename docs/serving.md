@@ -72,6 +72,7 @@ curl http://127.0.0.1:8000/v1/completions \
 | `temperature`, `top_p`, `top_k` | 0, 1, -1; passed to `SamplingParams` |
 | `seed`, `ignore_eos` | 0, false; request-local RNG and EOS policy |
 | `min_loops`, `max_loops`, `exit_threshold` | 2, model depth, 1; Ouro extensions |
+| `target_loops` | null; fixed-loop models default to model depth; trace replay takes precedence when enabled; otherwise shallower targets are rejected pending prefill support, and `max_loops` must match when supplied |
 | `stream` | false; true enables SSE |
 | `stream_options.include_usage` | false; valid with streaming |
 | `n`, `best_of`, `echo` | only 1, 1, false |
@@ -81,7 +82,7 @@ curl http://127.0.0.1:8000/v1/completions \
 Unsupported fields/behaviors, invalid values, empty tokenized prompts, impossible
 KV reservations and context overflow return 400. An unknown model returns 404.
 Missing or invalid model identifiers return 400. Omit fields to use defaults;
-explicit null is accepted only for `max_tokens`, `max_loops`, `stream_options` and the four
+explicit null is accepted only for `max_tokens`, `max_loops`, `target_loops`, `stream_options` and the four
 null-only fields above. Structured errors use the same value for `error.type`
 and `error.code`; admission messages include diagnostic context/KV limits.
 The HTTP default uses the model context length minus the number of encoded

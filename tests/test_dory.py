@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tests.reference.dory import dense_dory_reference
-from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import LLM, CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.attention import BackendCapabilities
 from vllm_rlt.attention.backend import AttentionBackend
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
@@ -589,16 +589,201 @@ def test_engine_serves_fixed_loops_and_matches_greedy_reference(model):
     assert result.token_ids == tokens[len(prompt) :]
 
 
-def test_engine_rejects_unqualified_dory_configuration(model):
+def test_engine_accepts_request_target_loops(model):
+    target_loops = model.config.total_ut_steps
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=256, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+    )
+    params = SamplingParams(max_tokens=2, target_loops=target_loops, ignore_eos=True)
+    engine.add_request("request", [4, 7, 3], params)
+    request = engine.scheduler.requests["request"]
+    assert request.target_loops == target_loops
+    assert request.loop_limit(model.config.total_ut_steps) == target_loops
+    finished = {}
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output
+    assert finished["request"].exit_depths == [target_loops, target_loops]
+
+
+@pytest.mark.parametrize("mode", ["ouro", "ouro_delayed", "random_lookahead"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_fixed_request_ignores_adaptive_exit_threshold(model, mode, asynchronous):
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=256, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+        exit_config=ExitConfig(mode=mode),
+        execution_config=ExecutionConfig(async_scheduling=asynchronous),
+    )
+    engine.add_request(
+        "request",
+        [4, 7, 3],
+        SamplingParams(max_tokens=2, target_loops=2, exit_threshold=0, ignore_eos=True),
+    )
+    finished = {}
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output
+    assert finished["request"].exit_depths == [2, 2]
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_single_loop_model_accepts_default_and_explicit_target(explicit):
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=1)).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=64, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+    )
+    params = SamplingParams(
+        max_tokens=2,
+        target_loops=1 if explicit else None,
+        max_loops=1 if explicit else None,
+        ignore_eos=True,
+    )
+    prompt = [4, 7, 3]
+    engine.add_request("request", prompt, params)
+    assert engine.scheduler.requests["request"].target_loops == 1
+    finished = {}
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output
+    result = finished["request"]
+    assert result.exit_depths == [1, 1]
+    tokens = list(prompt)
+    for _ in range(2):
+        logits = dense_dory_reference(model, torch.tensor(tokens))["logits"]
+        tokens.append(int(logits[-1].argmax()))
+    assert result.token_ids == tokens[len(prompt) :]
+
+
+def test_default_target_uses_model_depth_above_minimum_default():
+    model = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=4)).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=64, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+    )
+    engine.add_request("request", [4, 7, 3], SamplingParams(max_tokens=2, ignore_eos=True))
+    assert engine.scheduler.requests["request"].target_loops == 4
+    finished = {}
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output
+    assert finished["request"].exit_depths == [4, 4]
+
+
+def test_llm_passes_request_target_across_stage_process(model):
+    with LLM(model, cache_config=CacheConfig(num_blocks=64, block_size=2)) as llm:
+        result = llm.generate(
+            [[4, 7, 3]], SamplingParams(max_tokens=2, target_loops=2, ignore_eos=True)
+        )
+        assert result[0].exit_depths == [2, 2]
+        with pytest.raises(ValueError, match="per-request prefill support"):
+            llm.generate([[4, 7, 3]], SamplingParams(max_tokens=1, target_loops=1))
+
+
+def test_engine_accepts_legacy_fixed_loop_bounds(model):
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=256, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+    )
+    params = SamplingParams(max_tokens=1, min_loops=2, max_loops=2, ignore_eos=True)
+    engine.add_request("request", [4, 7, 3], params)
+    assert engine.scheduler.requests["request"].target_loops == model.config.total_ut_steps
+    engine.abort_request("request")
+
+
+def test_engine_defaults_request_target_loops_to_model_depth(model):
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=256, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+    )
+    engine.add_request("request", [4, 7, 3], SamplingParams(max_tokens=1, ignore_eos=True))
+    assert engine.scheduler.requests["request"].target_loops == model.config.total_ut_steps
+    engine.abort_request("request")
+
+
+def test_engine_rejects_invalid_request_target_loops(model):
+    with pytest.raises(ValueError, match="target_loops"):
+        LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=256, block_size=2),
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+        ).add_request(
+            "request",
+            [4, 7, 3],
+            SamplingParams(max_tokens=1, target_loops=model.config.total_ut_steps + 1),
+        )
+    with pytest.raises(ValueError, match="per-request prefill support"):
+        LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=256, block_size=2),
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+        ).add_request("request", [4, 7, 3], SamplingParams(max_tokens=1, target_loops=1))
     with pytest.raises(ValueError, match="max_loops"):
         LLMEngine(
             model,
             cache_config=CacheConfig(num_blocks=256, block_size=2),
-            scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
-        ).add_request("request", [4, 7, 3], SamplingParams(max_tokens=1, min_loops=1, max_loops=1))
-    with pytest.raises(ValueError, match="min_loops and max_loops"):
-        # A fabricated gate of -1e4 becomes 0.0 after sigmoid, so an unchecked
-        # exit_threshold=0 would let a shallow request "exit" after min_loops.
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+        ).add_request(
+            "request",
+            [4, 7, 3],
+            SamplingParams(max_tokens=1, target_loops=1, min_loops=1, max_loops=2),
+        )
+    with pytest.raises(ValueError, match="min_loops"):
+        LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=256, block_size=2),
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+        ).add_request(
+            "request",
+            [4, 7, 3],
+            SamplingParams(
+                max_tokens=1,
+                target_loops=1,
+                min_loops=3,
+                ignore_eos=True,
+            ),
+        )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_trace_overrides_fixed_request_target(model, asynchronous):
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(num_blocks=64, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=4),
+        exit_config=ExitConfig(mode="trace", depths_by_request={"request": [2, 1]}),
+        execution_config=ExecutionConfig(async_scheduling=asynchronous),
+    )
+    engine.add_request(
+        "request",
+        [4, 7, 3],
+        SamplingParams(max_tokens=2, target_loops=1, ignore_eos=True),
+    )
+    request = engine.scheduler.requests["request"]
+    assert request.target_loops is None
+    finished = {}
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if output.finished:
+                finished[output.request_id] = output
+    assert finished["request"].exit_depths == [2, 1]
+
+
+def test_engine_rejects_unqualified_dory_configuration(model):
+    with pytest.raises(ValueError, match="max_loops"):
         LLMEngine(
             model,
             cache_config=CacheConfig(num_blocks=256, block_size=2),
@@ -606,9 +791,17 @@ def test_engine_rejects_unqualified_dory_configuration(model):
         ).add_request(
             "request",
             [4, 7, 3],
-            SamplingParams(
-                max_tokens=1, min_loops=1, max_loops=2, exit_threshold=0.0, ignore_eos=True
-            ),
+            SamplingParams(max_tokens=1, min_loops=1, max_loops=1),
+        )
+    with pytest.raises(ValueError, match="min_loops"):
+        LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=256, block_size=2),
+            scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
+        ).add_request(
+            "request",
+            [4, 7, 3],
+            SamplingParams(max_tokens=1, min_loops=1, max_loops=2, target_loops=2, ignore_eos=True),
         )
     with pytest.raises(ValueError, match="last_exited"):
         LLMEngine(

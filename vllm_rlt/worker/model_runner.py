@@ -1252,13 +1252,11 @@ class ModelRunner:
                     and batch.operation == Operation.RECURRENT
                     and not any(
                         span.emit_gate
+                        and span.request.target_loops is None
                         and self.exit_config.mode in ("ouro_delayed", "random_lookahead")
                         and span.request.sampling_params.exit_threshold < 1
                         and span.depth + batch.loop_count
-                        < (
-                            span.request.sampling_params.max_loops
-                            or self.model.config.total_ut_steps
-                        )
+                        < span.request.loop_limit(self.model.config.total_ut_steps)
                         for span in batch.spans
                     )
                 ):
