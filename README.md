@@ -104,15 +104,11 @@ in mixed prefill/decode batches.
 
 ## Getting Started
 
-Requires **Python 3.10+** and **PyTorch 2.5+**. Choose the setup for your device.
+Requires **Python 3.10+** and **PyTorch 2.5+**. The commands below install
+`v0.2.0` for CPU or NVIDIA CUDA. CUDA inference requires Linux, an NVIDIA GPU,
+and compatible CUDA-enabled PyTorch.
 
-| Platform | Setup and support |
-| --- | --- |
-| CPU | Torch reference execution. See [CPU serving options](docs/serving.md#device-setup). |
-| NVIDIA CUDA | Linux, an NVIDIA GPU, and compatible CUDA-enabled PyTorch. Follow the [first-run guide](docs/launching.md). |
-| Huawei Ascend NPU | Ouro-1.4B on one NPU, with BF16, four fixed loops, and greedy decoding. Use `main` with compatible Torch, Torch-NPU, and CANN. Support landed after `v0.2.0`. Follow the [Ascend setup](docs/recipes/ouro_ascend.md). |
-
-These CPU and CUDA installation commands pin `v0.2.0`.
+For Ascend NPU on `main`, follow the [Ascend setup guide](docs/recipes/ouro_ascend.md).
 
 ```bash
 # Activate your Python environment first.
@@ -127,10 +123,9 @@ builds use the Torch activation fallback; optional native CUDA compilation
 requires a compatible toolchain. Model weights are downloaded separately.
 No PyPI publication is implied.
 
-- [Installation and first request](docs/launching.md)
-- [Python API and CLI](docs/launching.md)
-- [HTTP serving and streaming](docs/serving.md) — use a trusted network or secure
-  gateway; the server has no built-in authentication or TLS.
+- [Installation, first request, Python API, and CLI](docs/launching.md)
+- [HTTP serving and streaming](docs/serving.md), including [CPU setup](docs/serving.md#device-setup).
+  Use a trusted network or secure gateway. The server has no built-in authentication or TLS.
 - [Supported models](#model-support) and [Ouro-Thinking recipe](docs/recipes/ouro_thinking.md)
 - [Configuration and compatibility](docs/runtime.md)
 - [Native CUDA build](docs/launching.md#automatic-native-cuda-build)
@@ -146,7 +141,6 @@ a fixed scale at startup. See the
 [hardware and calibration requirements](docs/runtime.md#experimental-fa4-static-scale-adapter).
 
 ## Model Support
-
 
 | Checkpoint | Implementation | Platforms | Documented validation scope | Guide |
 | --- | --- | --- | --- | --- |
