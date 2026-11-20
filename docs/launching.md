@@ -11,7 +11,6 @@ now construct a spawned stage worker and need the guarded example below.
 The release is for research/evaluation, not a production deployment guarantee.
 
 For Huawei Ascend NPU, follow the [Ascend setup](recipes/ouro_ascend.md) on `main`.
-For CPU reference execution, see [device setup](serving.md#device-setup).
 
 ## 1. Check the machine
 

@@ -23,15 +23,12 @@ CUDA_VISIBLE_DEVICES=<available-id> \
   --num-blocks 512 --max-num-seqs 8
 ```
 
-For CPU reference execution, use `--device cpu --attention-backend torch` in the
-command above and omit `CUDA_VISIBLE_DEVICES`.
-
 BF16 weights, ordinary activations and KV are this frontend's primary target,
 as described in the [precision policy](precision-policy.md).
 The current model uses FP32 RMSNorm/RoPE intermediates and gate/sampling
 probabilities; Triton attention uses FP32 internal accumulation. Record the
 matrix multiplication backend/reduction flags separately. `--dtype float32`
-is available for diagnostics.
+is available for diagnostics. CPU execution requires `--attention-backend torch`.
 
 `GET /health` returns 503 during initialization, shutdown or engine failure, and
 200 only after model, tokenizer and engine initialization finish. Tokenization
