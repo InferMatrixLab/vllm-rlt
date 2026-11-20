@@ -2,16 +2,34 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import RequestPhase
 
+DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+
 
 def model():
     torch.manual_seed(15)
     return OuroForCausalLM(tiny_ouro_config())
+
+
+def model_on(device):
+    device = torch.device(device)
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    return model().to(device=device, dtype=dtype)
+
+
+def backend_for(device):
+    return "triton" if torch.device(device).type == "cuda" else "torch"
+
+
+def synchronize(device):
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def finish(engine):
@@ -154,6 +172,91 @@ def test_lossless_preemption_preserves_looped_history():
             assert e.rng.peek("a") is None
     assert results[0].token_ids == results[1].token_ids
     assert results[0].exit_depths == results[1].exit_depths
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_async_pressure_preemption_preserves_random_stream_and_tokens(device):
+    # Under memory pressure the Scheduler, not the test, selects the victim. A
+    # suspended request must keep its RNG slot and resume the same stream, so the
+    # seeded token/exit trajectory matches an unpressured run.
+    m = model_on(device)
+    depths = [4, 1, 2, 3, 4, 1, 2, 3]
+    params = SamplingParams(
+        max_tokens=len(depths),
+        temperature=0.8,
+        top_k=7,
+        top_p=0.9,
+        seed=45,
+        min_loops=1,
+        ignore_eos=True,
+    )
+    options = dict(
+        attention_backend=backend_for(device),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=3,
+            max_num_batched_tokens=3,
+            prefill_chunk_size=2,
+            enable_preemption=True,
+        ),
+        exit_config=ExitConfig("trace", depths_by_request={"t": depths}),
+        execution_config=ExecutionConfig(async_scheduling=True),
+    )
+    results = []
+    for blocks in (128, 24):
+        e = LLMEngine(
+            m, cache_config=CacheConfig(blocks, 2, incremental_allocation=True), **options
+        )
+        generators, suspended = {}, {}
+        outputs = {}
+        try:
+            for i in range(3):
+                e.add_request(str(i), [1, 2], params, trace_id="t")
+            for _ in range(1000):
+                if not e.has_unfinished_requests():
+                    break
+                for output in e.step():
+                    if output.finished:
+                        outputs[output.request_id] = (
+                            output.token_ids,
+                            output.exit_depths,
+                        )
+                # The registry entry must be the same object for the request's
+                # whole lifetime, including across a suspend/resume pair.
+                for rid in e.scheduler.requests:
+                    generator = e.rng.peek(rid)
+                    if generator is not None:
+                        generators.setdefault(rid, generator)
+                        assert generators[rid] is generator
+                for rid in list(suspended):
+                    if rid not in e.preemption.snapshots:
+                        del suspended[rid]
+                for rid in e.preemption.snapshots:
+                    generator = e.rng.peek(rid)
+                    if generator is None:
+                        continue
+                    synchronize(device)
+                    state = generator.get_state()
+                    if rid in suspended:
+                        # Suspension itself must not rebuild or advance the stream.
+                        assert torch.equal(state, suspended[rid])
+                    else:
+                        suspended[rid] = state.clone()
+            else:
+                pytest.fail("async pressure engine did not drain")
+            assert not e.preemption.snapshots
+            assert not e.rng.generators
+            assert e.cache_manager.num_used_blocks == 0
+            if blocks == 24:
+                assert e.preemption.preemptions > 0
+                assert e.preemption.resumptions > 0
+            assert all(
+                generator.device.type == torch.device(device).type
+                for generator in generators.values()
+            )
+        finally:
+            e.close()
+        results.append(outputs)
+    assert results[0] == results[1]
 
 
 @pytest.mark.gpu
