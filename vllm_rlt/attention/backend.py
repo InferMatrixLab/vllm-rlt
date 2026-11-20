@@ -47,6 +47,24 @@ class AttentionBackend:
     def __call__(self, *args, **kwargs):
         return self.kernel(*args, **kwargs)
 
+    def attend_metadata(self, q, keys, values, batch, **kwargs):
+        """Use the prepared batch for packed or per-query attention."""
+        method = getattr(self.kernel, "attend_metadata", None)
+        if method is not None:
+            return method(q, keys, values, batch, **kwargs)
+        if batch.cu_seqlens_q is not None:
+            return self.prefill(
+                q,
+                keys,
+                values,
+                batch.block_tables,
+                batch.context_lengths,
+                batch.cu_seqlens_q,
+                batch.max_seqlen_q,
+                **kwargs,
+            )
+        return self(q, keys, values, batch.block_tables, batch.context_lengths, **kwargs)
+
     def prefill(self, *args, **kwargs):
         return self.kernel.prefill(*args, **kwargs)
 
@@ -99,12 +117,23 @@ def backend_capabilities(implementation) -> BackendCapabilities:
     return implementation.capabilities
 
 
-def validate_backend_name(backend: str) -> None:
-    if backend not in {"auto", "torch", "triton", *FLASH_BACKENDS}:
+def validate_backend_name(backend: str, *, device_type: str | None = None) -> None:
+    if device_type == "npu" and backend not in ("torch", "ascend_eager"):
+        raise ValueError(
+            "NPU execution requires explicit attention_backend='torch' or 'ascend_eager'"
+        )
+    if backend not in {"auto", "torch", "triton", "ascend_eager", *FLASH_BACKENDS}:
         raise ValueError("unknown attention backend")
 
 
 def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, packed_window_shape):
+    if backend == "ascend_eager":
+        if device.type != "npu" or dtype != torch.bfloat16:
+            raise ValueError("ascend_eager requires an NPU and BF16")
+        from vllm_rlt.kernels.ascend_attention import AscendAttention
+
+        capabilities = BackendCapabilities(packed_prefill=packed, async_scheduling=True)
+        return AttentionBackend(AscendAttention(), capabilities, {"backend": backend})
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
@@ -169,7 +198,7 @@ def create_backend(
     Engine callers that can calibrate may satisfy an FP8 KV request with a
     fixed-scale backend. Cache-only callers must provide a resolved scale.
     """
-    validate_backend_name(backend)
+    validate_backend_name(backend, device_type=device.type)
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
     skipped = []
     if backend == "auto" and device.type != "cuda":

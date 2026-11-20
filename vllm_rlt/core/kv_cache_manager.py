@@ -12,6 +12,7 @@ write and dequantized by the attention backends on read.
 
 import hashlib
 import struct
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
@@ -27,6 +28,7 @@ from vllm_rlt.attention import (
     create_backend,
     validate_backend_name,
 )
+from vllm_rlt.device import resolve_device
 from vllm_rlt.request import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
@@ -81,6 +83,20 @@ class _WrittenPositions:
             self.pending.remove(self.prefix)
             self.prefix += 1
 
+    def add_range(self, start: int, end: int) -> None:
+        """Record [start, end), preserving sparse/out-of-order coverage."""
+        if start >= end or end <= self.prefix:
+            return
+        if start > self.prefix:
+            self.pending.update(range(start, end))
+            return
+        self.prefix = end
+        if self.pending:
+            self.pending = {position for position in self.pending if position >= end}
+            while self.prefix in self.pending:
+                self.pending.remove(self.prefix)
+                self.prefix += 1
+
     def __contains__(self, position: int) -> bool:
         return position < self.prefix or position in self.pending
 
@@ -92,6 +108,40 @@ class _Allocation:
     written: list[list[_WrittenPositions]]
     transfer_leases: set[str] = field(default_factory=set)
     release_requested: bool = False
+
+
+@dataclass(frozen=True)
+class _SequenceCoverage:
+    allocation: _Allocation
+    plane: int
+    ranges: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _PreparedCoverage:
+    allocation_epoch: int
+    sequences: Sequence[_SequenceCoverage]
+
+
+def _sequence_coverage(rows, plane):
+    """Collapse query rows once, leaving written state owned by the allocation."""
+    grouped = {}
+    for allocation, depth, position in rows:
+        key = (id(allocation), plane(depth))
+        if key not in grouped:
+            grouped[key] = (allocation, [])
+        grouped[key][1].append(position)
+    sequences = []
+    for (_, storage_plane), (allocation, positions) in grouped.items():
+        ranges = []
+        for position in sorted(positions):
+            if ranges and position <= ranges[-1][1]:
+                start, end = ranges[-1]
+                ranges[-1] = (start, max(end, position + 1))
+            else:
+                ranges.append((position, position + 1))
+        sequences.append(_SequenceCoverage(allocation, storage_plane, tuple(ranges)))
+    return tuple(sequences)
 
 
 @dataclass(frozen=True)
@@ -187,7 +237,7 @@ class KVCacheManager:
         ):
             raise ValueError("recurrent_layers must be valid cache layer indices")
         self.storage_depths = max_loops if layout == "last_exited" else 1
-        self.device = torch.device(device)
+        self.device = resolve_device(device)
         self.dtype = dtype
         self.attention = attention or create_backend(
             backend,
@@ -230,6 +280,14 @@ class KVCacheManager:
         self.device = self.key_cache.device
         self._free_blocks = list(reversed(range(num_blocks)))
         self._allocations: dict[str, _Allocation] = {}
+        self._allocation_epoch = 0
+        # Only the Ascend host-metadata path changes. Weak keys must not keep
+        # request descriptors or their staged tensor storage alive.
+        self._prepared_coverage = (
+            weakref.WeakKeyDictionary()
+            if self.device.type == "npu" and self.backend == "ascend_eager"
+            else None
+        )
         self.enable_prefix_caching = enable_prefix_caching
         self.incremental_allocation = incremental_allocation
         # Full allocation already reserves each request's maximum KV capacity.
@@ -397,6 +455,7 @@ class KVCacheManager:
                 for _ in range(self.storage_depths)
             ],
         )
+        self._allocation_epoch += 1
         self.prefix_queries += 1
         self.prefix_hits += length
         return True
@@ -416,6 +475,7 @@ class KVCacheManager:
             t + tuple(blocks[d * extra : (d + 1) * extra])
             for d, t in enumerate(allocation.block_tables)
         )
+        self._allocation_epoch += 1
         return True
 
     def truncate_suffix(self, request_id: str, frontier: int) -> None:
@@ -445,6 +505,7 @@ class KVCacheManager:
             return
         allocation = self._allocations.pop(request_id, None)
         if allocation is not None:
+            self._allocation_epoch += 1
             self._drop_refs(b for table in allocation.block_tables for b in reversed(table))
 
     def pin_transfer(self, request_id: str, transfer_id: str):
@@ -730,12 +791,26 @@ class KVCacheManager:
         host = torch.tensor(values, dtype=dtype, pin_memory=self.device.type == "cuda")
         return host.to(self.device, non_blocking=True)
 
-    def _require_live_batch(self, batch: KVMetadata | DeviceKVMetadata) -> None:
+    def _require_live_batch(self, batch: KVMetadata | DeviceKVMetadata):
         if isinstance(batch, KVMetadata) and batch.owner is not self:
             raise ValueError("prepared KV batch belongs to a different cache manager")
+        plan = None
+        reusable = self._prepared_coverage is not None and isinstance(batch, KVMetadata)
+        epoch = self._allocation_epoch
+        if reusable:
+            plan = self._prepared_coverage.get(batch)
+            if plan is not None and plan.allocation_epoch == epoch:
+                return plan
         for request_id, allocation in batch.allocations:
             if self._allocations.get(request_id) is not allocation:
                 raise RuntimeError(f"stale prepared KV batch for request {request_id!r}")
+        if reusable:
+            sequences = (
+                _sequence_coverage(batch.rows, self._plane) if plan is None else plan.sequences
+            )
+            plan = _PreparedCoverage(epoch, sequences)
+            self._prepared_coverage[batch] = plan
+        return plan
 
     def _validate_tensor(self, tensor, batch_size, name, *, query=False):
         if tensor.ndim != 3 or tensor.shape[0] != batch_size or tensor.shape[-1] != self.head_dim:
@@ -771,10 +846,14 @@ class KVCacheManager:
 
     @torch.no_grad()
     def _write_prepared(
-        self, layer: int, batch: KVMetadata | DeviceKVMetadata, k: torch.Tensor, v: torch.Tensor
+        self,
+        layer: int,
+        batch: KVMetadata | DeviceKVMetadata,
+        k: torch.Tensor,
+        v: torch.Tensor,
     ) -> None:
         self._validate_layer(layer)
-        self._require_live_batch(batch)
+        coverage = self._require_live_batch(batch)
         if isinstance(batch, DeviceKVMetadata):
             self._validate_tensor(k, len(batch.position_ids), "k")
             self._validate_tensor(v, len(batch.position_ids), "v")
@@ -794,12 +873,20 @@ class KVCacheManager:
             raise ValueError("a read-only prepared KV batch cannot be written")
         self._validate_tensor(k, len(batch.position_ids), "k")
         self._validate_tensor(v, len(batch.position_ids), "v")
-        if not batch.rows:
-            return
         rows = len(batch.rows)
+        if not rows:
+            return
         self._store_layer(layer, batch.write_blocks, batch.write_offsets, k[:rows], v[:rows])
-        for allocation, depth, position in batch.rows:
-            allocation.written[self._plane(depth)][layer].add(position)
+        if coverage is None:
+            for allocation, depth, position in batch.rows:
+                allocation.written[self._plane(depth)][layer].add(position)
+        else:
+            # Advance only this layer, only after BOTH device copies enqueue.
+            # Keep holes and partial-layer writes observable to later attention.
+            for sequence in coverage.sequences:
+                written = sequence.allocation.written[sequence.plane][layer]
+                for start, end in sequence.ranges:
+                    written.add_range(start, end)
 
     def _store_layer(self, layer, blocks, offsets, k, v, *, mask=None, active=None) -> None:
         """Write one layer's K/V rows, quantizing them for an FP8 pool.
@@ -889,7 +976,7 @@ class KVCacheManager:
         window: int | None = None,
     ) -> torch.Tensor:
         self._validate_layer(layer)
-        self._require_live_batch(batch)
+        coverage = self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
         if window is not None:
             if batch.cu_seqlens_q is None:
@@ -913,27 +1000,21 @@ class KVCacheManager:
             )
         if not batch.rows:
             return torch.empty_like(q)
-        for allocation, depth, position in batch.rows:
-            self._require_prefix(allocation, layer, depth, position + 1)
-        if batch.cu_seqlens_q is not None:
-            return self.attention.prefill(
-                q,
-                self.key_cache[:, layer],
-                self.value_cache[:, layer],
-                batch.block_tables,
-                batch.context_lengths,
-                batch.cu_seqlens_q,
-                batch.max_seqlen_q,
-                **self._layer_scales(layer),
-                **({} if window is None else {"window": window}),
-            )
-        return self.attention(
+        if coverage is None:
+            for allocation, depth, position in batch.rows:
+                self._require_prefix(allocation, layer, depth, position + 1)
+        else:
+            for sequence in coverage.sequences:
+                self._require_prefix(
+                    sequence.allocation, layer, sequence.plane, sequence.ranges[-1][1]
+                )
+        return self.attention.attend_metadata(
             q,
             self.key_cache[:, layer],
             self.value_cache[:, layer],
-            batch.block_tables,
-            batch.context_lengths,
+            batch,
             **self._layer_scales(layer),
+            **({} if window is None else {"window": window}),
         )
 
     @torch.no_grad()
