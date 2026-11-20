@@ -491,7 +491,7 @@ class DoryForCausalLM(nn.Module):
     # target's first loops, and boundary KV is committed by the target pass.
     supports_self_speculation = True
     # Complete-state prefix reuse: boundary KV is published from depth 0 and
-    # recurrent KV from every depth. Prefix caching requires per_loop KV.
+    # recurrent KV from every depth (per_loop) or the final loop (last_loop).
     supports_boundary_prefix_caching = True
 
     def __init__(self, config: DoryConfig) -> None:

@@ -192,10 +192,10 @@ EXECUTION_MODES = {
 PROMPTS = {"a": [4, 7, 3], "b": [9, 2, 6, 5], "c": [8, 3, 3, 11, 5, 2, 7, 13, 6]}
 
 
-def reference_pair():
-    reference = DoryForCausalLM(tiny_dory_config()).eval()
+def reference_pair(**overrides):
+    reference = DoryForCausalLM(tiny_dory_config(**overrides)).eval()
     torch.manual_seed(42)
-    model = make_gpu_model()
+    model = make_gpu_model(**overrides)
     reference.load_state_dict({name: value.cpu() for name, value in model.state_dict().items()})
     return reference, model
 
@@ -560,6 +560,38 @@ def test_dory_prefix_hits_match_cpu_oracle_in_every_execution_mode(mode):
         engine.close()
 
 
+@pytest.mark.parametrize("chunk", [3, 16])
+def test_dory_last_loop_prefix_hits_match_cpu_oracle(chunk):
+    reference, model = reference_pair(recurrent_kv_cache_mode="last_loop")
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(
+            num_blocks=512, block_size=2, enable_prefix_caching=True, layout="shared"
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=3, max_num_batched_tokens=16, prefill_chunk_size=chunk
+        ),
+    )
+    params = SamplingParams(max_tokens=6, min_loops=2, max_loops=2, ignore_eos=True)
+    prompt = PROMPTS["c"]
+    branch = prompt[:6] + [4, 9, 1]
+    cache = engine.cache_manager
+    try:
+        expected = greedy_reference(reference, prompt, 6)
+        engine.add_request("cold", prompt, params)
+        assert drain(engine)["cold"].token_ids == expected
+        engine.add_request("hit", prompt, params)
+        engine.add_request("branch", branch, params)
+        actual = drain(engine)
+        assert actual["hit"].token_ids == expected
+        assert actual["branch"].token_ids == greedy_reference(reference, branch, 6)
+        assert cache.prefix_hits == 14
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
 @pytest.mark.parametrize("speculative_mode", ["block", "pipeline"])
 def test_dory_speculative_prefix_hits_match_cpu_oracle(speculative_mode):
     reference, model = reference_pair()
@@ -659,6 +691,8 @@ def test_grouped_swa_reclamation_uses_cuda_completion_and_reuses_pages(kv_mode, 
 
     def observe_completion(event=None):
         assert isinstance(event, torch.cuda.Event)
+        if not cache.has_allocation("request"):
+            return finish(event)
         before = resident_pages()
         reused.update(before & retired)
         finish(event)
@@ -675,6 +709,118 @@ def test_grouped_swa_reclamation_uses_cuda_completion_and_reuses_pages(kv_mode, 
         actual = drain(engine)["request"]
         assert actual.token_ids == greedy_reference(reference, prompt, 4)
         assert retired and reused
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+class HeldEvent:
+    """A CUDA event that reports pending until the test releases it."""
+
+    def __init__(self, event):
+        self.event, self.released = event, False
+
+    def query(self):
+        return self.released and self.event.query()
+
+
+@pytest.mark.parametrize("kv_mode", ["per_loop", "last_loop"])
+def test_deferred_prefix_publication_survives_swa_reclamation(kv_mode, monkeypatch):
+    reference, model = reference_pair(recurrent_kv_cache_mode=kv_mode)
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(
+            num_blocks=16,
+            block_size=2,
+            layout=model.kv_cache_layout,
+            incremental_allocation=True,
+            enable_prefix_caching=True,
+            reclaim_swa=True,
+        ),
+        # Six-token submissions expire pages of the window-4 layers before they end.
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=6, prefill_chunk_size=6
+        ),
+    )
+    cache = engine.cache_manager
+    held, deferred = [], []
+    publish, finish = cache.publish_prefix, cache.finish_submission
+
+    def publish_later(request_id, tokens, length, event=None):
+        if event is not None:
+            event = HeldEvent(event)
+            held.append(event)
+        return publish(request_id, tokens, length, event)
+
+    def release_then_finish(event=None):
+        deferred.append(len(cache._pending_prefixes))
+        # The submission's own wait completes every earlier publication event.
+        for pending in held:
+            pending.released = True
+        return finish(event)
+
+    monkeypatch.setattr(cache, "publish_prefix", publish_later)
+    monkeypatch.setattr(cache, "finish_submission", release_then_finish)
+    params = SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True)
+    publisher = [4, 7, 3, 9, 5, 2, 8, 6, 10]
+    prompt = publisher[:8] + [11, 12, 13]
+    try:
+        assert cache.grouped and cache.reclaim_swa
+        engine.add_request("publisher", publisher, params)
+        assert drain(engine)["publisher"].token_ids == greedy_reference(reference, publisher, 4)
+        assert any(deferred)
+        assert len(cache._prefixes) == 4
+        engine.add_request("hit", prompt, params)
+        assert drain(engine)["hit"].token_ids == greedy_reference(reference, prompt, 4)
+        assert cache.prefix_hits == 8
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+def test_packed_prefill_prefix_hits_use_all_layer_blocks():
+    """Packed prefill falls back to all-layer pages; a prefix hit matches cold tokens."""
+    model = make_gpu_model(head_dim=256, max_position_embeddings=256, sliding_window=32).to(
+        dtype=torch.bfloat16
+    )
+    config = model.config
+    _packed_tile(
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        config.num_kv_layers,
+        window=config.sliding_window,
+    )
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=64, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=128, prefill_chunk_size=64
+        ),
+        execution_config=ExecutionConfig(packed_prefill=True),
+    )
+    packed_layers = set()
+    attend = engine.cache_manager._attend_prepared
+
+    def record_packed(layer, metadata, q, *, window=None):
+        if metadata.cu_seqlens_q is not None:
+            packed_layers.add(layer)
+        return attend(layer, metadata, q, window=window)
+
+    engine.cache_manager._attend_prepared = record_packed
+    params = SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True)
+    # Packed prefill applies only to prompts longer than 64 tokens.
+    prompt = ([4, 7, 9, 3, 12, 5, 23] * 12)[:80]
+    cache = engine.cache_manager
+    try:
+        assert engine.execution_config.packed_prefill and not cache.grouped
+        engine.add_request("cold", prompt, params)
+        cold = drain(engine)["cold"].token_ids
+        assert packed_layers and cache.prefix_hits == 0
+        engine.add_request("hit", prompt, params)
+        assert drain(engine)["hit"].token_ids == cold
+        assert cache.prefix_hits > 0
         assert cache.num_used_blocks == 0
     finally:
         engine.close()

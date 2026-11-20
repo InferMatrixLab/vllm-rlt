@@ -50,9 +50,10 @@ to one cache layout:
 | `last_loop` | `shared` | One plane per layer, overwritten by each loop |
 
 Boundary stages always write depth 0, so input and output KV are never
-replicated per loop. In `last_loop` mode a token's current-step KV is overwritten
-by the next loop, so results depend on the chunk schedule; the qualified
-schedule is one token per step. `per_loop` preserves the same mathematical
+replicated per loop. In `last_loop` mode a token's KV is overwritten by each of
+its loops, so the runtime completes every loop of a token before the next one,
+also inside a prefill chunk: later tokens read final-loop KV whatever the chunk
+size. `per_loop` preserves the same mathematical
 computation for token-at-a-time and all-positions-at-once execution; floating-point
 rounding can still vary with chunk and batch shapes.
 
@@ -96,8 +97,9 @@ all layers in their group have consumed the range and the submission completes.
 Full-attention history remains resident.
 
 CUDA Graphs and asynchronous scheduling borrow device-owned KV metadata;
-self-speculation needs suffix truncation after a rejection. Grouped pages do not
-provide these operations yet. For all three modes, the engine uses all-layer
+self-speculation needs suffix truncation after a rejection; packed prefill does
+not record which SWA positions it read; FP8 KV keeps per-layer scales. Grouped
+pages do not support these yet. In all five cases the engine uses all-layer
 blocks, including for prefix caching, and rejects `reclaim_swa`.
 
 Native SWA attention stages only the needed page-aligned read span. Logical token
@@ -122,8 +124,12 @@ Grouped prefix caching publishes one entry per token page holding every
 owned (group, plane, layer) page, ordered as the allocator splits a claim.
 The entry takes its own reference, so the publishing request can finish or
 release its pages without freeing the cached ones. Publication stops at the
-first token page with any owned page missing. Prefix caching together with
-`reclaim_swa` is rejected until hit-path reclamation is qualified.
+first token page with any owned page missing; each step publishes its prompt
+pages before retiring expired ones. With `reclaim_swa`, a hit takes
+request references only to SWA pages still within the next token's window.
+The prefix cache can hold older pages for reuse by shorter hits. Each request
+is budgeted for its own peak KV use so sharing does not reserve less memory
+than the requests may need as they advance.
 
 ## Supported today
 
@@ -153,11 +159,13 @@ first token page with any owned page missing. Prefix caching together with
 - The official tokenizer, including the Hub's `tokenizer.json` and chat
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
-- Prefix caching (`enable_prefix_caching=True`) in `per_loop` mode. A
+- Prefix caching (`enable_prefix_caching=True`). In `per_loop` mode a
   published page carries boundary KV from plane 0 and recurrent KV from every
   plane; boundary layers never write deeper planes, so they are not required
-  there. A hit restores exactly that coverage and the scheduler resumes prefill
-  from the cached offset. `last_loop` keeps one shared plane and stays rejected.
+  there. In `last_loop` mode the single shared plane holds each cached token's
+  final-loop KV, which is what a cold prefill leaves; this mode is qualified
+  for synchronous eager execution only. A hit restores exactly that coverage
+  and the scheduler resumes prefill from the cached offset.
   Prefix keys hash tokens only. That is sound because the loop count is fixed
   when the model loads and the layout is fixed by `CacheConfig`, and each
   engine owns its own KV manager, so pages from different loop counts or
@@ -209,7 +217,8 @@ even with per-query attention.
 These fail fast rather than degrade silently:
 
 - WCPB, mixed or staged prefill, and PD.
-- Prefix caching in `last_loop` mode.
+- Prefix caching in `last_loop` mode with CUDA Graphs or asynchronous
+  scheduling.
 - Preemption and snapshot/restore with grouped KV.
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
   preemption, `reclaim_swa` or `last_loop` KV, and sampled token-pipeline
@@ -321,7 +330,13 @@ and publication refuses pages missing any owned plane. Prefix pages stay
 pinned for the life of the cache entry. Prefix tests run on both the legacy
 all-layer blocks and grouped storage. On a small FP32 model, prefix hits and
 diverging branches match the oracle in sync eager, sync Graph, async eager and
-async Graph modes.
+async Graph modes. The checks above are `per_loop`. `last_loop` checks the
+cache-hit logits against the oracle on both storages, and block-aligned,
+diverging and concurrent requests after a hit against the cold greedy tokens,
+with prefill chunks of 3 and 4 tokens; on CUDA with Triton, a hit and a
+diverging branch match the oracle with chunks of 3 and 16. With `reclaim_swa`,
+in both modes, hits of 2 and 8 tokens match the oracle logits and reclamation
+advances past the hit, including submissions longer than the window.
 
 Real checkpoint, one L20, two loops, 16 greedy tokens, `prefill_chunk_size=256`,
 prompts cut from the model card. Each cell compares prefix caching on and off in

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tests.reference.dory import dense_dory_reference
-from tests.test_dory import tiny_dory_config
+from tests.test_dory import run_engine, tiny_dory_config
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
@@ -26,6 +26,74 @@ def live_pages(cache, model, request_id, *, sliding):
                 page for page in cache.layer_block_table(request_id, layer, depth) if page >= 0
             )
     return pages
+
+
+@pytest.mark.parametrize("mode", ["per_loop", "last_loop"])
+@pytest.mark.parametrize("hit_tokens", [2, 8])
+# A 6-token submission retires pages of the window-4 layers before it ends.
+@pytest.mark.parametrize("submission", [4, 6])
+def test_reclaim_continues_after_prefix_hit(monkeypatch, mode, hit_tokens, submission):
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode=mode)).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(
+            num_blocks=8 if submission == 4 else 16,
+            block_size=2,
+            layout=model.kv_cache_layout,
+            incremental_allocation=True,
+            enable_prefix_caching=True,
+            reclaim_swa=True,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=submission, prefill_chunk_size=6
+        ),
+    )
+    cache = engine.cache_manager
+    publisher = [4, 7, 3, 9, 5, 2, 8, 6, 10]
+    prompt = publisher[:hit_tokens] + [11, 12, 13, 14, 15, 16]
+    params = SamplingParams(max_tokens=2, min_loops=2, max_loops=2, ignore_eos=True)
+    run_engine(engine, [("publisher", publisher)], params)
+    assert cache.prefix_hits == 0
+    assert len(cache._prefixes) == 4
+    assert cache.num_used_blocks == 0
+
+    window_layer = next(layer for layer, window in model.kv_layer_windows.items() if window)
+    full_layer = next(layer for layer, window in model.kv_layer_windows.items() if window is None)
+    frontiers = []
+    finish_submission = cache.finish_submission
+
+    def record_reclamation(event=None):
+        if not cache.has_allocation("hit"):
+            return finish_submission(event)
+        if not frontiers:
+            # The hit starts retaining only what its next token can read.
+            frontiers.append(cache.retained_range("hit", window_layer, 0)[0])
+            assert frontiers[0] == (4 if hit_tokens == 8 else 0)
+        finish_submission(event)
+        frontiers.append(cache.retained_range("hit", window_layer, 0)[0])
+        assert cache.retained_range("hit", full_layer, 0)[0] == 0
+
+    observed = []
+    logits = model.logits
+
+    def record_logits(state):
+        output = logits(state)
+        observed.append(output.detach().clone())
+        return output
+
+    monkeypatch.setattr(cache, "finish_submission", record_reclamation)
+    monkeypatch.setattr(model, "logits", record_logits)
+    actual = run_engine(engine, [("hit", prompt)], params)["hit"]
+    assert cache.prefix_hits == hit_tokens
+    assert frontiers[-1] > frontiers[0]
+    assert cache.num_used_blocks == 0
+    assert len(observed) == len(actual) == 2
+    tokens = list(prompt)
+    for output, token in zip(observed, actual):
+        expected = dense_dory_reference(model, torch.tensor(tokens))["logits"][-1:]
+        torch.testing.assert_close(output, expected, atol=3e-6, rtol=3e-5)
+        tokens.append(token)
 
 
 @pytest.mark.parametrize("mode", ["per_loop", "last_loop"])
@@ -451,3 +519,138 @@ def test_reclaim_multi_request_abort_and_reuse(monkeypatch, mode):
             tokens.append(int(logits[-1].argmax()))
         assert completed[rid].token_ids == tokens[len(prompts[rid]) :]
     assert cache.num_used_blocks == 0 and cache.num_free_blocks == cache.num_blocks
+
+
+def test_reclaim_rejects_fp8_kv():
+    model = DoryForCausalLM(tiny_dory_config()).eval()
+    with pytest.raises(ValueError, match="SWA reclamation requires"):
+        LLMEngine(
+            model,
+            cache_config=CacheConfig(
+                num_blocks=8,
+                block_size=2,
+                incremental_allocation=True,
+                reclaim_swa=True,
+                kv_cache_dtype="fp8_e4m3",
+            ),
+        )
+
+
+def test_fp8_kv_falls_back_to_all_layer_blocks():
+    model = DoryForCausalLM(tiny_dory_config()).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(
+            num_blocks=64, block_size=2, kv_cache_dtype="fp8_e4m3", enable_prefix_caching=True
+        ),
+    )
+    assert not engine.cache_manager.grouped
+
+
+def test_reclaim_rejects_explicit_packed_prefill_before_backend_selection(monkeypatch):
+    from vllm_rlt import ExecutionConfig
+
+    def unexpected_backend(*args, **kwargs):
+        pytest.fail("packed prefill with SWA reclamation must be rejected before backend probing")
+
+    monkeypatch.setattr("vllm_rlt.engine.stage_engine.create_backend", unexpected_backend)
+    with pytest.raises(ValueError, match="unpacked prefill"):
+        LLMEngine(
+            DoryForCausalLM(tiny_dory_config()).eval(),
+            cache_config=CacheConfig(
+                num_blocks=8, block_size=2, incremental_allocation=True, reclaim_swa=True
+            ),
+            execution_config=ExecutionConfig(packed_prefill=True),
+        )
+
+
+@pytest.mark.parametrize("reclaim", [True, False], ids=["reclaim", "packed_off"])
+def test_grouped_prefill_ignores_advertised_packing(monkeypatch, reclaim):
+    """A natively packing backend must not get packed metadata for grouped pages."""
+    from dataclasses import replace
+
+    from vllm_rlt import ExecutionConfig
+    from vllm_rlt.attention import AttentionBackend
+    from vllm_rlt.engine import stage_engine
+
+    create_backend = stage_engine.create_backend
+
+    def packing_backend(*args, **kwargs):
+        backend = create_backend(*args, **kwargs)
+        capabilities = replace(
+            backend.capabilities, packed_prefill=True, packed_sliding_window=True
+        )
+        return AttentionBackend(backend.kernel, capabilities, backend.info)
+
+    monkeypatch.setattr(stage_engine, "create_backend", packing_backend)
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(max_position_embeddings=128)).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(
+            num_blocks=64,
+            block_size=2,
+            incremental_allocation=reclaim,
+            reclaim_swa=reclaim,
+        ),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=16),
+        execution_config=ExecutionConfig(packed_prefill=None if reclaim else False),
+    )
+    assert engine.cache_manager.grouped
+    assert engine.cache_manager.attention_capabilities.packed_prefill
+    assert not engine.execution_config.packed_prefill
+    # Runner packing applies only to prompts longer than 64 tokens.
+    prompt = [(index * 7) % 50 + 2 for index in range(65)]
+    params = SamplingParams(max_tokens=2, min_loops=2, max_loops=2, ignore_eos=True)
+    tokens = list(prompt)
+    for _ in range(2):
+        logits = dense_dory_reference(model, torch.tensor(tokens))["logits"]
+        tokens.append(int(logits[-1].argmax()))
+    assert run_engine(engine, [("long", prompt)], params)["long"] == tokens[len(prompt) :]
+    assert engine.cache_manager.num_used_blocks == 0
+
+
+def test_shared_fp8_prefix_hits_ignore_advertised_packing(monkeypatch):
+    """last_loop + FP8 keeps shared all-layer pages, which have no packed metadata."""
+    from dataclasses import replace
+
+    from vllm_rlt.attention import AttentionBackend
+    from vllm_rlt.engine import stage_engine
+
+    create_backend = stage_engine.create_backend
+
+    def packing_backend(*args, **kwargs):
+        backend = create_backend(*args, **kwargs)
+        capabilities = replace(backend.capabilities, packed_prefill=True)
+        return AttentionBackend(backend.kernel, capabilities, backend.info)
+
+    monkeypatch.setattr(stage_engine, "create_backend", packing_backend)
+    torch.manual_seed(42)
+    model = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode="last_loop")).eval()
+    engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(
+            num_blocks=256,
+            block_size=2,
+            layout="shared",
+            kv_cache_dtype="fp8_e4m3",
+            enable_prefix_caching=True,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=3, max_num_batched_tokens=12, prefill_chunk_size=4
+        ),
+    )
+    cache = engine.cache_manager
+    assert cache.layout == "shared" and not cache.grouped
+    assert cache.attention_capabilities.packed_prefill
+    params = SamplingParams(max_tokens=3, min_loops=2, max_loops=2, ignore_eos=True)
+    long = [4, 7, 3, 9, 5, 2, 8, 6, 3, 10]
+    # "short" ends its prompt inside the first chunk while the 10-token prompts
+    # on either side continue, so CODA rows 0 and 2 are rebuilt non-contiguously.
+    requests = [("first", long), ("short", long[:4]), ("last", long[:9] + [11])]
+    cold = run_engine(engine, requests, params)
+    assert cache.prefix_hits == 0
+    hits = run_engine(engine, [(f"hit-{rid}", prompt) for rid, prompt in requests], params)
+    assert {rid: hits[f"hit-{rid}"] for rid, _ in requests} == cold
+    assert cache.prefix_hits > 0
+    assert cache.num_used_blocks == 0
