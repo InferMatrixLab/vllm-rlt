@@ -104,15 +104,22 @@ class StageEngine:
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
         sliding_window = getattr(model, "requires_sliding_window", False)
-        prefer_packed = packed_prefill_eligible(
-            self.execution_config,
-            device_type=parameter.device.type,
-            layout=cache_config.layout,
-            staged_prefill=staged_prefill,
-            sliding_window=sliding_window,
-            stage_role=self.stage_config.role,
-            speculative=speculative_config is not None,
-            preemption=scheduler_config.enable_preemption,
+        # Grouped SWA reclamation records consumed history per row. Reject an
+        # explicit request before backend probing; never auto-select packing.
+        if cache_config.reclaim_swa and self.execution_config.packed_prefill:
+            raise ValueError("SWA reclamation requires unpacked prefill")
+        prefer_packed = (
+            packed_prefill_eligible(
+                self.execution_config,
+                device_type=parameter.device.type,
+                layout=cache_config.layout,
+                staged_prefill=staged_prefill,
+                sliding_window=sliding_window,
+                stage_role=self.stage_config.role,
+                speculative=speculative_config is not None,
+                preemption=scheduler_config.enable_preemption,
+            )
+            and not cache_config.reclaim_swa
         )
         if getattr(model, "requires_boundary_kv", False):
             if staged_prefill:
@@ -137,6 +144,13 @@ class StageEngine:
                         "boundary-KV speculative decoding requires synchronous eager "
                         "execution without CUDA graphs or preemption"
                     )
+        if cache_config.enable_prefix_caching and cache_config.layout == "shared":
+            # The shared runner finishes every loop of a token before the next,
+            # so cached final-loop KV is the cold prefill state.
+            if not getattr(model, "supports_boundary_prefix_caching", False):
+                raise ValueError("this model does not support shared-KV prefix caching")
+            if self.execution_config.async_scheduling or self.execution_config.cuda_graphs:
+                raise ValueError("shared-KV prefix caching requires synchronous eager execution")
         if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
             raise ValueError("this model does not support CUDA graphs yet")
         self.speculative_config = speculative_config
@@ -279,14 +293,11 @@ class StageEngine:
             if cache_config.reclaim_swa:
                 raise ValueError(
                     "SWA reclamation requires synchronous eager execution without "
-                    "packed prefill, speculation or FP8 KV"
+                    "speculation, packed prefill or FP8 KV"
                 )
             layer_windows = None
-        if layer_windows is not None:
-            if scheduler_config.enable_preemption:
-                raise NotImplementedError("grouped KV does not support preemption snapshots")
-            if cache_config.enable_prefix_caching and cache_config.reclaim_swa:
-                raise NotImplementedError("prefix caching with SWA reclamation is not qualified")
+        if layer_windows is not None and scheduler_config.enable_preemption:
+            raise NotImplementedError("grouped KV does not support preemption snapshots")
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -621,11 +632,13 @@ class StageEngine:
             return []
         try:
             ticket = self.executor.submit(batch)
-            self.cache_manager.finish_submission(ticket.event)
             # Only host-dependent decisions collect now. Prompt/PRELUDE submissions
             # advance logically under their event without a readback wait.
             result = ticket.collect() if ticket.has_result else None
-            return self._update(batch, result)
+            outputs = self._update(batch, result)
+            # Publish this submission's prompt pages before SWA retires them.
+            self.cache_manager.finish_submission(ticket.event)
+            return outputs
         except Exception:
             if self.connector is not None:
                 raise  # Transfer leases remain quarantined until peer shutdown.

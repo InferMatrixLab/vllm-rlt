@@ -34,8 +34,6 @@ class CacheConfig:
             raise ValueError("reclaim_swa requires incremental_allocation")
         if not 0 <= self.watermark_ratio < 1:
             raise ValueError("watermark_ratio must be in [0, 1)")
-        if self.enable_prefix_caching and self.layout != "last_exited":
-            raise ValueError("prefix caching requires last_exited KV")
         if self.num_blocks is not None:
             _positive("num_blocks", self.num_blocks)
         _positive("block_size", self.block_size)

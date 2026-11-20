@@ -7,6 +7,7 @@ import math
 import pytest
 import torch
 
+from tests.helpers import tiny_ouro_config
 from tests.reference.dory import dense_dory_reference
 from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.attention import BackendCapabilities
@@ -14,7 +15,7 @@ from vllm_rlt.attention.backend import AttentionBackend
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.kernels.paged_attention import torch_paged_attention
-from vllm_rlt.models import AutoModelForCausalLM, DoryConfig, DoryForCausalLM
+from vllm_rlt.models import AutoModelForCausalLM, DoryConfig, DoryForCausalLM, OuroForCausalLM
 
 ARTIFACT_PAIRS = 36
 
@@ -709,11 +710,14 @@ def prefill_rows(model, cache, request_id, tokens, start):
     return torch.stack(logits)
 
 
+@pytest.mark.parametrize("kv_mode", ["per_loop", "last_loop"])
 @pytest.mark.parametrize("grouped", [False, True], ids=["legacy", "grouped"])
 @pytest.mark.parametrize("loops", [1, 2, 4])
-def test_prefix_hit_resumes_boundary_and_recurrent_kv(loops, grouped):
+def test_prefix_hit_resumes_boundary_and_recurrent_kv(loops, grouped, kv_mode):
     torch.manual_seed(42)
-    model = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=loops)).eval()
+    model = DoryForCausalLM(
+        tiny_dory_config(n_recurrent_loops=loops, recurrent_kv_cache_mode=kv_mode)
+    ).eval()
     cache = make_cache(model, enable_prefix_caching=True, grouped=grouped)
     # The cached prefix exceeds the four-token sliding attention window.
     tokens = torch.tensor([4, 7, 3, 9, 5, 2, 8, 6, 3])
@@ -796,45 +800,6 @@ def test_grouped_prefix_pages_outlive_the_publishing_request(model):
     assert cache.num_used_blocks == 0
 
 
-def test_grouped_prefix_caching_rejects_swa_reclamation(model):
-    config = model.config
-    with pytest.raises(NotImplementedError, match="SWA reclamation"):
-        KVCacheManager(
-            num_layers=config.num_kv_layers,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            num_blocks=256,
-            block_size=2,
-            max_loops=config.total_ut_steps,
-            device="cpu",
-            dtype=torch.float32,
-            backend="torch",
-            layout=config.kv_cache_layout,
-            recurrent_layers=model.recurrent_kv_layers,
-            layer_windows=model.kv_layer_windows,
-            enable_prefix_caching=True,
-            incremental_allocation=True,
-            reclaim_swa=True,
-        )
-
-
-def test_engine_rejects_prefix_caching_with_swa_reclamation_before_planning(model, monkeypatch):
-    def unexpected_plan(*args, **kwargs):
-        pytest.fail("prefix caching with SWA reclamation must be rejected before cache planning")
-
-    monkeypatch.setattr("vllm_rlt.engine.stage_engine.plan_cache", unexpected_plan)
-    with pytest.raises(NotImplementedError, match="prefix caching with SWA reclamation"):
-        LLMEngine(
-            model,
-            cache_config=CacheConfig(
-                block_size=2,
-                enable_prefix_caching=True,
-                incremental_allocation=True,
-                reclaim_swa=True,
-            ),
-        )
-
-
 def run_engine(engine, requests, params):
     for request_id, prompt in requests:
         engine.add_request(request_id, prompt, params)
@@ -854,14 +819,24 @@ def greedy_reference(model, prompt, steps):
     return tokens[len(prompt) :]
 
 
+@pytest.mark.parametrize("kv_mode,chunk", [("per_loop", 4), ("last_loop", 3), ("last_loop", 4)])
 @pytest.mark.parametrize("loops", [1, 2, 4])
-def test_engine_prefix_hits_match_cold_greedy_reference(loops):
+def test_engine_prefix_hits_match_cold_greedy_reference(loops, kv_mode, chunk):
     torch.manual_seed(42)
-    model = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=loops)).eval()
+    model = DoryForCausalLM(
+        tiny_dory_config(n_recurrent_loops=loops, recurrent_kv_cache_mode=kv_mode)
+    ).eval()
     engine = LLMEngine(
         model,
-        cache_config=CacheConfig(num_blocks=512, block_size=2, enable_prefix_caching=True),
-        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=4),
+        cache_config=CacheConfig(
+            num_blocks=512,
+            block_size=2,
+            enable_prefix_caching=True,
+            layout=model.kv_cache_layout,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=chunk
+        ),
     )
     steps = model.config.total_ut_steps
     params = SamplingParams(max_tokens=3, min_loops=steps, max_loops=steps, ignore_eos=True)
@@ -886,6 +861,29 @@ def test_engine_prefix_hits_match_cold_greedy_reference(loops):
         assert finished[rid] == greedy_reference(model, prompts[rid], 3), rid
     assert cache.prefix_hits >= 3 * len(shared)
     assert cache.num_used_blocks == 0
+
+
+@pytest.mark.parametrize(
+    "execution", [ExecutionConfig(async_scheduling=True), ExecutionConfig(cuda_graphs=True)]
+)
+def test_last_loop_prefix_caching_requires_sync_eager(execution):
+    model = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode="last_loop")).eval()
+    with pytest.raises(ValueError, match="synchronous eager"):
+        LLMEngine(
+            model,
+            execution_config=execution,
+            cache_config=CacheConfig(
+                num_blocks=64, block_size=2, enable_prefix_caching=True, layout="shared"
+            ),
+        )
+
+
+def test_shared_prefix_caching_requires_an_opted_in_model():
+    with pytest.raises(ValueError, match="shared-KV prefix caching"):
+        LLMEngine(
+            OuroForCausalLM(tiny_ouro_config()),
+            cache_config=CacheConfig(enable_prefix_caching=True, layout="shared"),
+        )
 
 
 @pytest.mark.parametrize("loops", [1, 2, 4])

@@ -277,8 +277,6 @@ class KVCacheManager:
         self.groups = ()
         self.layer_groups = {}
         if self.grouped:
-            if enable_prefix_caching and reclaim_swa:
-                raise NotImplementedError("prefix caching with SWA reclamation is not qualified")
             policies = dict(layer_windows)
             if not policies or any(
                 type(layer) is not int or not 0 <= layer < num_layers for layer in policies
@@ -369,8 +367,6 @@ class KVCacheManager:
         self._prefix_epoch = 0
         self._pending_prefixes = []
         self.prefix_hits = self.prefix_queries = 0
-        if enable_prefix_caching and layout != "last_exited":
-            raise ValueError("prefix caching requires last_exited KV")
 
     @property
     def attention_capabilities(self) -> BackendCapabilities:
@@ -535,8 +531,8 @@ class KVCacheManager:
     def _prefix_page(self, allocation, index):
         """Every physical page holding token page ``index``, or None if any is gone.
 
-        Grouped entries are flattened group -> plane -> layer, the order
-        ``_group_tables`` uses to split one page's claim back into bundles.
+        Grouped entries are flattened group -> plane -> layer for
+        ``_group_prefix_tables`` to split back into bundles.
         """
         if not self.grouped:
             return tuple(t[index] for t in allocation.block_tables)
@@ -587,24 +583,44 @@ class KVCacheManager:
             raise ValueError(
                 f"request needs {required} physical KV blocks, but the pool has {self.num_blocks}"
             )
+        cached_tokens = len(prefix) * self.block_size
         if initial_tokens is None:
             initial_tokens = (
-                min(max_tokens, self.max_submission_tokens) if self.reclaim_swa else max_tokens
+                min(max_tokens, cached_tokens + self.max_submission_tokens)
+                if self.reclaim_swa
+                else max_tokens
             )
-        if self.reclaim_swa and initial_tokens > self.max_submission_tokens:
-            raise ValueError("initial KV frontier exceeds the configured submission bound")
+        if self.reclaim_swa and initial_tokens - cached_tokens > self.max_submission_tokens:
+            raise ValueError("uncached initial KV exceeds the configured submission bound")
         if not 0 < initial_tokens <= max_tokens:
             raise ValueError("invalid initial KV frontier")
-        pages = (initial_tokens + self.block_size - 1) // self.block_size
-        if len(prefix) > pages:
+        if cached_tokens > initial_tokens:
             raise ValueError("prefix exceeds initial KV frontier")
-        claimed = [b for bundle in prefix for b in bundle]
+        pages = (initial_tokens + self.block_size - 1) // self.block_size
+        retired_pages = [
+            [self._expired_swa_pages(group, cached_tokens) if self.reclaim_swa else 0]
+            * group.planes
+            for group in self.groups
+        ]
+        if self.grouped and prefix:
+            cached_tables = self._group_prefix_tables(prefix, retired_pages)
+            claimed = [
+                b
+                for planes in cached_tables
+                for table in planes
+                for bundle in table
+                if bundle is not None
+                for b in bundle
+            ]
+        else:
+            cached_tables = ()
+            claimed = [b for bundle in prefix for b in bundle]
         for b in claimed:
             self._refs[b] += 1
+        tail = pages - len(prefix)
         if self.grouped:
-            tables = self._claim_group_tables(pages - len(prefix), prefix=prefix)
+            tables = self._claim_group_tables(tail, tables=cached_tables)
         else:
-            tail = pages - len(prefix)
             blocks = self._claim(tail * self.storage_depths)
             tables = (
                 None
@@ -617,11 +633,10 @@ class KVCacheManager:
         if tables is None:
             self._drop_refs(claimed)
             return False
-        length = len(prefix) * self.block_size
         # A hit restores exactly the coverage publish_prefix required.
         written = [
             [
-                _WrittenPositions(prefix=length if self._plane_owns(plane, layer) else 0)
+                _WrittenPositions(prefix=cached_tokens if self._plane_owns(plane, layer) else 0)
                 for layer in range(self.num_layers)
             ]
             for plane in range(self.storage_depths)
@@ -632,11 +647,11 @@ class KVCacheManager:
             written,
             group_tables=tables if self.grouped else (),
             group_epochs=[[0] * group.planes for group in self.groups],
-            retired_pages=[[0] * group.planes for group in self.groups],
+            retired_pages=retired_pages,
             consumed=(
                 [
-                    [_WrittenPositions() for _ in range(self.num_layers)]
-                    for _ in range(self.storage_depths)
+                    [_WrittenPositions(prefix=positions.prefix) for positions in plane]
+                    for plane in written
                 ]
                 if self.reclaim_swa
                 else []
@@ -644,13 +659,25 @@ class KVCacheManager:
         )
         self._allocation_epoch += 1
         self.prefix_queries += 1
-        self.prefix_hits += length
+        self.prefix_hits += cached_tokens
         return True
 
-    def _claim_group_tables(self, new_pages, *, prefix=()):
-        """Append newly claimed pages to ``prefix``, or return None if the pool is short."""
+    def _claim_group_tables(self, new_pages, *, tables=()):
+        """Append ``new_pages`` fresh bundles to every plane, or None if the pool is short."""
         fresh = self._claim(new_pages * self.pages_per_token_block)
-        return None if fresh is None else self._group_tables(fresh, new_pages, prefix=prefix)
+        if fresh is None:
+            return None
+        if not tables:
+            tables = tuple(tuple([] for _ in range(group.planes)) for group in self.groups)
+        offset = 0
+        for group, planes in zip(self.groups, tables):
+            width = len(group.layers)
+            for table in planes:
+                for _ in range(new_pages):
+                    table.append(tuple(fresh[offset : offset + width]))
+                    offset += width
+        assert offset == len(fresh)
+        return tables
 
     def ensure_capacity(self, request_id, tokens):
         allocation = self._get_allocation(request_id)
@@ -921,23 +948,20 @@ class KVCacheManager:
                 self.value_scale[block].copy_(snapshot.value_scales[row])
         allocation.written = deepcopy(snapshot.written)
 
-    def _group_tables(self, blocks, new_pages, *, prefix=()):
-        """Build each plane once from cached bundles followed by one fresh claim."""
-        block_offset, prefix_offset, result = 0, 0, []
-        for group in self.groups:
+    def _group_prefix_tables(self, prefix, retired_pages):
+        """Attach only the cached pages each group can still read."""
+        offset, result = 0, []
+        for group, retired_planes in zip(self.groups, retired_pages):
             planes = []
             width = len(group.layers)
-            for _ in range(group.planes):
-                # Entries are flattened group -> plane -> layer.
-                table = [tuple(page[prefix_offset : prefix_offset + width]) for page in prefix]
-                prefix_offset += width
-                for _ in range(new_pages):
-                    table.append(tuple(blocks[block_offset : block_offset + width]))
-                    block_offset += width
-                planes.append(table)
+            for retired in retired_planes:
+                end = offset + width
+                planes.append(
+                    [None] * retired + [tuple(page[offset:end]) for page in prefix[retired:]]
+                )
+                offset = end
             result.append(tuple(planes))
-        assert block_offset == len(blocks)
-        assert all(len(page) == prefix_offset for page in prefix)
+        assert all(len(page) == offset for page in prefix)
         return tuple(result)
 
     def _group_plane(self, group: KVGroup, depth: int) -> int:
@@ -1071,6 +1095,12 @@ class KVCacheManager:
             allocation.consumed[self._plane(depth)][layer].add(position)
             allocation.reclaim_pending = True
 
+    def _expired_swa_pages(self, group, frontier):
+        """Count whole pages the next token at ``frontier`` cannot read."""
+        if group.window is None:
+            return 0
+        return max(0, frontier - group.window + 1) // self.block_size
+
     def finish_submission(self, event=None):
         """Return whole expired bundles only after this submission's final reader.
 
@@ -1089,7 +1119,7 @@ class KVCacheManager:
                     frontier = min(
                         allocation.consumed[plane][layer].prefix for layer in group.layers
                     )
-                    stop = max(0, frontier - group.window + 1) // self.block_size
+                    stop = self._expired_swa_pages(group, frontier)
                     start = allocation.retired_pages[group_id][plane]
                     if stop > start:
                         plans.append((allocation, group_id, plane, start, stop))
@@ -1098,6 +1128,8 @@ class KVCacheManager:
                 raise ValueError("CUDA reclamation requires the submission completion event")
             if event is not None:
                 event.synchronize()
+                # Deferred publications are now complete; index them before retiring.
+                self.poll_prefixes()
             for allocation, group_id, plane, start, stop in plans:
                 table = allocation.group_tables[group_id][plane]
                 released = []
@@ -1235,7 +1267,9 @@ class KVCacheManager:
         host = torch.tensor(values, dtype=dtype, pin_memory=self.device.type == "cuda")
         return host.to(self.device, non_blocking=True)
 
-    def _require_live_batch(self, batch: KVMetadata | GroupedKVMetadata | DeviceKVMetadata) -> None:
+    def _require_live_batch(
+        self, batch: KVMetadata | GroupedKVMetadata | DeviceKVMetadata
+    ) -> _PreparedCoverage | None:
         if self.grouped and isinstance(batch, DeviceKVMetadata):
             raise NotImplementedError("grouped KV does not support device-owned metadata")
         if isinstance(batch, (KVMetadata, GroupedKVMetadata)) and batch.owner is not self:
@@ -1594,6 +1628,6 @@ class KVCacheManager:
         if self.key_scale is None:
             return keys, values
         return (
-            dequantize_fp8(keys, self.key_scale[blocks, layer, offsets], self.dtype),
-            dequantize_fp8(values, self.value_scale[blocks, layer, offsets], self.dtype),
+            dequantize_fp8(keys, self.key_scale[blocks, storage_layer, offsets], self.dtype),
+            dequantize_fp8(values, self.value_scale[blocks, storage_layer, offsets], self.dtype),
         )

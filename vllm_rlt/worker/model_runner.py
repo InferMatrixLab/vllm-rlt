@@ -646,9 +646,7 @@ class ModelRunner:
                 [ids[row] for row in rows],
                 [[0] * len(rows)],
                 [positions[row] for row in rows],
-                packed=self.cache_manager.attention_capabilities.packed_prefill
-                if packed is None
-                else packed,
+                packed=self._packs_prefill() if packed is None else packed,
             )[0]
         return ForwardBatch(
             Operation.CODA, prelude_coda_kv_metadata=kv_metadata, compute_logits=False
@@ -739,6 +737,16 @@ class ModelRunner:
                 inputs.append(PreparedForward(coda, outputs=(), hidden_rows=coda_rows))
         return tuple(inputs)
 
+    def _packs_prefill(self):
+        # Packed metadata needs last_exited all-layer pages. Native-packing
+        # backends advertise it regardless of the cache layout.
+        cache = self.cache_manager
+        return (
+            cache.attention_capabilities.packed_prefill
+            and cache.layout == "last_exited"
+            and not cache.grouped
+        )
+
     def _uses_packed_loop_inputs(self, batch):
         capabilities = self.cache_manager.attention_capabilities
         return (
@@ -766,7 +774,7 @@ class ModelRunner:
             tokens.extend(span.input_tokens)
             requests.extend([request] * count)
             outputs.append((len(tokens) - 1, request))
-        packed = cache.attention_capabilities.packed_prefill and (
+        packed = self._packs_prefill() and (
             not cache.attention_capabilities.packed_sliding_window
             or all(len(span.request.prompt_token_ids) > 64 for span in batch.spans)
         )
@@ -882,8 +890,7 @@ class ModelRunner:
                         for offset in range(start, batch.loop_count)
                     ],
                     positions,
-                    packed=batch.has_chunks
-                    and self.cache_manager.attention_capabilities.packed_prefill,
+                    packed=batch.has_chunks and self._packs_prefill(),
                 )
         elif getattr(self.model, "requires_boundary_kv", False):
             ids, depths, positions = batch.addresses()
