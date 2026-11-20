@@ -381,7 +381,7 @@ class DoryAttention(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         batch: "KVMetadata | DeviceKVMetadata",
         cache: "KVCacheManager",
     ) -> torch.Tensor:
@@ -390,7 +390,7 @@ class DoryAttention(nn.Module):
         k = self.k_proj(hidden).view(count, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden).view(count, self.num_kv_heads, self.head_dim)
         gate = self.g_proj(hidden)
-        cos, sin = self.rotary_emb(hidden, position_ids)
+        cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         # nGPT Q/K normalization happens after RoPE: queries carry the square of
         # the learned scale, keys only the unit-length normalization.
@@ -448,12 +448,12 @@ class DorySublayer(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         batch: "KVMetadata | DeviceKVMetadata",
         cache: "KVCacheManager",
     ) -> torch.Tensor:
         if self.is_attention:
-            update = self.mixer(hidden, position_ids, batch, cache)
+            update = self.mixer(hidden, position_embeddings, batch, cache)
             return slerp_alpha(hidden, update, self.attn_alpha, self.alpha_scale)
         return slerp_alpha(hidden, self.mixer(hidden), self.mlp_alpha, self.alpha_scale)
 
@@ -474,6 +474,18 @@ class DoryBackbone(nn.Module):
         self.input_layers = tuple(range(*input_slice))
         self.recurrent_layers = tuple(range(*recurrent_slice))
         self.output_layers = tuple(range(*output_slice))
+
+    def forward(self, hidden, batch, cache, layers):
+        # Positions are shared within a traversal, but change between graph replays.
+        position_embeddings = {}
+        for index in layers:
+            layer = self.layers[index]
+            if layer.is_attention and layer.layer_type not in position_embeddings:
+                position_embeddings[layer.layer_type] = layer.mixer.rotary_emb(
+                    hidden, batch.position_ids
+                )
+            hidden = layer(hidden, position_embeddings.get(layer.layer_type), batch, cache)
+        return hidden
 
 
 class DoryForCausalLM(nn.Module):
@@ -546,8 +558,7 @@ class DoryForCausalLM(nn.Module):
         if tokens.ndim != 1:
             raise ValueError("prelude expects packed token_ids with shape [N]")
         hidden = self.backbone.embeddings(tokens)
-        for index in self.backbone.input_layers:
-            hidden = self.backbone.layers[index](hidden, batch.position_ids, batch, cache)
+        hidden = self.backbone(hidden, batch, cache, self.backbone.input_layers)
         # The retained injection input is half of the carried state, and loop zero
         # starts from the same tensor, matching the reference ``state = input_h``.
         return torch.cat((hidden, hidden), dim=-1)
@@ -571,8 +582,7 @@ class DoryForCausalLM(nn.Module):
             raise ValueError("recurrent expects hidden with shape [N, hidden_size]")
         state, injection = hidden.split(self.config.d_model, dim=-1)
         current = justnorm(state + injection)
-        for index in self.backbone.recurrent_layers:
-            current = self.backbone.layers[index](current, batch.position_ids, batch, cache)
+        current = self.backbone(current, batch, cache, self.backbone.recurrent_layers)
         state = justnorm(current)
         # Dory has no exit gate; a constant gate keeps the scheduler on the
         # configured depth instead of inventing an exit policy.
@@ -586,8 +596,7 @@ class DoryForCausalLM(nn.Module):
     def coda_prepared(self, hidden, batch, cache, *, compute_logits: bool = True):
         """Run the attention-bearing output stage and the scaled LM head."""
         state, _ = hidden.split(self.config.d_model, dim=-1)
-        for index in self.backbone.output_layers:
-            state = self.backbone.layers[index](state, batch.position_ids, batch, cache)
+        state = self.backbone(state, batch, cache, self.backbone.output_layers)
         return self.logits(state) if compute_logits else None
 
     def logits(self, state: torch.Tensor) -> torch.Tensor:

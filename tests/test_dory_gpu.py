@@ -246,6 +246,39 @@ def test_dory_execution_modes_match_cpu_oracle(mode, max_num_seqs):
 
 
 @pytest.mark.parametrize("mode", EXECUTION_MODES)
+def test_reused_rotary_embeddings_follow_positions_in_every_execution_mode(mode):
+    config = tiny_dory_config(
+        num_hidden_layers=24,
+        n_input_layers=8,
+        n_recurrent_layers=8,
+        n_output_layers=8,
+        layer_types=("sliding_attention", "mlp", "full_attention", "mlp") * 6,
+    )
+    torch.manual_seed(42)
+    reference = DoryForCausalLM(config).eval()
+    model = DoryForCausalLM(config).to(device=DEVICE, dtype=torch.float32).eval()
+    model.load_state_dict(reference.state_dict())
+    engine = make_engine(model, mode)
+    params = SamplingParams(max_tokens=6, min_loops=2, max_loops=2, ignore_eos=True)
+    for request_id, prompt in PROMPTS.items():
+        engine.add_request(request_id, prompt, params)
+    try:
+        finished = drain(engine)
+        for request_id, prompt in PROMPTS.items():
+            assert finished[request_id].token_ids == greedy_reference(reference, prompt, 6)
+        assert engine.cache_manager.num_used_blocks == 0
+        if "graph" in mode:
+            for graphs in (
+                engine.model_runner.prelude_graphs,
+                engine.model_runner.graphs,
+                engine.model_runner.coda_graphs,
+            ):
+                assert graphs.replays > 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("mode", EXECUTION_MODES)
 @pytest.mark.parametrize("after", [0, 1, 3, 6, 9])
 def test_dory_cancellation_releases_kv_in_every_execution_mode(mode, after):
     reference, model = reference_pair()
