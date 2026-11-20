@@ -34,8 +34,9 @@ def packed_prefill_eligible(
                 "with ordinary prefill, without speculation or preemption"
             )
         return False
-    if device_type != "cuda" or layout != "last_exited":
+    if device_type not in ("cuda", "npu") or layout != "last_exited":
         if requested is True:
-            raise ValueError("packed_prefill requires CUDA packed prefill with last_exited KV")
+            raise ValueError("packed_prefill requires CUDA or Ascend with last_exited KV")
         return False
-    return requested is True or not staged_prefill
+    # Ascend prepares both ordinary and staged packed metadata on the host.
+    return requested is True or device_type == "npu" or not staged_prefill

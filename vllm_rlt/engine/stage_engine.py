@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
+import torch
+
 from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.config import (
     CacheConfig,
@@ -73,6 +75,27 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
+        if parameter.device.type == "npu":
+            if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
+                raise ValueError("NPU currently supports Ouro with four loops")
+            if parameter.dtype != torch.bfloat16:
+                raise ValueError("NPU Ouro requires BF16 weights")
+            if cache_config.kv_cache_dtype != "auto":
+                raise ValueError("NPU Ouro requires BF16 KV cache")
+            if (
+                self.execution_config.cuda_graphs
+                or (self.execution_config.async_scheduling and self.execution_config.static_buffers)
+                or speculative_config is not None
+                or self.stage_config.role != "prefill_decode"
+                or scheduler_config.enable_preemption
+                or cache_config.enable_prefix_caching
+                or cache_config.layout != "last_exited"
+                or self.exit_config.mode not in ("ouro", "ouro_delayed")
+            ):
+                raise ValueError(
+                    "NPU Ouro requires local execution, ouro/ouro_delayed exit mode and "
+                    "last_exited KV without speculation, graphs, preemption or prefix caching"
+                )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
@@ -211,7 +234,8 @@ class StageEngine:
                 packed_sliding_window=require_packed and sliding_window,
                 cuda_graphs=self.execution_config.cuda_graphs,
                 async_scheduling=(
-                    parameter.device.type == "cuda" and self.execution_config.async_scheduling
+                    parameter.device.type in ("cuda", "npu")
+                    and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
                 fp8_kv=cache_config.kv_cache_dtype == "fp8_e4m3",
@@ -277,7 +301,12 @@ class StageEngine:
         # speculative paths must advance the same per-request slot, and only the
         # engine knows when a request terminates.
         self.rng = RngRegistry()
-        self.model_runner = ModelRunner(
+        runner_type = ModelRunner
+        if parameter.device.type == "npu":
+            from vllm_rlt.worker.ascend_model_runner import AscendModelRunner
+
+            runner_type = AscendModelRunner
+        self.model_runner = runner_type(
             model,
             self.cache_manager,
             exit_config=self.exit_config,
@@ -428,6 +457,10 @@ class StageEngine:
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
         fixed_loop_count = getattr(self.model, "fixed_loop_count", False)
         target_loops, max_loops = self._resolve_loop_bounds(params)
+        if next(self.model.parameters()).device.type == "npu" and (
+            max_loops != 4 or params.exit_threshold != 1.0 or params.temperature != 0
+        ):
+            raise ValueError("NPU Ouro requests require four loops, exit_threshold=1 and greedy")
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
@@ -973,8 +1006,7 @@ class StageEngine:
             request_events=self.model_runner.events,
             signals=signals,
         )
-        for row in update.next_prelude:
-            batch.requests[row].request.input_token_tensor = ticket.device_values[row]
+        self.model_runner.bind_sampled_tokens(batch, ticket.device_values, update.next_prelude)
         for row in update.retain_signal:
             self._pending_exit_signals[batch.requests[row].request.request_id] = SignalHandle(
                 ticket, row
