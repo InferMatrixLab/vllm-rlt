@@ -86,6 +86,9 @@ layer id rather than their physical sublayer index.
   the next input stage and only its readback is deferred. The two switches are
   independent: sync eager, sync Graph, async eager and async Graph are tested
   separately.
+- Self-speculation in block and token-pipeline mode, in the same four execution
+  modes. Asynchronous rounds take greedy requests only. See
+  [Self-speculation](#self-speculation).
 - The official tokenizer, including the Hub's `tokenizer.json` and chat
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
@@ -136,9 +139,9 @@ These fail fast rather than degrade silently:
 
 - WCPB, mixed or staged prefill, and PD.
 - Prefix caching.
-- Self-speculation combined with CUDA Graphs, asynchronous scheduling,
-  preemption or `last_loop` KV, and sampled token-pipeline speculation. The
-  synchronous eager form is supported; see below.
+- Self-speculation combined with preemption or `last_loop` KV, sampled
+  token-pipeline speculation, and sampled asynchronous rounds. The other forms
+  are supported; see below.
 - Per-request loop counts other than the configured full depth: Dory has no
   trained exit gate, so the runtime refuses to invent one, including via
   `min_loops` with `exit_threshold=0`.
@@ -155,13 +158,15 @@ construction instead of attending full history. Masking accepts host-planned,
 graph-private and device-owned metadata; storage reclamation of out-of-window
 pages stays with 2B.
 
-## Synchronous self-speculation
+## Self-speculation
 
 `SpeculativeConfig(K, draft_loops=d, target_loops=T, mode=...)` drafts with the
 first `d` recurrent loops and verifies with all `T`, where `T` is the loop count
-the model was loaded with. It needs `per_loop` KV, synchronous eager execution
-and fixed-depth requests (`min_loops == max_loops == T`). Qualified depth pairs
-are 1→2, 1→4 and 2→4.
+the model was loaded with. It needs `per_loop` KV and fixed-depth requests
+(`min_loops == max_loops == T`). Qualified depth pairs are 1→2, 1→4 and 2→4.
+This section describes synchronous eager rounds first;
+[asynchronous rounds and CUDA Graphs](#asynchronous-rounds-and-cuda-graphs) keep
+the same KV contract.
 
 | Mode | Sampling | Round |
 | --- | --- | --- |
@@ -221,6 +226,45 @@ Layout tensors borrow the runner's typed upload snapshots until the submission's
 final consumer completes. The pipeline mode uses the same preparation-local
 layout store and operation indices for its new-token, recurrent and endpoint
 views; all views are bound before execution.
+
+### Asynchronous rounds and CUDA Graphs
+
+`ExecutionConfig(async_scheduling=True)` submits the next round before the host
+reads the previous one (see `docs/async-speculative.md`). The actual positions
+then exist only on the device. Thus the runner builds device metadata
+(`DeviceKVMetadata`) at depth 0 for PRELUDE and CODA, as it does for the
+recurrent loops. The KV contract does not change: all KV below the start of the
+next round is the serial target history.
+
+- **Block rounds.** Each draft offset gives its rows one depth-0 view for
+  PRELUDE and the draft CODA. A partial draft CODA gets its own view of the
+  drafting rows. Verification gives every row one depth-0 view for the target
+  CODA.
+- **Pipeline steps.** Every row runs both boundary stages, so each call keeps one
+  shape (the fixed-slot calls of `docs/async-speculative.md`). Write masks select
+  the rows that store KV. PRELUDE stores only for rows at depth 0. CODA stores
+  only for rows that reach the draft or the target depth. A row between these
+  depths (1→4) keeps the CODA KV of its draft pass, as in a synchronous step.
+- **Sampling.** Asynchronous rounds take greedy requests only. Asynchronous
+  block rounds can sample for models without boundary KV, but that combination
+  is not qualified for Dory. Such a request fails when it is added.
+
+The asynchronous pipeline keeps all its slots full: when the root reaches the
+target depth, the newest draft row gets its successor in the same step. The
+synchronous pipeline appends only inside the scheduled span. The two modes
+therefore run different step sequences, and their acceptance can differ. Both
+commit the target tokens.
+
+`ExecutionConfig(cuda_graphs=True)`:
+
+- **Asynchronous rounds** replay bucketed graphs for PRELUDE, every recurrent
+  loop and CODA (`DeviceBoundaryGraphs`, `DeviceRecurrentGraphs`). Positions,
+  write addresses, write masks and context lengths are graph inputs. The engine
+  captures all buckets at construction. A row count above the largest bucket
+  runs eager.
+- **Synchronous rounds** use the host-planned boundary graphs of ordinary decode
+  (`PreludeGraphs`, and `CodaGraphs` with the cache). These capture one graph
+  per row count, up to `cuda_graph_max_graphs`; other row counts run eager.
 
 ## Validation status
 
@@ -390,6 +434,152 @@ Reading the numbers:
   memory was 74–82 GiB with the automatically sized KV pool; every arm released
   its KV blocks.
 
+### Asynchronous self-speculation and CUDA Graphs
+
+`tests/test_dory_speculative_gpu.py` (97 CUDA cases, small FP32 model, Triton)
+checks the execution modes against the dense oracle:
+
+- Greedy tokens for ragged requests in block and pipeline mode, for 1→2, 1→4 and
+  2→4 and K = 1 and 3, in async eager, async Graph and sync Graph.
+- A forced rejection at every draft position of an async block round, and forced
+  acceptance patterns of an async pipeline. After every collected round, every
+  plane below the committed frontier equals the serial target history while the
+  next round is in flight.
+- After every async pipeline step, a retained row keeps its PRELUDE KV and a row
+  between the draft and target depths keeps the CODA KV of its draft pass, bit
+  for bit.
+- No host read of a device value during submission, cancellation with two
+  rounds in flight and ID reuse, cleanup after a failed round, and the greedy
+  and preemption rejections.
+
+The Graph cases also check that all three graph families replay; async Graph
+rounds have no eager fallback. On one H100 (torch 2.15.0+cu132, Triton 3.9), the
+file passes together with `tests/test_dory_speculative.py`,
+`tests/test_dory_gpu.py`, `tests/test_speculative.py`, `tests/test_cuda_graph.py`
+and the `tests/test_async_*` files. The `flash_attn` cases were not selected,
+because that package is not installed there.
+
+Real checkpoint (pinned revision), K = 3, greedy, Triton, one H100, torch
+2.15.0+cu132. Prompts are disjoint windows of the WikiText-103 test split.
+
+**FP32 token agreement.** 32 requests × 512 prompt tokens + 128 generated
+tokens. Every speculative arm (sync and async eager pipeline and block, sync
+Graph pipeline, async Graph pipeline and block) is compared with synchronous
+eager decoding without speculation at the same loop count:
+
+| Loops | Draft → target | Requests with identical tokens, every arm | Acceptance, pipeline | Acceptance, block |
+| --- | --- | --- | --- | --- |
+| 2 | 1 → 2 | 32/32 | 0.85 | 0.85 |
+| 4 | 1 → 4 | 32/32 | 0.81 sync, 0.73 async | 0.85 |
+| 4 | 2 → 4 | 32/32 | 0.93 | 0.92 |
+
+At 1 → 4 the asynchronous pipeline runs a different step sequence (see
+[Asynchronous rounds and CUDA Graphs](#asynchronous-rounds-and-cuda-graphs)),
+so its acceptance differs. Its tokens do not.
+
+**GSM8K, BF16.** The first 200 test questions, 8-shot prompt from the first
+eight training examples, at most 256 generated tokens. An answer is correct
+when the number after `####` equals the reference:
+
+| Arm | Correct |
+| --- | --- |
+| Baseline: async Graph, no speculation | 161/200 |
+| Async Graph pipeline | 164/200 |
+| Async Graph block | 163/200 |
+
+BF16 tokens depend on the batch composition, so most sequences differ from the
+baseline after some token. Accuracy does not drop.
+
+**BF16 wall time.** Two loops, a one-loop draft. All requests are sent at the
+same time. Each arm runs one warmup, then five timed repetitions, all in one
+container. Wall times are the mean whole-run time in seconds, prefill included.
+Every Graph arm uses `cuda_graph_max_graphs=128`, so no arm runs eager because
+its graph cache is full; every Graph arm had zero graph fallbacks. BF16
+acceptance is 0.85–0.88.
+
+Table 1: with CUDA Graphs, concurrency sweep. Prompt 1024 tokens, 128 generated
+tokens for each request. Percentages are against the baseline.
+
+| Requests | Baseline (async Graph, no spec) | Baseline, default graph cache | Sync Graph pipeline | Async Graph pipeline | Async Graph block |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 2.50 | 2.49 (−0.1 %) | 1.83 (−27 %) | **1.78 (−29 %)** | 1.91 (−23 %) |
+| 4 | 3.17 | 3.18 (+0.4 %) | 2.66 (−16 %) | **2.63 (−17 %)** | 2.95 (−7 %) |
+| 16 | 5.89 | 5.90 (+0.1 %) | 5.51 (−6 %) | **5.30 (−10 %)** | 5.63 (−5 %) |
+| 64 | 15.60 | 25.72 (+65 %) | 16.00 (+3 %) | **15.10 (−3 %)** | 16.45 (+5 %) |
+
+Table 2: latency with CUDA Graphs, same workload. TTFT is the time to the first
+token; TPOT is the time per output token after the first token. Percentages are
+against the baseline at the same concurrency.
+
+| Requests | Arm | TTFT p50 (s) | TTFT p90 (s) | TPOT p50 (ms) | TPOT p90 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Baseline (async Graph, no spec) | 0.18 | 0.18 | 18.3 | 18.3 |
+| 1 | Async Graph pipeline | 0.17 (−2 %) | 0.20 (+13 %) | 12.6 (−31 %) | 12.6 (−31 %) |
+| 1 | Async Graph block | 0.17 (−1 %) | 0.19 (+7 %) | 13.7 (−25 %) | 13.7 (−25 %) |
+| 4 | Baseline (async Graph, no spec) | 0.67 | 0.67 | 20.0 | 20.0 |
+| 4 | Async Graph pipeline | 0.66 (−1 %) | 0.67 (−0.8 %) | 16.6 (−17 %) | 17.4 (−13 %) |
+| 4 | Async Graph block | 0.69 (+3 %) | 0.69 (+3 %) | 18.1 (−10 %) | 19.0 (−5 %) |
+| 16 | Baseline (async Graph, no spec) | 2.01 | 2.75 | 35.2 | 40.9 |
+| 16 | Async Graph pipeline | 1.68 (−17 %) | 2.70 (−2 %) | 28.8 (−18 %) | 36.1 (−12 %) |
+| 16 | Async Graph block | 1.79 (−11 %) | 2.93 (+6 %) | 30.1 (−15 %) | 36.1 (−12 %) |
+| 64 | Baseline (async Graph, no spec) | 6.21 | 10.58 | 76.6 | 108.5 |
+| 64 | Async Graph pipeline | 5.78 (−7 %) | 10.02 (−5 %) | 70.9 (−7 %) | 102.5 (−5 %) |
+| 64 | Async Graph block | 6.43 (+3 %) | 11.54 (+9 %) | 68.1 (−11 %) | 96.4 (−11 %) |
+
+Table 3: without CUDA Graphs (eager), sync against async, same workload. There
+is no eager baseline without speculation, so each async percentage is against
+the sync value of the same mode.
+
+| Requests | Pipeline sync | Pipeline async | Block sync | Block async |
+| --- | --- | --- | --- | --- |
+| 1 | 6.80 | 6.42 (−6 %) | 6.83 | 7.16 (+5 %) |
+| 4 | 7.80 | 8.24 (+6 %) | 9.64 | 9.71 (+0.8 %) |
+| 16 | 10.74 | 10.57 (−2 %) | 13.24 | 13.25 (+0.1 %) |
+| 64 | 21.22 | 20.49 (−3 %) | 28.02 | 27.29 (−3 %) |
+
+Table 4: long context. 8 requests, prompt 8192 tokens, 128 generated tokens for
+each request.
+
+| Arm | Wall (s) | TTFT p50 (s) | TTFT p90 (s) | TPOT p50 (ms) | TPOT p90 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| Baseline (async Graph, no spec) | 23.73 | 18.60 | 20.71 | 53.2 | 68.9 |
+| Sync Graph pipeline | 23.52 (−0.9 %) | 17.85 (−4 %) | 20.73 (+0.1 %) | 51.2 (−4 %) | 72.5 (+5 %) |
+| Async Graph pipeline | 23.18 (−2 %) | 17.69 (−5 %) | 20.58 (−0.6 %) | 49.4 (−7 %) | 70.3 (+2 %) |
+| Async Graph block | 23.13 (−3 %) | 17.60 (−5 %) | 20.42 (−1 %) | 49.9 (−6 %) | 67.9 (−1 %) |
+| Sync eager pipeline | 28.83 | 18.04 | 21.08 | 86.1 | 111.4 |
+| Async eager pipeline | 28.52 (−1 % vs sync) | 18.10 (+0.3 % vs sync) | 21.15 (+0.3 % vs sync) | 87.2 (+1 % vs sync) | 108.0 (−3 % vs sync) |
+
+Reading the numbers:
+
+- The gain of speculation falls as concurrency rises. At one request the GPU
+  has spare capacity, so draft and verify work is almost free. At 64 requests
+  the GPU is busy, and the extra verify rows cancel most of the saved steps.
+- At 8 × 8192, prefill takes about 18 of 24 seconds. Speculation shortens only
+  decode, so the whole run is 2–3 % faster.
+- The baseline with the default graph cache (16 shapes) runs eager in most calls
+  at 64 requests and takes 25.72 s instead of 15.60 s. Comparisons against that
+  baseline overstate the gain of speculation.
+- These runs use a different harness and host than the 2D and 3A tables above,
+  so the absolute numbers do not compare with those tables.
+- Not covered: HTTP serving and open-loop arrival traces.
+
+**Known issues.**
+
+- Async Graph block is 5 % slower than the baseline at 64 requests. Its time per
+  output token is 11 % lower, but its time to the first token is 3–9 % higher.
+  The async Graph pipeline is 3 % faster there, so it is the better mode at high
+  concurrency.
+- Without CUDA Graphs, async rounds at 1 and 4 requests are between 6 % faster
+  and 6 % slower than sync rounds (Table 3). A dedicated run alternated a sync
+  and an async engine in ABBA order, 10 timed repetitions each, at one request
+  in pipeline mode. Async was 2.7 % and 3.9 % slower in two containers. The
+  profiler counts 5503 kernel launches per generated token for sync and 5626 for
+  async (+124, +2.2 %). Async rounds keep positions on the GPU, so the GPU
+  computes the KV metadata, the PRELUDE and CODA write masks and the slot-pool
+  update; sync rounds do this work on the CPU. Eager Dory is bound by host-side
+  launch cost, so the extra launches give the extra time. At 16 and 64 requests,
+  async eager is 0–3 % faster than sync eager.
+
 ### Not yet performed
 
 - A runtime-to-runtime comparison against vLLM once a Dory-capable build is
@@ -402,7 +592,7 @@ Reading the numbers:
 - Graph-captured prefill, open-loop arrival traces and sampled decoding on the
   real checkpoint in Graph or async mode. The measurements above are
   closed-loop, greedy, and their time to first token is eager prefill.
-- Self-speculation with CUDA graphs, asynchronous scheduling, preemption,
-  sampled token-pipeline, adaptive exit, or a draft width above the fixed K.
+- Self-speculation with preemption, sampled asynchronous rounds, sampled
+  token-pipeline, adaptive exit, or a draft width above the fixed K.
 - Sampled speculation on the real checkpoint (the rejection-sampling contract is
   qualified on the tiny CPU model only).

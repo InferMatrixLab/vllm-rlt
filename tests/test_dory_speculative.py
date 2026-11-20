@@ -426,11 +426,11 @@ def test_block_sampling_recovers_the_target_distribution():
 
 def test_unqualified_speculative_combinations_fail_at_construction():
     model = dory(2)
-    with pytest.raises(ValueError, match="synchronous"):
+    with pytest.raises(ValueError, match="requires CUDA"):
         engine(model, 2, 1, execution_config=ExecutionConfig(async_scheduling=True))
     with pytest.raises(ValueError, match="CUDA graphs"):
         engine(model, 2, 1, execution_config=ExecutionConfig(cuda_graphs=True))
-    with pytest.raises(ValueError, match="without CUDA graphs or preemption"):
+    with pytest.raises(ValueError, match="does not support preemption"):
         engine(
             model,
             2,

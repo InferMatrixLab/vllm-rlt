@@ -1207,7 +1207,7 @@ def test_async_pipeline_uses_gpu_decision_before_collect(reject, monkeypatch):
         runner = e.speculative_runner
         calls = 0
 
-        def controlled(hidden):
+        def controlled(hidden, boundary=None):
             nonlocal calls
             calls += 1
             logits = torch.full(

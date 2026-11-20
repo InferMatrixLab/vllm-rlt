@@ -164,7 +164,9 @@ def test_cuda_serving_two_completed_rounds_isolate_decode_failure(
         monkeypatch.setattr(
             engine.speculative_runner,
             "_coda",
-            lambda h: torch.zeros(len(h), engine.model.config.vocab_size, device=h.device),
+            lambda h, boundary=None: torch.zeros(
+                len(h), engine.model.config.vocab_size, device=h.device
+            ),
         )
         engine.step()
         engine.step()
