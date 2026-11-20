@@ -5,9 +5,14 @@ environment. The `vllm-rlt-serve` entrypoint (or `python -m
 vllm_rlt.entrypoints.serve`) serves one resident model on one device. Bind defaults
 to `127.0.0.1:8000`; this benchmark frontend has no authentication or TLS.
 
+## Device setup
+
+For Huawei Ascend NPU on `main`, follow the [Ascend serving setup](recipes/ouro_ascend.md)
+for the Torch-NPU and CANN environment and the launch command.
+
 Prepare the Ouro checkpoint and tokenizer separately. The official model ID
 pins revision `574fa66cb8bf5abdc979642d01cf2b79b16bfab1`; local paths are supported.
-Select an available GPU explicitly; a scheduler is optional:
+For NVIDIA CUDA, select an available GPU explicitly.
 
 ```bash
 nvidia-smi
