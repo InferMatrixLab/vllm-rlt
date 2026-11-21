@@ -1,3 +1,6 @@
+import hashlib
+import weakref
+
 import pytest
 import torch
 
@@ -64,6 +67,228 @@ def test_prefix_refcounts_and_eviction():
     assert not c.lookup_prefix([1, 2, 3, 4, 5])
     c.free("all")
     assert c.num_free_blocks == 12
+
+
+def test_completed_chunks_hash_each_prefix_page_once(monkeypatch):
+    count, block_size = 8192, 16
+    cache = KVCacheManager(1, 1, 4, count // block_size, block_size, 1, enable_prefix_caching=True)
+    tokens = list(range(count))
+    assert cache.allocate("request", count)
+    cache.mark_imported_prefix("request", count)
+    hash_calls = 0
+    sha256 = hashlib.sha256
+
+    def counted(data):
+        nonlocal hash_calls
+        hash_calls += 1
+        return sha256(data)
+
+    monkeypatch.setattr(hashlib, "sha256", counted)
+    for length in range(128, count + 1, 128):
+        cache.publish_prefix("request", tokens, length, PrefixEvent(ready=True))
+    cache.publish_prefix("request", tokens, count)
+    assert hash_calls == (count - 1) // block_size
+    assert len(cache.lookup_prefix(tokens)) == (count - 1) // block_size
+
+
+@pytest.mark.parametrize("missing", ["coverage", "physical_page"])
+def test_prefix_publication_retries_the_first_incomplete_page(missing):
+    cache = KVCacheManager(
+        2,
+        1,
+        4,
+        12,
+        2,
+        2,
+        enable_prefix_caching=True,
+        recurrent_layers=(1,),
+        layer_windows={0: 4, 1: None},
+    )
+    tokens = list(range(7))
+    assert cache.allocate(
+        "request", len(tokens), initial_tokens=2 if missing == "physical_page" else 7
+    )
+    allocation = cache._get_allocation("request")
+    for plane, layers in enumerate(allocation.written):
+        for layer, written in enumerate(layers):
+            if plane == 0 or layer == 1:
+                written.prefix = len(tokens)
+    if missing == "coverage":
+        allocation.written[1][1].prefix = 2
+
+    cache.publish_prefix("request", tokens, len(tokens))
+    assert len(cache.lookup_prefix(tokens)) == 1
+    if missing == "physical_page":
+        assert cache.ensure_capacity("request", len(tokens))
+    else:
+        allocation.written[1][1].prefix = len(tokens)
+    cache.publish_prefix("request", tokens, len(tokens))
+    assert len(cache.lookup_prefix(tokens)) == 3
+
+
+def test_active_request_republishes_its_prefix_after_lru_eviction():
+    cache = KVCacheManager(1, 1, 4, 10, 2, 1, enable_prefix_caching=True)
+    tokens, other = list(range(7)), list(range(100, 107))
+    assert cache.allocate("publisher", len(tokens))
+    cache.mark_imported_prefix("publisher", len(tokens))
+    cache.publish_prefix("publisher", tokens, len(tokens))
+    cache.free("publisher")
+    assert cache.allocate("source", len(tokens), prefix=cache.lookup_prefix(tokens))
+    cache.publish_prefix("source", tokens, len(tokens))
+    assert cache.allocate("other", len(other))
+    cache.mark_imported_prefix("other", len(other))
+    cache.publish_prefix("other", other, len(other))
+    cache.free("other")
+
+    # Reaching the evictable pages also removes the older source entries,
+    # whose physical pages remain pinned by the live request.
+    assert cache.allocate("pressure", 10)
+    assert not cache.lookup_prefix(tokens)
+    cache.publish_prefix("source", tokens, len(tokens))
+    assert len(cache.lookup_prefix(tokens)) == 3
+    cache.free("source")
+    cache.free("pressure")
+    assert cache.num_free_blocks == cache.num_blocks
+
+
+class PrefixEvent:
+    def __init__(self, ready=False):
+        self.ready = ready
+        self.queries = 0
+
+    def query(self):
+        self.queries += 1
+        return self.ready
+
+    def synchronize(self):
+        raise AssertionError("prefix publication must not wait for an event")
+
+
+@pytest.mark.parametrize("leased", [False, True])
+def test_free_drops_pending_prefix_without_polling_or_waiting(leased):
+    cache = KVCacheManager(1, 1, 4, 6, 2, 1, enable_prefix_caching=True)
+    tokens = [1, 2, 3, 4, 5]
+    events = []
+    for request_id in ("request", "other"):
+        assert cache.allocate(request_id, len(tokens))
+        event = PrefixEvent()
+        events.append(event)
+        cache.publish_prefix(request_id, tokens, len(tokens), event)
+    owner = weakref.ref(cache._get_allocation("request"))
+    if leased:
+        cache.pin_transfer("request", "transfer")
+    cache.free("request")
+    if leased:
+        assert cache.has_allocation("request")
+        assert len(cache._pending_prefixes) == 2
+        cache.unpin_transfer("request", "transfer")
+    assert owner() is None
+    assert not cache.has_allocation("request")
+    assert len(cache._pending_prefixes) == 1
+    assert cache._pending_prefixes[0][0] == "other"
+
+    assert cache.allocate("request", len(tokens))
+    events.append(PrefixEvent())
+    cache.publish_prefix("request", tokens, len(tokens), events[-1])
+    cache.free("unknown")
+    assert len(cache._pending_prefixes) == 2
+    cache.free("request")
+    cache.free("request")
+    assert len(cache._pending_prefixes) == 1
+    assert cache._pending_prefixes[0][0] == "other"
+    cache.free("other")
+    assert not cache._pending_prefixes
+    assert all(event.queries == 1 for event in events)
+    assert cache.num_free_blocks == cache.num_blocks
+
+
+def test_completed_prefix_event_publishes_without_pending_storage():
+    cache = KVCacheManager(1, 1, 4, 6, 2, 1, enable_prefix_caching=True)
+    tokens = [1, 2, 3, 4, 5]
+    assert cache.allocate("request", len(tokens))
+    cache.mark_imported_prefix("request", len(tokens))
+
+    cache.publish_prefix("request", tokens, len(tokens), PrefixEvent(ready=True))
+
+    assert not cache._pending_prefixes
+    assert len(cache.lookup_prefix(tokens)) == 2
+
+
+def test_pending_prefix_chunks_share_one_prompt_and_do_not_rescan_events():
+    count, chunk_size = 8192, 128
+    cache = KVCacheManager(1, 1, 4, count // 16, 16, 1, enable_prefix_caching=True)
+    tokens = list(range(count))
+    assert cache.allocate("request", count)
+    cache.mark_imported_prefix("request", count)
+    events = []
+    for length in range(chunk_size, count + 1, chunk_size):
+        event = PrefixEvent()
+        events.append(event)
+        cache.publish_prefix("request", tokens, length, event)
+
+    assert len(cache._pending_prefixes) == 1
+    _, _, snapshot, frontier, pending_events = cache._pending_prefixes[0]
+    assert snapshot == tuple(tokens)
+    assert frontier == count
+    assert len(pending_events) == len(events)
+    assert all(event.queries == 1 for event in events)
+    assert not cache._prefixes
+
+    cache.poll_prefixes()
+    assert cache._pending_prefixes[0][2] is snapshot
+    assert all(event.queries == 2 for event in events)
+    for event in events:
+        event.ready = True
+    cache.poll_prefixes()
+    assert not cache._pending_prefixes
+    assert len(cache.lookup_prefix(tokens)) == (count - 1) // cache.block_size
+
+
+def test_pending_prefix_waits_for_all_events_and_keeps_the_largest_frontier():
+    cache = KVCacheManager(1, 1, 4, 8, 2, 1, enable_prefix_caching=True)
+    tokens = list(range(9))
+    assert cache.allocate("request", len(tokens))
+    cache.mark_imported_prefix("request", len(tokens))
+    earlier, later = PrefixEvent(), PrefixEvent()
+    cache.publish_prefix("request", tokens, 4, earlier)
+    cache.publish_prefix("request", tokens, 8, later)
+    # A completed submission with a smaller frontier must not discard either
+    # outstanding writer or the larger prefix awaiting publication.
+    cache.publish_prefix("request", tokens, 2, PrefixEvent(ready=True))
+    later.ready = True
+    cache.poll_prefixes()
+    assert not cache._prefixes
+    assert cache._pending_prefixes[0][3] == 8
+    assert cache._pending_prefixes[0][4] == [earlier]
+
+    earlier.ready = True
+    cache.poll_prefixes()
+    assert not cache._pending_prefixes
+    assert len(cache.lookup_prefix(tokens)) == 4
+
+
+def test_pending_prefix_does_not_publish_a_replaced_allocation():
+    cache = KVCacheManager(1, 1, 4, 6, 2, 1, enable_prefix_caching=True)
+    old_tokens, new_tokens = [1, 2, 3, 4, 5], [6, 7, 8, 9, 10]
+    assert cache.allocate("request", len(old_tokens))
+    cache.mark_imported_prefix("request", len(old_tokens))
+    old_event = PrefixEvent()
+    cache.publish_prefix("request", old_tokens, len(old_tokens), old_event)
+    cache.free("request")
+    assert cache.allocate("request", len(new_tokens))
+    cache.mark_imported_prefix("request", len(new_tokens))
+    new_event = PrefixEvent()
+    cache.publish_prefix("request", new_tokens, len(new_tokens), new_event)
+
+    old_event.ready = True
+    cache.poll_prefixes()
+    assert not cache._prefixes
+    assert len(cache._pending_prefixes) == 1
+    assert cache._pending_prefixes[0][2] == tuple(new_tokens)
+    new_event.ready = True
+    cache.poll_prefixes()
+    assert len(cache.lookup_prefix(new_tokens)) == 2
+    assert not cache.lookup_prefix(old_tokens)
 
 
 def test_incremental_growth_matches_reserved_generation():

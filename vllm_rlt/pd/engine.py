@@ -14,7 +14,7 @@ from pathlib import Path
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.engine.stage_config import StageConfig
-from vllm_rlt.models import prepare_model
+from vllm_rlt.models import MODEL_MAPPING, prepare_model
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
@@ -76,10 +76,11 @@ class PDEngine:
         )
         if self.model_config.model_type == "huginn_raven":
             raise ValueError("PD does not support Huginn")
-        if getattr(model, "requires_boundary_kv", False):
-            raise ValueError(
-                f"PD does not support {self.model_config.model_type} boundary-KV models"
-            )
+        # A path or a config source has no model instance yet; the class
+        # declares the capability for every source.
+        architecture = MODEL_MAPPING[self.model_config.model_type]
+        if speculative_config is not None and getattr(architecture, "requires_boundary_kv", False):
+            raise ValueError("PD does not support boundary-KV speculative decoding yet")
         self.config = pd_config or PDConfig()
         self.exit_config = exit_config or ExitConfig(
             "ouro" if speculative_config else "ouro_delayed"

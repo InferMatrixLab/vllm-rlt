@@ -219,7 +219,7 @@ class PDStageConnector:
 
     def queue_chunk(self, transfer, start, end, event, final):
         peer = self.transport.peers[transfer.peer]
-        tables = self.cache.plane_block_tables(transfer.tid)
+        tables = self.cache.transfer_tables(transfer.tid)
         start = max(start, transfer.target_cached_tokens)
         if start < end:
             boundary = (start, end)
@@ -227,8 +227,14 @@ class PDStageConnector:
                 transfer.transfer_boundary_first = boundary
             transfer.transfer_boundary_last = boundary
             transfer.transfer_boundary_count += 1
-        source = list(kv_segments(self.transport.info, tables, start, end)) if start < end else []
-        target = list(kv_segments(peer, transfer.target_tables, start, end)) if start < end else []
+        source, target = [], []
+        page = self.transport.info["block_size"]
+        for local, remote in zip(tables, transfer.target_tables):
+            # The receiver holds no SWA page that its first query cannot read.
+            lo = max(start, next(i for i, block in enumerate(remote) if block >= 0) * page)
+            if lo < end:
+                source.extend(kv_segments(self.transport.info, (local,), lo, end))
+                target.extend(kv_segments(peer, (remote,), lo, end))
         if final:
             size = self.transport.info["hidden_bytes"]
             source.append(
@@ -291,7 +297,7 @@ class PDStageConnector:
             self.notify(
                 "reserved",
                 tid=tid,
-                tables=self.cache.plane_block_tables(tid),
+                tables=self.cache.transfer_tables(tid),
                 slot=transfer.slot,
                 cached_tokens=hit,
             )

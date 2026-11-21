@@ -686,8 +686,18 @@ def test_cuda_graph_reserve_reduces_budget_with_fixed_memory_inputs(monkeypatch,
     scheduler = SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=3)
     execution = ExecutionConfig(cuda_graph_memory_reserve_bytes=32 * mib)
 
-    _, eager = plan_cache(base, cache, scheduler, execution, "triton")
-    _, graphed = plan_cache(base, cache, scheduler, replace(execution, cuda_graphs=True), "triton")
+    _, eager = plan_cache(
+        base, cache, scheduler, execution, "triton", layer_windows=None, reclaim_swa=False
+    )
+    _, graphed = plan_cache(
+        base,
+        cache,
+        scheduler,
+        replace(execution, cuda_graphs=True),
+        "triton",
+        layer_windows=None,
+        reclaim_swa=False,
+    )
 
     assert eager["cuda_graph_reserve_bytes"] == 0
     assert graphed["cuda_graph_reserve_bytes"] == 32 * mib

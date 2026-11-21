@@ -346,15 +346,23 @@ class Scheduler:
         self.enqueue(request, restored)
         return ResumeResult.RESTORED
 
-    def _reserved_growth_blocks(self, *, reserve_outputs: bool) -> int:
+    def _reserved_growth_blocks(
+        self, *, reserve_outputs: bool, independent_budget: bool = False
+    ) -> int:
         """Budget future growth of existing requests without allocating it.
 
         Example: a request needs 12 blocks eventually but owns 4. Without
         preemption, reserve the remaining 8 even though they still look free.
         With preemption, protect in-progress prompts; decode growth may instead
         reclaim capacity by suspending another request later.
+
+        ``independent_budget`` counts every request's full peak and subtracts
+        current use once, so shared pages cannot hide growth. That subtraction
+        assumes every allocated request is counted, which needs reserve_outputs.
         """
         cache = self.cache_manager
+        if independent_budget and not reserve_outputs:
+            raise ValueError("independent budgeting requires reserved outputs")
         reserved = 0
         for request in self.requests.values():
             # Imported/reserved requests already own pages before compute admission.
@@ -369,9 +377,9 @@ class Scheduler:
             tokens = len(request.prompt_token_ids)
             if reserve_outputs:
                 tokens += request.sampling_params.max_tokens - 1
-            allocated = cache.allocated_blocks(request.request_id)
+            allocated = 0 if independent_budget else cache.charged_blocks(request.request_id)
             reserved += max(0, cache.required_blocks(tokens) - allocated)
-        return reserved
+        return max(0, reserved - cache.num_used_blocks) if independent_budget else reserved
 
     def _plan_admission(self, request: Request, active_count: int) -> AdmissionPlan:
         """Describe prefix reuse, physical allocation and logical admission cost.
@@ -388,26 +396,37 @@ class Scheduler:
         capacity = len(request.prompt_token_ids) + request.sampling_params.max_tokens - 1
         prefix = cache.lookup_prefix(request.prompt_token_ids)
         cached_tokens = len(prefix) * cache.block_size
-        initial_tokens = min(
-            len(request.prompt_token_ids), cached_tokens + self.config.prefill_chunk_size
+        chunk_size = (
+            cache.max_submission_tokens
+            if cache.submission_bounded
+            else self.config.prefill_chunk_size
         )
-        if not cache.incremental_allocation:
-            initial_tokens = capacity
+        initial_tokens = (
+            min(len(request.prompt_token_ids), cached_tokens + chunk_size)
+            if cache.incremental_allocation
+            else capacity
+        )
         reserve_outputs = cache.incremental_allocation and self.suspend_callback is None
         budget_tokens = (
             len(request.prompt_token_ids)
             if cache.incremental_allocation and not reserve_outputs
             else capacity
         )
-        required = cache.required_blocks(budget_tokens) - len(prefix) * cache.storage_depths
-        reserved = self._reserved_growth_blocks(reserve_outputs=reserve_outputs)
+        # SWA sharers can retire the same page at different times. Budget each
+        # request's peak independently so sharing cannot leave growth underfunded.
+        # Preallocation already reserves each whole peak.
+        independent_budget = cache.submission_bounded and cache.enable_prefix_caching
+        required = cache.required_blocks(budget_tokens)
+        cached_claim = 0
+        if not independent_budget:
+            required -= len(prefix) * cache.pages_per_token_block
+            # Prefix-only blocks count as free until a request claims them.
+            cached_claim = cache.exclusive_prefix_blocks(prefix)
+        reserved = self._reserved_growth_blocks(
+            reserve_outputs=reserve_outputs, independent_budget=independent_budget
+        )
         # Allow an otherwise idle engine to start a large request.
         admission_headroom_blocks = cache.watermark_blocks if active_count else 0
-        # num_free_blocks includes evictable prefix-only blocks. Reusing those
-        # blocks makes them non-evictable: do not count the same capacity twice.
-        # Example: free=8 fresh + 4 cached, demand=12 with a 4-block prefix.
-        # New demand is 8, but the cached claim is 4: admission costs 12, not 8.
-        cached_claim = cache.exclusive_prefix_blocks(prefix)
         return AdmissionPlan(
             capacity_tokens=capacity,
             initial_tokens=initial_tokens,
@@ -419,7 +438,7 @@ class Scheduler:
             cached_claim_blocks=cached_claim,
         )
 
-    def reserve_transfer(self, request: Request) -> AdmissionPlan | None:
+    def reserve_transfer(self, request: Request, *, receiving: bool) -> AdmissionPlan | None:
         """Reserve transport KV under the same growth budget as local admission.
 
         A transfer needs its whole prompt mapped before compute starts. Reserving
@@ -430,15 +449,23 @@ class Scheduler:
         plan = self._plan_admission(request, int(occupied))
         if self.cache_manager.incremental_allocation:
             plan = replace(plan, initial_tokens=len(request.prompt_token_ids))
-        if not self._allocate(request, plan):
+        if not self._allocate(request, plan, receiving=receiving):
             return None
         self.cache_manager.pin_transfer(request.request_id, request.request_id)
         return plan
 
-    def _allocate(self, request: Request, plan: AdmissionPlan) -> bool:
+    def _allocate(self, request: Request, plan: AdmissionPlan, *, receiving=False) -> bool:
         cache = self.cache_manager
         if plan.total_budget_blocks > cache.num_free_blocks:
             return False
+        if receiving:
+            return cache.allocate_import(
+                request.request_id,
+                plan.capacity_tokens,
+                len(request.prompt_token_ids),
+                initial_tokens=plan.initial_tokens,
+                prefix=plan.prefix_blocks,
+            )
         return cache.allocate(
             request.request_id,
             plan.capacity_tokens,

@@ -29,8 +29,9 @@ def _kv_region(key, value):
 def kv_segments(info, tables, start, end):
     """Map valid token ranges to contiguous byte segments, preserving every depth.
 
-    A full physical block holds all layers. Partial blocks need one range per
-    layer; unused tail bytes are never sent or advertised as initialized.
+    A full physical block holds every layer that it stores: all layers, or one
+    layer for a grouped page. Partial blocks need one range per layer; unused
+    tail bytes are never sent or advertised as initialized.
     """
     page = info["block_size"]
     if not 0 <= start < end:
@@ -146,7 +147,8 @@ class NixlConnector:
             device=k.device.index,
             num_blocks=cache.num_blocks,
             block_size=cache.block_size,
-            num_layers=cache.num_layers,
+            # Layers per physical block: a grouped page holds one layer.
+            num_layers=k.shape[1],
             depths=cache.storage_depths,
             kv_dtype=str(k.dtype),
             fp8_scale=cache.fp8_scale,

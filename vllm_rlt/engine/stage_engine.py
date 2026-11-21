@@ -69,7 +69,11 @@ class StageEngine:
             required_layout = getattr(model, "kv_cache_layout", "last_exited")
             if cache_config.layout != required_layout:
                 raise ValueError(f"boundary-KV models require {required_layout} KV")
-            if cache_config.enable_prefix_caching:
+            # Only models that verified hit/miss parity opt in: the cache must
+            # cover boundary KV at depth 0 and recurrent KV at every depth.
+            if cache_config.enable_prefix_caching and not getattr(
+                model, "supports_boundary_prefix_caching", False
+            ):
                 raise ValueError("boundary-KV prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = resolve_cuda_graph_rows(
@@ -100,6 +104,8 @@ class StageEngine:
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
         sliding_window = getattr(model, "requires_sliding_window", False)
+        # Automatic packed prefill wins where supported; it needs all-layer
+        # blocks, so packed_prefill=False keeps grouped storage and reclamation.
         prefer_packed = packed_prefill_eligible(
             self.execution_config,
             device_type=parameter.device.type,
@@ -133,6 +139,13 @@ class StageEngine:
                         "boundary-KV speculative decoding requires synchronous eager "
                         "execution without CUDA graphs or preemption"
                     )
+        if cache_config.enable_prefix_caching and cache_config.layout == "shared":
+            # The shared runner finishes every loop of a token before the next,
+            # so cached final-loop KV is the cold prefill state.
+            if not getattr(model, "supports_boundary_prefix_caching", False):
+                raise ValueError("this model does not support shared-KV prefix caching")
+            if self.execution_config.async_scheduling or self.execution_config.cuda_graphs:
+                raise ValueError("shared-KV prefix caching requires synchronous eager execution")
         if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
             raise ValueError("this model does not support CUDA graphs yet")
         self.speculative_config = speculative_config
@@ -258,6 +271,28 @@ class StageEngine:
             self.execution_config = replace(
                 self.execution_config, packed_prefill=prefer_packed and supported
             )
+        layer_windows = getattr(model, "kv_layer_windows", None)
+        # Graph, async, packed, speculative, FP8 and preemption paths keep
+        # all-layer blocks: their metadata, rollback, scales or CPU offload have
+        # no grouped support yet.
+        if layer_windows is not None and (
+            self.execution_config.cuda_graphs
+            or self.execution_config.async_scheduling
+            or self.execution_config.packed_prefill
+            or speculative_config is not None
+            or cache_config.kv_cache_dtype != "auto"
+            or scheduler_config.enable_preemption
+        ):
+            layer_windows = None
+        # Grouped pages expire only when every token runs all loops in ouro order.
+        # A prefill stage holds a prompt only until its transfer completes, and
+        # reclamation there could return a page that a transfer still reads.
+        reclaim_swa = (
+            layer_windows is not None
+            and getattr(model, "fixed_loop_count", False)
+            and self.exit_config.mode == "ouro"
+            and self.stage_config.produces_tokens
+        )
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -267,6 +302,8 @@ class StageEngine:
             speculative=speculative_config,
             staged_prefill=staged_prefill,
             fp8_scale=fp8_scale,
+            layer_windows=layer_windows,
+            reclaim_swa=reclaim_swa,
         )
         self.cache_manager = KVCacheManager(
             num_layers=kv_layers,
@@ -286,6 +323,11 @@ class StageEngine:
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
             kv_cache_dtype=cache_config.kv_cache_dtype,
             fp8_scale=fp8_scale,
+            layer_windows=layer_windows,
+            reclaim_swa=reclaim_swa,
+            max_submission_tokens=min(
+                scheduler_config.prefill_chunk_size, scheduler_config.max_num_batched_tokens
+            ),
         )
         self.scheduler = Scheduler(
             scheduler_config,
@@ -623,7 +665,10 @@ class StageEngine:
             # Only host-dependent decisions collect now. Prompt/PRELUDE submissions
             # advance logically under their event without a readback wait.
             result = ticket.collect() if ticket.has_result else None
-            return self._update(batch, result)
+            outputs = self._update(batch, result)
+            # Publish this submission's prompt pages before SWA retires them.
+            self.cache_manager.finish_submission(ticket.event)
+            return outputs
         except Exception:
             if self.connector is not None:
                 raise  # Transfer leases remain quarantined until peer shutdown.
@@ -690,7 +735,7 @@ class StageEngine:
         else:
             self.add_request(request_id, prompt_token_ids, sampling_params, trace_id=trace_id)
         request = self.scheduler.requests[request_id]
-        plan = self.scheduler.reserve_transfer(request)
+        plan = self.scheduler.reserve_transfer(request, receiving=receiving)
         if plan is None:
             self.scheduler.abort(request_id)
             return None
@@ -762,7 +807,12 @@ class StageEngine:
         ):
             raise ValueError("request is not awaiting an import")
         count = len(request.prompt_token_ids)
-        self.cache_manager.mark_imported_prefix(request.request_id, count, start=cached_tokens)
+        self.cache_manager.mark_imported_prefix(
+            request.request_id,
+            count,
+            start=cached_tokens,
+            output_layers=getattr(self.model, "coda_kv_layers", ()),
+        )
         self.cache_manager.publish_prefix(request.request_id, request.prompt_token_ids, count)
         request.num_prefilled_tokens = request.num_preluded_tokens = count
         request.prefill_window_origin = count
