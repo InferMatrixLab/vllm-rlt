@@ -1,0 +1,140 @@
+{
+  "quality-adaptive-old": {
+    "correct": 7,
+    "examples": 10,
+    "unparseable": 3,
+    "length_limited": 0,
+    "depth": {
+      "decode_tokens": 968,
+      "mean_decode_depth": 3.5289256198347108,
+      "decode_depth_histogram": {
+        "3": 456,
+        "4": 512
+      },
+      "decode_loops_per_question_mean": 341.6
+    },
+    "finish_reasons": {
+      "stop": 10
+    },
+    "incorrect_ids": [
+      182,
+      392,
+      1257
+    ],
+    "unparseable_ids": [
+      182,
+      392,
+      1257
+    ]
+  },
+  "quality-adaptive-reference": {
+    "correct": 7,
+    "examples": 10,
+    "unparseable": 3,
+    "length_limited": 0,
+    "depth": {
+      "decode_tokens": 965,
+      "mean_decode_depth": 3.521243523316062,
+      "decode_depth_histogram": {
+        "3": 462,
+        "4": 503
+      },
+      "decode_loops_per_question_mean": 339.8
+    },
+    "finish_reasons": {
+      "stop": 10
+    },
+    "incorrect_ids": [
+      182,
+      392,
+      1257
+    ],
+    "unparseable_ids": [
+      182,
+      392,
+      1257
+    ]
+  },
+  "quality-adaptive-native": {
+    "correct": 7,
+    "examples": 10,
+    "unparseable": 3,
+    "length_limited": 0,
+    "depth": {
+      "decode_tokens": 965,
+      "mean_decode_depth": 3.5264248704663212,
+      "decode_depth_histogram": {
+        "3": 457,
+        "4": 508
+      },
+      "decode_loops_per_question_mean": 340.3
+    },
+    "finish_reasons": {
+      "stop": 10
+    },
+    "incorrect_ids": [
+      182,
+      392,
+      1257
+    ],
+    "unparseable_ids": [
+      182,
+      392,
+      1257
+    ]
+  },
+  "quality-fixed-old": {
+    "correct": 7,
+    "examples": 10,
+    "unparseable": 3,
+    "length_limited": 0,
+    "depth": {
+      "decode_tokens": 970,
+      "mean_decode_depth": 4.0,
+      "decode_depth_histogram": {
+        "4": 970
+      },
+      "decode_loops_per_question_mean": 388
+    },
+    "finish_reasons": {
+      "stop": 10
+    },
+    "incorrect_ids": [
+      182,
+      392,
+      1257
+    ],
+    "unparseable_ids": [
+      182,
+      392,
+      1257
+    ]
+  },
+  "quality-fixed-native": {
+    "correct": 7,
+    "examples": 10,
+    "unparseable": 3,
+    "length_limited": 0,
+    "depth": {
+      "decode_tokens": 976,
+      "mean_decode_depth": 4.0,
+      "decode_depth_histogram": {
+        "4": 976
+      },
+      "decode_loops_per_question_mean": 390.4
+    },
+    "finish_reasons": {
+      "stop": 10
+    },
+    "incorrect_ids": [
+      182,
+      392,
+      1257
+    ],
+    "unparseable_ids": [
+      182,
+      392,
+      1257
+    ]
+  }
+}

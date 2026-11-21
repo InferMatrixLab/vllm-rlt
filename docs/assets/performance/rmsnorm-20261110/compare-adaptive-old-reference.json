@@ -1,0 +1,119 @@
+{
+  "examples": 10,
+  "split": "test",
+  "reference": {
+    "backend": "native",
+    "exit": {
+      "mode": "ouro",
+      "threshold": 0.7,
+      "min_loops": 2,
+      "max_loops": 4,
+      "async_scheduling": false
+    },
+    "depth": {
+      "decode_tokens": 968,
+      "mean_decode_depth": 3.5289256198347108,
+      "decode_depth_histogram": {
+        "3": 456,
+        "4": 512
+      },
+      "decode_loops_per_question_mean": 341.6
+    }
+  },
+  "candidate": {
+    "backend": "native",
+    "exit": {
+      "mode": "ouro",
+      "threshold": 0.7,
+      "min_loops": 2,
+      "max_loops": 4,
+      "async_scheduling": false
+    },
+    "depth": {
+      "decode_tokens": 965,
+      "mean_decode_depth": 3.521243523316062,
+      "decode_depth_histogram": {
+        "3": 462,
+        "4": 503
+      },
+      "decode_loops_per_question_mean": 339.8
+    }
+  },
+  "reference_accuracy_pct": 70.0,
+  "candidate_accuracy_pct": 70.0,
+  "reference_correct": 7,
+  "candidate_correct": 7,
+  "delta_pp": 0,
+  "paired_delta_stderr_pp": 0.0,
+  "reference_correct_candidate_wrong": 0,
+  "reference_wrong_candidate_correct": 0,
+  "answer_disagreements": [],
+  "sequence_differences": {
+    "token_ids": {
+      "questions_compared": 10,
+      "questions_differing": 4,
+      "earliest_first_divergence": 2,
+      "median_first_divergence": 64.0,
+      "questions": [
+        {
+          "id": 182,
+          "first_divergence": 2
+        },
+        {
+          "id": 526,
+          "first_divergence": 122
+        },
+        {
+          "id": 645,
+          "first_divergence": 15
+        },
+        {
+          "id": 1094,
+          "first_divergence": 113
+        }
+      ]
+    },
+    "exit_depths": {
+      "questions_compared": 10,
+      "questions_differing": 6,
+      "earliest_first_divergence": 3,
+      "median_first_divergence": 48.5,
+      "questions": [
+        {
+          "id": 182,
+          "first_divergence": 3,
+          "identical_context": false
+        },
+        {
+          "id": 436,
+          "first_divergence": 55,
+          "identical_context": true
+        },
+        {
+          "id": 526,
+          "first_divergence": 42,
+          "identical_context": true
+        },
+        {
+          "id": 645,
+          "first_divergence": 20,
+          "identical_context": false
+        },
+        {
+          "id": 853,
+          "first_divergence": 59,
+          "identical_context": true
+        },
+        {
+          "id": 1094,
+          "first_divergence": 116,
+          "identical_context": false
+        }
+      ],
+      "questions_differing_on_identical_context": 3
+    }
+  },
+  "max_regression_pp": 0.0,
+  "passes_observed_accuracy_gate": true,
+  "min_reference_accuracy_pct": null
+}

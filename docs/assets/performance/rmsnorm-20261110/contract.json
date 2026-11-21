@@ -1,0 +1,59 @@
+{
+  "vllm_sha": "2b678ac739166bd0356883048673bbd1c34a3b0e",
+  "vllm_status": "",
+  "sha256": {
+    "csrc/layernorm_kernels.cu": "aa582ca3bba69adb62b43cfb27bd8264f904921ba91c59271c8a5c5f37a2c9cb",
+    "csrc/quantization/vectorization_utils.cuh": "991d501211c90a6a5c88d1062723b04c73ca1418d84f8aa07e255bd97128dff8",
+    "csrc/core/utils.hpp": "8e019dd075720c001dde5f09c8d110b99758420c85ee8299d3faf5cd938013f8"
+  },
+  "scope": "operator-only; no model quality or throughput claim",
+  "matrix": {
+    "dtype": [
+      "bfloat16",
+      "float16",
+      "float32"
+    ],
+    "H": [
+      128,
+      256,
+      768,
+      2048,
+      2049,
+      4096,
+      8192
+    ],
+    "rows": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256,
+      1024
+    ],
+    "residual": [
+      false,
+      true
+    ],
+    "repeats": 5,
+    "iterations": 50
+  },
+  "tolerance": {
+    "float32": {
+      "rtol": 2e-06,
+      "atol": 2e-06
+    },
+    "float16": {
+      "rtol": 0.002,
+      "atol": 0.002
+    },
+    "bfloat16": {
+      "rtol": 0.01,
+      "atol": 0.01
+    }
+  },
+  "baseline_residual": "vLLM rms_norm then separate residual add; not vLLM fused_add_rms_norm"
+}
