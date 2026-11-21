@@ -385,13 +385,20 @@ class KVCacheManager:
     def _open_mapped_planes(self, storage: KVCapacitySource, num_blocks: int) -> None:
         """Bind the K/V planes to a pool that owns their physical mappings.
 
-        FP8 KV needs per-vector scales, which the pool does not carry yet, so it
-        is rejected here rather than writing unquantized bytes into a quantized
-        cache. Only the pool's backed blocks are exposed; publishing them is the
-        manager's decision, not the storage's.
+        The pool must declare the element format it carries. FP8 KV is supported
+        only through the hook below: a source that carries per-vector scales
+        exposes ``scale_tensors`` (K first), and one that relies on a fixed
+        ``fp8_scale`` needs no per-vector storage. Anything else is rejected here
+        rather than writing unquantized bytes into a quantized cache. Only the
+        pool's backed blocks are exposed; publishing them is the manager's
+        decision, not the storage's.
         """
-        if self.kv_cache_dtype != "auto":
-            raise ValueError("mapped KV storage does not carry FP8 scales yet")
+        pool_dtype = getattr(storage, "kv_cache_dtype", "auto")
+        if pool_dtype != self.kv_cache_dtype:
+            raise ValueError(
+                f"the pool stores {pool_dtype} KV but the cache was configured for "
+                f"{self.kv_cache_dtype}; a mapped pool must declare the format it carries"
+            )
         if storage.committed_blocks > storage.max_blocks:
             raise ValueError(
                 f"storage reports {storage.committed_blocks} committed blocks but "
@@ -427,14 +434,47 @@ class KVCacheManager:
             self.num_kv_heads,
             self.head_dim,
         )
+        element_dtype = torch.float8_e4m3fn if self.kv_cache_dtype == "fp8_e4m3" else self.dtype
         for name, tensor in (("keys", keys), ("values", values)):
-            if tensor.dtype != self.dtype or tuple(tensor.shape) != shape:
+            if tensor.dtype != element_dtype or tuple(tensor.shape) != shape:
                 raise ValueError(f"storage {name} do not match the KV layout")
         self.key_cache, self.value_cache = keys, values
-        self.key_scale = self.value_scale = None
-        self._fixed_scale = None
+        self.key_scale, self.value_scale = self._bind_scale_planes(storage)
+        self._fixed_scale = (
+            torch.tensor(self.fp8_scale, device=self.device, dtype=torch.float32)
+            if self.fp8_scale is not None
+            else None
+        )
         self.max_blocks = storage.max_blocks
         self.committed_blocks = storage.committed_blocks
+
+    def _bind_scale_planes(self, storage):
+        """Return the pool's per-vector FP8 scales, or ``(None, None)``.
+
+        This is the extension point for FP8 KV over a mapped pool. A source that
+        carries scales exposes ``scale_tensors`` with K first; a source used with
+        a fixed ``fp8_scale`` needs no per-vector storage. ``committed_bytes`` is
+        expected to cover the data and the scale pools together.
+        """
+        if self.kv_cache_dtype == "auto" or self.fp8_scale is not None:
+            return None, None
+        scales = getattr(storage, "scale_tensors", None)
+        if scales is None:
+            raise ValueError(
+                "mapped FP8 KV needs per-vector scales: expose `scale_tensors` on the "
+                "capacity source, or configure a fixed fp8_scale"
+            )
+        key_scale, value_scale = scales
+        scale_shape = (
+            storage.max_blocks,
+            self.num_layers,
+            self.block_size,
+            self.num_kv_heads,
+        )
+        for name, tensor in (("key_scale", key_scale), ("value_scale", value_scale)):
+            if tensor.dtype != torch.float32 or tuple(tensor.shape) != scale_shape:
+                raise ValueError(f"storage {name} do not match the FP8 scale layout")
+        return key_scale, value_scale
 
     def publish_capacity(self, blocks: int) -> int:
         """Grow the allocatable pool after the storage mapped more blocks.

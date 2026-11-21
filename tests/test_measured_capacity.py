@@ -5,6 +5,8 @@ values below are hand-computed from the KV layout and the stated margins, not
 from the implementation.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -149,14 +151,36 @@ def test_invalid_inputs_are_rejected(overrides, message):
 class FakeStorage:
     """Mapped storage stand-in: only ``committed_blocks`` has backing."""
 
-    def __init__(self, *, max_blocks, committed=0, dtype=torch.float32):
-        element = torch.empty((), dtype=dtype).element_size()
-        self.bytes_per_block = 2 * LAYERS * BLOCK * KV_HEADS * HEAD_DIM * element
+    def __init__(
+        self,
+        *,
+        max_blocks,
+        committed=0,
+        dtype=torch.float32,
+        kv_cache_dtype="auto",
+        with_scales=False,
+    ):
+        self.kv_cache_dtype = kv_cache_dtype
+        if kv_cache_dtype == "auto":
+            vector = HEAD_DIM * torch.empty((), dtype=dtype).element_size()
+            stored = dtype
+        else:
+            # FP8 stores one byte per element plus a float32 scale per vector.
+            vector = HEAD_DIM + 4
+            stored = torch.float8_e4m3fn
+        self.bytes_per_block = 2 * LAYERS * BLOCK * KV_HEADS * vector
         shape = (max_blocks, LAYERS, BLOCK, KV_HEADS, HEAD_DIM)
         self.tensors = (
-            torch.zeros(shape, dtype=dtype),
-            torch.zeros(shape, dtype=dtype),
+            torch.zeros(shape, dtype=stored),
+            torch.zeros(shape, dtype=stored),
         )
+        self.scale_tensors = None
+        if with_scales:
+            scale_shape = (max_blocks, LAYERS, BLOCK, KV_HEADS)
+            self.scale_tensors = (
+                torch.ones(scale_shape, dtype=torch.float32),
+                torch.ones(scale_shape, dtype=torch.float32),
+            )
         self.max_blocks = max_blocks
         self.dtype = dtype
         self.committed_blocks = 0
@@ -386,9 +410,84 @@ def test_commit_measured_capacity_rejects_backing_beyond_the_reservation():
         commit_measured_capacity(storage, **commit_args())
 
 
-def test_commit_measured_capacity_clamps_to_the_reservation():
+def test_commit_measured_capacity_refuses_to_truncate_to_the_estimate():
+    # Decision: the reservation must be sized from the useful cap. If the
+    # measured capacity would be clamped back to the estimate, startup fails
+    # rather than shipping a pool that can never grow.
     storage = FakeStorage(max_blocks=5000, committed=1000)
-    backed, record = commit_measured_capacity(storage, **commit_args())
+    with pytest.raises(RuntimeError, match="reserve the useful cap"):
+        commit_measured_capacity(storage, **commit_args())
+
+
+def test_commit_measured_capacity_can_truncate_when_explicitly_allowed():
+    storage = FakeStorage(max_blocks=5000, committed=1000)
+    backed, record = commit_measured_capacity(
+        storage, **commit_args(allow_reservation_truncation=True)
+    )
     assert record["limited_by"] == "reservation"
     assert backed == 5000
     assert any("exceeds the reservation" in gap for gap in record["coverage_gaps"])
+
+
+def test_commit_measured_capacity_requires_a_backed_trial_pool():
+    storage = FakeStorage(max_blocks=131072, committed=0)
+    empty = report(free=60 * GIB, total=80 * GIB, blocks=0)
+    with pytest.raises(ValueError, match="trial pool must back at least one block"):
+        commit_measured_capacity(storage, **commit_args(report=empty))
+
+
+def stub_attention():
+    return SimpleNamespace(
+        info={"selected_backend": "stub"},
+        capabilities=SimpleNamespace(fp8_kv=True, fp8_kv_static=True),
+    )
+
+
+def test_a_mapped_pool_binds_per_vector_fp8_scales():
+    storage = FakeStorage(max_blocks=10, committed=4, kv_cache_dtype="fp8_e4m3", with_scales=True)
+    cache = make_cache(
+        storage,
+        num_blocks=4,
+        kv_cache_dtype="fp8_e4m3",
+        attention=stub_attention(),
+    )
+    assert cache.key_cache.dtype == torch.float8_e4m3fn
+    assert cache.key_scale is storage.scale_tensors[0]
+    assert cache.value_scale is storage.scale_tensors[1]
+    assert cache._fixed_scale is None
+
+
+def test_a_mapped_pool_accepts_a_fixed_fp8_scale_without_scale_planes():
+    storage = FakeStorage(max_blocks=10, committed=4, kv_cache_dtype="fp8_e4m3")
+    cache = make_cache(
+        storage,
+        num_blocks=4,
+        kv_cache_dtype="fp8_e4m3",
+        fp8_scale=0.5,
+        attention=stub_attention(),
+    )
+    assert cache.key_scale is None
+    assert float(cache._fixed_scale) == 0.5
+
+
+def test_fp8_over_a_pool_without_scale_support_names_the_hook():
+    storage = FakeStorage(max_blocks=10, committed=4, kv_cache_dtype="fp8_e4m3")
+    with pytest.raises(ValueError, match="scale_tensors"):
+        make_cache(
+            storage,
+            num_blocks=4,
+            kv_cache_dtype="fp8_e4m3",
+            attention=stub_attention(),
+        )
+
+
+def test_the_pool_must_declare_the_format_it_carries():
+    storage = FakeStorage(max_blocks=10, committed=4)  # declares "auto"
+    with pytest.raises(ValueError, match="must declare the format it carries"):
+        make_cache(
+            storage,
+            num_blocks=4,
+            kv_cache_dtype="fp8_e4m3",
+            fp8_scale=0.5,
+            attention=stub_attention(),
+        )

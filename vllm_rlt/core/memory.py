@@ -60,6 +60,11 @@ def measured_kv_capacity(
     ``safety_bytes`` the fixed reserve. The result is clamped by the logical
     ``useful_blocks`` and, when the pool cannot grow that far, by
     ``reservation_blocks``; the binding limit and every margin are recorded.
+
+    ``gpu_memory_utilization`` keeps its existing meaning: a fraction of the
+    whole device, not of what is free after the baseline. The KV budget is that
+    cap minus everything already resident, i.e. weights, execution buffers,
+    captured graphs and mapped blocks.
     """
     for name, value in (
         ("bytes_per_block", bytes_per_block),
@@ -168,6 +173,7 @@ def commit_measured_capacity(
     gpu_memory_utilization,
     transient_bytes,
     safety_bytes,
+    allow_reservation_truncation=False,
 ):
     """Plan the measured capacity, map it, and return the publishable block count.
 
@@ -175,10 +181,22 @@ def commit_measured_capacity(
     pool the storage already backs, the plan never exceeds the reservation, and
     the storage must report at least the planned blocks as backed. The caller
     publishes exactly the returned count and nothing else.
+
+    Two caller policies are checked here rather than assumed. The trial pool must
+    already back at least one block, because a mapped pool cannot be built with no
+    mapping at all. And its reservation must be sized from ``useful_blocks``, not
+    from the pre-warmup estimate: otherwise the measured capacity is clamped back
+    to the estimate and the pool can never grow. Pass
+    ``allow_reservation_truncation=True`` only when that clamp is intended.
     """
     existing = (report or {}).get("num_blocks")
     if type(existing) is not int or existing < 0:
         raise ValueError("the startup report must record the current pool as num_blocks")
+    if existing < 1:
+        raise ValueError(
+            "the trial pool must back at least one block; size it from the warmup "
+            "coverage target before preparing the runtime"
+        )
     if existing > storage.max_blocks:
         raise ValueError(
             f"the report describes {existing} blocks but the storage reserves {storage.max_blocks}"
@@ -200,6 +218,12 @@ def commit_measured_capacity(
         existing_blocks=existing,
         reservation_blocks=storage.max_blocks,
     )
+    if record["limited_by"] == "reservation" and not allow_reservation_truncation:
+        raise RuntimeError(
+            f"the measured capacity ({capacity} blocks) exceeds the "
+            f"{storage.max_blocks}-block reservation, so it would be truncated to the "
+            "pre-warmup estimate; reserve the useful cap instead of the estimate"
+        )
     backed = storage.commit(capacity)
     if type(backed) is not int or backed < capacity:
         raise RuntimeError(f"storage reported {backed} backed blocks after committing {capacity}")
