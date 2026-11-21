@@ -17,12 +17,20 @@ def test_cpu_reports_why_vmm_is_unavailable():
     assert "cpu" in vmm_unavailable_reason(torch.device("cpu"))
 
 
+@pytest.mark.parametrize("initial_blocks", [0, 4097])
+def test_initial_blocks_outside_capacity_fail_before_any_reservation(initial_blocks):
+    with pytest.raises(ValueError, match="initial_blocks"):
+        StableKVStorage(SPECS, max_blocks=4096, initial_blocks=initial_blocks, device=CUDA)
+
+
 @pytest.mark.gpu
 def test_commit_backs_more_blocks_without_moving_or_clearing_them():
     assert vmm_unavailable_reason(CUDA) is None
     storage = StableKVStorage(SPECS, max_blocks=4096, initial_blocks=1, device=CUDA)
     first = storage.committed_blocks
     assert 1 <= first < 4096
+    with pytest.raises(ValueError, match="max_blocks"):
+        storage.commit(4097)
     layout = [(t.device, t.data_ptr(), t.shape, t.stride()) for t in storage.tensors]
     written = [torch.randn(t[:first].shape, device=CUDA).to(t.dtype) for t in storage.tensors]
     for tensor, values in zip(storage.tensors, written):
