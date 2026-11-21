@@ -272,16 +272,14 @@ class StageEngine:
                 self.execution_config, packed_prefill=prefer_packed and supported
             )
         layer_windows = getattr(model, "kv_layer_windows", None)
-        # Graph, async, packed, speculative, FP8 and preemption paths keep
-        # all-layer blocks: their metadata, rollback, scales or CPU offload have
-        # no grouped support yet.
+        # Graph, async, packed, speculative and FP8 paths keep all-layer
+        # blocks: their metadata, rollback or scales have no grouped support yet.
         if layer_windows is not None and (
             self.execution_config.cuda_graphs
             or self.execution_config.async_scheduling
             or self.execution_config.packed_prefill
             or speculative_config is not None
             or cache_config.kv_cache_dtype != "auto"
-            or scheduler_config.enable_preemption
         ):
             layer_windows = None
         # Grouped pages expire only when every token runs all loops in ouro order.

@@ -350,7 +350,7 @@ def test_grouped_static_buffers_with_three_padded_rows_match_dense_reference(mod
         engine.close()
 
 
-def test_preemption_selects_all_layer_kv_and_restores_a_prefix_hit():
+def test_preemption_keeps_grouped_kv_and_restores_a_prefix_hit():
     model = DoryForCausalLM(tiny_dory_config()).eval()
     engine = LLMEngine(
         model,
@@ -369,7 +369,7 @@ def test_preemption_selects_all_layer_kv_and_restores_a_prefix_hit():
         return outputs
 
     try:
-        assert not cache.grouped
+        assert cache.grouped and cache.reclaim_swa
         engine.add_request("cold", prompt, greedy)
         cold = finish()["cold"]
         engine.add_request("hit", prompt, greedy)

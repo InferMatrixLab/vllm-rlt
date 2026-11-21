@@ -414,8 +414,11 @@ class Scheduler:
         )
         # SWA sharers can retire the same page at different times. Budget each
         # request's peak independently so sharing cannot leave growth underfunded.
-        # Preallocation already reserves each whole peak.
-        independent_budget = cache.submission_bounded and cache.enable_prefix_caching
+        # Preallocation already reserves each whole peak. With preemption, growth
+        # that sharing leaves short suspends a victim, as decode growth does.
+        independent_budget = (
+            cache.submission_bounded and cache.enable_prefix_caching and reserve_outputs
+        )
         required = cache.required_blocks(budget_tokens)
         cached_claim = 0
         if not independent_budget:

@@ -102,10 +102,16 @@ request's full peak and still returns expired pages to the pool.
 
 CUDA Graphs and asynchronous scheduling borrow device-owned KV metadata;
 self-speculation needs suffix truncation after a rejection; packed prefill does
-not record which SWA positions it read; FP8 KV keeps per-layer scales;
-preemption may offload KV to a CPU snapshot. Grouped pages do not support these
-yet. In all six cases the engine uses all-layer blocks, including for prefix
-caching, and reclamation is off.
+not record which SWA positions it read; FP8 KV keeps per-layer scales. Grouped
+pages do not support these yet. In all five cases the engine uses all-layer
+blocks, including for prefix caching, and reclamation is off.
+
+Preemption keeps grouped storage. A CPU snapshot copies only the pages the
+request holds, so SWA pages that reclamation already returned are not copied.
+Resumption claims the same number of pages, and reclamation continues from the
+positions each layer had read before the suspension. With preemption, admission
+does not reserve each sharer's peak separately; growth that prefix sharing
+leaves short suspends a victim, as decode growth does.
 
 Native SWA attention stages only the needed page-aligned read span. Logical token
 positions, write addresses and public layer maps remain absolute; the backend's
@@ -166,7 +172,8 @@ than the requests may need as they advance.
   resident or CPU-offloaded KV, in both KV modes and in the four execution
   modes above. A suspended request keeps its boundary and recurrent KV, its
   carried state with the injection input, its stage and loop progress, and its
-  sampling RNG. See [Preemption](#preemption).
+  sampling RNG. Sync eager keeps grouped storage and SWA reclamation; the other
+  three modes use all-layer blocks. See [Preemption](#preemption).
 - The official tokenizer, including the Hub's `tokenizer.json` and chat
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
@@ -237,9 +244,8 @@ These fail fast rather than degrade silently:
   trained exit gate, so the runtime refuses to invent one, including via
   `min_loops` with `exit_threshold=0`.
 
-`enable_preemption` selects the all-layer fallback, so suspend, CPU offload and
-restore work, with or without prefix caching, in execution modes that accept
-preemption (self-speculation does not).
+Suspension, CPU offload and restoration work with or without prefix caching, in
+execution modes that accept preemption (self-speculation does not).
 
 Sliding-window masking exists in the Torch reference backend and in the Triton
 decode kernel (`window=` on `KVCacheManager.attend`). Backend selection requires
@@ -476,22 +482,27 @@ not promised across batch shapes.
 
 `tests/test_dory_preemption.py` suspends and resumes requests on the tiny model:
 
-- CPU, 58 cases. A request is suspended at six stage boundaries: inside the
-  prefill chunks, at the prompt's output stage, at the input stage, after the
-  first loop, between the loops and at the output stage. Each boundary runs in
-  both KV modes, with resident and with CPU-offloaded KV. Greedy output equals
-  the dense oracle, and seeded sampled output equals an uninterrupted run. After
-  resumption, every plane below the request frontier equals the serial KV. Two
-  more cases cover a resident suspension that is later offloaded and preemption
-  under KV capacity pressure.
+- CPU, 65 cases, all on grouped storage. A request is suspended at six stage
+  boundaries: inside the prefill chunks, at the prompt's output stage, at the
+  input stage, after the first loop, between the loops and at the output stage.
+  Each boundary runs in both KV modes, with resident and with CPU-offloaded KV.
+  Greedy output equals the dense oracle, and seeded sampled output equals an
+  uninterrupted run. After resumption, every retained position below the
+  request frontier equals the serial KV in every plane. More cases cover a
+  resident suspension that is later offloaded, and preemption under KV capacity
+  pressure. Seven cases target grouped pages: an offloaded request whose SWA
+  pages were already reclaimed resumes with the same page count, retained
+  ranges and KV, and reclamation then continues, with preallocation and with
+  incremental allocation; a prefix hit with SWA reclamation is offloaded and
+  resumed; a snapshot waits until the pool has room for its pages.
 - CUDA, 48 cases on Triton. Capacity-pressure and priority preemption run in sync
-  eager, sync Graph, async eager and async Graph, in both KV modes, against the
-  dense oracle.
+  eager (grouped storage), sync Graph, async eager and async Graph (all-layer
+  blocks), in both KV modes, against the dense oracle.
 
-The tests fail when restoration drops output-stage KV, reseeds the RNG or
-permutes the carried state. On one H100 (torch 2.15.0+cu132), the file passes
-together with `tests/test_dory_gpu.py` (222 passed). The existing suspension and
-snapshot path needed no Dory-specific change.
+The tests fail when restoration drops output-stage KV, reseeds the RNG, permutes
+the carried state, resets the positions that reclamation has read, or claims
+the reclaimed pages again. On one H100 (torch 2.15.0+cu132), the file passes
+together with `tests/test_dory_gpu.py` (245 passed).
 
 ### Self-speculation
 
