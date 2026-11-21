@@ -285,10 +285,13 @@ class StageEngine:
         ):
             layer_windows = None
         # Grouped pages expire only when every token runs all loops in ouro order.
+        # A prefill stage holds a prompt only until its transfer completes, and
+        # reclamation there could return a page that a transfer still reads.
         reclaim_swa = (
             layer_windows is not None
             and getattr(model, "fixed_loop_count", False)
             and self.exit_config.mode == "ouro"
+            and self.stage_config.produces_tokens
         )
         num_blocks, self.memory_plan = plan_cache(
             model,
@@ -698,7 +701,7 @@ class StageEngine:
         else:
             self.add_request(request_id, prompt_token_ids, sampling_params, trace_id=trace_id)
         request = self.scheduler.requests[request_id]
-        plan = self.scheduler.reserve_transfer(request)
+        plan = self.scheduler.reserve_transfer(request, receiving=receiving)
         if plan is None:
             self.scheduler.abort(request_id)
             return None
@@ -770,7 +773,12 @@ class StageEngine:
         ):
             raise ValueError("request is not awaiting an import")
         count = len(request.prompt_token_ids)
-        self.cache_manager.mark_imported_prefix(request.request_id, count, start=cached_tokens)
+        self.cache_manager.mark_imported_prefix(
+            request.request_id,
+            count,
+            start=cached_tokens,
+            output_layers=getattr(self.model, "coda_kv_layers", ()),
+        )
         self.cache_manager.publish_prefix(request.request_id, request.prompt_token_ids, count)
         request.num_prefilled_tokens = request.num_preluded_tokens = count
         request.prefill_window_origin = count

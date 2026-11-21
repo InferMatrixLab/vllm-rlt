@@ -438,7 +438,7 @@ class Scheduler:
             cached_claim_blocks=cached_claim,
         )
 
-    def reserve_transfer(self, request: Request) -> AdmissionPlan | None:
+    def reserve_transfer(self, request: Request, *, receiving: bool) -> AdmissionPlan | None:
         """Reserve transport KV under the same growth budget as local admission.
 
         A transfer needs its whole prompt mapped before compute starts. Reserving
@@ -449,15 +449,23 @@ class Scheduler:
         plan = self._plan_admission(request, int(occupied))
         if self.cache_manager.incremental_allocation:
             plan = replace(plan, initial_tokens=len(request.prompt_token_ids))
-        if not self._allocate(request, plan):
+        if not self._allocate(request, plan, receiving=receiving):
             return None
         self.cache_manager.pin_transfer(request.request_id, request.request_id)
         return plan
 
-    def _allocate(self, request: Request, plan: AdmissionPlan) -> bool:
+    def _allocate(self, request: Request, plan: AdmissionPlan, *, receiving=False) -> bool:
         cache = self.cache_manager
         if plan.total_budget_blocks > cache.num_free_blocks:
             return False
+        if receiving:
+            return cache.allocate_import(
+                request.request_id,
+                plan.capacity_tokens,
+                len(request.prompt_token_ids),
+                initial_tokens=plan.initial_tokens,
+                prefix=plan.prefix_blocks,
+            )
         return cache.allocate(
             request.request_id,
             plan.capacity_tokens,

@@ -745,8 +745,93 @@ class KVCacheManager:
                 pending for pending in self._pending_prefixes if pending[1] is not allocation
             ]
 
+    def allocate_import(
+        self, request_id: str, max_tokens: int, prompt_tokens: int, *, initial_tokens, prefix=()
+    ) -> bool:
+        """Reserve the pages that a received prompt needs, or return False if the pool is short.
+
+        The receiver first runs the output stage of the last prompt token. With
+        SWA reclamation, the receiver holds no SWA page that this query cannot
+        read, so the sender writes no KV there. ``allocate`` would claim those
+        pages and apply the submission bound, which counts computed tokens only.
+        """
+        if not self.reclaim_swa:
+            return self.allocate(
+                request_id, max_tokens, initial_tokens=initial_tokens, prefix=prefix
+            )
+        pages = (initial_tokens + self.block_size - 1) // self.block_size
+        retired = [
+            [self._expired_swa_pages(group, prompt_tokens - 1)] * group.planes
+            for group in self.groups
+        ]
+        # Prefix entries are flattened group -> plane -> layer, like a claim.
+        spans, start = [], 0
+        for group, planes in zip(self.groups, retired):
+            for first in planes:
+                spans.append((first, start, start + len(group.layers)))
+                start += len(group.layers)
+        attached = [b for first, lo, hi in spans for page in prefix[first:] for b in page[lo:hi]]
+        # References first: the claim below can evict the entries being attached.
+        for b in attached:
+            self._refs[b] += 1
+        fresh = self._claim(
+            sum((pages - max(first, len(prefix))) * (hi - lo) for first, lo, hi in spans)
+        )
+        if fresh is None:
+            self._drop_refs(attached)
+            return False
+        fresh = iter(fresh)
+        rows = iter(
+            [None] * first
+            + [
+                tuple(prefix[page][lo:hi])
+                if page < len(prefix)
+                else tuple(next(fresh) for _ in range(hi - lo))
+                for page in range(first, pages)
+            ]
+            for first, lo, hi in spans
+        )
+        cached_tokens = len(prefix) * self.block_size
+        written = [
+            [
+                _WrittenPositions(prefix=cached_tokens if self._plane_owns(plane, layer) else 0)
+                for layer in range(self.num_layers)
+            ]
+            for plane in range(self.storage_depths)
+        ]
+        self._allocations[request_id] = _Allocation(
+            int(max_tokens),
+            (),
+            written,
+            group_tables=tuple(
+                tuple(next(rows) for _ in range(group.planes)) for group in self.groups
+            ),
+            group_epochs=[[0] * group.planes for group in self.groups],
+            retired_pages=retired,
+            consumed=deepcopy(written),
+        )
+        self._allocation_epoch += 1
+        self.prefix_queries += 1
+        self.prefix_hits += cached_tokens
+        return True
+
+    def transfer_tables(self, request_id: str) -> tuple[tuple[int, ...], ...]:
+        """Block tables that a KV transfer addresses, with -1 for a page not held.
+
+        All-layer storage has one table per plane. Grouped storage has one table
+        per group, plane and layer, in that order, because each page holds one layer.
+        """
+        allocation = self._get_allocation(request_id)
+        if not self.grouped:
+            return allocation.block_tables
+        return tuple(
+            tuple(-1 if bundle is None else bundle[local] for bundle in table)
+            for group, planes in zip(self.groups, allocation.group_tables)
+            for table in planes
+            for local in range(len(group.layers))
+        )
+
     def pin_transfer(self, request_id: str, transfer_id: str):
-        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if allocation.release_requested:
             raise RuntimeError("cannot transfer KV scheduled for release")
@@ -758,13 +843,14 @@ class KVCacheManager:
         if allocation.release_requested and not allocation.transfer_leases:
             self.free(request_id)
 
-    def mark_imported_prefix(self, request_id: str, length: int, *, start=0):
+    def mark_imported_prefix(self, request_id: str, length: int, *, start=0, output_layers=()):
         """Publish received KV only after the connector confirms remote writes are complete.
 
         Like a prefix hit, the import covers only the planes each layer owns:
         boundary layers never write deeper planes, so the sender has no KV there.
+        ``output_layers`` still have to read the last imported position here,
+        because the receiver runs the output stage of that token.
         """
-        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if type(length) is not int or not 0 < length <= allocation.max_tokens:
             raise ValueError("imported prefix exceeds reserved capacity")
@@ -780,6 +866,10 @@ class KVCacheManager:
             raise RuntimeError("KV prefix was already initialized")
         for written in owned:
             written.prefix = length
+        # The sender read every other position; reclamation continues from here.
+        for plane in allocation.consumed:
+            for layer, consumed in enumerate(plane):
+                consumed.prefix = length - 1 if layer in output_layers else length
 
     # Other modules learn about allocations only through the methods below.
     # They return plain facts, never _Allocation objects or reference counts.
