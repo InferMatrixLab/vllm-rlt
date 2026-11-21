@@ -47,8 +47,8 @@ and coda, including the LM head.
 The [Dory baseline notes](dory.md) list the narrower scope qualified for Dory:
 synchronous fixed-loop execution with boundary KV in both KV modes, sliding-window
 masking on the Torch and Triton backends, and BF16 agreement with the pinned
-checkpoint at 1/2/4 loops; Graphs, WCPB, async, speculation, prefix reuse and PD
-remain out of scope.
+checkpoint at 1/2/4 loops. The notes also list the qualified scope of Graphs,
+async, speculation, prefix reuse and PD; WCPB remains out of scope.
 CPU execution provides a Torch reference backend. FlashAttention hardware validation is currently documented
 for FA4 on B300; FA2/FA3 require validation on their target devices. Disaggregated
 serving currently targets multiple GPUs on a single host.

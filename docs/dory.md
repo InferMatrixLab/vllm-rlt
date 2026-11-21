@@ -107,6 +107,14 @@ preemption may offload KV to a CPU snapshot. Grouped pages do not support these
 yet. In all six cases the engine uses all-layer blocks, including for prefix
 caching, and reclamation is off.
 
+PD stages keep grouped storage. A transfer addresses one table per group,
+plane and layer, because each grouped page holds one layer. P holds a prompt
+only until its transfer completes, so P does not reclaim: reclamation could
+return a page that a transfer still reads. D first runs the output stage of the
+last prompt token. D reserves no SWA page that this query cannot read, and P
+sends no KV to those pages. After the import, D reclaims from the positions
+that P has read.
+
 Native SWA attention stages only the needed page-aligned read span. Logical token
 positions, write addresses and public layer maps remain absolute; the backend's
 read-table context lengths are local to that span. Native attention calls must
@@ -161,6 +169,16 @@ than the requests may need as they advance.
   the next input stage and only its readback is deferred. The two switches are
   independent: sync eager, sync Graph, async eager and async Graph are tested
   separately.
+- Same-host PD (`PDEngine`). P runs the input stage, every recurrent loop and
+  the output stage of each prompt token except the last, so its output-stage
+  KV covers the prompt history. D receives the KV of every plane and the
+  carried state of the last prompt token. D then runs that token's output stage
+  and samples, so no prompt stage runs twice or is skipped. PD runs in the four
+  execution modes above, with prefix caching on either side. In sync eager,
+  both stages keep grouped storage and D reclaims SWA pages; the other three
+  modes use all-layer blocks. With SWA reclamation on D, an imported prompt
+  publishes no prefix on D, because D never holds its first SWA pages. See
+  [PD](#pd).
 - The official tokenizer, including the Hub's `tokenizer.json` and chat
   template, resolved without requiring transformers to accept the checkpoint
   config (its generic validator rejects Dory's `mlp` sublayer entries).
@@ -221,7 +239,8 @@ even with per-query attention.
 
 These fail fast rather than degrade silently:
 
-- WCPB, mixed or staged prefill, and PD.
+- WCPB, and mixed or staged prefill.
+- Speculative decoding with PD.
 - Prefix caching in `last_loop` mode with CUDA Graphs or asynchronous
   scheduling.
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
@@ -542,6 +561,34 @@ Reading the numbers:
   memory was 74–82 GiB with the automatically sized KV pool; every arm released
   its KV blocks.
 
+### PD
+
+`tests/test_dory_pd.py` runs P on one GPU and D on another, with NIXL and FP32
+Triton:
+
+- CUDA, 19 cases. Greedy output in both KV modes, in sync eager (grouped
+  storage), sync Graph, async eager and async Graph (all-layer blocks), equals
+  the dense oracle and a single-stage engine. A seeded sampled request equals
+  the single-stage engine, so sampling stays on D. Prefix caching on P, on D or
+  on both skips prompt work and keeps the outputs. For a 40-token prompt,
+  grouped PD sends fewer bytes than all-layer PD. Cancellation during prefill,
+  during decode and while a reservation is in flight releases the KV of both
+  stages, with grouped and with all-layer storage.
+- CPU, 8 cases. P and D keep grouped storage, and only D reclaims. An import
+  reserves only the SWA pages that D reads, sets the read positions for
+  reclamation, and drops the attached prefix references when the pool is
+  short. A CPU handoff that copies only the pages D holds matches the oracle,
+  and D reclamation then continues. An import after a prefix hit on D marks
+  only the planes each layer owns. PD rejects speculative decoding for Dory
+  before it starts the workers.
+
+The CPU tests fail when an import reserves one SWA page too few, or when the
+read positions stop reclamation. On two H100 GPUs (torch 2.15.0+cu132, NIXL
+1.4.1), the file passes together with `tests/test_pd.py`, the stage engine,
+transfer connector, Dory, hybrid KV and SWA reclamation tests (321 passed).
+Two `tests/test_pd.py` cases skip: one needs FlashAttention-4 and one needs
+four GPUs.
+
 ### Not yet performed
 
 - A runtime-to-runtime comparison against vLLM once a Dory-capable build is
@@ -558,3 +605,4 @@ Reading the numbers:
   sampled token-pipeline, adaptive exit, or a draft width above the fixed K.
 - Sampled speculation on the real checkpoint (the rejection-sampling contract is
   qualified on the tiny CPU model only).
+- PD on the real checkpoint, and PD with speculative decoding.
