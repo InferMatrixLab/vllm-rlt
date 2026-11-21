@@ -10,7 +10,13 @@ import torch
 
 from tests.reference.dory import dense_dory_reference
 from tests.test_dory import tiny_dory_config
-from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import (
+    CacheConfig,
+    ExecutionConfig,
+    SamplingParams,
+    SchedulerConfig,
+    SpeculativeConfig,
+)
 from vllm_rlt.attention import create_backend
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
@@ -164,18 +170,23 @@ def test_plan_cache_profiles_dory_on_cuda():
     model = make_gpu_model()
     cache = CacheConfig(block_size=2, memory_reserve_bytes=0)
     scheduler = SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8)
-    blocks, plan = plan_cache(model, cache, scheduler, ExecutionConfig(), "triton")
+    blocks, plan = plan_cache(
+        model,
+        cache,
+        scheduler,
+        ExecutionConfig(),
+        "triton",
+        layer_windows=model.kv_layer_windows,
+        reclaim_swa=False,
+    )
     assert blocks > 0
     # The probe ran the real staged path, including windowed boundary attention.
     assert plan["source"] == "cuda_profile"
     config = model.config
+    # Grouped storage budgets one physical attention-layer page per block.
+    assert plan["block_unit"] == "physical_layer_page"
     assert plan["bytes_per_block"] == (
-        2
-        * config.num_kv_layers
-        * cache.block_size
-        * config.num_key_value_heads
-        * config.head_dim
-        * 4
+        2 * cache.block_size * config.num_key_value_heads * config.head_dim * 4
     )
 
 
@@ -189,10 +200,10 @@ EXECUTION_MODES = {
 PROMPTS = {"a": [4, 7, 3], "b": [9, 2, 6, 5], "c": [8, 3, 3, 11, 5, 2, 7, 13, 6]}
 
 
-def reference_pair():
-    reference = DoryForCausalLM(tiny_dory_config()).eval()
+def reference_pair(**overrides):
+    reference = DoryForCausalLM(tiny_dory_config(**overrides)).eval()
     torch.manual_seed(42)
-    model = make_gpu_model()
+    model = make_gpu_model(**overrides)
     reference.load_state_dict({name: value.cpu() for name, value in model.state_dict().items()})
     return reference, model
 
@@ -510,3 +521,312 @@ def test_dory_packed_prefill_keeps_small_value_residual():
     actual = paged_prefill_attention(q, k, v, table, length, offset, 1, compensate=True)
     assert expected[0, 0, 0] > 0.0006
     torch.testing.assert_close(actual, expected, atol=5e-6, rtol=0)
+
+
+@pytest.mark.parametrize("mode", EXECUTION_MODES)
+def test_dory_prefix_hits_match_cpu_oracle_in_every_execution_mode(mode):
+    """Prefix reuse composes with Graph replay and async submission: a cache hit
+    and a diverging branch serve the same greedy tokens as the dense oracle."""
+    reference, model = reference_pair()
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=512, block_size=2, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(max_num_seqs=3, max_num_batched_tokens=16),
+        execution_config=ExecutionConfig(**EXECUTION_MODES[mode]),
+    )
+    params = SamplingParams(max_tokens=6, min_loops=2, max_loops=2, ignore_eos=True)
+    prompt = PROMPTS["c"]
+    branch = prompt[:6] + [4, 9, 1]
+    cache = engine.cache_manager
+    try:
+        assert cache.grouped is (mode == "sync_eager")
+        expected = greedy_reference(reference, prompt, 6)
+        engine.add_request("cold", prompt, params)
+        assert drain(engine)["cold"].token_ids == expected
+        assert cache.prefix_hits == 0
+        graphs = (
+            (
+                engine.model_runner.prelude_graphs,
+                engine.model_runner.graphs,
+                engine.model_runner.coda_graphs,
+            )
+            if "graph" in mode
+            else ()
+        )
+        replays = [graph.replays for graph in graphs]
+
+        engine.add_request("hit", prompt, params)
+        engine.add_request("branch", branch, params)
+        actual = drain(engine)
+        assert actual["hit"].token_ids == expected
+        assert actual["branch"].token_ids == greedy_reference(reference, branch, 6)
+        assert cache.prefix_hits == 14  # Eight shared tokens for hit, six for branch.
+        assert all(graph.replays > before for graph, before in zip(graphs, replays))
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("chunk", [3, 16])
+def test_dory_last_loop_prefix_hits_match_cpu_oracle(chunk):
+    reference, model = reference_pair(recurrent_kv_cache_mode="last_loop")
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(
+            num_blocks=512, block_size=2, enable_prefix_caching=True, layout="shared"
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=3, max_num_batched_tokens=16, prefill_chunk_size=chunk
+        ),
+    )
+    params = SamplingParams(max_tokens=6, min_loops=2, max_loops=2, ignore_eos=True)
+    prompt = PROMPTS["c"]
+    branch = prompt[:6] + [4, 9, 1]
+    cache = engine.cache_manager
+    try:
+        expected = greedy_reference(reference, prompt, 6)
+        engine.add_request("cold", prompt, params)
+        assert drain(engine)["cold"].token_ids == expected
+        engine.add_request("hit", prompt, params)
+        engine.add_request("branch", branch, params)
+        actual = drain(engine)
+        assert actual["hit"].token_ids == expected
+        assert actual["branch"].token_ids == greedy_reference(reference, branch, 6)
+        assert cache.prefix_hits == 14
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("speculative_mode", ["block", "pipeline"])
+def test_dory_speculative_prefix_hits_match_cpu_oracle(speculative_mode):
+    reference, model = reference_pair()
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=512, block_size=2, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=16),
+        speculative_config=SpeculativeConfig(
+            2, draft_loops=1, target_loops=2, mode=speculative_mode
+        ),
+    )
+    prompt = PROMPTS["c"]
+    branch = prompt[:6] + [4, 9, 1]
+    params = SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True)
+    try:
+        cache = engine.cache_manager
+        assert not cache.grouped
+        expected = greedy_reference(reference, prompt, 4)
+        engine.add_request("cold", prompt, params)
+        assert drain(engine)["cold"].token_ids == expected
+        assert cache.prefix_hits == 0
+        rounds = engine.speculative_runner.stats.rounds
+
+        engine.add_request("hit", prompt, params)
+        engine.add_request("branch", branch, params)
+        actual = drain(engine)
+        assert actual["hit"].token_ids == expected
+        assert actual["branch"].token_ids == greedy_reference(reference, branch, 4)
+        assert cache.prefix_hits == 14
+        assert engine.speculative_runner.stats.rounds > rounds
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+def test_grouped_static_buffers_keep_three_decode_rows_aligned():
+    reference, model = reference_pair()
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=64, block_size=2),
+        scheduler_config=SchedulerConfig(max_num_seqs=3, max_num_batched_tokens=3),
+        execution_config=ExecutionConfig(static_buffers=True, pad_to_power_of_two=True),
+    )
+    prompts = {"a": [4], "b": [7], "c": [3]}
+    params = SamplingParams(max_tokens=3, min_loops=2, max_loops=2, ignore_eos=True)
+    try:
+        assert engine.cache_manager.grouped
+        assert engine.model_runner.requestspaces
+        for request_id, prompt in prompts.items():
+            engine.add_request(request_id, prompt, params)
+        actual = drain(engine)
+        assert set(actual) == set(prompts)
+        for request_id, prompt in prompts.items():
+            assert actual[request_id].token_ids == greedy_reference(reference, prompt, 3)
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("kv_mode", ["per_loop", "last_loop"])
+def test_grouped_swa_reclamation_uses_cuda_completion_and_reuses_pages(kv_mode, monkeypatch):
+    model = make_gpu_model(recurrent_kv_cache_mode=kv_mode)
+    reference = DoryForCausalLM(tiny_dory_config(recurrent_kv_cache_mode=kv_mode)).eval()
+    reference.load_state_dict({name: value.cpu() for name, value in model.state_dict().items()})
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(
+            num_blocks=8,
+            block_size=2,
+            layout=model.kv_cache_layout,
+            incremental_allocation=True,
+        ),
+        # One token per chunk preserves last_loop's token-then-loop ordering.
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=1, prefill_chunk_size=1
+        ),
+    )
+    prompt = [4, 7, 9, 3, 12, 5, 6, 8, 11, 13, 14, 15]
+    cache = engine.cache_manager
+    retired, reused = set(), set()
+    finish = cache.finish_submission
+
+    def resident_pages():
+        return {
+            page
+            for layer in model.kv_layer_windows
+            for depth in (
+                range(cache.storage_depths) if layer in model.recurrent_kv_layers else (0,)
+            )
+            for page in cache.layer_block_table("request", layer, depth)
+            if page >= 0
+        }
+
+    def observe_completion(event=None):
+        assert isinstance(event, torch.cuda.Event)
+        if not cache.has_allocation("request"):
+            return finish(event)
+        before = resident_pages()
+        reused.update(before & retired)
+        finish(event)
+        retired.update(before - resident_pages())
+
+    monkeypatch.setattr(cache, "finish_submission", observe_completion)
+    try:
+        assert cache.grouped and cache.reclaim_swa
+        engine.add_request(
+            "request",
+            prompt,
+            SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True),
+        )
+        actual = drain(engine)["request"]
+        assert actual.token_ids == greedy_reference(reference, prompt, 4)
+        assert retired and reused
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+class HeldEvent:
+    """A CUDA event that reports pending until the test releases it."""
+
+    def __init__(self, event):
+        self.event, self.released = event, False
+
+    def query(self):
+        return self.released and self.event.query()
+
+
+@pytest.mark.parametrize("kv_mode", ["per_loop", "last_loop"])
+def test_deferred_prefix_publication_survives_swa_reclamation(kv_mode, monkeypatch):
+    reference, model = reference_pair(recurrent_kv_cache_mode=kv_mode)
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(
+            num_blocks=16,
+            block_size=2,
+            layout=model.kv_cache_layout,
+            incremental_allocation=True,
+            enable_prefix_caching=True,
+        ),
+        # Six-token submissions expire pages of the window-4 layers before they end.
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=6, prefill_chunk_size=6
+        ),
+    )
+    cache = engine.cache_manager
+    held, deferred = [], []
+    publish, finish = cache.publish_prefix, cache.finish_submission
+
+    def publish_later(request_id, tokens, length, event=None):
+        if event is not None:
+            event = HeldEvent(event)
+            held.append(event)
+        return publish(request_id, tokens, length, event)
+
+    def release_then_finish(event=None):
+        deferred.append(len(cache._pending_prefixes))
+        # The submission's own wait completes every earlier publication event.
+        for pending in held:
+            pending.released = True
+        return finish(event)
+
+    monkeypatch.setattr(cache, "publish_prefix", publish_later)
+    monkeypatch.setattr(cache, "finish_submission", release_then_finish)
+    params = SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True)
+    publisher = [4, 7, 3, 9, 5, 2, 8, 6, 10]
+    prompt = publisher[:8] + [11, 12, 13]
+    try:
+        assert cache.grouped and cache.reclaim_swa
+        engine.add_request("publisher", publisher, params)
+        assert drain(engine)["publisher"].token_ids == greedy_reference(reference, publisher, 4)
+        assert any(deferred)
+        assert len(cache._prefixes) == 4
+        engine.add_request("hit", prompt, params)
+        assert drain(engine)["hit"].token_ids == greedy_reference(reference, prompt, 4)
+        assert cache.prefix_hits == 8
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+def test_packed_prefill_prefix_hits_use_all_layer_blocks():
+    """Packed prefill falls back to all-layer pages; a prefix hit matches cold tokens."""
+    model = make_gpu_model(head_dim=256, max_position_embeddings=256, sliding_window=32).to(
+        dtype=torch.bfloat16
+    )
+    config = model.config
+    _packed_tile(
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        config.num_kv_layers,
+        window=config.sliding_window,
+    )
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=64, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_num_batched_tokens=128, prefill_chunk_size=64
+        ),
+        execution_config=ExecutionConfig(packed_prefill=True),
+    )
+    packed_layers = set()
+    attend = engine.cache_manager._attend_prepared
+
+    def record_packed(layer, metadata, q, *, window=None):
+        if metadata.cu_seqlens_q is not None:
+            packed_layers.add(layer)
+        return attend(layer, metadata, q, window=window)
+
+    engine.cache_manager._attend_prepared = record_packed
+    params = SamplingParams(max_tokens=4, min_loops=2, max_loops=2, ignore_eos=True)
+    # Packed prefill applies only to prompts longer than 64 tokens.
+    prompt = ([4, 7, 9, 3, 12, 5, 23] * 12)[:80]
+    cache = engine.cache_manager
+    try:
+        assert engine.execution_config.packed_prefill and not cache.grouped
+        engine.add_request("cold", prompt, params)
+        cold = drain(engine)["cold"].token_ids
+        assert packed_layers and cache.prefix_hits == 0
+        engine.add_request("hit", prompt, params)
+        assert drain(engine)["hit"].token_ids == cold
+        assert cache.prefix_hits > 0
+        assert cache.num_used_blocks == 0
+    finally:
+        engine.close()
