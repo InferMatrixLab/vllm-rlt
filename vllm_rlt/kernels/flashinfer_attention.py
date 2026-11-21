@@ -25,9 +25,7 @@ class FlashInferPagedAttention:
         # crashes the process (host SIGFPE) while building the f16 JIT module
         # on first in-process use; reject instead of shipping that.
         if dtype is torch.float16:
-            raise ValueError(
-                "the flashinfer backend is not validated with float16; use bfloat16"
-            )
+            raise ValueError("the flashinfer backend is not validated with float16; use bfloat16")
         if dtype is not torch.bfloat16:
             raise ValueError("flashinfer requires bfloat16")
         # The XQA JIT module generator rejects anything else at first call;
@@ -59,16 +57,14 @@ class FlashInferPagedAttention:
                 "and its lib directory on LD_LIBRARY_PATH for the JIT modules). "
                 "No backend fallback was performed."
             ) from error
-        if major != 12:
+        if (major, minor) != (12, 0):
             logging.getLogger(__name__).warning(
                 "flashinfer attention is validated on SM120 only; SM%d%d is unvalidated",
                 major,
                 minor,
             )
-        # Persistent, pre-zeroed scratch shared by every call. Allocated on the
-        # first execution rather than here so backend selection stays free of
-        # device allocations: engines always profile before CUDA-graph capture,
-        # so the workspace exists by the time any graph is recorded.
+        # Allocate scratch on the first nonempty call. Graph warmup initializes
+        # it before capture, including engines using an explicit KV capacity.
         self.workspace = None
         self.info = dict(
             backend="flashinfer",
@@ -80,8 +76,15 @@ class FlashInferPagedAttention:
         logging.getLogger(__name__).warning("Attention implementation: %s", self.info)
 
     def __call__(
-        self, q, key_cache, value_cache, block_tables, context_lengths, *,
-        key_scale=None, value_scale=None,
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        *,
+        key_scale=None,
+        value_scale=None,
     ):
         # An empty batch host-crashes (SIGFPE, not an exception) inside the
         # FlashInfer dispatch; return the same empty shape the other backends do.

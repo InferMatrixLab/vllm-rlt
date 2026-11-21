@@ -244,7 +244,7 @@ depths, and the finish reason.
 
 Use `--attention-backend auto` with the inference CLI or the local HTTP server
 to select a compatible implementation at startup. Auto tries FA4, FA3, FA2,
-Triton, then Torch, checking hardware, dtype, head dimension, block size, installed
+FlashInfer (SM120 only), Triton, then Torch, checking hardware, dtype, head dimension, block size, installed
 packages, and execution requirements. CPU uses Torch. For example, on an RTX
 4090, the default 16-token block size rules out FA2's 256-token page requirement;
 auto selects Triton if it is installed.
@@ -260,7 +260,7 @@ omitting both selects it automatically when supported. `--no-uva` independently
 selects copies instead of mapped host-memory reads. See the
 [packed-prefill selection rules](runtime.md#packed-prefill).
 
-Explicit choices (`torch`, `triton`, `flash_attn`, or `flash_attn_2/3/4`) retain
+Explicit choices (`torch`, `triton`, `flashinfer`, `flash_attn`, or `flash_attn_2/3/4`) retain
 their validation errors and never fall back. Existing defaults are unchanged:
 the inference CLI defaults to Torch and the local server defaults to Triton.
 The Python equivalent is `attention_backend="auto"`. Read the worker startup

@@ -138,16 +138,12 @@ def test_backend_contract_anchors():
     assert attention.info["package"] == "flashinfer-python"
     assert attention.info["page_size"] == 16
     assert attention.info["kernel"] == "xqa"
-    # Absence is the contract: capability declarations live only in the
-    # attention registration layer, and the FA4 packed-prefill gates key off
-    # a missing generation attribute staying missing.
-    assert not hasattr(attention, "capabilities")
-    assert not hasattr(attention, "generation")
-    assert not hasattr(attention, "prefill")
+    # StageEngine selects packed prefill from the registered backend capabilities.
     wrapper = create_backend("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
     assert wrapper.info["selected_backend"] == "flashinfer"
     assert wrapper.capabilities == BackendCapabilities(
-        cuda_graphs=True, async_scheduling=True,
+        cuda_graphs=True,
+        async_scheduling=True,
         fp8_kv_static=torch.cuda.get_device_capability() == (12, 0),
     )
 

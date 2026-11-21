@@ -128,7 +128,7 @@ def _auto_flashinfer_supported(device) -> bool:
     """
     if device.type != "cuda" or torch.version.hip:
         return False
-    return torch.cuda.get_device_capability(device)[0] == 12
+    return torch.cuda.get_device_capability(device) == (12, 0)
 
 
 def validate_backend_name(backend: str, *, device_type: str | None = None) -> None:
@@ -200,6 +200,7 @@ def create_backend(
     block_size: int,
     *,
     required_capabilities: BackendCapabilities = BackendCapabilities(),
+    head_group_ratio: int | None = None,
     prefer_packed_prefill: bool = False,
     packed_window_shape: PackedWindowShape | None = None,
     allow_fp8_calibration: bool = False,
@@ -232,6 +233,13 @@ def create_backend(
             skipped.append("flashinfer: automatic selection is validated on SM120 only")
             continue
         try:
+            if (
+                candidate == "flashinfer"
+                and head_dim > 256
+                and head_group_ratio is not None
+                and head_group_ratio > 16
+            ):
+                raise ValueError("XQA with head_dim > 256 requires head_group_ratio <= 16")
             implementation = _create_explicit(
                 candidate,
                 device,

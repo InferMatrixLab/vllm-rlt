@@ -352,6 +352,9 @@ model dtype and leaves every existing path unchanged.
   token in FP8 as well. Accuracy should be checked per model and workload; adaptive exits can
   change where a token exits because the gate sees slightly different attention.
 
+On SM120, the [FlashInfer XQA adapter](flashinfer.md#scope) also accepts E4M3 KV.
+It uses a single calibrated scale for K and V and keeps Q and output in BF16.
+
 ### Experimental FA4 static-scale adapter
 
 Use `--kv-cache-dtype fp8_e4m3 --attention-backend flash_attn_4`

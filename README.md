@@ -139,7 +139,8 @@ including Dory sliding attention, uses `flash-attn-4==4.0.0b39` and calibrates
 a fixed scale at startup. See the
 [hardware and calibration requirements](docs/runtime.md#experimental-fa4-static-scale-adapter).
 
-For the FlashInfer XQA backend, see the [FlashInfer guide](docs/flashinfer.md).
+On SM120, FlashInfer XQA supports BF16 attention with BF16 KV or calibrated
+fixed-scale E4M3 KV. See the [FlashInfer guide](docs/flashinfer.md).
 
 ## Model Support
 

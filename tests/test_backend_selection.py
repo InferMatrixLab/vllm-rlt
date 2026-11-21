@@ -45,9 +45,7 @@ def packages(monkeypatch):
         if name == "flashinfer.decode":
             if "flashinfer" not in installed:
                 raise ImportError("flashinfer is not installed")
-            return SimpleNamespace(
-                trtllm_batch_decode_with_kv_cache=lambda *args, **kwargs: None
-            )
+            return SimpleNamespace(trtllm_batch_decode_with_kv_cache=lambda *args, **kwargs: None)
         return original_import(name)
 
     monkeypatch.setattr(flash_attention.importlib, "import_module", import_module)
@@ -201,6 +199,7 @@ def test_dory_requirements_select_native_fa4_and_reject_old_hd256(packages, monk
         ),
         ((10, 0), torch.bfloat16, 128, 16, ("flash_attn.cute",), "triton"),
         ((12, 0), torch.bfloat16, 128, 16, (), "flashinfer"),
+        ((12, 1), torch.bfloat16, 128, 16, (), "triton"),
         ((12, 0), torch.bfloat16, 128, 16, ("flashinfer",), "triton"),
         ((7, 5), torch.float16, 128, 256, (), "torch"),
     ],
@@ -217,11 +216,19 @@ def test_auto_selection_constraints(
         assert backend_capabilities(selected).packed_prefill
 
 
-def test_explicit_flashinfer_opt_in_outside_sm120(packages, monkeypatch, caplog):
-    import logging
+def test_flashinfer_wide_head_group_limit(packages, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    args = (torch.device("cuda"), torch.bfloat16, 512, 16)
+    assert create_backend("flashinfer", *args, head_group_ratio=16).info["kernel"] == "xqa"
+    with pytest.raises(ValueError, match="head_group_ratio <= 16"):
+        create_backend("flashinfer", *args, head_group_ratio=32)
+    assert create_backend("auto", *args, head_group_ratio=32).info["selected_backend"] == "torch"
 
+
+@pytest.mark.parametrize("sm", [(9, 0), (12, 1)])
+def test_explicit_flashinfer_opt_in_outside_sm120(packages, monkeypatch, caplog, sm):
     caplog.set_level(logging.WARNING, logger="vllm_rlt.kernels.flashinfer_attention")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
     selected = create_backend("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
     assert selected.info["selected_backend"] == "flashinfer"
     assert selected.capabilities.cuda_graphs and selected.capabilities.async_scheduling

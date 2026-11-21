@@ -591,7 +591,6 @@ def run(args):
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
         "backend": args.backend,
-        "attention_backend": args.attention_backend,
         "protocol_sha256": file_digest(args.protocol),
         "source": source(),
         "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
@@ -605,18 +604,30 @@ def run(args):
         "loops": loops,
         "exit": exit_policy,
     }
-    write_json(output / "metadata.json", metadata)
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
     close_id = thinking_close_id(tokenizer) if scorer == SCORER_THINKING else None
     task = make_task(protocol["task_config"])
     start = time.monotonic()
     generator = Generator(
-        args.backend, str(model), tokenizer, protocol["max_length"], exit_policy,
+        args.backend,
+        str(model),
+        tokenizer,
+        protocol["max_length"],
+        exit_policy,
         attention_backend=args.attention_backend,
+        no_packed_prefill=args.no_packed_prefill,
     )
     load_seconds = time.monotonic() - start
     rows = []
     try:
+        metadata["attention_backend"] = generator.attention_backend
+        if args.backend == "native":
+            metadata["packed_prefill"] = generator.engine.execution_config.packed_prefill
+        if generator.attention_backend == "flashinfer":
+            metadata["attention_backend_version"] = generator.engine.cache_manager.attention_info[
+                "version"
+            ]
+        write_json(output / "metadata.json", metadata)
         with (output / "samples.jsonl").open("x", buffering=1) as stream:
             for row in protocol["records"]:
                 stops = row["generation_kwargs"]["until"] + [tokenizer.eos_token]
@@ -664,6 +675,20 @@ def run(args):
     return summary
 
 
+def comparison_run(summary):
+    # The release model always used eager, including older summaries that
+    # recorded the native CLI default. Native runs predating the option used Triton.
+    backend = summary["backend"]
+    attention = "eager" if backend == "transformers" else summary.get("attention_backend", "triton")
+    return {
+        "backend": backend,
+        "attention_backend": attention,
+        **{k: summary[k] for k in ("packed_prefill", "attention_backend_version") if k in summary},
+        "exit": summary.get("exit", fixed_exit(4)),
+        "depth": summary.get("depth"),
+    }
+
+
 def compare(args):
     paths = [Path(args.transformers), Path(args.native)]
     summaries = [json.loads((p / "summary.json").read_text()) for p in paths]
@@ -703,16 +728,8 @@ def compare(args):
         "split": a["split"],
         # Summaries written before exit options existed used the fixed recipe, and the
         # harness then accepted only four-loop checkpoints.
-        "reference": {
-            "backend": a["backend"],
-            "exit": a.get("exit", fixed_exit(4)),
-            "depth": a.get("depth"),
-        },
-        "candidate": {
-            "backend": b["backend"],
-            "exit": b.get("exit", fixed_exit(4)),
-            "depth": b.get("depth"),
-        },
+        "reference": comparison_run(a),
+        "candidate": comparison_run(b),
         "reference_accuracy_pct": 100 * a["accuracy"],
         "candidate_accuracy_pct": 100 * b["accuracy"],
         "reference_correct": a["correct"],
@@ -794,8 +811,12 @@ def main():
     p.add_argument(
         "--attention-backend",
         choices=["torch", "triton", "flashinfer"],
-        default="triton",
-        help="Native engine attention kernel; recorded in the run metadata",
+        help="Native engine attention kernel (default: triton)",
+    )
+    p.add_argument(
+        "--no-packed-prefill",
+        action="store_true",
+        help="Use per-query rows for native prefill; useful for matched kernel comparisons",
     )
     p.add_argument("--exit-mode", choices=["ouro", "ouro_delayed"], default="ouro")
     p.add_argument(
@@ -811,6 +832,9 @@ def main():
     p.add_argument("--native", "--candidate", dest="native", required=True)
     p.add_argument("--output", required=True)
     args = parser.parse_args()
+    if args.command == "run" and args.backend == "transformers":
+        if args.attention_backend is not None or args.no_packed_prefill:
+            parser.error("--attention-backend and --no-packed-prefill require --backend native")
     result = {"prepare": prepare, "run": run, "compare": compare}[args.command](args)
     if args.command == "compare" and not result["passes_observed_accuracy_gate"]:
         raise SystemExit(1)

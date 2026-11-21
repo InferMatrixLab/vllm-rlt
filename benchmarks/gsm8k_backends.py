@@ -102,19 +102,30 @@ class ReleaseExitHooks:
 
 class Generator:
     def __init__(
-        self, backend, model_path, tokenizer, max_length, exit_policy, attention_backend="triton"
+        self,
+        backend,
+        model_path,
+        tokenizer,
+        max_length,
+        exit_policy,
+        attention_backend=None,
+        *,
+        no_packed_prefill=False,
     ):
         self.backend, self.tokenizer, self.exit = backend, tokenizer, exit_policy
         # Full depth, taken from the protocol (the checkpoint's total_ut_steps).
         loops = exit_policy["max_loops"]
         if backend == "transformers":
+            if attention_backend is not None or no_packed_prefill:
+                raise ValueError("Attention and packed prefill options require --backend native")
+            self.attention_backend = "eager"
             self.model = (
                 AutoModelForCausalLM.from_pretrained(
                     model_path,
                     trust_remote_code=True,
                     local_files_only=True,
                     torch_dtype=torch.bfloat16,
-                    attn_implementation="eager",
+                    attn_implementation=self.attention_backend,
                 )
                 .eval()
                 .to("cuda")
@@ -138,15 +149,19 @@ class Generator:
                 model_path, device="cuda", dtype=torch.bfloat16
             ).eval()
             check_depth(self.model.config, loops)
+            execution = {"async_scheduling": exit_policy["async_scheduling"]}
+            if no_packed_prefill:
+                execution["packed_prefill"] = False
             self.engine = StageEngine(
                 self.model,
-                attention_backend=attention_backend,
+                attention_backend=attention_backend or "triton",
                 # last_exited KV keeps one plane per loop.
                 cache_config=CacheConfig(num_blocks=loops * ((max_length + 15) // 16)),
                 scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=128),
                 exit_config=ExitConfig(exit_policy["mode"]),
-                execution_config=ExecutionConfig(async_scheduling=exit_policy["async_scheduling"]),
+                execution_config=ExecutionConfig(**execution),
             )
+            self.attention_backend = self.engine.cache_manager.backend
             # Observe the existing sampling boundary without changing arithmetic.
             self._finite_hook = self.model.lm_head.register_forward_hook(
                 lambda module, inputs, output: check_logits(output)
