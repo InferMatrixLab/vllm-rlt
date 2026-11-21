@@ -90,7 +90,7 @@ def copy_tensor(source, target, *, secondary=None, use_uva=True):
 def pinned_tensor(shape, dtype, device):
     """Allocate host staging; CPU execution needs no pinned allocation."""
     return torch.empty(
-        shape, dtype=dtype, device="cpu", pin_memory=torch.device(device).type == "cuda"
+        shape, dtype=dtype, device="cpu", pin_memory=torch.device(device).type in ("cuda", "npu")
     )
 
 

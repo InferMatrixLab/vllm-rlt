@@ -13,6 +13,7 @@ from dataclasses import is_dataclass
 
 import torch
 
+from vllm_rlt.device import resolve_device
 from vllm_rlt.engine.connector import TransferConnector
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.engine.stage_engine import StageEngine
@@ -33,12 +34,16 @@ class StageWorker:
     ):
         if type(max_control_messages) is not int or max_control_messages < 1:
             raise ValueError("max_control_messages must be a positive integer")
-        device = torch.device(f"cuda:{device}" if isinstance(device, int) else device)
+        device = resolve_device(f"cuda:{device}" if isinstance(device, int) else device)
         torch.set_num_threads(1)
         if device.type == "cuda":
             if device.index is None:
                 device = torch.device("cuda", torch.cuda.current_device())
             torch.cuda.set_device(device)
+        elif device.type == "npu":
+            if device.index is None:
+                device = torch.device("npu", torch.npu.current_device())
+            torch.npu.set_device(device)
         torch.manual_seed(options["seed"])
         self.channel = channel
         self.max_control_messages = max_control_messages

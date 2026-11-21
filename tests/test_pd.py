@@ -201,6 +201,8 @@ def test_pd_nanbeige_startup_uses_entry_config_for_request_validation(monkeypatc
             engine.add_request(
                 "bad_depth", [1], SamplingParams(max_loops=config.total_ut_steps + 1)
             )
+        with pytest.raises(ValueError, match="PD does not support per-request target_loops"):
+            engine.add_request("target", [1], SamplingParams(target_loops=config.total_ut_steps))
         with pytest.raises(ValueError, match="exceeds context capacity"):
             engine.add_request(
                 "bad_context", [1], SamplingParams(max_tokens=config.max_position_embeddings + 1)

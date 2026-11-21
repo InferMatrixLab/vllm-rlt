@@ -5,9 +5,9 @@ execution; optional GPU paths and historical measurements have narrower
 qualification scopes than the feature list. See the [changelog and migration
 notes](../CHANGELOG.md) before upgrading from v0.1.0.
 
-New users should follow the [first-run user guide](launching.md), from creating
-an environment to receiving the first generated response. The
-[README](../README.md#getting-started) provides a brief installation reference.
+The [Getting Started section](../README.md#getting-started) lists the platform
+options. The [first-run user guide](launching.md) walks through the NVIDIA CUDA
+setup on `v0.2.0`. The Ascend guide below uses `main`.
 
 | Guide | Topics |
 | --- | --- |
@@ -27,7 +27,8 @@ an environment to receiving the first generated response. The
 | [FlashInfer](flashinfer.md) | XQA decode for SM120: installation, configuration and limitations |
 | [Cache and scheduling features](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
 | [Prefill/decode disaggregation](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
-| [HTTP serving](serving.md) | Completions API, streaming, and service lifecycle |
+| [HTTP serving](serving.md) | Device setup, completions API, streaming, and service lifecycle |
+| [Ouro on Ascend](recipes/ouro_ascend.md) | Huawei Ascend NPU setup on `main`, serving commands, and validation scope |
 | [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
 | [Ouro-Thinking recipe](recipes/ouro_thinking.md) | Shared 1.4B/2.6B setup, JSON/SSE client, budgets and validation limits |
 | [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |

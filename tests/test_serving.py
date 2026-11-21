@@ -123,6 +123,9 @@ def body(**kwargs):
         {"max_tokens": -1},
         {"max_tokens": 1.5},
         {"max_tokens": "4"},
+        {"target_loops": 0},
+        {"target_loops": True},
+        {"target_loops": 1.5},
         {"temperature": "0"},
         {"temperature": float("nan")},
         {"top_p": True},
@@ -147,20 +150,26 @@ def test_neutral_client_fields_and_extensions():
             logprobs=None,
             min_loops=2,
             max_loops=3,
+            target_loops=3,
             exit_threshold=0.7,
             top_k=9,
             top_p=0.8,
         ),
         "test-model",
     )
-    assert spec.include_usage and spec.params.max_loops == 3 and spec.params.top_k == 9
+    assert (
+        spec.include_usage
+        and spec.params.max_loops == 3
+        and spec.params.target_loops == 3
+        and spec.params.top_k == 9
+    )
 
 
 def test_automatic_max_tokens_uses_remaining_context_and_server_cap():
-    request = CompletionRequest.parse(body(max_tokens=None, top_k=3), "test-model")
+    request = CompletionRequest.parse(body(max_tokens=None, top_k=3, target_loops=2), "test-model")
     assert request.resolve_params(1024, 4096).max_tokens == 3072
     capped = request.resolve_params(1024, 4096, max_output_tokens=64)
-    assert capped.max_tokens == 64 and capped.top_k == 3
+    assert capped.max_tokens == 64 and capped.top_k == 3 and capped.target_loops == 2
     assert SamplingParams().max_tokens == 16
 
 

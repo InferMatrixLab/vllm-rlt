@@ -9,6 +9,7 @@ import torch
 
 from vllm_rlt.config import ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.scheduler import SchedulerOutput
+from vllm_rlt.device import stream_module
 from vllm_rlt.request import ExecutionBatch, Operation, Request
 from vllm_rlt.worker.buffers import (
     PackedMetadataBuffer,
@@ -167,6 +168,7 @@ class ModelRunner:
         self.runtime = ModelRuntime(self.model, cache_manager)
         parameter = next(model.parameters())
         self.device = parameter.device
+        self.device_ops = stream_module(self.device)
         self.sampler = Sampler()
         # Sampling RNG state lives with the engine, which shares this registry
         # between the CODA runner and the speculative runner.
@@ -218,20 +220,20 @@ class ModelRunner:
             self.lookahead_head = head.to(device=self.device, dtype=parameter.dtype).eval()
             self.lookahead_head.requires_grad_(False)
         self.core_stream = self.boundary_stream = self.copy_stream = self.readback_stream = None
-        if self.device.type == "cuda":
-            self.core_stream = torch.cuda.Stream(device=self.device)
+        if self.device_ops is not None:
+            self.core_stream = self.device_ops.Stream(device=self.device)
             self.boundary_stream = (
-                torch.cuda.Stream(device=self.device)
+                self.device_ops.Stream(device=self.device)
                 if self.execution_config.multi_stream
                 else self.core_stream
             )
             self.copy_stream = (
-                torch.cuda.Stream(device=self.device)
+                self.device_ops.Stream(device=self.device)
                 if self.execution_config.multi_stream
                 else self.core_stream
             )
             self.readback_stream = (
-                torch.cuda.Stream(device=self.device)
+                self.device_ops.Stream(device=self.device)
                 if self.execution_config.multi_stream
                 else self.core_stream
             )
@@ -241,9 +243,9 @@ class ModelRunner:
                 self.copy_stream,
                 self.readback_stream,
             ):
-                stream.wait_stream(torch.cuda.current_stream(self.device))
+                stream.wait_stream(self.device_ops.current_stream(self.device))
         self.readback_slots = []
-        if self.device.type == "cuda":
+        if self.device_ops is not None:
             # cudaHostAlloc during submission can serialize streams. Allocate all
             # readback storage before work starts, retaining leases until consumed.
             for dtype in (torch.float32, torch.int64):
@@ -344,7 +346,7 @@ class ModelRunner:
             # Buffers allocated after stream creation must be visible there too.
             for stream in (self.core_stream, self.boundary_stream):
                 if stream is not None:
-                    stream.wait_stream(torch.cuda.current_stream(self.device))
+                    stream.wait_stream(self.device_ops.current_stream(self.device))
 
         self.async_state = None
         if use_async_state:
@@ -364,7 +366,7 @@ class ModelRunner:
             self.state_slots = self.async_state.slots
             self.free_state_slots = self.async_state.free
             for stream in (self.core_stream, self.boundary_stream, self.copy_stream):
-                stream.wait_stream(torch.cuda.current_stream(self.device))
+                stream.wait_stream(self.device_ops.current_stream(self.device))
 
     def _size(self, count):
         size = count
@@ -612,6 +614,11 @@ class ModelRunner:
         for request in requests:
             request.hidden_state = self.states[self.state_slots[request.request_id]]
 
+    def bind_sampled_tokens(self, batch, values, rows):
+        """Bind the scheduler-selected sample rows as the next prelude inputs."""
+        for row in rows:
+            batch.requests[row].request.input_token_tensor = values[row]
+
     def _gather(self, requests, workspace, size):
         if workspace is None:
             return torch.stack([r.hidden_state for r in requests])
@@ -720,7 +727,9 @@ class ModelRunner:
     def _uses_packed_loop_inputs(self, batch):
         capabilities = self.cache_manager.attention_capabilities
         return (
-            batch.operation == Operation.PRELUDE
+            # PackedMetadataBuffer expands write addresses with a CUDA kernel.
+            self.device.type == "cuda"
+            and batch.operation == Operation.PRELUDE
             and batch.loop_count
             and self.cache_manager.layout != "shared"
             and capabilities.packed_prefill
@@ -974,10 +983,10 @@ class ModelRunner:
                 ),
             )
         if prepared.routing is not None:
-            with torch.cuda.stream(self.copy_stream):
+            with self.device_ops.stream(self.copy_stream):
                 kv = prepared.routing.transfer(prepared.kv)
             if self.device.type == "cuda":
-                torch.cuda.current_stream(self.device).wait_event(prepared.routing.ready_event)
+                self.device_ops.current_stream(self.device).wait_event(prepared.routing.ready_event)
             prepared = replace(prepared, kv=kv)
         elif prepared.kv is not None and prepared.workspace is not None:
             prepared = replace(prepared, kv=prepared.workspace.upload_metadata(prepared.kv))
@@ -1139,14 +1148,21 @@ class ModelRunner:
                         )
                         values = selected.float().sigmoid()
             elif forward.compute_logits:
-                values = torch.stack(
-                    [
-                        self.sampler.sample(row, params, generator)
-                        for row, params, generator in zip(
-                            result.logits, prepared.sampling_params, prepared.sampling_generators
-                        )
-                    ]
-                )
+                if self.device.type == "npu":
+                    values = self.sampler.sample_batch(
+                        result.logits, prepared.sampling_params, prepared.sampling_generators
+                    )
+                else:
+                    values = torch.stack(
+                        [
+                            self.sampler.sample(row, params, generator)
+                            for row, params, generator in zip(
+                                result.logits,
+                                prepared.sampling_params,
+                                prepared.sampling_generators,
+                            )
+                        ]
+                    )
                 if prepared.routing is not None:
                     prepared.routing.scatter(values, tokens=True)
         return values
@@ -1168,9 +1184,9 @@ class ModelRunner:
         raise RuntimeError("readback buffers exhausted; retire completed submissions")
 
     def _synchronize_submission(self, stream, prepared):
-        if self.device.type != "cuda":
+        if self.device_ops is None:
             return
-        (stream or torch.cuda.current_stream(self.device)).synchronize()
+        (stream or self.device_ops.current_stream(self.device)).synchronize()
         if self.readback_stream is not None and self.readback_stream is not stream:
             self.readback_stream.synchronize()
         if prepared is not None and prepared.routing is not None:
@@ -1208,14 +1224,14 @@ class ModelRunner:
                 self.split_prefill_submission_waits += 1
             prepared = self.prepare_on_cpu(batch)
             source_stream = (
-                torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+                self.device_ops.current_stream(self.device) if self.device_ops is not None else None
             )
             if prepared.routing is not None and prepared.routing.imports:
                 self.copy_stream.wait_stream(source_stream)
                 # Imported hidden/token tensors may have been produced by core,
                 # not by the caller's stream. The copy itself must wait for them.
                 self._wait_for_requests(batch, self.copy_stream)
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            with self.device_ops.stream(stream) if stream is not None else nullcontext():
                 if stream is not None:
                     if self.async_state is None and source_stream != stream:
                         stream.wait_stream(source_stream)
@@ -1236,34 +1252,32 @@ class ModelRunner:
                     and batch.operation == Operation.RECURRENT
                     and not any(
                         span.emit_gate
+                        and span.request.target_loops is None
                         and self.exit_config.mode in ("ouro_delayed", "random_lookahead")
                         and span.request.sampling_params.exit_threshold < 1
                         and span.depth + batch.loop_count
-                        < (
-                            span.request.sampling_params.max_loops
-                            or self.model.config.total_ut_steps
-                        )
+                        < span.request.loop_limit(self.model.config.total_ut_steps)
                         for span in batch.spans
                     )
                 ):
                     result = None
                 device_values = result
                 event = compute_done = None
-                if self.device.type == "cuda":
-                    compute_stream = torch.cuda.current_stream(self.device)
-                    compute_done = torch.cuda.Event()
+                if self.device_ops is not None:
+                    compute_stream = self.device_ops.current_stream(self.device)
+                    compute_done = self.device_ops.Event()
                     compute_done.record(compute_stream)
                     event = compute_done
                     if result is not None:
                         slot = self._readback_slot(result)
                         readback_stream = self.readback_stream or compute_stream
-                        with torch.cuda.stream(readback_stream):
+                        with self.device_ops.stream(readback_stream):
                             if readback_stream != compute_stream:
                                 readback_stream.wait_event(compute_done)
                             result.record_stream(readback_stream)
                             host = slot.storage[: result.numel()].view(result.shape)
                             host.copy_(result, non_blocking=True)
-                            event = torch.cuda.Event()
+                            event = self.device_ops.Event()
                             event.record(readback_stream)
                         slot.event = event
                         result = host
@@ -1294,7 +1308,7 @@ class ModelRunner:
                     and prepared.routing is not None
                     and not routing_finish_attempted
                 ):
-                    with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                    with self.device_ops.stream(stream) if stream is not None else nullcontext():
                         routing_finish_attempted = True
                         prepared.routing.record_done()
             finally:
@@ -1303,7 +1317,7 @@ class ModelRunner:
             raise
         finally:
             if prepared is not None and prepared.workspace is not None:
-                with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                with self.device_ops.stream(stream) if stream is not None else nullcontext():
                     prepared.workspace.record_done()
 
     def finalize_many(self, requests):
@@ -1383,7 +1397,7 @@ class ModelRunner:
     def finalize(self, request):
         # The final core event must precede copies and coda on the boundary stream.
         stream = self.boundary_stream
-        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+        with self.device_ops.stream(stream) if stream is not None else nullcontext():
             event = self.events.get(request.request_id)
             if stream is not None and event is not None:
                 stream.wait_event(event)
@@ -1391,7 +1405,7 @@ class ModelRunner:
                 request.request_id, request.position, request.loops_done - 1
             )
             if stream is not None:
-                event = torch.cuda.Event()
+                event = self.device_ops.Event()
                 event.record(stream)
                 self.events[request.request_id] = event
 
@@ -1427,6 +1441,9 @@ class ModelRunner:
         self.rng.drop(request_id)
 
     def synchronize(self):
+        if self.device.type == "npu":
+            torch.npu.synchronize(self.device)
+            return
         for stream in (
             self.core_stream,
             self.boundary_stream,

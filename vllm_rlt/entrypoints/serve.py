@@ -7,6 +7,7 @@ from functools import partial
 
 import torch
 
+from vllm_rlt.attention import validate_backend_name
 from vllm_rlt.config import SchedulerConfig
 from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.entrypoints.runtime_args import (
@@ -82,12 +83,13 @@ def main():
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokenizer-revision")
     parser.add_argument("--served-model-name")
-    parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--device", choices=["cpu", "cuda", "npu"], default="cuda")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument(
         "--attention-backend",
         type=str.lower,
         choices=[
+            "ascend_eager",
             "auto",
             "torch",
             "triton",
@@ -118,6 +120,10 @@ def main():
     limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
     if args.device == "cpu" and args.attention_backend not in ("auto", "torch"):
         parser.error("CPU execution requires --attention-backend torch or auto")
+    try:
+        validate_backend_name(args.attention_backend, device_type=args.device)
+    except ValueError as exc:
+        parser.error(str(exc))
     torch.set_num_threads(args.cpu_threads)
     logging.basicConfig(level=logging.INFO)
     app = create_app(

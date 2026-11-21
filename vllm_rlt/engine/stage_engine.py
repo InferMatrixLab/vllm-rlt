@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
+import torch
+
 from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.config import (
     CacheConfig,
@@ -21,7 +23,7 @@ from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.kernels.paged_attention import PackedWindowShape
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestPhase
-from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.sampling_params import DEFAULT_MIN_LOOPS, SamplingParams
 from vllm_rlt.worker.executor import Executor
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
@@ -73,6 +75,27 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
+        if parameter.device.type == "npu":
+            if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
+                raise ValueError("NPU currently supports Ouro with four loops")
+            if parameter.dtype != torch.bfloat16:
+                raise ValueError("NPU Ouro requires BF16 weights")
+            if cache_config.kv_cache_dtype != "auto":
+                raise ValueError("NPU Ouro requires BF16 KV cache")
+            if (
+                self.execution_config.cuda_graphs
+                or (self.execution_config.async_scheduling and self.execution_config.static_buffers)
+                or speculative_config is not None
+                or self.stage_config.role != "prefill_decode"
+                or scheduler_config.enable_preemption
+                or cache_config.enable_prefix_caching
+                or cache_config.layout != "last_exited"
+                or self.exit_config.mode not in ("ouro", "ouro_delayed")
+            ):
+                raise ValueError(
+                    "NPU Ouro requires local execution, ouro/ouro_delayed exit mode and "
+                    "last_exited KV without speculation, graphs, preemption or prefix caching"
+                )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
@@ -211,7 +234,8 @@ class StageEngine:
                 packed_sliding_window=require_packed and sliding_window,
                 cuda_graphs=self.execution_config.cuda_graphs,
                 async_scheduling=(
-                    parameter.device.type == "cuda" and self.execution_config.async_scheduling
+                    parameter.device.type in ("cuda", "npu")
+                    and self.execution_config.async_scheduling
                 ),
                 device_context_lengths=self.async_speculative,
                 fp8_kv=cache_config.kv_cache_dtype == "fp8_e4m3",
@@ -277,7 +301,12 @@ class StageEngine:
         # speculative paths must advance the same per-request slot, and only the
         # engine knows when a request terminates.
         self.rng = RngRegistry()
-        self.model_runner = ModelRunner(
+        runner_type = ModelRunner
+        if parameter.device.type == "npu":
+            from vllm_rlt.worker.ascend_model_runner import AscendModelRunner
+
+            runner_type = AscendModelRunner
+        self.model_runner = runner_type(
             model,
             self.cache_manager,
             exit_config=self.exit_config,
@@ -360,6 +389,44 @@ class StageEngine:
             self._connector_blocked.add(request.request_id)
         return ready
 
+    def _resolve_loop_bounds(self, params):
+        model_depth = self.model.config.total_ut_steps
+        fixed_loop_count = getattr(self.model, "fixed_loop_count", False)
+        trace_mode = self.exit_config.mode == "trace"
+
+        if trace_mode:
+            if params.target_loops is not None and params.target_loops > model_depth:
+                raise ValueError("target_loops cannot exceed total_ut_steps")
+            max_loops = params.max_loops or model_depth
+            if max_loops > model_depth or (not fixed_loop_count and params.min_loops > max_loops):
+                raise ValueError("requested loop bounds exceed the model's supported depth")
+            return (None if fixed_loop_count else model_depth), max_loops
+
+        if params.target_loops is not None and not fixed_loop_count:
+            raise ValueError("target_loops is only supported for fixed-loop models")
+        if params.target_loops is not None and params.target_loops > model_depth:
+            raise ValueError("target_loops cannot exceed total_ut_steps")
+
+        if fixed_loop_count:
+            target_loops = params.target_loops or model_depth
+            if params.max_loops is not None and params.max_loops != target_loops:
+                raise ValueError("max_loops must match the fixed target_loops")
+            if params.min_loops not in (DEFAULT_MIN_LOOPS, target_loops):
+                raise ValueError(
+                    "min_loops and max_loops must match the fixed target_loops when specified, "
+                    "except the min_loops default"
+                )
+            if target_loops != model_depth:
+                raise ValueError(
+                    "target_loops below total_ut_steps requires per-request prefill support"
+                )
+            return target_loops, target_loops
+
+        max_loops = params.max_loops or model_depth
+        if max_loops > model_depth or params.min_loops > max_loops:
+            raise ValueError("requested loop bounds exceed the model's supported depth")
+        return model_depth, max_loops
+
     def add_request(
         self,
         request_id: str,
@@ -388,16 +455,12 @@ class StageEngine:
             raise ValueError("prompt must contain at least one token")
         if any(type(t) is not int or not 0 <= t < config.vocab_size for t in prompt_token_ids):
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
-        max_loops = params.max_loops or config.total_ut_steps
-        if max_loops > config.total_ut_steps or params.min_loops > max_loops:
-            raise ValueError("requested loop bounds exceed the model's supported depth")
-        if getattr(self.model, "fixed_loop_count", False) and (
-            max_loops != config.total_ut_steps or params.min_loops != config.total_ut_steps
+        fixed_loop_count = getattr(self.model, "fixed_loop_count", False)
+        target_loops, max_loops = self._resolve_loop_bounds(params)
+        if next(self.model.parameters()).device.type == "npu" and (
+            max_loops != 4 or params.exit_threshold != 1.0 or params.temperature != 0
         ):
-            raise ValueError(
-                "this model always runs the configured loop count; min_loops and "
-                "max_loops must both equal it"
-            )
+            raise ValueError("NPU Ouro requests require four loops, exit_threshold=1 and greedy")
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
@@ -417,7 +480,8 @@ class StageEngine:
                 len(trace) < params.max_tokens
                 or trace[0] != config.total_ut_steps
                 or any(
-                    type(d) is not int or not params.min_loops <= d <= max_loops
+                    type(d) is not int
+                    or not (1 if fixed_loop_count else params.min_loops) <= d <= max_loops
                     for d in trace[1 : params.max_tokens]
                 )
             ):
@@ -444,6 +508,9 @@ class StageEngine:
                 # loop bound the request asks for.
                 prefill_depth_ranges=Request.prefill_boundaries(
                     len(prompt_token_ids), config.total_ut_steps
+                ),
+                _target_loops=(
+                    target_loops if fixed_loop_count and self.exit_config.mode != "trace" else None
                 ),
             )
         )
@@ -700,7 +767,7 @@ class StageEngine:
         request.num_prefilled_tokens = request.num_preluded_tokens = count
         request.prefill_window_origin = count
         request.prefill_reclaimable_tokens = count
-        request.loops_done = self.model.config.total_ut_steps
+        request.loops_done = request.target_loops or self.model.config.total_ut_steps
         request.hidden_state = hidden
         # Keep RECEIVING until the scheduler grants a compute slot. The lease
         # protects the imported allocation while it waits alongside local work.
@@ -939,8 +1006,7 @@ class StageEngine:
             request_events=self.model_runner.events,
             signals=signals,
         )
-        for row in update.next_prelude:
-            batch.requests[row].request.input_token_tensor = ticket.device_values[row]
+        self.model_runner.bind_sampled_tokens(batch, ticket.device_values, update.next_prelude)
         for row in update.retain_signal:
             self._pending_exit_signals[batch.requests[row].request.request_id] = SignalHandle(
                 ticket, row

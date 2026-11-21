@@ -480,8 +480,7 @@ class DoryForCausalLM(nn.Module):
     """Inference-only Dory with eager KV boundaries and a graphable recurrent core."""
 
     requires_boundary_kv = True
-    # No Ouro-style learned exit gate: the reviewed implementation always runs
-    # the configured loop count, so requesting a shallower depth is unsupported.
+    # No Ouro-style learned exit gate: a request uses one fixed target depth.
     fixed_loop_count = True
     # Fixed loops need no exit signal, so ordinary asynchronous scheduling can
     # submit a request's next loop without reading the previous one back.

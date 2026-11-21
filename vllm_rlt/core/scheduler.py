@@ -1232,7 +1232,9 @@ class Scheduler:
     def _should_exit(self, request: Request) -> bool:
         """Evaluate the policy after recording the completed loop's actual hazard."""
         params = request.sampling_params
-        maximum = params.max_loops or self.total_ut_steps
+        maximum = request.loop_limit(self.total_ut_steps)
+        if request.target_loops is not None:
+            return request.loops_done >= maximum
         return request.loops_done >= maximum or (
             params.exit_threshold < 1.0
             and request.loops_done >= params.min_loops
@@ -1260,7 +1262,9 @@ class Scheduler:
     def needs_exit_signal(self, request: Request) -> bool:
         """Whether the next submitted loop needs its predecessor's readback."""
         params = request.sampling_params
-        maximum = params.max_loops or self.total_ut_steps
+        maximum = request.loop_limit(self.total_ut_steps)
+        if request.target_loops is not None:
+            return False
         # No score can end a request whose minimum depth is its maximum.
         return (
             self.exit_mode != "trace"
@@ -1322,13 +1326,15 @@ class Scheduler:
                 request.loops_done += 1
                 if self.exit_mode == "trace":
                     should_exit = self._trace_exit(request)
+                elif request.target_loops is not None:
+                    should_exit = self._should_exit(request)
                 else:
                     score = result.gate_scores[row]
                     if self.exit_mode == "ouro":
                         request.remaining_probability *= 1.0 - score
                         should_exit = self._should_exit(request)
                     else:
-                        maximum = request.sampling_params.max_loops or self.total_ut_steps
+                        maximum = request.loop_limit(self.total_ut_steps)
                         should_exit = (
                             request.loops_done >= maximum
                             or request.pending_exit_depth == request.loops_done
@@ -1455,12 +1461,10 @@ class Scheduler:
                     and self.needs_exit_signal(request)
                 )
                 request.loops_done += 1
-                should_exit = (
-                    self._trace_exit(request)
-                    if self.exit_mode == "trace"
-                    else request.loops_done
-                    >= (request.sampling_params.max_loops or self.total_ut_steps)
-                )
+                if self.exit_mode == "trace":
+                    should_exit = self._trace_exit(request)
+                else:
+                    should_exit = request.loops_done >= request.loop_limit(self.total_ut_steps)
                 signal = signals.get(row) if signals else None
                 if consume_signal:
                     if (
@@ -1475,7 +1479,8 @@ class Scheduler:
                     request.pending_exit_depth = request.loops_done
                     update.exited.append(request)
                 elif (
-                    self.exit_mode in ("ouro_delayed", "random_lookahead")
+                    request.target_loops is None
+                    and self.exit_mode in ("ouro_delayed", "random_lookahead")
                     and request.sampling_params.exit_threshold < 1
                 ):
                     update.retain_signal.append(row)
