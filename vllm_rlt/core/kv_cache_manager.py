@@ -125,6 +125,22 @@ class _Allocation:
     prefix_keys: list[bytes] = field(default_factory=list)
     prefix_epoch: int = 0
 
+    def logical_pages(self) -> int:
+        return len(self.group_tables[0][0]) if self.group_tables else len(self.block_tables[0])
+
+    def held_blocks(self) -> list[int]:
+        """Physical blocks in snapshot order; reclaimed SWA pages are not held."""
+        if not self.group_tables:
+            return [b for table in self.block_tables for b in table]
+        return [
+            b
+            for planes in self.group_tables
+            for table in planes
+            for bundle in table
+            if bundle is not None
+            for b in bundle
+        ]
+
 
 @dataclass(frozen=True)
 class KVGroup:
@@ -172,12 +188,16 @@ def _sequence_coverage(rows, plane):
 class KVSnapshot:
     """What preemption keeps for one request: its pages and its written state.
 
-    ``keys`` and ``values`` hold every page of every plane, in block-table
-    order, as ``[pages * planes, layer, token, kv_head, dim]`` host tensors.
-    Leases are not captured because a leased allocation cannot be preempted.
+    ``keys`` and ``values`` hold every physical page the allocation holds, as
+    ``[held pages, layers per page, token, kv_head, dim]`` host tensors.
+    All-layer pages are in plane, then block-table order. Grouped pages are in
+    group, plane, logical page, then layer order, without the SWA pages that
+    reclamation already returned. Leases are not captured because a leased
+    allocation cannot be preempted.
     """
 
     max_tokens: int
+    # Logical token pages per plane, reclaimed ones included.
     pages: int
     # Written-position state per plane and layer. Opaque: hand it back to
     # ``restore`` and do not read or modify it.
@@ -188,6 +208,10 @@ class KVSnapshot:
     key_scales: torch.Tensor | None = None
     value_scales: torch.Tensor | None = None
     fp8_scale: float | None = None
+    # Grouped pools only, opaque like ``written``: the leading pages per group
+    # plane that reclamation returned, and the positions each layer has read.
+    retired_pages: list[list[int]] = field(default_factory=list)
+    consumed: list[list[_WrittenPositions]] = field(default_factory=list)
 
 
 class KVCacheManager:
@@ -901,11 +925,10 @@ class KVCacheManager:
         Copying page by page avoids a request-sized temporary on a device
         that is already full, which is exactly when preemption happens.
         """
-        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if allocation.transfer_leases:
             raise RuntimeError("cannot snapshot KV during a transfer")
-        blocks = [b for table in allocation.block_tables for b in table]
+        blocks = allocation.held_blocks()
         keys = torch.empty((len(blocks), *self.key_cache.shape[1:]), dtype=self.key_cache.dtype)
         values = torch.empty_like(keys)
         for row, block in enumerate(blocks):
@@ -917,27 +940,67 @@ class KVCacheManager:
             value_scales = self.value_scale[blocks].cpu()
         return KVSnapshot(
             max_tokens=allocation.max_tokens,
-            pages=len(allocation.block_tables[0]),
+            pages=allocation.logical_pages(),
             written=deepcopy(allocation.written),
             keys=keys,
             values=values,
             key_scales=key_scales,
             value_scales=value_scales,
             fp8_scale=self.fp8_scale,
+            retired_pages=deepcopy(allocation.retired_pages),
+            consumed=deepcopy(allocation.consumed),
         )
 
-    def restore(self, request_id: str, snapshot: KVSnapshot) -> None:
-        """Load a snapshot back into a fresh allocation of the same size.
+    def allocate_snapshot(self, request_id: str, snapshot: KVSnapshot) -> bool:
+        """Acquire the pages ``snapshot`` holds, or return False if the pool is short.
 
-        ``allocate`` stays a separate step because it can fail and that
-        decision belongs to the scheduler. The copies go on the current
+        Grouped SWA pages that reclamation returned before the snapshot stay
+        unallocated: the next token cannot read them, and ``allocate`` would
+        claim them again and break the submission bound.
+        """
+        if not self.grouped:
+            frontier = min(snapshot.max_tokens, snapshot.pages * self.block_size)
+            return self.allocate(request_id, snapshot.max_tokens, initial_tokens=frontier)
+        fresh = self._claim(len(snapshot.keys))
+        if fresh is None:
+            return False
+        tables, offset = [], 0
+        for group, retired_planes in zip(self.groups, snapshot.retired_pages):
+            width, planes = len(group.layers), []
+            for retired in retired_planes:
+                table = [None] * retired
+                for _ in range(retired, snapshot.pages):
+                    table.append(tuple(fresh[offset : offset + width]))
+                    offset += width
+                planes.append(table)
+            tables.append(tuple(planes))
+        written = [
+            [_WrittenPositions() for _ in range(self.num_layers)]
+            for _ in range(self.storage_depths)
+        ]
+        self._allocations[request_id] = _Allocation(
+            snapshot.max_tokens,
+            (),
+            written,
+            group_tables=tuple(tables),
+            group_epochs=[[0] * group.planes for group in self.groups],
+            retired_pages=deepcopy(snapshot.retired_pages),
+            consumed=deepcopy(written) if self.reclaim_swa else [],
+        )
+        self._allocation_epoch += 1
+        return True
+
+    def restore(self, request_id: str, snapshot: KVSnapshot) -> None:
+        """Load a snapshot back into the allocation ``allocate_snapshot`` made.
+
+        ``allocate_snapshot`` stays a separate step because it can fail and
+        that decision belongs to the scheduler. The copies go on the current
         stream; the caller decides when other streams may read them.
         """
-        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if allocation.max_tokens != snapshot.max_tokens:
             raise ValueError("snapshot capacity does not match the allocation")
-        if len(allocation.block_tables[0]) != snapshot.pages:
+        if allocation.logical_pages() != snapshot.pages:
             raise ValueError("snapshot page count does not match the allocation")
         if any(w.prefix or w.pending for plane in allocation.written for w in plane):
             raise RuntimeError("cannot restore into an allocation that already holds KV")
@@ -945,14 +1008,14 @@ class KVCacheManager:
             raise ValueError("snapshot KV dtype does not match the pool")
         if self.fp8_scale != snapshot.fp8_scale:
             raise ValueError("snapshot FP8 scale policy does not match the pool")
-        blocks = [b for table in allocation.block_tables for b in table]
-        for row, block in enumerate(blocks):
+        for row, block in enumerate(allocation.held_blocks()):
             self.key_cache[block].copy_(snapshot.keys[row])
             self.value_cache[block].copy_(snapshot.values[row])
             if self.key_scale is not None:
                 self.key_scale[block].copy_(snapshot.key_scales[row])
                 self.value_scale[block].copy_(snapshot.value_scales[row])
         allocation.written = deepcopy(snapshot.written)
+        allocation.consumed = deepcopy(snapshot.consumed)
 
     def _prefix_claim(self, prefix):
         """Expired pages per group plane, the tables a hit attaches, and its blocks.
