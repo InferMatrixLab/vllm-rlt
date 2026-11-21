@@ -99,7 +99,7 @@ def test_two_graph_rounds_keep_device_frontier_and_rejection_mask(backend, accep
         written_before = [[layer.prefix for layer in depth] for depth in allocation.written]
         calls = 0
 
-        def controlled(hidden):
+        def controlled(hidden, boundary=None):
             nonlocal calls
             phase = calls % 4
             calls += 1
@@ -165,7 +165,9 @@ def test_graph_eos_retires_later_round_before_id_reuse(backend, monkeypatch):
             patch.setattr(
                 runner,
                 "_coda",
-                lambda h: torch.zeros(len(h), engine.model.config.vocab_size, device=h.device),
+                lambda h, boundary=None: torch.zeros(
+                    len(h), engine.model.config.vocab_size, device=h.device
+                ),
             )
             engine.step()
             engine.step()

@@ -122,17 +122,9 @@ class StageEngine:
             if speculative_config is not None:
                 if not getattr(model, "supports_self_speculation", False):
                     raise ValueError("boundary-KV speculative decoding is not yet supported")
-                # Qualified: synchronous eager rounds. Async rounds, Graph replay and
-                # resumable preemption of draft/target boundary state are separate work.
-                if (
-                    self.execution_config.async_scheduling
-                    or self.execution_config.cuda_graphs
-                    or scheduler_config.enable_preemption
-                ):
-                    raise ValueError(
-                        "boundary-KV speculative decoding requires synchronous eager "
-                        "execution without CUDA graphs or preemption"
-                    )
+                # Resumable preemption of draft/target boundary state is separate work.
+                if scheduler_config.enable_preemption:
+                    raise ValueError("boundary-KV speculative decoding does not support preemption")
         if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
             raise ValueError("this model does not support CUDA graphs yet")
         self.speculative_config = speculative_config
@@ -444,10 +436,15 @@ class StageEngine:
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
-        if (
-            self.speculative_config and self.speculative_config.mode == "pipeline"
-        ) and params.temperature != 0:
-            raise ValueError("pipeline speculative decoding currently requires greedy sampling")
+        if params.temperature != 0:
+            if self.pipeline_speculative:
+                raise ValueError("pipeline speculative decoding currently requires greedy sampling")
+            # RFC #176 qualifies asynchronous boundary-KV rounds for greedy requests only.
+            if self.async_speculative and getattr(self.model, "requires_boundary_kv", False):
+                raise ValueError(
+                    "asynchronous boundary-KV speculative decoding currently requires "
+                    "greedy sampling"
+                )
         if request_id in self._retiring_speculative:
             self._retire_speculative(wait=True, request_id=request_id)
         config = self.model.config
