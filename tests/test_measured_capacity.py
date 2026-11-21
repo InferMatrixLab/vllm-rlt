@@ -9,16 +9,20 @@ import pytest
 import torch
 
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
-from vllm_rlt.core.memory import measured_kv_capacity
+from vllm_rlt.core.memory import (
+    commit_measured_capacity,
+    measured_kv_capacity,
+    transient_allowance,
+)
 
 MIB = 1 << 20
 GIB = 1024 * MIB
 LAYERS, KV_HEADS, HEAD_DIM, BLOCK = 2, 1, 4, 2
 
 
-def report(*, free, total, gaps=()):
+def report(*, free, total, gaps=(), blocks=None):
     """One drained, post-cleanup sample as ``prepare_runtime`` reports it."""
-    return dict(
+    sample = dict(
         phases=[
             dict(
                 name="prepared",
@@ -30,6 +34,9 @@ def report(*, free, total, gaps=()):
         ],
         coverage_gaps=tuple(gaps),
     )
+    if blocks is not None:
+        sample["num_blocks"] = blocks
+    return sample
 
 
 def plan(**overrides):
@@ -298,3 +305,90 @@ def test_storage_may_not_report_more_committed_blocks_than_it_reserves():
     storage.committed_blocks = 5  # a storage-side accounting bug
     with pytest.raises(ValueError, match="reserves only"):
         make_cache(storage, num_blocks=4)
+
+
+def test_transient_allowance_takes_the_larger_of_measured_and_estimate():
+    phases = [
+        dict(name="initialized", allocated_bytes=100 * MIB, peak_allocated_bytes=400 * MIB),
+        dict(name="prepared", allocated_bytes=300 * MIB, peak_allocated_bytes=500 * MIB),
+    ]
+    value, record = transient_allowance({"phases": phases}, estimate_bytes=64 * MIB)
+    assert record["measured_transient_bytes"] == 300 * MIB  # max(300, 500 - 300)
+    assert value == 300 * MIB
+    assert record["sampled_phases"] == 2
+
+    value, _ = transient_allowance({"phases": phases}, estimate_bytes=512 * MIB)
+    assert value == 512 * MIB  # an unexercised path keeps the estimate
+
+    value, _ = transient_allowance({"phases": phases}, estimate_bytes=0, overlap_factor=2)
+    assert value == 600 * MIB  # a serial peak does not bound a concurrent envelope
+
+
+def test_transient_allowance_ignores_phases_without_peak_samples():
+    value, record = transient_allowance({"phases": [dict(name="cpu")]}, estimate_bytes=MIB)
+    assert record["sampled_phases"] == 0
+    assert value == MIB
+
+
+@pytest.mark.parametrize(
+    "kwargs", [dict(estimate_bytes=-1), dict(estimate_bytes=0, overlap_factor=0)]
+)
+def test_transient_allowance_rejects_invalid_inputs(kwargs):
+    with pytest.raises(ValueError):
+        transient_allowance({"phases": []}, **kwargs)
+
+
+def commit_args(**kwargs):
+    """Arguments for ``commit_measured_capacity`` on the 60/80 GiB sample."""
+    options = dict(
+        report=report(free=60 * GIB, total=80 * GIB, blocks=1000),
+        bytes_per_block=3 * MIB,
+        useful_blocks=131072,
+        gpu_memory_utilization=0.9,
+        transient_bytes=4 * GIB,
+        safety_bytes=256 * MIB,
+    )
+    options.update(kwargs)
+    return options
+
+
+def test_commit_measured_capacity_maps_the_plan_and_returns_backed_blocks():
+    storage = FakeStorage(max_blocks=131072, committed=1000)
+    backed, record = commit_measured_capacity(storage, **commit_args())
+    assert backed == 1000 + 16298
+    assert storage.committed_blocks == backed
+    assert record["committed_blocks"] == backed
+    assert record["storage"] == "mapped"
+    assert record["limited_by"] == "budget"
+
+
+def test_commit_measured_capacity_requires_the_report_to_describe_this_pool():
+    storage = FakeStorage(max_blocks=131072, committed=1000)
+    drifted = report(free=60 * GIB, total=80 * GIB, blocks=999)
+    with pytest.raises(ValueError, match="storage backs"):
+        commit_measured_capacity(storage, **commit_args(report=drifted))
+    no_pool = report(free=60 * GIB, total=80 * GIB)
+    with pytest.raises(ValueError, match="num_blocks"):
+        commit_measured_capacity(storage, **commit_args(report=no_pool))
+
+
+def test_commit_measured_capacity_rejects_a_storage_that_under_commits():
+    storage = FakeStorage(max_blocks=131072, committed=1000)
+    storage.commit = lambda blocks: storage.committed_blocks
+    with pytest.raises(RuntimeError, match="after committing"):
+        commit_measured_capacity(storage, **commit_args())
+
+
+def test_commit_measured_capacity_rejects_backing_beyond_the_reservation():
+    storage = FakeStorage(max_blocks=131072, committed=1000)
+    storage.commit = lambda blocks: storage.max_blocks + 1
+    with pytest.raises(RuntimeError, match="beyond its"):
+        commit_measured_capacity(storage, **commit_args())
+
+
+def test_commit_measured_capacity_clamps_to_the_reservation():
+    storage = FakeStorage(max_blocks=5000, committed=1000)
+    backed, record = commit_measured_capacity(storage, **commit_args())
+    assert record["limited_by"] == "reservation"
+    assert backed == 5000
+    assert any("exceeds the reservation" in gap for gap in record["coverage_gaps"])

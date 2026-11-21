@@ -126,6 +126,92 @@ def measured_kv_capacity(
     )
 
 
+def transient_allowance(report, *, estimate_bytes, overlap_factor=1):
+    """Allowance for execution above the persistent baseline of a phase.
+
+    A phase records its end state and its own peak, so ``peak - allocated`` is
+    what that phase needed on top of what it kept. The largest such delta is
+    measured; ``estimate_bytes`` covers paths the preparation did not exercise
+    and must stay in force. ``overlap_factor`` covers supported concurrency,
+    because a serial peak understates a concurrent envelope. The larger of the
+    two is returned, so an unmeasured path is never sized as if measured.
+    """
+    if type(estimate_bytes) is not int or estimate_bytes < 0:
+        raise ValueError("estimate_bytes must be a nonnegative integer")
+    if type(overlap_factor) is not int or overlap_factor < 1:
+        raise ValueError("overlap_factor must be an integer of at least 1")
+    phases = (report or {}).get("phases") or ()
+    measured = 0
+    sampled = 0
+    for phase in phases:
+        peak, allocated = phase.get("peak_allocated_bytes"), phase.get("allocated_bytes")
+        if type(peak) is not int or type(allocated) is not int:
+            continue
+        sampled += 1
+        measured = max(measured, peak - allocated)
+    value = max(measured * overlap_factor, estimate_bytes)
+    return value, dict(
+        transient_bytes=value,
+        measured_transient_bytes=measured,
+        estimate_bytes=estimate_bytes,
+        overlap_factor=overlap_factor,
+        sampled_phases=sampled,
+    )
+
+
+def commit_measured_capacity(
+    storage,
+    *,
+    report,
+    bytes_per_block,
+    useful_blocks,
+    gpu_memory_utilization,
+    transient_bytes,
+    safety_bytes,
+):
+    """Plan the measured capacity, map it, and return the publishable block count.
+
+    Enforces the preconditions of the agreed ordering: the report describes the
+    pool the storage already backs, the plan never exceeds the reservation, and
+    the storage must report at least the planned blocks as backed. The caller
+    publishes exactly the returned count and nothing else.
+    """
+    existing = (report or {}).get("num_blocks")
+    if type(existing) is not int or existing < 0:
+        raise ValueError("the startup report must record the current pool as num_blocks")
+    if existing > storage.max_blocks:
+        raise ValueError(
+            f"the report describes {existing} blocks but the storage reserves {storage.max_blocks}"
+        )
+    if storage.committed_blocks != existing:
+        # The pool changed after the sample, so the measured free memory no
+        # longer describes this storage.
+        raise ValueError(
+            f"the report describes {existing} blocks but the storage backs "
+            f"{storage.committed_blocks}"
+        )
+    capacity, record = measured_kv_capacity(
+        report=report,
+        bytes_per_block=bytes_per_block,
+        useful_blocks=useful_blocks,
+        gpu_memory_utilization=gpu_memory_utilization,
+        transient_bytes=transient_bytes,
+        safety_bytes=safety_bytes,
+        existing_blocks=existing,
+        reservation_blocks=storage.max_blocks,
+    )
+    backed = storage.commit(capacity)
+    if type(backed) is not int or backed < capacity:
+        raise RuntimeError(f"storage reported {backed} backed blocks after committing {capacity}")
+    if backed > storage.max_blocks:
+        raise RuntimeError(
+            f"storage reported {backed} backed blocks beyond its "
+            f"{storage.max_blocks}-block reservation"
+        )
+    record.update(committed_blocks=backed, storage="mapped")
+    return backed, record
+
+
 def graph_memory_reserve(model, scheduler, execution, speculative=None):
     """Headroom per pool plus retained speculative coda logits across all entries.
 
