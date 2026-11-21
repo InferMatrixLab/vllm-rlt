@@ -759,18 +759,27 @@ class KVCacheManager:
             self.free(request_id)
 
     def mark_imported_prefix(self, request_id: str, length: int, *, start=0):
-        """Publish received KV only after the connector confirms remote writes are complete."""
+        """Publish received KV only after the connector confirms remote writes are complete.
+
+        Like a prefix hit, the import covers only the planes each layer owns:
+        boundary layers never write deeper planes, so the sender has no KV there.
+        """
         self._require_legacy()
         allocation = self._get_allocation(request_id)
         if type(length) is not int or not 0 < length <= allocation.max_tokens:
             raise ValueError("imported prefix exceeds reserved capacity")
         if allocation.release_requested:
             raise RuntimeError("cannot activate cancelled KV")
-        if any(w.prefix != start or w.pending for plane in allocation.written for w in plane):
+        owned = [
+            written
+            for plane, layers in enumerate(allocation.written)
+            for layer, written in enumerate(layers)
+            if self._plane_owns(plane, layer)
+        ]
+        if any(w.prefix != start or w.pending for w in owned):
             raise RuntimeError("KV prefix was already initialized")
-        for plane in allocation.written:
-            for written in plane:
-                written.prefix = length
+        for written in owned:
+            written.prefix = length
 
     # Other modules learn about allocations only through the methods below.
     # They return plain facts, never _Allocation objects or reference counts.
