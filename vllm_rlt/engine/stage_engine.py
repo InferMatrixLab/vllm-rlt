@@ -122,16 +122,12 @@ class StageEngine:
             if speculative_config is not None:
                 if not getattr(model, "supports_self_speculation", False):
                     raise ValueError("boundary-KV speculative decoding is not yet supported")
-                # Qualified: synchronous eager rounds. Async rounds, Graph replay and
-                # resumable preemption of draft/target boundary state are separate work.
-                if (
-                    self.execution_config.async_scheduling
-                    or self.execution_config.cuda_graphs
-                    or scheduler_config.enable_preemption
-                ):
+                # Qualified: synchronous eager rounds, with or without preemption.
+                # Async rounds and Graph replay are separate work.
+                if self.execution_config.async_scheduling or self.execution_config.cuda_graphs:
                     raise ValueError(
                         "boundary-KV speculative decoding requires synchronous eager "
-                        "execution without CUDA graphs or preemption"
+                        "execution without CUDA graphs"
                     )
         if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
             raise ValueError("this model does not support CUDA graphs yet")

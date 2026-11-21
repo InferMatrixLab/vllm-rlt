@@ -430,13 +430,10 @@ def test_unqualified_speculative_combinations_fail_at_construction():
         engine(model, 2, 1, execution_config=ExecutionConfig(async_scheduling=True))
     with pytest.raises(ValueError, match="CUDA graphs"):
         engine(model, 2, 1, execution_config=ExecutionConfig(cuda_graphs=True))
-    with pytest.raises(ValueError, match="without CUDA graphs or preemption"):
-        engine(
-            model,
-            2,
-            1,
-            scheduler_config=SchedulerConfig(max_num_seqs=4, enable_preemption=True),
-        )
+    # Preemption is qualified in tests/test_dory_speculative_preemption.py.
+    engine(
+        model, 2, 1, scheduler_config=SchedulerConfig(max_num_seqs=4, enable_preemption=True)
+    ).close()
     with pytest.raises(ValueError, match="target_loops"):
         LLMEngine(model, speculative_config=SpeculativeConfig(2, draft_loops=1, target_loops=4))
     shared = dory(2, recurrent_kv_cache_mode="last_loop")

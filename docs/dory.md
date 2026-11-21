@@ -136,17 +136,18 @@ These fail fast rather than degrade silently:
 
 - WCPB, mixed or staged prefill, and PD.
 - Prefix caching.
-- Self-speculation combined with CUDA Graphs, asynchronous scheduling,
-  preemption or `last_loop` KV, and sampled token-pipeline speculation. The
-  synchronous eager form is supported; see below.
+- Self-speculation combined with CUDA Graphs, asynchronous scheduling or
+  `last_loop` KV, and sampled token-pipeline speculation. The synchronous eager
+  form is supported, with or without preemption; see below.
 - Per-request loop counts other than the configured full depth: Dory has no
   trained exit gate, so the runtime refuses to invent one, including via
   `min_loops` with `exit_threshold=0`.
 
-Preemption and snapshots are **not qualified** rather than enforced: the
+Preemption without speculation is **not qualified** rather than enforced: the
 generic KV snapshot mechanism copies every plane, so it may well work, but no
-restoration test exists for Dory's boundary state. Keep `enable_preemption`
-off until 2E covers it.
+restoration test exists for Dory's boundary state outside speculation. Keep
+`enable_preemption` off for non-speculative Dory until 2E covers it.
+Synchronous self-speculation with preemption is qualified; see below.
 
 Sliding-window masking exists in the Torch reference backend and in the Triton
 decode kernel (`window=` on `KVCacheManager.attend`). Backend selection requires
@@ -221,6 +222,21 @@ Layout tensors borrow the runner's typed upload snapshots until the submission's
 final consumer completes. The pipeline mode uses the same preparation-local
 layout store and operation indices for its new-token, recurrent and endpoint
 views; all views are bound before execution.
+
+**Preemption.** A request is suspended only between collected submissions:
+the scheduler never selects a request with speculative rounds or output
+placeholders in flight, and `snapshot_pipeline` raises if a submission is still
+pending. Speculation stores every plane at every depth, so the generic KV
+snapshot covers the committed history, the boundary KV and the recurrent KV
+that in-flight pipeline tokens stored above the committed frontier. The
+pipeline snapshot keeps each retained token's position, depth, carried hidden
+state and draft candidate; block mode keeps no state between rounds. Resident
+suspension keeps KV in the pool; offload (capacity pressure, or converting a
+resident snapshot) copies KV and hidden state to the CPU and frees the pages.
+Resumption restores both, so the pipeline continues the same rows and depths
+as an uninterrupted run instead of restarting from a depth-0 row. The request
+keeps its sampling generator across suspension. Preemption with asynchronous
+rounds or CUDA Graphs stays rejected together with those modes.
 
 ## Validation status
 
@@ -329,6 +345,20 @@ GH200 the file passes together with `tests/test_dory_gpu.py` and
 `tests/test_speculative.py` (251 passed; the only failures are 12
 `flash_attn_4` cases whose optional package is not installed there).
 
+`tests/test_dory_speculative_preemption.py` (52 CPU and 12 CUDA cases) suspends
+a request in block and pipeline mode at every qualified depth pair, resident
+and offloaded, after a pipeline has tokens in flight. At resumption the KV of
+every written position, in-flight positions above the committed frontier
+included, equals the KV before suspension, and the restored pipeline holds the
+saved tokens. Tokens match the dense oracle, and the pipeline schedule (each
+submission's positions and depths) matches an uninterrupted run. The file also
+covers sampled block rounds keeping the RNG stream, a resident snapshot later
+offloaded, abort while suspended, suspension between chunked-prefill steps
+before the first token, and growth preemption in a pool that holds two
+requests or only one. Two mutation tests check the checks: dropping the
+restored pipeline keeps tokens correct but changes the schedule, and zeroing
+the snapshot above the frontier fails the KV comparison.
+
 Real checkpoint, Triton, synchronous eager, greedy, WikiText prompts, one GH200
 (torch 2.14.0+cu130). Speculative tokens are compared with the non-speculative
 baseline of the same process:
@@ -402,7 +432,7 @@ Reading the numbers:
 - Graph-captured prefill, open-loop arrival traces and sampled decoding on the
   real checkpoint in Graph or async mode. The measurements above are
   closed-loop, greedy, and their time to first token is eager prefill.
-- Self-speculation with CUDA graphs, asynchronous scheduling, preemption,
+- Self-speculation with CUDA graphs, asynchronous scheduling,
   sampled token-pipeline, adaptive exit, or a draft width above the fixed K.
 - Sampled speculation on the real checkpoint (the rejection-sampling contract is
   qualified on the tiny CPU model only).
