@@ -765,6 +765,8 @@ class KVCacheManager:
                 )
             else:
                 self._drop_refs(b for table in allocation.block_tables for b in reversed(table))
+            # The pool can reuse the freed pages before the next poll, so a
+            # deferred publication must not run. Only prefix hits are lost.
             self._pending_prefixes = [
                 pending for pending in self._pending_prefixes if pending[1] is not allocation
             ]
@@ -954,6 +956,12 @@ class KVCacheManager:
     def allocate_snapshot(self, request_id: str, snapshot: KVSnapshot) -> bool:
         """Acquire the pages ``snapshot`` holds, or return False if the pool is short.
 
+        Every page comes back as a private page, also a page that the request
+        shared through a prefix hit. The offload returned only the pages that
+        no other holder kept, so a resumed sharer holds more pages than before.
+        Resumption does not depend on the prefix entry, because the cache can
+        evict that entry while the request is suspended.
+
         Grouped SWA pages that reclamation returned before the snapshot stay
         unallocated: the next token cannot read them, and ``allocate`` would
         claim them again and break the submission bound.
@@ -974,6 +982,7 @@ class KVCacheManager:
                     offset += width
                 planes.append(table)
             tables.append(tuple(planes))
+        assert offset == len(fresh)
         written = [
             [_WrittenPositions() for _ in range(self.num_layers)]
             for _ in range(self.storage_depths)
@@ -1015,6 +1024,8 @@ class KVCacheManager:
                 self.key_scale[block].copy_(snapshot.key_scales[row])
                 self.value_scale[block].copy_(snapshot.value_scales[row])
         allocation.written = deepcopy(snapshot.written)
+        # reclaim_pending is not restored: expired SWA pages come back held,
+        # and the next read schedules their reclamation again.
         allocation.consumed = deepcopy(snapshot.consumed)
 
     def _prefix_claim(self, prefix):

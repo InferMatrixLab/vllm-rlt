@@ -365,6 +365,47 @@ def test_grouped_snapshot_waits_for_capacity_and_restores_every_plane():
     assert cache.num_used_blocks == 0
 
 
+def physical_pages(cache, model, request_id):
+    return {
+        block
+        for layer, depth in planes(model)
+        for block in cache.layer_block_table(request_id, layer, depth)
+        if block >= 0
+    }
+
+
+@pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "all_layer"])
+def test_a_resumed_prefix_sharer_holds_private_copies_of_the_shared_pages(grouped):
+    model = dory("per_loop")
+    cache = make_cache(model, enable_prefix_caching=True, grouped=grouped)
+    tokens = [3, 1, 4, 1, 5, 9, 2]
+    count = len(tokens)
+    assert cache.allocate("a", count)
+    for layer, depth in planes(model):
+        keys = torch.randn(count, model.config.num_key_value_heads, model.config.head_dim)
+        cache.write(layer, ["a"] * count, [depth] * count, list(range(count)), keys, keys + 1)
+    cache.publish_prefix("a", tokens, count)
+    assert cache.allocate("b", count, prefix=cache.lookup_prefix(tokens))
+    shared = physical_pages(cache, model, "a") & physical_pages(cache, model, "b")
+    assert shared
+    expected = {(layer, depth): cache.read(layer, "b", depth) for layer, depth in planes(model)}
+    snapshot = cache.snapshot("b")
+    assert len(snapshot.keys) == cache.allocated_blocks("b")
+    free = cache.num_free_blocks
+    cache.free("b")
+    assert cache.num_free_blocks == free + len(snapshot.keys) - len(shared)
+    assert cache.allocate_snapshot("b", snapshot)
+    cache.restore("b", snapshot)
+    assert cache.num_free_blocks == free - len(shared)
+    assert not physical_pages(cache, model, "a") & physical_pages(cache, model, "b")
+    for (layer, depth), (keys, values) in expected.items():
+        restored = cache.read(layer, "b", depth)
+        assert torch.equal(restored[0], keys) and torch.equal(restored[1], values)
+    cache.free("a")
+    cache.free("b")
+    assert cache.num_used_blocks == 0
+
+
 EXECUTION_MODES = {
     "sync_eager": dict(),
     "sync_graph": dict(cuda_graphs=True),
