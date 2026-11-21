@@ -19,6 +19,223 @@ def budget_blocks(available_bytes, bytes_per_block):
     return blocks
 
 
+def measurement_budget(report):
+    """Driver free/total bytes and coverage gaps from a startup preparation report.
+
+    ``report`` is step 1 of RFC #192 (``StageEngine.prepare_runtime``): boundary
+    samples taken after draining, with the allocator cache retained. Only the
+    last sample sizes capacity, because it is the state after warmup and capture.
+    """
+    if not report:
+        raise ValueError("a measured KV plan requires a startup preparation report")
+    phases = report.get("phases") or ()
+    if not phases:
+        raise ValueError("the startup report contains no phase samples")
+    final = phases[-1]
+    free, total = final.get("driver_free_bytes"), final.get("device_total_bytes")
+    if type(free) is not int or type(total) is not int or total <= 0 or free < 0:
+        raise ValueError("the final startup phase lacks valid driver free/total bytes")
+    return free, total, tuple(report.get("coverage_gaps") or ())
+
+
+def measured_kv_capacity(
+    *,
+    report,
+    bytes_per_block,
+    useful_blocks,
+    gpu_memory_utilization,
+    transient_bytes,
+    safety_bytes,
+    existing_blocks=0,
+    reservation_blocks=None,
+):
+    """Total blocks the pool may hold after warmup and capture.
+
+    ``free`` memory already excludes weights, execution buffers, captured graphs
+    and anything already mapped, including ``existing_blocks`` (the bootstrap
+    prefix). The measured capacity is therefore additional, and the cumulative
+    ``commit(total)`` of a storage maps only the new part.
+
+    ``transient_bytes`` covers execution above that persistent baseline and
+    ``safety_bytes`` the fixed reserve. The result is clamped by the logical
+    ``useful_blocks`` and, when the pool cannot grow that far, by
+    ``reservation_blocks``; the binding limit and every margin are recorded.
+
+    ``gpu_memory_utilization`` keeps its existing meaning: a fraction of the
+    whole device, not of what is free after the baseline. The KV budget is that
+    cap minus everything already resident, i.e. weights, execution buffers,
+    captured graphs and mapped blocks.
+    """
+    for name, value in (
+        ("bytes_per_block", bytes_per_block),
+        ("useful_blocks", useful_blocks),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    for name, value in (
+        ("transient_bytes", transient_bytes),
+        ("safety_bytes", safety_bytes),
+        ("existing_blocks", existing_blocks),
+    ):
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if reservation_blocks is not None and (
+        type(reservation_blocks) is not int or reservation_blocks < 1
+    ):
+        raise ValueError("reservation_blocks must be a positive integer")
+    if not 0 < gpu_memory_utilization <= 1:
+        raise ValueError("gpu_memory_utilization must be in (0, 1]")
+    free, total, gaps = measurement_budget(report)
+    if gaps and not transient_bytes:
+        # The preparation reported paths it did not exercise. Sizing them as if
+        # measured would publish a pool that cannot serve them.
+        raise ValueError(f"coverage gaps require an explicit transient allowance: {gaps[0]}")
+    resident = total - free
+    # What the utilization cap still allows, bounded by measured free memory.
+    remaining = min(free, int(total * gpu_memory_utilization) - resident)
+    budget = remaining - transient_bytes - safety_bytes
+    additional = max(0, budget // bytes_per_block)
+    capacity = existing_blocks + additional
+    if capacity < 1:
+        raise ValueError(
+            "no KV capacity fits the measured budget: "
+            f"remaining={remaining} transient={transient_bytes} "
+            f"safety={safety_bytes} block={bytes_per_block}"
+        )
+    limit = "budget"
+    if capacity > useful_blocks:
+        capacity, limit = useful_blocks, "useful_blocks"
+    if reservation_blocks is not None and capacity > reservation_blocks:
+        capacity, limit = reservation_blocks, "reservation"
+        gaps = (
+            *gaps,
+            "measured capacity exceeds the reservation; committed capacity truncated",
+        )
+    return capacity, dict(
+        source="measured_warmup",
+        bytes_per_block=bytes_per_block,
+        driver_free_bytes=free,
+        device_total_bytes=total,
+        resident_bytes=resident,
+        utilization_cap_bytes=int(total * gpu_memory_utilization),
+        remaining_instance_bytes=remaining,
+        transient_bytes=transient_bytes,
+        safety_bytes=safety_bytes,
+        kv_budget_bytes=budget,
+        existing_blocks=existing_blocks,
+        additional_blocks=additional,
+        max_useful_blocks=useful_blocks,
+        reservation_blocks=reservation_blocks,
+        limited_by=limit,
+        coverage_gaps=gaps,
+    )
+
+
+def transient_allowance(report, *, estimate_bytes, overlap_factor=1):
+    """Allowance for execution above the persistent baseline of a phase.
+
+    A phase records its end state and its own peak, so ``peak - allocated`` is
+    what that phase needed on top of what it kept. The largest such delta is
+    measured; ``estimate_bytes`` covers paths the preparation did not exercise
+    and must stay in force. ``overlap_factor`` covers supported concurrency,
+    because a serial peak understates a concurrent envelope. The larger of the
+    two is returned, so an unmeasured path is never sized as if measured.
+    """
+    if type(estimate_bytes) is not int or estimate_bytes < 0:
+        raise ValueError("estimate_bytes must be a nonnegative integer")
+    if type(overlap_factor) is not int or overlap_factor < 1:
+        raise ValueError("overlap_factor must be an integer of at least 1")
+    phases = (report or {}).get("phases") or ()
+    measured = 0
+    sampled = 0
+    for phase in phases:
+        peak, allocated = phase.get("peak_allocated_bytes"), phase.get("allocated_bytes")
+        if type(peak) is not int or type(allocated) is not int:
+            continue
+        sampled += 1
+        measured = max(measured, peak - allocated)
+    value = max(measured * overlap_factor, estimate_bytes)
+    return value, dict(
+        transient_bytes=value,
+        measured_transient_bytes=measured,
+        estimate_bytes=estimate_bytes,
+        overlap_factor=overlap_factor,
+        sampled_phases=sampled,
+    )
+
+
+def commit_measured_capacity(
+    storage,
+    *,
+    report,
+    bytes_per_block,
+    useful_blocks,
+    gpu_memory_utilization,
+    transient_bytes,
+    safety_bytes,
+    allow_reservation_truncation=False,
+):
+    """Plan the measured capacity, map it, and return the publishable block count.
+
+    Enforces the preconditions of the agreed ordering: the report describes the
+    pool the storage already backs, the plan never exceeds the reservation, and
+    the storage must report at least the planned blocks as backed. The caller
+    publishes exactly the returned count and nothing else.
+
+    Two caller policies are checked here rather than assumed. The trial pool must
+    already back at least one block, because a mapped pool cannot be built with no
+    mapping at all. And its reservation must be sized from ``useful_blocks``, not
+    from the pre-warmup estimate: otherwise the measured capacity is clamped back
+    to the estimate and the pool can never grow. Pass
+    ``allow_reservation_truncation=True`` only when that clamp is intended.
+    """
+    existing = (report or {}).get("num_blocks")
+    if type(existing) is not int or existing < 0:
+        raise ValueError("the startup report must record the current pool as num_blocks")
+    if existing < 1:
+        raise ValueError(
+            "the trial pool must back at least one block; size it from the warmup "
+            "coverage target before preparing the runtime"
+        )
+    if existing > storage.max_blocks:
+        raise ValueError(
+            f"the report describes {existing} blocks but the storage reserves {storage.max_blocks}"
+        )
+    if storage.committed_blocks != existing:
+        # The pool changed after the sample, so the measured free memory no
+        # longer describes this storage.
+        raise ValueError(
+            f"the report describes {existing} blocks but the storage backs "
+            f"{storage.committed_blocks}"
+        )
+    capacity, record = measured_kv_capacity(
+        report=report,
+        bytes_per_block=bytes_per_block,
+        useful_blocks=useful_blocks,
+        gpu_memory_utilization=gpu_memory_utilization,
+        transient_bytes=transient_bytes,
+        safety_bytes=safety_bytes,
+        existing_blocks=existing,
+        reservation_blocks=storage.max_blocks,
+    )
+    if record["limited_by"] == "reservation" and not allow_reservation_truncation:
+        raise RuntimeError(
+            f"the measured capacity ({capacity} blocks) exceeds the "
+            f"{storage.max_blocks}-block reservation, so it would be truncated to the "
+            "pre-warmup estimate; reserve the useful cap instead of the estimate"
+        )
+    backed = storage.commit(capacity)
+    if type(backed) is not int or backed < capacity:
+        raise RuntimeError(f"storage reported {backed} backed blocks after committing {capacity}")
+    if backed > storage.max_blocks:
+        raise RuntimeError(
+            f"storage reported {backed} backed blocks beyond its "
+            f"{storage.max_blocks}-block reservation"
+        )
+    record.update(committed_blocks=backed, storage="mapped")
+    return backed, record
+
+
 def graph_memory_reserve(model, scheduler, execution, speculative=None):
     """Headroom per pool plus retained speculative coda logits across all entries.
 
