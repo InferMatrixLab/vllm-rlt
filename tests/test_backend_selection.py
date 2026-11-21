@@ -15,7 +15,7 @@ from vllm_rlt.models import OuroForCausalLM
 
 @pytest.fixture
 def packages(monkeypatch):
-    from vllm_rlt.kernels import flash_attention
+    from vllm_rlt.kernels import flash_attention, flashinfer_attention
 
     installed = {
         "flash_attn",
@@ -23,6 +23,7 @@ def packages(monkeypatch):
         "flash_attn.cute",
         "TensorwiseScales",
         "triton",
+        "flashinfer",
     }
     original_import = flash_attention.importlib.import_module
 
@@ -41,12 +42,19 @@ def packages(monkeypatch):
             if name == "flash_attn.cute" and "TensorwiseScales" in installed:
                 result.TensorwiseScales = SimpleNamespace
             return result
+        if name == "flashinfer.decode":
+            if "flashinfer" not in installed:
+                raise ImportError("flashinfer is not installed")
+            return SimpleNamespace(
+                trtllm_batch_decode_with_kv_cache=lambda *args, **kwargs: None
+            )
         return original_import(name)
 
     monkeypatch.setattr(flash_attention.importlib, "import_module", import_module)
     monkeypatch.setattr(
         flash_attention, "version", lambda name: "4.0.0b39" if name == "flash-attn-4" else "test"
     )
+    monkeypatch.setattr(flashinfer_attention, "version", lambda name: "test")
     monkeypatch.setattr(torch.version, "hip", None)
     return installed
 
@@ -173,7 +181,17 @@ def test_dory_requirements_select_native_fa4_and_reject_old_hd256(packages, monk
             "flash_attn_2",
         ),
         ((10, 0), torch.bfloat16, 128, 16, (), "flash_attn_4"),
-        ((12, 0), torch.bfloat16, 128, 16, (), "triton"),
+        (
+            (9, 0),
+            torch.bfloat16,
+            128,
+            16,
+            ("flash_attn.cute", "flash_attn_3.flash_attn_interface"),
+            "triton",
+        ),
+        ((10, 0), torch.bfloat16, 128, 16, ("flash_attn.cute",), "triton"),
+        ((12, 0), torch.bfloat16, 128, 16, (), "flashinfer"),
+        ((12, 0), torch.bfloat16, 128, 16, ("flashinfer",), "triton"),
         ((7, 5), torch.float16, 128, 256, (), "torch"),
     ],
 )
@@ -187,6 +205,18 @@ def test_auto_selection_constraints(
     assert selected.info["selection_reason"]
     if expected == "flash_attn_4":
         assert backend_capabilities(selected).packed_prefill
+
+
+def test_explicit_flashinfer_opt_in_outside_sm120(packages, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="vllm_rlt.kernels.flashinfer_attention")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    selected = create_backend("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
+    assert selected.info["selected_backend"] == "flashinfer"
+    assert selected.capabilities.cuda_graphs and selected.capabilities.async_scheduling
+    assert not selected.capabilities.packed_prefill
+    assert "unvalidated" in caplog.text
 
 
 def test_rocm_auto_uses_triton(packages, monkeypatch):
@@ -208,12 +238,15 @@ def test_auto_reports_missing_packages_and_configuration(packages, monkeypatch):
     assert "multiple of 256" in reason and "triton" in reason
 
 
-@pytest.mark.parametrize("backend", ["flash_attn_2", "triton"])
-def test_explicit_missing_package_never_falls_back(packages, monkeypatch, backend):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+@pytest.mark.parametrize(
+    "backend,sm,block_size",
+    [("flash_attn_2", (8, 9), 256), ("triton", (8, 9), 256), ("flashinfer", (12, 0), 16)],
+)
+def test_explicit_missing_package_never_falls_back(packages, monkeypatch, backend, sm, block_size):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
     packages.clear()
     with pytest.raises(ImportError):
-        create_backend(backend, torch.device("cuda"), torch.bfloat16, 128, 256)
+        create_backend(backend, torch.device("cuda"), torch.bfloat16, 128, block_size)
 
 
 def test_explicit_flash_incompatibility_is_not_overridden(packages, monkeypatch):
