@@ -934,11 +934,11 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             )
             # Only rows that reach the draft or target depth read a distribution.
             # The output-stage KV of other rows must stay the KV of their draft pass.
-            reached = row_depths + self.config.draft_loops
-            endpoints = (reached == self.config.draft_loops) | (reached == self.config.target_loops)
-            coda_kv = self.device_metadata(
-                positions, row_tables, 0, allocations, row_active, row_active & endpoints
-            )
+            # Fresh rows reach the draft depth, so CODA writes the PRELUDE rows and
+            # the rows that reach the target depth. Both stages reuse one depth-0
+            # view because eager rounds are bound by kernel launches.
+            last = row_depths == self.config.target_loops - self.config.draft_loops
+            coda_kv = replace(prelude_kv, write_mask=prelude_kv.write_mask | (row_active & last))
         prelude = self._prelude(tokens.view(-1)[flat], prelude_kv)
         hidden = torch.where(fresh[:, None], prelude, retained.view(n * width, -1)[flat])
         for offset in range(self.config.draft_loops):
