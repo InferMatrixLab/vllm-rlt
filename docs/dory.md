@@ -245,6 +245,10 @@ next round is the serial target history.
   the rows that store KV. PRELUDE stores only for rows at depth 0. CODA stores
   only for rows that reach the draft or the target depth. A row between these
   depths (1→4) keeps the CODA KV of its draft pass, as in a synchronous step.
+  Both stages use one depth-0 view and differ only in the write mask, as in
+  synchronous steps and asynchronous block rounds.
+  The runtime discards the PRELUDE output of rows that are not at depth 0, and
+  the CODA output of rows that reach neither depth.
 - **Sampling.** Asynchronous rounds take greedy requests only. Asynchronous
   block rounds can sample for models without boundary KV, but that combination
   is not qualified for Dory. Such a request fails when it is added.
@@ -495,7 +499,8 @@ same time. Each arm runs one warmup, then five timed repetitions, all in one
 container. Wall times are the mean whole-run time in seconds, prefill included.
 Every Graph arm uses `cuda_graph_max_graphs=128`, so no arm runs eager because
 its graph cache is full; every Graph arm had zero graph fallbacks. BF16
-acceptance is 0.85–0.88.
+acceptance is 0.85–0.88. Tables 1–4 were measured before PRELUDE and CODA of a
+pipeline step shared one depth-0 view.
 
 Table 1: with CUDA Graphs, concurrency sweep. Prompt 1024 tokens, 128 generated
 tokens for each request. Percentages are against the baseline.
@@ -554,6 +559,11 @@ Reading the numbers:
 - The gain of speculation falls as concurrency rises. At one request the GPU
   has spare capacity, so draft and verify work is almost free. At 64 requests
   the GPU is busy, and the extra verify rows cancel most of the saved steps.
+- In pipeline mode, every row runs both boundary stages, so that each call keeps
+  one shape. PRELUDE also runs on rows that already hold their input-stage KV,
+  and CODA also runs on rows that reach neither the draft nor the target depth.
+  The runtime discards these outputs. At 64 requests, this extra work can
+  explain a part of the small gain.
 - At 8 × 8192, prefill takes about 18 of 24 seconds. Speculation shortens only
   decode, so the whole run is 2–3 % faster.
 - The baseline with the default graph cache (16 shapes) runs eager in most calls
@@ -573,12 +583,19 @@ Reading the numbers:
   and 6 % slower than sync rounds (Table 3). A dedicated run alternated a sync
   and an async engine in ABBA order, 10 timed repetitions each, at one request
   in pipeline mode. Async was 2.7 % and 3.9 % slower in two containers. The
-  profiler counts 5503 kernel launches per generated token for sync and 5626 for
-  async (+124, +2.2 %). Async rounds keep positions on the GPU, so the GPU
+  profiler counted 5503 kernel launches per generated token for sync and 5626
+  for async (+124, +2.2 %). Async rounds keep positions on the GPU, so the GPU
   computes the KV metadata, the PRELUDE and CODA write masks and the slot-pool
   update; sync rounds do this work on the CPU. Eager Dory is bound by host-side
   launch cost, so the extra launches give the extra time. At 16 and 64 requests,
   async eager is 0–3 % faster than sync eager.
+- After PRELUDE and CODA of a pipeline step shared one depth-0 view, async makes
+  5615 launches per generated token (+113 against sync). The same ABBA run gave
+  −0.2 % and +0.4 % in two new containers, and async was slower in 5 of 10
+  rounds in each. The time between containers varies by a few percent, so these
+  runs do not show that the gap is closed. A fused kernel for the per-step
+  update and metadata would remove more launches. It also changes the Ouro path,
+  so it is a separate change.
 
 ### Not yet performed
 
