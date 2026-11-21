@@ -919,6 +919,8 @@ class KVCacheManager:
                 plan,
                 layer=layer,
                 dense_attention=self.attention,
+                # A later layer joins a device plan's deferred selection.
+                defer_select=layer < self.num_layers - 1,
             )
         if isinstance(batch, DeviceKVMetadata):
             if window is not None:

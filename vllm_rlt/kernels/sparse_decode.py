@@ -293,6 +293,10 @@ _GATHER_BLOCK = 128
 _SEGMENT_ALIGN = 32
 # The split kernel builds the first pass's histograms while it scores the keys.
 _PASS0_IN_SPLIT = True
+# A device plan's capture is read only by a later submission, so a call that a
+# later layer follows on the same stream runs the selection after its merge
+# pass on a side stream, overlapped with the rest of the layer.
+_DEFER_SELECT = True
 
 # Triton's Python dispatch costs several microseconds per launch, and a fused
 # capture makes six launches, so at short contexts in eager mode the dispatch,
@@ -413,6 +417,42 @@ def _launch(kernel, grid, *args, **meta):
     if launcher is None or launcher.kernel is not kernel:
         launcher = _LAUNCHERS[id(kernel)] = _Launcher(kernel)
     launcher.launch(grid, args, meta)
+
+
+# Per device: the side stream and its fork/join events, and the stream that
+# forked a selection chain no later call has joined yet.
+_SIDE: dict = {}
+_PENDING: dict = {}
+
+
+def _side(device):
+    entry = _SIDE.get(device.index)
+    if entry is None:
+        entry = _SIDE[device.index] = (
+            torch.cuda.Stream(device),
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+        )
+    return entry
+
+
+def join_deferred(device) -> None:
+    """Order the current stream after the device's deferred selection chain, if any.
+
+    Every fused call joins first, so the chain finishes before the next
+    capture overwrites its scratch or the store grows its index pool. The
+    caller's last layer defers nothing, so a forward (and a graph capture)
+    ends joined.
+    """
+    owner = _PENDING.pop(device.index, None)
+    if owner is None:
+        return
+    join = _SIDE[device.index][2]
+    if owner.cuda_stream != _current_stream(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("a deferred sparse selection would cross a CUDA graph capture")
+        torch.cuda.current_stream(device).wait_event(join)
+    owner.wait_event(join)
 
 
 @triton.jit
@@ -1162,6 +1202,7 @@ def fused_paged_attention(
     layer,
     dense_attention,
     workspace=None,
+    defer_select=False,
 ):
     """Capture or consume one submission without host readbacks.
 
@@ -1174,9 +1215,15 @@ def fused_paged_attention(
     only checks the plan's liveness instead of launching the bookkeeping.
     ``workspace`` comes from ``capture_workspace`` and must cover the rows
     and table width of the submission; consume uses only its split parts.
+
+    ``defer_select`` promises that a later fused call (the next layer) follows
+    on this stream before anything reads this call's capture. A device plan
+    then runs the selection after the merge pass on a side stream; the next
+    call joins it first. Results are the same kernels' bit for bit.
     """
     store = plan.store
     store._require_live(plan)
+    join_deferred(q.device)
     rows, heads, dim = q.shape
     page = key_cache.shape[1]
     groups = heads // key_cache.shape[2]
@@ -1276,7 +1323,8 @@ def fused_paged_attention(
             # A device plan whose step has no capture loop still merges its dense
             # rows in the first pass; it launches no further selection kernels.
             selecting = not mixed or plan.may_capture
-            for level in range(first_pass, 4 if selecting else first_pass + 1):
+
+            def select_pass(level):
                 _launch(
                     _select_pass_kernel,
                     (rows, heads, SELECT_PARTS),
@@ -1315,7 +1363,10 @@ def fused_paged_attention(
                     MIXED=mixed,
                     num_warps=_SCAN_WARPS,
                 )
-            if selecting:
+
+            def select_chain():
+                for level in range(first_pass + 1, 4):
+                    select_pass(level)
                 _launch(
                     _select_write_kernel,
                     (rows, heads, SELECT_PARTS),
@@ -1375,6 +1426,20 @@ def fused_paged_attention(
                     MIXED=mixed,
                     num_warps=4,
                 )
+
+            select_pass(first_pass)
+            if selecting and mixed and defer_select and _DEFER_SELECT:
+                # The merge pass wrote this call's output; the rest of the
+                # selection only fills store entries a later submission reads.
+                stream, fork, join = _side(q.device)
+                fork.record()
+                stream.wait_event(fork)
+                with torch.cuda.stream(stream):
+                    select_chain()
+                    join.record()
+                _PENDING[q.device.index] = torch.cuda.current_stream(q.device)
+            elif selecting:
+                select_chain()
             if not mixed:
                 return output
         else:

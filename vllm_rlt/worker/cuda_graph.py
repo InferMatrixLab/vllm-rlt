@@ -174,6 +174,8 @@ class _DeviceCache:
                 layer=layer,
                 dense_attention=cache.attention,
                 workspace=self.workspace,
+                # The next layer joins the deferred selection inside the capture.
+                defer_select=layer < cache.num_layers - 1,
             )
         if batch.cu_seqlens_q is not None:
             return cache.attention.prefill(

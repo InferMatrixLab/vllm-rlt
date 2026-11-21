@@ -175,6 +175,123 @@ def test_steps_without_capture_skip_selection_kernels(monkeypatch):
         assert torch.equal(a, b)
 
 
+def _two_layer_mixed(seed):
+    """A mixed device plan over two layers whose consume rows have references."""
+    from vllm_rlt.kernels import sparse_decode
+    from vllm_rlt.kernels.paged_attention import TritonPagedAttention
+
+    rows, heads, kv_heads, dim, block_size, pages = 6, 4, 2, 64, 16, 9
+    dense = TritonPagedAttention()
+    q, keys, values, tables = _paged(
+        rows, heads, kv_heads, dim, pages, block_size, torch.float32, seed
+    )
+    lengths = torch.tensor([5, 33, 70, 129, 140, 1], device="cuda", dtype=torch.int32)
+    modes = [DENSE, CAPTURE, CONSUME, CAPTURE, CONSUME, DENSE]
+    store = make_store(
+        slots=rows,
+        layers=2,
+        heads=heads,
+        head_dim=dim,
+        key_bucket=pages * block_size,
+        initial_key_capacity=pages * block_size,
+        device="cuda",
+        implementation="fused",
+    )
+    lease = store.reserve("r", 0, rows, generation=1)
+    earlier = [row for row, mode in enumerate(modes) if mode == CONSUME]
+    for layer in range(2):
+        plan = store.build_plan(
+            [(lease, row) for row in earlier], [CAPTURE] * len(earlier), key_retention=0.25
+        )
+        sparse_decode.fused_paged_attention(
+            q[earlier] + layer,
+            keys,
+            values,
+            tables[earlier],
+            lengths[earlier],
+            plan,
+            layer=layer,
+            dense_attention=dense,
+        )
+    plan = store.build_device_plan(
+        [lease],
+        lease.slot_ids,
+        torch.tensor(modes, device="cuda", dtype=torch.int8),
+        key_retention=0.25,
+    )
+
+    # Graphs bake the scratch in, so the caller owns it, as the graph runner does.
+    workspace = sparse_decode.capture_workspace(
+        q.device, rows, heads, tables.shape[1] * block_size, dim
+    )
+
+    def run(out):
+        for layer in range(2):
+            out[layer].copy_(
+                sparse_decode.fused_paged_attention(
+                    q * (layer + 2),
+                    keys,
+                    values,
+                    tables,
+                    lengths,
+                    plan,
+                    layer=layer,
+                    dense_attention=dense,
+                    workspace=workspace,
+                    defer_select=layer == 0,
+                )
+            )
+
+    return store, run, torch.empty(2, *q.shape, device="cuda")
+
+
+_STORE_FIELDS = ("selected", "counts", "mass", "output", "contribution", "valid", "uses")
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("graph", [False, True])
+def test_deferred_selection_matches_inline(monkeypatch, graph):
+    """Layer 0's selection on the side stream, joined by layer 1, changes no bit."""
+    from vllm_rlt.kernels import sparse_decode
+
+    results, sides = [], []
+    side = sparse_decode._side
+    monkeypatch.setattr(
+        sparse_decode, "_side", lambda device: (sides.append(device), side(device))[1]
+    )
+    for defer in (False, True):
+        monkeypatch.setattr(sparse_decode, "_DEFER_SELECT", defer)
+        store, run, out = _two_layer_mixed(11)
+        if graph and defer:
+            # Warm up on a side copy of the store state, then capture and replay
+            # once from the captured references, as an engine does.
+            saved = {name: getattr(store, name).clone() for name in _STORE_FIELDS}
+            capture_stream = torch.cuda.Stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                run(out)
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            torch.cuda.synchronize()
+            for name, value in saved.items():
+                getattr(store, name).copy_(value)
+            cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph):
+                run(out)
+            assert not sparse_decode._PENDING
+            out.zero_()
+            cuda_graph.replay()
+        else:
+            run(out)
+        assert not sparse_decode._PENDING
+        assert bool(sides) == defer
+        torch.cuda.synchronize()
+        results.append((out.clone(), {n: getattr(store, n).clone() for n in _STORE_FIELDS}))
+    (inline, inline_store), (deferred, deferred_store) = results
+    assert torch.equal(inline, deferred)
+    for name in _STORE_FIELDS:
+        assert torch.equal(inline_store[name], deferred_store[name]), name
+
+
 def _engine(mode, sparse, *, draft_loops=2, graphs=False, retention=0.5):
     from vllm_rlt.engine.stage_engine import StageEngine
     from vllm_rlt.models import OuroForCausalLM

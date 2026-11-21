@@ -366,6 +366,7 @@ def sparse_paged_attention(
     *,
     layer,
     dense_attention: Callable | None = None,
+    defer_select: bool = False,
 ):
     """Use bounded row batches on CUDA, retaining the scalar numerical oracle.
 
@@ -390,6 +391,7 @@ def sparse_paged_attention(
             plan,
             layer=layer,
             dense_attention=dense_attention,
+            defer_select=defer_select,
         )
     if not q.is_cuda:
         return reference_paged_attention(
