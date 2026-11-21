@@ -325,6 +325,72 @@ def test_stream_parser_handles_large_events(tmp_path):
     assert json.loads((tmp_path / "summary.json").read_text())["observed_duration_us"] == 22
 
 
+@pytest.mark.parametrize("device_category", [None, "kernel", "gpu_memcpy", "gpu_memset"])
+@pytest.mark.parametrize(
+    ("activity_metadata", "expects_cuda"),
+    [
+        pytest.param(
+            {"config": {"activities": None}, "activities": ["cpu", "cuda"]},
+            True,
+            id="default-cuda",
+        ),
+        pytest.param(
+            {"config": {"activities": ["cpu", "cuda"]}, "activities": ["cpu", "cuda"]},
+            True,
+            id="explicit-cuda",
+        ),
+        pytest.param(
+            {"config": {"activities": ["cuda"]}, "activities": ["cuda"]},
+            True,
+            id="cuda-only",
+        ),
+        pytest.param(
+            {"config": {"activities": ["cpu"]}, "activities": ["cpu"], "device": "cuda:0"},
+            False,
+            id="cpu-only-on-cuda",
+        ),
+        pytest.param(
+            {"config": {"activities": None}, "activities": ["cpu"], "device": "cpu"},
+            False,
+            id="default-cpu",
+        ),
+        pytest.param(
+            {"config": {"activities": ["cuda"]}, "activities": ["cpu"]},
+            False,
+            id="resolved-cpu-takes-precedence",
+        ),
+        pytest.param(
+            {"config": {"activities": ["cpu"]}, "activities": ["cuda"]},
+            True,
+            id="resolved-cuda-takes-precedence",
+        ),
+        pytest.param(
+            {"config": {"activities": ["cuda"]}, "activities": []},
+            False,
+            id="present-empty-activities",
+        ),
+        pytest.param({"config": {"activities": ["cuda"]}}, True, id="legacy-cuda"),
+        pytest.param({"config": {"activities": ["cpu"]}}, False, id="legacy-cpu"),
+        pytest.param({"config": {"activities": None}}, False, id="legacy-default"),
+        pytest.param({}, False, id="missing-activities"),
+    ],
+)
+def test_trace_cuda_coverage_note(tmp_path, activity_metadata, expects_cuda, device_category):
+    events = [TRACE["traceEvents"][0], {"ph": "X", "cat": "cuda_runtime", "name": "cudaSync"}]
+    if device_category is not None:
+        events.append(dict(TRACE["traceEvents"][1], cat=device_category))
+    source = tmp_path / "trace.json"
+    source.write_text(json.dumps({"traceEvents": events}))
+    metadata = dict(activity_metadata)
+    metadata["config"] = {"profile_memory": False, **metadata.get("config", {})}
+
+    parse_trace(source, tmp_path, metadata)
+
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    note = "No CUDA device events recorded; device coverage is unverified."
+    assert (note in summary["notes"]) == (expects_cuda and device_category is None)
+
+
 def fake_pd():
     from vllm_rlt.pd.engine import PDEngine
 
