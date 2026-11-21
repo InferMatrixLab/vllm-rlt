@@ -45,6 +45,7 @@ class FlashInferPagedAttention:
         major, minor = torch.cuda.get_device_capability(device)
         if major not in (9, 10, 12):
             raise ValueError(f"flashinfer is not supported on SM{major}{minor}")
+        self.supports_fp8_static = (major, minor) == (12, 0)
         try:
             package_version = version("flashinfer-python")
             self.kernel = getattr(
@@ -78,11 +79,35 @@ class FlashInferPagedAttention:
         )
         logging.getLogger(__name__).warning("Attention implementation: %s", self.info)
 
-    def __call__(self, q, key_cache, value_cache, block_tables, context_lengths):
+    def __call__(
+        self, q, key_cache, value_cache, block_tables, context_lengths, *,
+        key_scale=None, value_scale=None,
+    ):
         # An empty batch host-crashes (SIGFPE, not an exception) inside the
         # FlashInfer dispatch; return the same empty shape the other backends do.
         if q.shape[0] == 0:
             return torch.empty_like(q)
+        bmm1_scale = q.shape[-1] ** -0.5
+        bmm2_scale = 1.0
+        if key_cache.dtype != value_cache.dtype:
+            raise ValueError("XQA K and V cache dtypes must match")
+        if key_cache.dtype == torch.float8_e4m3fn:
+            if not self.supports_fp8_static:
+                raise ValueError("fixed-scale FP8 KV requires SM120")
+            for scale in (key_scale, value_scale):
+                if (
+                    scale is None
+                    or scale.ndim != 0
+                    or scale.dtype != torch.float32
+                    or scale.device != q.device
+                ):
+                    raise ValueError("XQA FP8 KV requires scalar FP32 scales on the query device")
+            # Descale K before softmax and V in the weighted sum.
+            bmm1_scale = key_scale * bmm1_scale
+            bmm2_scale = value_scale
+        elif key_scale is not None or value_scale is not None:
+            raise ValueError("XQA KV scales require an E4M3 cache")
+
         if self.workspace is None:
             self.workspace = torch.zeros(
                 FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device=q.device
@@ -99,7 +124,8 @@ class FlashInferPagedAttention:
             block_tables=block_tables.clamp_min(0),
             seq_lens=context_lengths.to(torch.uint32),
             max_seq_len=block_tables.shape[1] * key_cache.shape[1],
-            bmm1_scale=q.shape[-1] ** -0.5,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
             out=out,
             q_len_per_req=1,
             # The engine pool is [blocks, page, heads, dim]; the API default is

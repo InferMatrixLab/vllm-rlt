@@ -149,7 +149,8 @@ def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, pa
         )
     if backend == "flashinfer":
         kernel = FlashInferPagedAttention(device, dtype, head_dim, block_size)
-        return AttentionBackend(kernel, _FLASHINFER_CAPABILITIES, dict(kernel.info))
+        capabilities = replace(_FLASHINFER_CAPABILITIES, fp8_kv_static=kernel.supports_fp8_static)
+        return AttentionBackend(kernel, capabilities, dict(kernel.info))
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         capabilities = replace(

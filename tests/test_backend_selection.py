@@ -97,6 +97,16 @@ def test_fa4_static_fp8_selection(packages, monkeypatch, sm, dtype, head_dim, su
     assert selected.info["selected_backend"] == "flash_attn_4"
 
 
+def test_xqa_static_fp8_selection(packages, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    args = ("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
+    required = BackendCapabilities(fp8_kv=True)
+    selected = create_backend(*args, required_capabilities=required, allow_fp8_calibration=True)
+    assert selected.capabilities.fp8_kv_static and not selected.capabilities.fp8_kv
+    with pytest.raises(ValueError, match="fp8_kv"):
+        create_backend(*args, required_capabilities=required)
+
+
 def test_fa4_static_fp8_requires_public_scale_api(packages, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
     packages.remove("TensorwiseScales")

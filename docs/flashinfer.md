@@ -14,7 +14,9 @@ reject paged KV.
   prefill runs per token exactly as with Triton.
 - No prefill/decode disaggregation; PD entrypoints reject the backend
   explicitly.
-- `bfloat16` only. `float16` is rejected at startup: the kernels compute
+- On SM120, `--kv-cache-dtype fp8_e4m3` selects E4M3 KV with a fixed
+  scale calibrated at startup. Query and output remain BF16.
+- Model dtype is `bfloat16` only. `float16` is rejected at startup: the kernels compute
   correctly, but flashinfer-python 0.7.0.post1 crashes the process (host
   SIGFPE) while building the f16 JIT module on first in-process use.
 - `--block-size` must be one of `16, 32, 64, 128` (compiled XQA page-size

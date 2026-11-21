@@ -72,14 +72,14 @@ def test_kernel_call_explicitly_selects_xqa(monkeypatch):
 
     output, workspace, uint32 = object(), object(), object()
     empty_like = Mock(return_value=output)
-    fake_torch = SimpleNamespace(empty_like=empty_like, uint32=uint32)
+    fake_torch = SimpleNamespace(empty_like=empty_like, uint32=uint32, float8_e4m3fn=object())
     monkeypatch.setitem(FlashInferPagedAttention.__call__.__globals__, "torch", fake_torch)
     attention = FlashInferPagedAttention.__new__(FlashInferPagedAttention)
     attention.workspace = workspace
     attention.kernel = Mock()
     q = SimpleNamespace(shape=(2, 4, 64))
-    keys = SimpleNamespace(shape=(8, 16, 2, 64))
-    values = SimpleNamespace(shape=(8, 16, 2, 64))
+    keys = SimpleNamespace(shape=(8, 16, 2, 64), dtype=torch.bfloat16)
+    values = SimpleNamespace(shape=keys.shape, dtype=keys.dtype)
     tables = Mock(shape=(2, 3))
     lengths = Mock()
 
@@ -93,6 +93,7 @@ def test_kernel_call_explicitly_selects_xqa(monkeypatch):
             seq_lens=lengths.to.return_value,
             max_seq_len=48,
             bmm1_scale=0.125,
+            bmm2_scale=1.0,
             out=output,
             q_len_per_req=1,
             kv_layout="NHD",
@@ -106,6 +107,28 @@ def test_kernel_call_explicitly_selects_xqa(monkeypatch):
     attention.kernel.reset_mock()
     assert attention(SimpleNamespace(shape=(0, 4, 64)), keys, values, tables, lengths) is output
     attention.kernel.assert_not_called()
+
+
+def test_xqa_fixed_fp8_call_on_cpu():
+    from unittest.mock import Mock
+
+    attention = FlashInferPagedAttention.__new__(FlashInferPagedAttention)
+    attention.supports_fp8_static = True
+    attention.kernel = Mock()
+    attention.workspace = object()
+    q = torch.empty(1, 2, 64, dtype=torch.bfloat16)
+    k = torch.empty((1, 16, 2, 64), dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    table = torch.zeros((1, 1), dtype=torch.int32)
+    lengths = torch.ones(1, dtype=torch.int32)
+    scale = torch.tensor(0.25)
+    attention(q, k, v, table, lengths, key_scale=scale, value_scale=scale)
+    kwargs = attention.kernel.call_args.kwargs
+    torch.testing.assert_close(kwargs["bmm1_scale"], scale / 8)
+    assert kwargs["bmm2_scale"] is scale
+    assert kwargs["backend"] == "xqa"
+    with pytest.raises(ValueError, match="scalar FP32"):
+        attention(q, k, v, table, lengths, key_scale=scale.expand(2), value_scale=scale)
 
 
 @pytest.mark.gpu
@@ -123,7 +146,10 @@ def test_backend_contract_anchors():
     assert not hasattr(attention, "prefill")
     wrapper = create_backend("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
     assert wrapper.info["selected_backend"] == "flashinfer"
-    assert wrapper.capabilities == BackendCapabilities(cuda_graphs=True, async_scheduling=True)
+    assert wrapper.capabilities == BackendCapabilities(
+        cuda_graphs=True, async_scheduling=True,
+        fp8_kv_static=torch.cuda.get_device_capability() == (12, 0),
+    )
 
 
 @pytest.mark.gpu
