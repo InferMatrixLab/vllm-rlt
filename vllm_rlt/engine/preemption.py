@@ -75,8 +75,7 @@ class PreemptionManager:
         cache = self.engine.cache_manager
         kv = state["kv"]
         if kv is not None:
-            frontier = min(kv.max_tokens, kv.pages * cache.block_size)
-            if not cache.allocate(request.request_id, kv.max_tokens, initial_tokens=frontier):
+            if not cache.allocate_snapshot(request.request_id, kv):
                 return False
             cache.restore(request.request_id, kv)
         request.hidden_state = None if state["hidden"] is None else state["hidden"].to(cache.device)
