@@ -225,8 +225,10 @@ def _two_layer_mixed(seed):
         q.device, rows, heads, tables.shape[1] * block_size, dim
     )
 
-    def run(out):
+    def run(out, between=None):
         for layer in range(2):
+            if layer == 1 and between is not None:
+                between()
             out[layer].copy_(
                 sparse_decode.fused_paged_attention(
                     q * (layer + 2),
@@ -401,3 +403,37 @@ def test_pipeline_rejects_sparse_paths_without_device_plans(sparse):
             speculative_config=SpeculativeConfig(3, mode="pipeline"),
             sparse_decode_attention_config=sparse,
         )
+
+
+@pytest.mark.gpu
+def test_deferred_selection_survives_main_stream_allocations(monkeypatch):
+    """Main-stream allocations and writes before the join leave the deferred chain intact.
+
+    Layer 0's chain reads only persistent scratch, store and caller tensors; a
+    burst of freshly allocated, NaN-filled tensors (and a long GEMM) on the main
+    stream between the two layers must not change a bit against the inline run.
+    """
+    from vllm_rlt.kernels import sparse_decode
+
+    def garbage():
+        held = []
+        for size in (1 << 12, 1 << 16, 1 << 20, 1 << 22):
+            for _ in range(4):
+                held.append(torch.full((size,), float("nan"), device="cuda"))
+        a = torch.randn(2048, 2048, device="cuda")
+        for _ in range(8):
+            a = a @ a
+        del held, a
+
+    results = []
+    for defer in (False, True):
+        monkeypatch.setattr(sparse_decode, "_DEFER_SELECT", defer)
+        store, run, out = _two_layer_mixed(11)
+        run(out, between=garbage)
+        assert not sparse_decode._PENDING
+        torch.cuda.synchronize()
+        results.append((out.clone(), {n: getattr(store, n).clone() for n in _STORE_FIELDS}))
+    (out_a, store_a), (out_b, store_b) = results
+    assert torch.equal(out_a, out_b)
+    for name in _STORE_FIELDS:
+        assert torch.equal(store_a[name], store_b[name]), name
