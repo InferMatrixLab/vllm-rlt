@@ -154,6 +154,14 @@ and select `--speculative-mode block` or `--speculative-mode pipeline`.
 Use synchronous scheduling and fixed four-loop greedy requests. The engine
 verifies candidate tokens at the target depth.
 
+For chunked-prefill parity checks, compare against HF SDPA using the same token
+IDs, chunk boundaries, and batch shapes. On Ascend 910B3, changing the number of
+rows in a BF16 `Linear` can change the projection even when the input rows and
+weights are identical. Compare full prefill with chunked prefill separately to
+measure sensitivity to chunk shape. The real-checkpoint regression checks exact
+logits and greedy tokens with packed and per-query metadata under identical
+127- and 128-token chunk boundaries.
+
 <a id="8-profile-guided-high-batch-scheduling"></a>
 ## Performance and correctness
 
