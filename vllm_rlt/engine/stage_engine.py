@@ -372,6 +372,7 @@ class StageEngine:
                 )
                 torch.cuda.reset_peak_memory_stats(runner.device)
 
+            torch.cuda.reset_peak_memory_stats(runner.device)
             phase("initialized")
             try:
                 report.update(

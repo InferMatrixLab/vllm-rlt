@@ -743,6 +743,32 @@ def test_cuda_startup_replay_and_generation_match_unprepared(
 
 
 @pytest.mark.gpu
+def test_cuda_startup_excludes_peaks_from_before_preparation():
+    engine = StageEngine(
+        OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16),
+        attention_backend="triton",
+        cache_config=CacheConfig(64, 16),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2, max_num_batched_tokens=4, prefill_chunk_size=2
+        ),
+        _defer_runtime_preparation=True,
+    )
+    device = engine.model_runner.device
+    try:
+        scratch = torch.empty(32 * 1024**2, device=device, dtype=torch.uint8)
+        del scratch
+        torch.cuda.empty_cache()
+        assert torch.cuda.max_memory_allocated(device) > torch.cuda.memory_allocated(device)
+
+        initialized = engine.prepare_runtime()["phases"][0]
+        assert initialized["name"] == "initialized"
+        assert initialized["peak_allocated_bytes"] == initialized["allocated_bytes"]
+        assert initialized["peak_reserved_bytes"] == initialized["reserved_bytes"]
+    finally:
+        engine.close()
+
+
+@pytest.mark.gpu
 def test_cuda_failed_preparation_clears_partial_graphs_and_can_retry(monkeypatch):
     from vllm_rlt.worker.warmup import graph_owners
 
