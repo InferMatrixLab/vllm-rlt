@@ -186,7 +186,12 @@ def round_up(value: int, multiple: int) -> int:
 
 
 def vmm_unavailable_reason(device: torch.device) -> str | None:
-    """Return why ``StableKVStorage`` cannot operate on ``device``, or None if it can."""
+    """Return why ``StableKVStorage`` cannot operate on ``device``, or None if it can.
+
+    Call it only for a device that PyTorch can already use. For a CUDA device,
+    the check loads ``libcuda.so.1``. If the driver is not installed, the check
+    raises an error and does not return a reason.
+    """
     if device.type != "cuda":
         return f"{device.type} devices have no CUDA virtual memory"
     if torch.version.hip is not None:
@@ -291,6 +296,11 @@ class StableKVStorage:
         initial_blocks: int,
         device: torch.device,
     ) -> None:
+        # PyTorch cannot make a tensor view before the pool has physical memory.
+        if not 0 < initial_blocks <= max_blocks:
+            raise ValueError(
+                f"initial_blocks must be in 1..max_blocks ({max_blocks}), not {initial_blocks}"
+            )
         self.max_blocks = max_blocks
         self._device = device_index(device)
         driver = cuda_driver()
@@ -324,6 +334,8 @@ class StableKVStorage:
         Return the number of blocks that have physical memory. The capacity can
         only increase. ``blocks`` must not be more than ``max_blocks``.
         """
+        if blocks > self.max_blocks:
+            raise ValueError(f"cannot commit {blocks} blocks, max_blocks is {self.max_blocks}")
         driver = cuda_driver()
         with driver.context(self._device):
             for pool in self._pools:
