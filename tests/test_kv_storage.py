@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_rlt.core.kv_storage import PoolSpec, StableKVStorage, vmm_unavailable_reason
+from vllm_rlt.core.kv_storage import (
+    PoolSpec,
+    StableKVStorage,
+    cuda_driver,
+    vmm_unavailable_reason,
+)
 
 # The granule is not a multiple of either block size. The two pools round up differently.
 SPECS = (PoolSpec((3, 16, 4, 64), torch.bfloat16), PoolSpec((3, 16, 4, 64), torch.float32))
@@ -29,8 +34,9 @@ def test_commit_backs_more_blocks_without_moving_or_clearing_them():
     storage = StableKVStorage(SPECS, max_blocks=4096, initial_blocks=1, device=CUDA)
     first = storage.committed_blocks
     assert 1 <= first < 4096
-    with pytest.raises(ValueError, match="max_blocks"):
-        storage.commit(4097)
+    for blocks in (-1, 4097):
+        with pytest.raises(ValueError, match="max_blocks"):
+            storage.commit(blocks)
     layout = [(t.device, t.data_ptr(), t.shape, t.stride()) for t in storage.tensors]
     written = [torch.randn(t[:first].shape, device=CUDA).to(t.dtype) for t in storage.tensors]
     for tensor, values in zip(storage.tensors, written):
@@ -104,3 +110,29 @@ def test_last_reference_releases_memory_the_torch_allocator_never_counted():
     assert [pool() is not None for pool in pools] == [True, False]
     del view
     assert pools[0]() is None
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("call", ["map", "set_access"])
+def test_failed_commit_returns_the_memory_that_it_mapped(monkeypatch, call):
+    storage = StableKVStorage(SPECS, max_blocks=4096, initial_blocks=1, device=CUDA)
+    capacity = storage.committed_blocks, storage.committed_bytes
+    free = torch.cuda.mem_get_info()[0]
+    driver = cuda_driver()
+    original = getattr(driver, call)
+    calls = []
+
+    def fail_in_second_pool(*args):
+        calls.append(args)
+        if len(calls) == 2:
+            raise RuntimeError("injected driver error")
+        return original(*args)
+
+    monkeypatch.setattr(driver, call, fail_in_second_pool)
+    with pytest.raises(RuntimeError, match="injected"):
+        storage.commit(2048)
+    assert (storage.committed_blocks, storage.committed_bytes) == capacity
+    assert torch.cuda.mem_get_info()[0] == free
+
+    monkeypatch.undo()
+    assert storage.commit(2048) >= 2048

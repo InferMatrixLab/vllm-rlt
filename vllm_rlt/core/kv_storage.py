@@ -270,7 +270,20 @@ class _Pool:
             self._driver.release(handle)
             raise
         self._chunks.append((address, size, handle))
-        self._driver.set_access(address, size, self._device)
+        try:
+            self._driver.set_access(address, size, self._device)
+        except RuntimeError:
+            self.unmap_after(self.mapped_bytes)
+            raise
+        self.mapped_bytes = mapped_bytes
+
+    def unmap_after(self, mapped_bytes: int) -> None:
+        # Only for pages that the current commit mapped. No kernel used them,
+        # so the unmap does not wait for the device.
+        while self._chunks and self._chunks[-1][0] >= self.base + mapped_bytes:
+            address, size, handle = self._chunks.pop()
+            self._driver.unmap(address, size)
+            self._driver.release(handle)
         self.mapped_bytes = mapped_bytes
 
 
@@ -332,14 +345,22 @@ class StableKVStorage:
         """Add physical memory to at least the first ``blocks`` blocks of each pool.
 
         Return the number of blocks that have physical memory. The capacity can
-        only increase. ``blocks`` must not be more than ``max_blocks``.
+        only increase. ``blocks`` must be in ``0..max_blocks``. If the commit
+        fails, all pools keep their previous capacity.
         """
-        if blocks > self.max_blocks:
-            raise ValueError(f"cannot commit {blocks} blocks, max_blocks is {self.max_blocks}")
+        if not 0 <= blocks <= self.max_blocks:
+            raise ValueError(f"blocks must be in 0..max_blocks ({self.max_blocks}), not {blocks}")
         driver = cuda_driver()
         with driver.context(self._device):
-            for pool in self._pools:
-                pool.grow(round_up(blocks * pool.block_bytes, self.granularity))
+            mapped = [pool.mapped_bytes for pool in self._pools]
+            try:
+                for pool in self._pools:
+                    pool.grow(round_up(blocks * pool.block_bytes, self.granularity))
+            except RuntimeError:
+                # Without this, the pools that grew keep memory that no block can use.
+                for pool, mapped_bytes in zip(self._pools, mapped):
+                    pool.unmap_after(mapped_bytes)
+                raise
         # The granule round-up can add physical memory for more blocks than the request.
         self.committed_blocks = min(
             self.max_blocks, *(pool.mapped_bytes // pool.block_bytes for pool in self._pools)
