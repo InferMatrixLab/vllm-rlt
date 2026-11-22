@@ -27,6 +27,7 @@ import torch
 
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import (
+    bootstrap_blocks,
     commit_measured_capacity,
     measured_kv_capacity,
     torch_attention_scratch_bytes,
@@ -572,6 +573,7 @@ def model_config(**overrides):
         num_attention_heads=16,
         num_key_value_heads=16,
         head_dim=128,
+        total_ut_steps=4,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -620,3 +622,31 @@ def test_a_grouped_query_configuration_counts_the_expanded_copy():
     # collapsing to the key-value count.
     assert grouped < plain
     assert grouped > 2 * 65536 * 4 * 128 * 6
+
+
+# The trial pool is a computed number, not a guess: without it warmup cannot
+# cover the shapes that decide the capacity.
+
+
+def test_the_bootstrap_covers_the_largest_prefill_step_and_the_decode_tails():
+    config = model_config(max_position_embeddings=65536)
+    cache = SimpleNamespace(block_size=16, layout="last_exited")
+    scheduler = SimpleNamespace(max_num_batched_tokens=1024, max_num_seqs=8)
+    # 1024 tokens over 16-token blocks is 64 blocks, times the four loop copies,
+    # plus one growing tail per concurrent sequence per copy.
+    assert bootstrap_blocks(config, cache, scheduler) == 64 * 4 + 8 * 4
+
+
+def test_the_bootstrap_is_capped_by_the_supported_context():
+    config = model_config(max_position_embeddings=2048)
+    cache = SimpleNamespace(block_size=16, layout="last_exited")
+    scheduler = SimpleNamespace(max_num_batched_tokens=1 << 20, max_num_seqs=1)
+    # No single forward can exceed one sequence at the supported context.
+    assert bootstrap_blocks(config, cache, scheduler) == 128 * 4 + 4
+
+
+def test_a_flat_layout_needs_no_loop_copies():
+    config = model_config()
+    cache = SimpleNamespace(block_size=16, layout="shared")
+    scheduler = SimpleNamespace(max_num_batched_tokens=1024, max_num_seqs=8)
+    assert bootstrap_blocks(config, cache, scheduler) == 64 + 8

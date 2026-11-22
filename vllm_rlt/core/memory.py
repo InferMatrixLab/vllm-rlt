@@ -372,6 +372,28 @@ def torch_attention_scratch_bytes(config, *, pool_element_size):
     return gathered + scores + repeat
 
 
+def bootstrap_blocks(config, cache, scheduler):
+    """Blocks the trial pool must back before startup warmup can measure anything.
+
+    Warmup runs one forward per shape, so the pool has to hold the largest
+    prefill step (``max_num_batched_tokens`` tokens, capped by
+    ``max_num_seqs * max_position_embeddings``) plus one growing tail block per
+    concurrent sequence for the decode cases that follow. The looped layout
+    keeps ``total_ut_steps`` copies of each.
+
+    A pool smaller than this makes warmup skip shapes and report a coverage gap,
+    and a measurement with gaps cannot retire the estimate it was meant to
+    replace: the measured plan keeps the formula reserve and the extra startup
+    work buys nothing. Commit at least this many blocks before
+    ``prepare_runtime``.
+    """
+    tokens = min(
+        scheduler.max_num_batched_tokens, scheduler.max_num_seqs * config.max_position_embeddings
+    )
+    depth = config.total_ut_steps if cache.layout == "last_exited" else 1
+    return math.ceil(tokens / cache.block_size) * depth + scheduler.max_num_seqs * depth
+
+
 @torch.inference_mode()
 def plan_cache(
     model,
@@ -425,13 +447,15 @@ def plan_cache(
         min(config.max_position_embeddings, count - start)
         for start in range(0, count, config.max_position_embeddings)
     ]
+    probe_blocks = sum(math.ceil(length / cache.block_size) for length in lengths) * (
+        config.total_ut_steps if cache.layout == "last_exited" else 1
+    )
     probe = KVCacheManager(
         num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         max_loops=config.total_ut_steps,
-        num_blocks=sum(math.ceil(length / cache.block_size) for length in lengths)
-        * (config.total_ut_steps if cache.layout == "last_exited" else 1),
+        num_blocks=probe_blocks,
         block_size=cache.block_size,
         layout=cache.layout,
         device=device,
@@ -449,11 +473,15 @@ def plan_cache(
         positions.extend(range(length))
     tokens = torch.zeros(count, dtype=torch.long, device=device)
     logits = _probe_forward(model, probe, tokens, ids, positions)
-    torch.cuda.synchronize(device)
-    peak = max(0, torch.cuda.max_memory_allocated(device) - allocated)
+    raw_peak = max(0, torch.cuda.max_memory_allocated(device) - allocated)
+    # The probe's own KV pool is not runtime workspace: charging it here would
+    # take KV bytes out of the KV budget twice (RFC #192, section 5).
+    probe_kv_bytes = probe_blocks * per_block
+    peak = max(0, raw_peak - probe_kv_bytes)
     del logits, probe
-    # Triton's online softmax keeps bounded scratch; the reference torch path
-    # gathers a whole history into float32, so it scales with the context.
+    # Fused attention keeps bounded scratch. The reference torch path gathers a
+    # whole history into float32 per row, so its transient scales with the
+    # context the deployment supports, not with the prefill batch.
     context_scratch = 0
     if backend == "torch":
         pool_element = 1 if cache.kv_cache_dtype == "fp8_e4m3" else parameter.element_size()
@@ -497,10 +525,13 @@ def plan_cache(
         source="cuda_profile",
         bytes_per_block=per_block,
         profile_peak_bytes=peak,
+        raw_profile_peak_bytes=raw_peak,
+        probe_kv_bytes=probe_kv_bytes,
         concurrent_peak_bytes=concurrent_peak,
         max_useful_blocks=useful_blocks,
         cuda_graph_reserve_bytes=graph_reserve,
         static_buffer_bytes=buffers,
         context_scratch_bytes=context_scratch,
+        metadata_bytes=metadata,
         kv_budget_bytes=int(budget),
     )

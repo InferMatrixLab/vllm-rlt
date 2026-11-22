@@ -33,9 +33,12 @@ pytest.importorskip("vllm_rlt.core.kv_storage")
 
 from vllm_rlt.core.kv_storage import PoolSpec, StableKVStorage, cuda_driver  # noqa: E402
 
+from tests.helpers import tiny_ouro_model  # noqa: E402
+from vllm_rlt.config import CacheConfig, ExecutionConfig, SchedulerConfig  # noqa: E402
 from vllm_rlt.core.kv_cache_manager import KVCacheManager, kv_bytes_per_block  # noqa: E402
 from vllm_rlt.core.memory import (  # noqa: E402
     commit_measured_capacity,
+    plan_cache,
     torch_attention_scratch_bytes,
 )
 from vllm_rlt.kernels.paged_attention import torch_paged_attention  # noqa: E402
@@ -418,3 +421,17 @@ def test_the_reference_attention_reserve_bounds_the_kernel_it_sizes():
     # Cover the kernel, but not by a blanket multiple: the previous estimate was
     # 2.7 times this measurement, and that excess came out of the KV budget.
     assert measured <= reserve <= 1.1 * measured
+
+
+def test_the_planner_does_not_charge_the_probe_pool_as_workspace():
+    # RFC #192 section 5: temporary probe KV is not runtime workspace. The probe
+    # allocates a pool just large enough for its forward, so a peak that still
+    # contains those bytes takes KV capacity out of the KV budget twice.
+    model = tiny_ouro_model(device=DEVICE, dtype=torch.bfloat16)
+    cache = CacheConfig(block_size=2)
+    scheduler = SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8, prefill_chunk_size=4)
+    _, record = plan_cache(model, cache, scheduler, ExecutionConfig(), "torch")
+    assert record["probe_kv_bytes"] > 0
+    assert record["profile_peak_bytes"] == max(
+        0, record["raw_profile_peak_bytes"] - record["probe_kv_bytes"]
+    )
