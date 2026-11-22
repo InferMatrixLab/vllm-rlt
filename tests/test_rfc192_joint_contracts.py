@@ -29,6 +29,7 @@ from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import (
     commit_measured_capacity,
     measured_kv_capacity,
+    torch_attention_scratch_bytes,
     transient_allowance,
 )
 
@@ -560,3 +561,62 @@ def test_a_single_block_pool_can_be_planned_published_and_used():
     assert float(cache.key_cache[0].mean()) == 1.0
     with pytest.raises(ValueError, match="reservation"):
         cache.publish_capacity(2)
+
+
+# The reference torch attention reserve, measured rather than assumed.
+
+
+def model_config(**overrides):
+    values = dict(
+        max_position_embeddings=65536,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        head_dim=128,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_the_reference_attention_reserve_is_the_measured_footprint():
+    # Measured on an A100 with torch_paged_attention and a bf16 pool: 65536
+    # tokens peak at 1612.2 MB, which is K and V gathered in the pool dtype and
+    # then in float32 (12 bytes per element) plus two score vectors.
+    reserve = torch_attention_scratch_bytes(model_config(), pool_element_size=2)
+    gathered = 2 * 65536 * 16 * 128 * (2 + 4)
+    scores = 2 * 65536 * 16 * 4
+    assert reserve == gathered + scores
+    measured = 1_612_190_208
+    assert measured <= reserve <= 1.01 * measured
+    # The estimate this replaces reserved 8 * head_dim + 8 floats per token and
+    # head, i.e. 4.03125 GiB for the same shape: 2.5 GiB out of the KV budget.
+    assert reserve < 4.03125 * GIB
+
+
+def test_the_reserve_scales_with_the_context_instead_of_a_fixed_multiple():
+    small = torch_attention_scratch_bytes(
+        model_config(max_position_embeddings=4096), pool_element_size=2
+    )
+    large = torch_attention_scratch_bytes(
+        model_config(max_position_embeddings=8192), pool_element_size=2
+    )
+    assert large == 2 * small
+    assert 100_766_208 <= small <= 1.05 * 100_766_208
+
+
+def test_an_fp8_pool_gathers_half_the_bytes_of_a_bf16_pool():
+    bf16 = torch_attention_scratch_bytes(model_config(), pool_element_size=2)
+    fp8 = torch_attention_scratch_bytes(model_config(), pool_element_size=1)
+    gathered = 2 * 65536 * 16 * 128
+    assert bf16 - fp8 == gathered
+
+
+def test_a_grouped_query_configuration_counts_the_expanded_copy():
+    plain = torch_attention_scratch_bytes(model_config(), pool_element_size=2)
+    grouped = torch_attention_scratch_bytes(
+        model_config(num_key_value_heads=4), pool_element_size=2
+    )
+    # Fewer key-value heads gather less history, but the float32 expansion is
+    # still paid for every attention head, so the reserve drops without
+    # collapsing to the key-value count.
+    assert grouped < plain
+    assert grouped > 2 * 65536 * 4 * 128 * 6

@@ -24,6 +24,7 @@ import gc
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,7 +34,11 @@ pytest.importorskip("vllm_rlt.core.kv_storage")
 from vllm_rlt.core.kv_storage import PoolSpec, StableKVStorage, cuda_driver  # noqa: E402
 
 from vllm_rlt.core.kv_cache_manager import KVCacheManager, kv_bytes_per_block  # noqa: E402
-from vllm_rlt.core.memory import commit_measured_capacity  # noqa: E402
+from vllm_rlt.core.memory import (  # noqa: E402
+    commit_measured_capacity,
+    torch_attention_scratch_bytes,
+)
+from vllm_rlt.kernels.paged_attention import torch_paged_attention  # noqa: E402
 
 MIB = 1 << 20
 LAYERS, HEADS, DIM, BLOCK = 2, 8, 128, 16
@@ -383,3 +388,33 @@ def test_the_plan_refuses_a_report_that_does_not_describe_this_pool():
             safety_bytes=MIB,
         )
     assert pool.committed_blocks > 1
+
+
+# The estimate that stays in force for uncovered paths has to be honest about
+# what the kernel it stands for actually allocates.
+
+
+def test_the_reference_attention_reserve_bounds_the_kernel_it_sizes():
+    length = 4096
+    blocks = length // BLOCK
+    key = torch.zeros((blocks, BLOCK, HEADS, DIM), dtype=torch.bfloat16, device=DEVICE)
+    value = torch.zeros_like(key)
+    query = torch.randn(1, HEADS, DIM, dtype=torch.bfloat16, device=DEVICE)
+    table = torch.arange(blocks, device=DEVICE).unsqueeze(0)
+    lengths = torch.tensor([length], device=DEVICE)
+    torch.cuda.synchronize(DEVICE)
+    torch.cuda.reset_peak_memory_stats(DEVICE)
+    baseline = torch.cuda.memory_allocated(DEVICE)
+    torch_paged_attention(query, key, value, table, lengths)
+    torch.cuda.synchronize(DEVICE)
+    measured = torch.cuda.max_memory_allocated(DEVICE) - baseline
+    config = SimpleNamespace(
+        max_position_embeddings=length,
+        num_attention_heads=HEADS,
+        num_key_value_heads=HEADS,
+        head_dim=DIM,
+    )
+    reserve = torch_attention_scratch_bytes(config, pool_element_size=2)
+    # Cover the kernel, but not by a blanket multiple: the previous estimate was
+    # 2.7 times this measurement, and that excess came out of the KV budget.
+    assert measured <= reserve <= 1.1 * measured

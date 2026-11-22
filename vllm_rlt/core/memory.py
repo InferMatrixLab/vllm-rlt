@@ -341,6 +341,37 @@ def calibrate_fp8_scale(model, cache, attention) -> float:
     return 2.0 ** math.ceil(math.log2(scale))
 
 
+def torch_attention_scratch_bytes(config, *, pool_element_size):
+    """Transient the reference torch attention needs for one long-context row.
+
+    ``torch_paged_attention`` resolves one row at a time: it gathers that row's
+    whole history for K and for V in the pool dtype, copies each of them into
+    float32, and keeps two score vectors of ``[heads, length]`` floats. Nothing
+    else scales with the context, and the tensors are released before the next
+    row, so the peak is linear in the length and does not depend on the layer
+    count.
+
+    Measured with ``torch_paged_attention`` on an A100 (16 heads, head_dim 128,
+    bf16 pool, one row): 100.8 MB at 4096 tokens, 403.1 MB at 16384 and
+    1612.2 MB at 65536 — 12 bytes per element of the gathered history, which is
+    exactly ``2 * (pool_element_size + 4)``, plus the two score vectors. The
+    estimate this replaces used ``8 * head_dim + 8`` floats per token and head,
+    which is 2.7 times the measurement, and that excess came straight out of the
+    KV budget: 2.5 GiB, or about 860 blocks, on a 65536-token checkpoint.
+
+    The repeated head axis is not measured, because no grouped-query checkpoint
+    was available; it adds a float32 copy of the expanded history and is counted
+    whenever key-value heads are fewer than attention heads.
+    """
+    length = config.max_position_embeddings
+    gathered = 2 * length * config.num_key_value_heads * config.head_dim * (pool_element_size + 4)
+    scores = 2 * length * config.num_attention_heads * 4
+    repeat = 0
+    if config.num_attention_heads > config.num_key_value_heads:
+        repeat = 2 * length * config.num_attention_heads * config.head_dim * 4
+    return gathered + scores + repeat
+
+
 @torch.inference_mode()
 def plan_cache(
     model,
@@ -421,16 +452,12 @@ def plan_cache(
     torch.cuda.synchronize(device)
     peak = max(0, torch.cuda.max_memory_allocated(device) - allocated)
     del logits, probe
-    # Profiling includes a conservative temporary KV allocation. Also budget for
-    # long-context reference attention (Triton's online softmax has bounded scratch).
+    # Triton's online softmax keeps bounded scratch; the reference torch path
+    # gathers a whole history into float32, so it scales with the context.
     context_scratch = 0
     if backend == "torch":
-        context_scratch = (
-            config.max_position_embeddings
-            * config.num_attention_heads
-            * (8 * config.head_dim + 8)
-            * 4
-        )
+        pool_element = 1 if cache.kv_cache_dtype == "fp8_e4m3" else parameter.element_size()
+        context_scratch = torch_attention_scratch_bytes(config, pool_element_size=pool_element)
     buffers = execution_buffer_bytes(
         config,
         scheduler,
