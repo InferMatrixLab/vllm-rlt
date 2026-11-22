@@ -120,7 +120,7 @@ def backend_capabilities(implementation) -> BackendCapabilities:
 
 
 def _auto_flashinfer_supported(device) -> bool:
-    """Gate automatic FlashInfer selection to the validated SM120 target.
+    """Limit automatic FlashInfer selection to the tested SM120 target.
 
     Other architectures the kernel accepts remain reachable through explicit
     `--attention-backend flashinfer` opt-in; auto keeps its pre-FlashInfer
@@ -230,16 +230,16 @@ def create_backend(
             and candidate == "flashinfer"
             and not _auto_flashinfer_supported(device)
         ):
-            skipped.append("flashinfer: automatic selection is validated on SM120 only")
+            skipped.append("flashinfer: automatic selection is limited to SM120")
             continue
         try:
-            if (
-                candidate == "flashinfer"
-                and head_dim > 256
-                and head_group_ratio is not None
-                and head_group_ratio > 16
-            ):
-                raise ValueError("XQA with head_dim > 256 requires head_group_ratio <= 16")
+            if candidate == "flashinfer" and head_dim > 256:
+                if backend == "auto" and head_group_ratio is None:
+                    raise ValueError(
+                        "XQA auto selection needs a known head_group_ratio for head_dim > 256"
+                    )
+                if head_group_ratio is not None and head_group_ratio > 16:
+                    raise ValueError("XQA with head_dim > 256 requires head_group_ratio <= 16")
             implementation = _create_explicit(
                 candidate,
                 device,

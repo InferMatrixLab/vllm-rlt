@@ -245,7 +245,11 @@ depths, and the finish reason.
 Use `--attention-backend auto` with the inference CLI or the local HTTP server
 to select a compatible implementation at startup. Auto tries FA4, FA3, FA2,
 FlashInfer (SM120 only), Triton, then Torch, checking hardware, dtype, head dimension, block size, installed
-packages, and execution requirements. CPU uses Torch. For example, on an RTX
+packages, and execution requirements. On SM120 the FlashInfer JIT must include
+the device target. When `head_dim > 256`, automatic XQA selection also requires a
+known ratio of at most 16 query heads per KV head. The
+[Ouro-1.4B RTX 5090 recipe](recipes/ouro_xqa_sm120.md) includes a
+four-loop launch and the matched benchmark configuration. CPU uses Torch. For example, on an RTX
 4090, the default 16-token block size rules out FA2's 256-token page requirement;
 auto selects Triton if it is installed.
 

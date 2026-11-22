@@ -215,7 +215,8 @@ python -m benchmarks.gsm8k compare --reference "$RESULTS/triton" \
 On RTX 5090 the matched BF16 runs scored **Triton 62/87 and FlashInfer 58/87**.
 The stored HF reference scored 59/87. The XQA run completed and failed the
 one-percentage-point gate. Both `run` and `compare` write their results before
-returning a failing gate status. See the [per-question results](flashinfer.md#accuracy-note-gsm8k-87-single-greedy-pass).
+returning a failing gate status. See the [per-question results](flashinfer.md#accuracy-note-gsm8k-87-single-greedy-pass)
+and the [RTX 5090 recipe with matched throughput](recipes/ouro_xqa_sm120.md).
 
 Dataset: [GSM8K](https://huggingface.co/datasets/openai/gsm8k).
 The [Ouro evaluation settings](https://arxiv.org/html/2510.25741v5#A3.T16) do not

@@ -6,6 +6,7 @@ import torch
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.attention import BackendCapabilities, create_backend
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.kernels.flashinfer_attention import FlashInferPagedAttention
 from vllm_rlt.kernels.paged_attention import torch_paged_attention
@@ -77,7 +78,7 @@ def test_kernel_call_explicitly_selects_xqa(monkeypatch):
     attention = FlashInferPagedAttention.__new__(FlashInferPagedAttention)
     attention.workspace = workspace
     attention.kernel = Mock()
-    q = SimpleNamespace(shape=(2, 4, 64))
+    q = torch.empty(2, 4, 64)
     keys = SimpleNamespace(shape=(8, 16, 2, 64), dtype=torch.bfloat16)
     values = SimpleNamespace(shape=keys.shape, dtype=keys.dtype)
     tables = Mock(shape=(2, 3))
@@ -132,7 +133,7 @@ def test_xqa_fixed_fp8_call_on_cpu():
 
 
 @pytest.mark.gpu
-def test_backend_contract_anchors():
+def test_backend_contract_anchors(flashinfer_gpu):
     attention = FlashInferPagedAttention(torch.device("cuda"), torch.bfloat16, 128, 16)
     assert attention.info["backend"] == "flashinfer"
     assert attention.info["package"] == "flashinfer-python"
@@ -150,7 +151,7 @@ def test_backend_contract_anchors():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("heads", [2, 4])
-def test_ragged_strided_paged_attention_with_zero_length_row(heads):
+def test_ragged_strided_paged_attention_with_zero_length_row(heads, flashinfer_gpu):
     torch.manual_seed(9)
     # Layer slicing leaves a non-contiguous block stride, as in the real cache.
     keys = torch.randn(12, 3, 16, 2, 128, device="cuda", dtype=torch.bfloat16)[:, 1]
@@ -171,7 +172,35 @@ def test_ragged_strided_paged_attention_with_zero_length_row(heads):
 
 
 @pytest.mark.gpu
-def test_padding_states_are_invisible():
+def test_cache_attend_accepts_strided_query_rows(flashinfer_gpu):
+    cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=16,
+        head_dim=128,
+        num_blocks=2,
+        block_size=16,
+        max_loops=1,
+        device="cuda",
+        dtype=torch.bfloat16,
+        backend="flashinfer",
+    )
+    for request in ("a", "b"):
+        assert cache.allocate(request, 2)
+    backing = torch.ones(4, 16, 128, dtype=torch.bfloat16, device="cuda")
+    backing[1::2].fill_(-1)
+    values = torch.zeros_like(backing)
+    values[1::2].fill_(1)
+    cache.write(0, ["a", "a", "b", "b"], [0] * 4, [0, 1, 0, 1], -backing, values)
+    q = backing[::2]
+    assert not q.is_contiguous()
+    dense = cache.attend(0, ["a", "b"], [0, 0], [1, 1], q.contiguous())
+    from_view = cache.attend(0, ["a", "b"], [0, 0], [1, 1], q)
+    assert torch.equal(dense, torch.ones_like(dense))
+    assert torch.equal(from_view, dense)
+
+
+@pytest.mark.gpu
+def test_padding_states_are_invisible(flashinfer_gpu):
     torch.manual_seed(11)
     keys = torch.randn(24, 3, 16, 2, 64, device="cuda", dtype=torch.bfloat16)[:, 1]
     values = torch.randn(24, 3, 16, 2, 64, device="cuda", dtype=torch.bfloat16)[:, 1]
@@ -189,24 +218,40 @@ def test_padding_states_are_invisible():
 
 
 @pytest.mark.gpu
-def test_flashinfer_decode_same_queries_match_across_batch_sizes():
+@pytest.mark.parametrize("kv_heads", [4, 16], ids=["gqa", "ouro-1.4b"])
+def test_flashinfer_decode_same_queries_across_batch_sizes(kv_heads, flashinfer_gpu):
     generator = torch.Generator(device="cuda").manual_seed(1234)
     dtype = torch.bfloat16
-    # Ouro geometry and long enough prefixes to exercise any KV split selection.
-    keys = torch.randn(260, 2, 16, 4, 128, generator=generator, device="cuda", dtype=dtype)[:, 1]
-    values = torch.randn(260, 2, 16, 4, 128, generator=generator, device="cuda", dtype=dtype)[:, 1]
+    # Keep the cache's layer stride. Ouro-1.4B uses 16 Q heads and 16 KV heads.
+    keys = torch.randn(260, 2, 16, kv_heads, 128, generator=generator, device="cuda", dtype=dtype)[
+        :, 1
+    ]
+    values = torch.randn(
+        260, 2, 16, kv_heads, 128, generator=generator, device="cuda", dtype=dtype
+    )[:, 1]
     q = torch.randn(4, 16, 128, generator=generator, device="cuda", dtype=dtype)
     tables = torch.arange(260, device="cuda", dtype=torch.int32).view(4, 65)
     lengths = torch.tensor([1025, 1029, 1025, 1031], device="cuda", dtype=torch.int32)
     attention = FlashInferPagedAttention(q.device, dtype, 128, 16)
     together = attention(q, keys, values, tables, lengths)
+    reference = torch_paged_attention(q.float(), keys, values, tables, lengths)
+    # Same BF16 operator tolerances as the ragged paged-reference test above.
+    torch.testing.assert_close(together.float(), reference, atol=0.015, rtol=0.02)
+    assert torch.equal(attention(q, keys, values, tables, lengths), together)
+    perm = [3, 0, 2, 1]
+    assert torch.equal(
+        attention(q[perm], keys, values, tables[perm], lengths[perm]), together[perm]
+    )
     for rows in ([2, 3], [3, 0], [1]):
         separate = attention(q[rows], keys, values, tables[rows], lengths[rows])
-        torch.testing.assert_close(separate, together[rows], rtol=0, atol=0)
+        torch.testing.assert_close(separate.float(), reference[rows], atol=0.015, rtol=0.02)
+        if kv_heads == 4:
+            # The original GQA regression is bitwise stable for these inputs.
+            assert torch.equal(separate, together[rows])
 
 
 @pytest.mark.gpu
-def test_graph_replay_updates_buffers():
+def test_graph_replay_updates_buffers(flashinfer_gpu):
     torch.manual_seed(5)
     keys = torch.randn(24, 3, 16, 2, 64, device="cuda", dtype=torch.bfloat16)[:, 1]
     values = torch.randn(24, 3, 16, 2, 64, device="cuda", dtype=torch.bfloat16)[:, 1]
@@ -237,7 +282,7 @@ def test_graph_replay_updates_buffers():
 @pytest.mark.gpu
 @pytest.mark.parametrize("layout", ["last_exited", "shared"])
 @pytest.mark.parametrize("static", [False, True])
-def test_flashinfer_sync_async_mixed_depths(layout, static):
+def test_flashinfer_sync_async_mixed_depths(layout, static, flashinfer_gpu):
     torch.manual_seed(123)
     config = tiny_ouro_config(head_dim=64)
     model = OuroForCausalLM(config).to(device="cuda", dtype=torch.bfloat16)

@@ -2,9 +2,9 @@
 
 The `flashinfer` backend runs paged decode attention through FlashInfer's XQA
 kernels (`flashinfer-python >= 0.7.0`, `trtllm_batch_decode_with_kv_cache`,
-`backend="xqa"`). It is the validated attention path for NVIDIA consumer
-Blackwell (SM120, e.g. RTX 5090), where the pinned FlashAttention releases
-reject paged KV.
+`backend="xqa"`). The RTX 5090 (SM120) runs this path with paged KV.
+The [GSM8K-87 results](#accuracy-note-gsm8k-87-single-greedy-pass) give its
+current model accuracy.
 
 ## Scope
 
@@ -23,6 +23,7 @@ reject paged KV.
 - `--block-size` must be one of `16, 32, 64, 128` (compiled XQA page-size
   variants) and `head_dim` must be divisible by 16 within `[16, 512]`.
   For `head_dim > 256`, XQA requires at most 16 query heads per KV head.
+  Automatic selection skips XQA if the caller does not know that ratio.
 
 ## Installation and runtime requirements
 
@@ -30,21 +31,20 @@ reject paged KV.
 pip install -e ".[flashinfer]"
 ```
 
-The XQA kernels are compiled just in time on first use, which imposes two
-environment requirements beyond the package install:
+Set `CUDA_HOME` to the toolkit that supplies `bin/nvcc` for the first JIT
+build. The dynamic loader must be able to find that toolkit's CUDA runtime.
+For a non-system toolkit, add its library directory to `LD_LIBRARY_PATH`.
 
-1. **A CUDA toolkit with `nvcc >= 12.9` reachable via `CUDA_HOME`.** SM120
-   kernels are built for the `compute_120f` architecture family, which needs
-   CUDA 12.9 or newer. Without `nvcc`, startup falls back to comparing against
-   the CUDA version PyTorch was built with, and SM 12.x devices are rejected
-   with `SM 12.x requires CUDA >= 12.9`.
-2. **That toolkit's `lib` directory on `LD_LIBRARY_PATH`.** The compiled
-   modules link `libcudart.so.13`; pip-installed toolkits keep it outside the
-   default loader path. With the pip toolkit layout
-   (`nvidia-cuda-nvcc`/`nvidia-cuda-runtime`/`nvidia-cuda-cccl`/...), the
-   unified tree lives under `site-packages/nvidia/cu13` and may need
-   `lib64/libcudart.so` and `lib64/stubs/libcuda.so` developer symlinks, which
-   the wheels do not ship.
+| FlashInfer on SM120 | CUDA toolkit used by the XQA JIT |
+| --- | --- |
+| `0.7.0.post1` | Selects `compute_120f`, which requires CUDA 12.9 or newer. |
+| `0.7.5.post1` | Builds `sm_120a` with CUDA 12.8 and selects `compute_120f` with CUDA 12.9 or newer. The CUDA 12.8 build links `libcudart.so.12`. |
+
+At startup the adapter checks whether the installed FlashInfer compilation
+context includes SM120 and whether the toolkit supports the selected target.
+This also applies to explicit `FLASHINFER_CUDA_ARCH_LIST` overrides.
+An incompatible target is reported immediately for
+explicit selection. With `auto`, selection continues to the next backend.
 
 The first call on a machine compiles for a few seconds and caches under
 `~/.cache/flashinfer/<package-version>/<arch>/`; later calls, including CUDA
@@ -52,15 +52,15 @@ Graph capture warmups, reuse the cache.
 
 ## Running
 
-```bash
-vllm-rlt --model "$MODEL" --revision "$REVISION" --prompt "What is 2 + 2?" \
-    --device cuda --dtype bfloat16 --attention-backend flashinfer
-```
+The [Ouro-1.4B RTX 5090 recipe](recipes/ouro_xqa_sm120.md) covers the pinned
+checkpoint, BF16 and calibrated E4M3 launch options, and the measured BF16
+accuracy and throughput.
 
 The adapter holds one 128 MiB zero-initialized workspace for the kernel's
 scratch and softmax statistics. The first nonempty call allocates it and later
-calls reuse it. Each call still prepares an output tensor, page table and
-sequence lengths. Padded block-table columns are
+calls reuse it. The adapter makes a dense copy only when Q has non-contiguous
+strides. Each call prepares an output tensor, page table and sequence lengths.
+Padded block-table columns are
 clamped non-negative before the call: the engine produces `-1` padding on the
 synchronous path, `0` on the asynchronous path, and stale-but-valid ids in
 CUDA Graph replay beyond the current width. The kernel bounds reads by
@@ -83,8 +83,12 @@ The RTX 5090 GSM8K run below used the Ouro-1.4B checkpoint. The GPU regression
 tests use a tiny Ouro model for cross-backend comparisons of tokens and
 prescribed exit depths in synchronous, asynchronous and multi-stream runs.
 The graph tests compare eager execution and replay within each backend.
-Attention operator tests compare numerical outputs against a paged reference
-with tolerances.
+Operator tests compare XQA with FP32 paged attention and check identical
+results under a permutation of rows. Ouro-1.4B has 16 Q heads, 16 KV heads
+and head dimension 128. With page size 16 and 1,025–1,031 visible tokens,
+reducing a four-row batch to two rows changed the XQA BF16 output by up to
+`0.001953125` on the RTX 5090. XQA's KV split count depends on batch size.
+The tests also cover a separate 16-Q/4-KV grouped-query configuration.
 
 ## Accuracy note (GSM8K-87, single greedy pass)
 
@@ -92,7 +96,11 @@ At commit `cd368ce` on RTX 5090, both native backends used Ouro-1.4B,
 BF16 weights and KV, page size 16, four fixed loops, greedy decoding, per-row
 prefill and the frozen strict scorer. FlashInfer `0.7.5.post1` scored **58/87**
 and Triton **62/87**. The generated token sequences matched on **61/87**.
-All generated tokens exited at depth four.
+All generated tokens exited at depth four. On 2026-11-22 the same frozen run
+with dense query normalization and the SM120 JIT selection fix reproduced
+all 87 token sequences for each respective backend. The stored HF reference
+scored 59/87. One question out of 87 exceeds the allowed one-percentage-point
+regression, so XQA still fails the accuracy gate.
 
 | Question | XQA final answer | Triton final answer | Strict scoring |
 | --- | --- | --- | --- |
@@ -104,6 +112,9 @@ All generated tokens exited at depth four.
 At the first differing attention row on question 203, rounding the unnormalized
 softmax weights to BF16 in both numerator and denominator reproduced all 2,048
 XQA output components. The Triton row matched the FP64 reference rounded to BF16.
-This experiment identifies the rounding behavior at that row. The three
-currency-format losses were established by replaying the scorer.
+All 1,632 XQA calls through the first divergent token used contiguous Q.
+Forcing a single KV split in a diagnostic reproduced the same two-key row,
+including its 151 differences from the BF16-rounded FP64 reference, and the
+same fifteenth token (`5`). The three currency-format losses were established
+by replaying the strict scorer.
 See the [matched benchmark commands and accuracy gate](accuracy.md#attention-backend-runs).

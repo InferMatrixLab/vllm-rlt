@@ -1,10 +1,8 @@
 """FlashInfer XQA paged decode kernels; no packed prefill in this backend.
 
 Decode uses independent single-query rows, exactly like the Triton path.
-SM120 (RTX 50) is the validated target; other supported majors are accepted
-but unvalidated. Requires a CUDA toolkit with nvcc >= 12.9 visible through
-CUDA_HOME for the just-in-time compiled kernels, and that toolkit's lib
-directory on LD_LIBRARY_PATH.
+SM120 (RTX 50) is the tested target. The installed FlashInfer version and
+CUDA toolkit determine which architectures the XQA JIT can build.
 """
 
 import importlib
@@ -15,6 +13,23 @@ import torch
 
 FLASHINFER_PAGE_SIZES = (16, 32, 64, 128)
 FLASHINFER_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _check_sm120_jit_target(package_version):
+    # Use the same architecture list as XQA's JIT. Older releases can import
+    # normally with an empty list when nvcc cannot target the current GPU.
+    context = importlib.import_module("flashinfer.compilation_context").CompilationContext()
+    targets = context.TARGET_CUDA_ARCHS
+    if not {(12, "0"), (12, "0a"), (12, "0f")}.intersection(targets):
+        raise ValueError(
+            f"FlashInfer {package_version} has no XQA JIT target for SM120 "
+            f"(targets: {sorted(targets)}). Check CUDA_HOME and FLASHINFER_CUDA_ARCH_LIST."
+        )
+    # An explicitly suffixed FLASHINFER_CUDA_ARCH_LIST bypasses FlashInfer's
+    # toolkit check. All requested targets are passed to nvcc.
+    minimum = "12.9" if (12, "0f") in targets else "12.8"
+    if not importlib.import_module("flashinfer.jit.cpp_ext").is_cuda_version_at_least(minimum):
+        raise ValueError(f"Configured FlashInfer XQA target for SM120 requires CUDA >= {minimum}")
 
 
 class FlashInferPagedAttention:
@@ -50,16 +65,21 @@ class FlashInferPagedAttention:
                 importlib.import_module("flashinfer.decode"),
                 "trtllm_batch_decode_with_kv_cache",
             )
+            if (major, minor) == (12, 0):
+                _check_sm120_jit_target(package_version)
         except (ImportError, AttributeError, PackageNotFoundError) as error:
             raise ImportError(
                 "install flashinfer with: pip install 'flashinfer-python>=0.7.0' "
-                "(a CUDA toolkit with nvcc >= 12.9 must be reachable via CUDA_HOME, "
-                "and its lib directory on LD_LIBRARY_PATH for the JIT modules). "
-                "No backend fallback was performed."
+                "and configure a compatible CUDA toolkit for its XQA JIT"
+            ) from error
+        except RuntimeError as error:
+            # FlashInfer can also initialize its compilation context at import.
+            raise ValueError(
+                f"FlashInfer XQA initialization on SM{major}{minor} failed: {error}"
             ) from error
         if (major, minor) != (12, 0):
             logging.getLogger(__name__).warning(
-                "flashinfer attention is validated on SM120 only; SM%d%d is unvalidated",
+                "flashinfer attention was tested on SM120; SM%d%d is unvalidated",
                 major,
                 minor,
             )
@@ -115,6 +135,8 @@ class FlashInferPagedAttention:
             self.workspace = torch.zeros(
                 FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device=q.device
             )
+        # XQA takes a raw query pointer and assumes dense [row, head, dim] strides.
+        q = q.contiguous()
         out = torch.empty_like(q)
         self.kernel(
             q,

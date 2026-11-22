@@ -46,6 +46,12 @@ def packages(monkeypatch):
             if "flashinfer" not in installed:
                 raise ImportError("flashinfer is not installed")
             return SimpleNamespace(trtllm_batch_decode_with_kv_cache=lambda *args, **kwargs: None)
+        if name == "flashinfer.compilation_context":
+            return SimpleNamespace(
+                CompilationContext=lambda: SimpleNamespace(TARGET_CUDA_ARCHS={(12, "0f")})
+            )
+        if name == "flashinfer.jit.cpp_ext":
+            return SimpleNamespace(is_cuda_version_at_least=lambda version: True)
         return original_import(name)
 
     monkeypatch.setattr(flash_attention.importlib, "import_module", import_module)
@@ -219,10 +225,69 @@ def test_auto_selection_constraints(
 def test_flashinfer_wide_head_group_limit(packages, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
     args = (torch.device("cuda"), torch.bfloat16, 512, 16)
+    assert create_backend("auto", *args).info["selected_backend"] == "torch"
+    assert create_backend("flashinfer", *args).info["selected_backend"] == "flashinfer"
+    assert (
+        create_backend("auto", *args, head_group_ratio=16).info["selected_backend"] == "flashinfer"
+    )
+    assert (
+        create_backend("auto", args[0], args[1], 256, 16).info["selected_backend"] == "flashinfer"
+    )
     assert create_backend("flashinfer", *args, head_group_ratio=16).info["kernel"] == "xqa"
     with pytest.raises(ValueError, match="head_group_ratio <= 16"):
         create_backend("flashinfer", *args, head_group_ratio=32)
     assert create_backend("auto", *args, head_group_ratio=32).info["selected_backend"] == "torch"
+
+
+@pytest.mark.parametrize("targets", [set(), {(9, "0a"), (12, "1a")}, {(12, "0a")}])
+def test_flashinfer_selection_requires_a_jit_target_for_the_device(packages, monkeypatch, targets):
+    from vllm_rlt.kernels import flashinfer_attention
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    original_import = flashinfer_attention.importlib.import_module
+
+    def import_module(name):
+        if name == "flashinfer.compilation_context":
+            return SimpleNamespace(
+                CompilationContext=lambda: SimpleNamespace(TARGET_CUDA_ARCHS=targets)
+            )
+        return original_import(name)
+
+    monkeypatch.setattr(flashinfer_attention.importlib, "import_module", import_module)
+    args = (torch.device("cuda"), torch.bfloat16, 128, 16)
+    selected = create_backend("auto", *args)
+    if (12, "0a") in targets:
+        assert selected.info["selected_backend"] == "flashinfer"
+    else:
+        assert selected.info["selected_backend"] == "triton"
+        assert "no XQA JIT target for SM120" in selected.info["selection_reason"]
+        with pytest.raises(ValueError, match="no XQA JIT target for SM120"):
+            create_backend("flashinfer", *args)
+
+
+@pytest.mark.parametrize("reject_at_import", [True, False], ids=["import", "forced-120f"])
+def test_flashinfer_jit_toolkit_failure_before_first_launch(
+    packages, monkeypatch, reject_at_import
+):
+    from vllm_rlt.kernels import flashinfer_attention
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    original_import = flashinfer_attention.importlib.import_module
+
+    def import_module(name):
+        if name == "flashinfer.decode" and reject_at_import:
+            raise RuntimeError("SM 12.x requires CUDA >= 12.9")
+        if name == "flashinfer.jit.cpp_ext":
+            return SimpleNamespace(is_cuda_version_at_least=lambda minimum: minimum == "12.8")
+        return original_import(name)
+
+    monkeypatch.setattr(flashinfer_attention.importlib, "import_module", import_module)
+    args = (torch.device("cuda"), torch.bfloat16, 128, 16)
+    selected = create_backend("auto", *args)
+    assert selected.info["selected_backend"] == "triton"
+    assert "CUDA >= 12.9" in selected.info["selection_reason"]
+    with pytest.raises(ValueError, match="CUDA >= 12.9"):
+        create_backend("flashinfer", *args)
 
 
 @pytest.mark.parametrize("sm", [(9, 0), (12, 1)])

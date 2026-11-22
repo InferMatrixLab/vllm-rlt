@@ -1,7 +1,22 @@
 import os
+from importlib.metadata import PackageNotFoundError, version
 
 import pytest
 import torch
+
+
+@pytest.fixture(scope="session")
+def flashinfer_gpu():
+    if (
+        not torch.cuda.is_available()
+        or torch.version.hip
+        or torch.cuda.get_device_capability()[0] not in (9, 10, 12)
+    ):
+        pytest.skip("XQA requires NVIDIA SM9x, SM10x or SM12x")
+    try:
+        version("flashinfer-python")
+    except PackageNotFoundError:
+        pytest.skip("install the flashinfer extra to run XQA GPU tests")
 
 
 def pytest_addoption(parser):

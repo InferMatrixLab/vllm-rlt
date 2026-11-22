@@ -11,6 +11,14 @@ from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 
 
+@pytest.fixture
+def backend(request):
+    name = request.param
+    if name == "flashinfer":
+        request.getfixturevalue("flashinfer_gpu")
+    return name
+
+
 def test_cuda_graph_validation():
     with pytest.raises(ValueError, match="positive"):
         ExecutionConfig(cuda_graph_max_graphs=0)
@@ -23,7 +31,7 @@ def test_cuda_graph_validation():
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("backend", ["triton", "flash_attn", "flashinfer"])
+@pytest.mark.parametrize("backend", ["triton", "flash_attn", "flashinfer"], indirect=True)
 @pytest.mark.parametrize("mode", ["sync", "async", "multi"])
 @pytest.mark.parametrize("layout", ["last_exited", "shared"])
 @pytest.mark.parametrize("static", [False, True])
@@ -73,7 +81,7 @@ def test_graph_replay_matches_eager_and_reuses_requests(backend, mode, layout, s
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+@pytest.mark.parametrize("backend", ["triton", "flashinfer"], indirect=True)
 def test_graph_cache_limit_fallback_and_abort(backend):
     torch.manual_seed(19)
     model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
