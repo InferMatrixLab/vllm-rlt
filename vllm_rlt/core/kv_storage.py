@@ -236,12 +236,12 @@ class _Pool:
         self._driver = driver
         self._device = device
         self._chunks: list[tuple[int, int, int]] = []
-        self.free = weakref.finalize(
+        finalizer = weakref.finalize(
             self, free_pool, driver, device, self.base, reserved_bytes, self._chunks
         )
         # At process exit, the driver removes all mappings. A driver call during
         # interpreter shutdown can cause an error, because CUDA can stop first.
-        self.free.atexit = False
+        finalizer.atexit = False
 
     @property
     def __cuda_array_interface__(self) -> dict[str, object]:
@@ -276,10 +276,11 @@ class StableKVStorage:
     does not change an address, a stride or a stored value. Because of this, a
     graph that you captured before a commit also operates correctly on new blocks.
 
-    The PyTorch allocator does not count this physical memory. ``close`` releases
-    it. The memory is also released when no reference to the storage or to its
-    tensor views remains. Both release paths wait for the device. After the
-    release, do not replay a graph that uses these tensors.
+    The PyTorch allocator does not count this physical memory. As with
+    ``torch.empty``, the memory is released when no reference to the storage or
+    to its tensor views remains. There is no explicit release, because it would
+    leave the remaining views on unmapped memory. The release waits for the
+    device. After the release, do not replay a graph that uses these tensors.
     """
 
     def __init__(
@@ -332,8 +333,3 @@ class StableKVStorage:
             self.max_blocks, *(pool.mapped_bytes // pool.block_bytes for pool in self._pools)
         )
         return self.committed_blocks
-
-    def close(self) -> None:
-        """Release the physical memory immediately, also when tensor views remain."""
-        for pool in self._pools:
-            pool.free()
