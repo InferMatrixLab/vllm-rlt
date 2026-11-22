@@ -27,6 +27,7 @@ from vllm_rlt.layers import (
     apply_rotary_pos_emb,
     rotate_half,
 )
+from vllm_rlt.layers.fused_projections import FusedWeight
 
 if TYPE_CHECKING:
     from vllm_rlt.core.kv_cache_manager import KVCacheManager
@@ -168,6 +169,9 @@ class OuroAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * config.head_dim, config.hidden_size, bias=False
         )
+        # q/k/v read the same hidden row, so one fused GEMV streams 25.2 MB instead of
+        # three 8.4 MB matrices, which is where the bandwidth is (see fused_projections).
+        self.qkv_proj = FusedWeight(self, ("q_proj", "k_proj", "v_proj"))
 
     def forward(
         self,
@@ -177,9 +181,14 @@ class OuroAttention(nn.Module):
         cache: "KVCacheManager",
     ) -> torch.Tensor:
         shape = (hidden.shape[0], -1, self.config.head_dim)
-        q = self.q_proj(hidden).view(shape)
-        k = self.k_proj(hidden).view(shape)
-        v = self.v_proj(hidden).view(shape)
+        fused = self.qkv_proj(hidden)
+        # The fused matrix is [q; k; v] stacked on the output axis, so the three results
+        # are contiguous column ranges of one GEMV output.
+        q_width = self.q_proj.out_features
+        kv_width = self.k_proj.out_features
+        q = fused[:, :q_width].view(shape)
+        k = fused[:, q_width : q_width + kv_width].view(shape)
+        v = fused[:, q_width + kv_width :].view(shape)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         cache._write_prepared(self.layer_idx, batch, k, v)
@@ -193,9 +202,12 @@ class OuroMLP(nn.Module):
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        # gate and up share the input row; one 46.1 MB GEMV instead of two 23.1 MB ones.
+        self.gate_up_proj = FusedWeight(self, ("gate_proj", "up_proj"))
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(silu_and_mul(self.gate_proj(hidden), self.up_proj(hidden)))
+        gate, up = self.gate_up_proj(hidden).split(self.gate_proj.out_features, dim=-1)
+        return self.down_proj(silu_and_mul(gate, up))
 
 
 class OuroDecoderLayer(nn.Module):
