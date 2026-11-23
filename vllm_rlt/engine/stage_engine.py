@@ -87,13 +87,12 @@ class StageEngine:
                 or (self.execution_config.async_scheduling and self.execution_config.static_buffers)
                 or speculative_config is not None
                 or self.stage_config.role != "prefill_decode"
-                or scheduler_config.enable_preemption
                 or cache_config.layout != "last_exited"
                 or self.exit_config.mode not in ("ouro", "ouro_delayed")
             ):
                 raise ValueError(
                     "NPU Ouro requires local execution, ouro/ouro_delayed exit mode and "
-                    "last_exited KV without speculation, graphs or preemption"
+                    "last_exited KV without speculation or graphs"
                 )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens

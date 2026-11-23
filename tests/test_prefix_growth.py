@@ -290,6 +290,67 @@ def test_priority_preempts_at_safe_boundary():
     assert e.preemption.preemptions == 1
 
 
+@pytest.mark.npu
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async-multi"])
+@pytest.mark.parametrize("offload", [False, True], ids=["resident", "offload"])
+@torch.inference_mode()
+def test_npu_preemption_restores_adaptive_decode(asynchronous, offload):
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    prompt = [3, 7, 11] * 5
+    params = SamplingParams(max_tokens=6, priority=10, exit_threshold=0.2, ignore_eos=True)
+    configs = dict(
+        attention_backend="ascend_eager",
+        cache_config=CacheConfig(8 if offload else 32, 16),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, policy="priority", enable_preemption=True),
+        exit_config=ExitConfig("ouro_delayed"),
+        execution_config=ExecutionConfig(
+            async_scheduling=asynchronous, multi_stream=asynchronous, use_uva=False
+        ),
+    )
+    reference = StageEngine(model, **configs)
+    try:
+        reference.add_request("low", prompt, params)
+        expected = finish(reference)["low"]
+    finally:
+        reference.close()
+
+    engine = StageEngine(model, **configs)
+    try:
+        engine.add_request("low", prompt, params)
+        request = engine.scheduler.requests["low"]
+        for _ in range(40):
+            engine.step()
+            if (
+                request.phase is RequestPhase.RECURRENT
+                and request.loops_done == 1
+                and not request.num_output_placeholders
+            ):
+                break
+        else:
+            pytest.fail("did not reach the recurrent preemption point")
+        engine.add_request("high", [13] * 15, SamplingParams(max_tokens=3, ignore_eos=True))
+        for _ in range(40):
+            engine.step()
+            if "low" in engine.preemption.snapshots:
+                break
+        else:
+            pytest.fail("priority request did not suspend the resident")
+        snapshot = engine.preemption.snapshots["low"]
+        assert (snapshot["kv"] is not None) == offload
+        assert snapshot["phase"] is RequestPhase.RECURRENT
+        completed = finish(engine)
+        assert list(completed) == ["high", "low"]
+        assert completed["low"].token_ids == expected.token_ids
+        assert completed["low"].exit_depths == expected.exit_depths
+        assert engine.preemption.preemptions == engine.preemption.resumptions == 1
+        assert not engine.preemption.snapshots
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("use_uva", [False, True])
 def test_packed_prefill_metadata_matches_reference_and_waits_for_consumer(use_uva):
