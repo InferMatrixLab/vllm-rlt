@@ -9,6 +9,7 @@ import torch
 from tests.helpers import LocalLLM as LLM
 from tests.helpers import tiny_ouro_config
 from tests.reference import dense_reference
+from tests.test_ascend import make_npu_model
 from vllm_rlt import (
     CacheConfig,
     ExecutionConfig,
@@ -17,6 +18,7 @@ from vllm_rlt import (
     SpeculativeConfig,
 )
 from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
+from vllm_rlt.device import resolve_device
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Request, RequestPhase
@@ -136,6 +138,41 @@ def test_greedy_matches_native_with_ragged_rounds_and_limits(k, budget):
     assert [o.token_ids for o in actual] == [o.token_ids for o in expected]
     assert [o.exit_depths for o in actual] == [o.exit_depths for o in expected]
     assert llm.engine.cache_manager.num_used_blocks == 0
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("mode", ["block", "pipeline"])
+@torch.inference_mode()
+def test_npu_sync_self_speculation_matches_greedy_across_kv_pages(mode):
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    m = make_npu_model(device)
+    prompts = [[3, 5, 7] * 5, [11, 13, 17] * 6]
+    params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in (8, 5)]
+    outputs = []
+    for speculation in (None, SpeculativeConfig(3, mode=mode)):
+        e = LLMEngine(
+            m,
+            attention_backend="ascend_eager",
+            cache_config=CacheConfig(64, 16),
+            speculative_config=speculation,
+            execution_config=ExecutionConfig(multi_stream=True, use_uva=False),
+        )
+        try:
+            for index, (prompt, options) in enumerate(zip(prompts, params, strict=True)):
+                e.add_request(str(index), prompt, options)
+            completed = drain(e)
+            outputs.append(
+                {key: (out.token_ids, out.exit_depths) for key, out in completed.items()}
+            )
+            assert all(out.finish_reason == "length" for out in completed.values())
+            assert e.cache_manager.num_used_blocks == 0
+            if speculation:
+                stats = e.speculative_runner.stats
+                assert stats.drafted_tokens > 0 and stats.verified_rows > 0
+        finally:
+            e.close()
+    assert outputs[0] == outputs[1]
 
 
 @pytest.mark.parametrize(

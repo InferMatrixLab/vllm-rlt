@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from vllm_rlt.core.scheduler import SchedulerOutput
+from vllm_rlt.device import stream_module
 from vllm_rlt.request import Operation, Request
 from vllm_rlt.worker.buffers import stage_metadata
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
@@ -95,7 +96,7 @@ class SpeculativeSubmission:
             if self.event is not None:
                 self.event.synchronize()
             stream = self.runner.compute_stream
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            with self.runner.device_ops.stream(stream) if stream is not None else nullcontext():
                 self.cached = ModelRunnerOutput(
                     speculative=(
                         self.runner._collect_pipeline(self)
@@ -203,6 +204,7 @@ class SpeculativeRunner:
         self.runtime = runtime if runtime is not None else ModelRuntime(model, cache)
         self.pipeline_states: dict[str, PipelineState] = {}
         self.device = next(model.parameters()).device
+        self.device_ops = stream_module(self.device)
         self.compute_stream = compute_stream
         self.submissions = SubmissionQueue()
         self.input_buffers = {
@@ -349,9 +351,9 @@ class SpeculativeRunner:
         self.submissions.begin()
         try:
             if self.compute_stream is not None:
-                self.compute_stream.wait_stream(torch.cuda.current_stream(self.device))
+                self.compute_stream.wait_stream(self.device_ops.current_stream(self.device))
             with (
-                torch.cuda.stream(self.compute_stream)
+                self.device_ops.stream(self.compute_stream)
                 if self.compute_stream is not None
                 else nullcontext()
             ):
@@ -363,8 +365,8 @@ class SpeculativeRunner:
                 return submission
         except Exception:
             # Failed submissions may not have recorded a completion event.
-            if self.device.type == "cuda":
-                (self.compute_stream or torch.cuda.current_stream(self.device)).synchronize()
+            if self.device_ops is not None:
+                (self.compute_stream or self.device_ops.current_stream(self.device)).synchronize()
             self.submissions.drain()
             raise
 
@@ -465,9 +467,9 @@ class SpeculativeRunner:
         )
         decisions = choices
         event = None
-        if self.device.type == "cuda":
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(self.device))
+        if self.device_ops is not None:
+            event = self.device_ops.Event()
+            event.record(self.device_ops.current_stream(self.device))
         self.stats.rounds += len(states)
         return SpeculativeSubmission(
             self,
@@ -562,9 +564,9 @@ class SpeculativeRunner:
         )
         logits = self._coda(hidden, self._boundary(layouts, prepared.target, Operation.CODA))
         event = None
-        if self.device.type == "cuda":
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(self.device))
+        if self.device_ops is not None:
+            event = self.device_ops.Event()
+            event.record(self.device_ops.current_stream(self.device))
         self.stats.rounds += len(scheduled_requests)
         self.stats.drafted_tokens += sum(len(rows) for rows, _ in drafted)
         self.stats.verified_rows += sum(span.token_count for span in scheduled_requests)

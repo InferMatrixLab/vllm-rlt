@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig, SpeculativeConfig
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.device import resolve_device, stream_module
 from vllm_rlt.engine.stage_engine import StageEngine
@@ -80,3 +80,12 @@ def test_builtin_profiler_does_not_mislabel_npu_as_cpu_only(tmp_path):
 def test_npu_async_requires_explicit_delayed_exit_policy():
     with pytest.raises(ValueError, match="async scheduling requires ouro_delayed"):
         StageEngine(npu_model_stub(), execution_config=ExecutionConfig(async_scheduling=True))
+
+
+def test_npu_rejects_async_self_speculation_before_allocation():
+    with pytest.raises(ValueError, match="async speculative decoding requires CUDA"):
+        StageEngine(
+            npu_model_stub(),
+            speculative_config=SpeculativeConfig(2),
+            execution_config=ExecutionConfig(async_scheduling=True),
+        )

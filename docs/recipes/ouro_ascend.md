@@ -126,8 +126,8 @@ describes how the two policies interpret the gate score.
   The Ascend backend gathers the visible KV rows for Torch SDPA.
 
 The example uses private, fully reserved `last_exited` KV. Keep graphs,
-static buffers, padding, speculation and prefill/decode
-disaggregation disabled in this configuration.
+static buffers, padding and prefill/decode disaggregation disabled in this
+configuration.
 Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs.
 
 ### Prompt reuse and KV growth
@@ -146,6 +146,13 @@ numbers are admitted first. A suspended request retains its KV pages when
 there is room. Under capacity pressure, the engine copies those pages to the
 host and restores them before resuming the request. Both synchronous and
 asynchronous eager execution use the same suspension and restoration path.
+
+### Synchronous self-speculation
+
+Run with `--exit-mode ouro --speculative-tokens 3 --draft-loops 2 --target-loops 4`
+and select `--speculative-mode block` or `--speculative-mode pipeline`.
+Use synchronous scheduling and fixed four-loop greedy requests. The engine
+verifies candidate tokens at the target depth.
 
 <a id="8-profile-guided-high-batch-scheduling"></a>
 ## Performance and correctness
