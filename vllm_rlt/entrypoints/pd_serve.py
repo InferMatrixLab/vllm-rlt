@@ -41,6 +41,7 @@ def load_engine(args):
         revision=revision,
         dtype=args.dtype,
         pd_config=PDConfig(
+            device_type=getattr(args, "device_type", "cuda"),
             prefill_devices=tuple(args.prefill_devices),
             decode_devices=tuple(args.decode_devices),
             transfer_chunk_bytes=args.pd_transfer_chunk_bytes,
@@ -102,9 +103,10 @@ def main():
     parser.add_argument("--tokenizer-revision")
     parser.add_argument("--served-model-name")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
+    parser.add_argument("--device-type", choices=["cuda", "npu"], default="cuda")
     parser.add_argument(
         "--attention-backend",
-        choices=["triton", "flash_attn", "flash_attn_4"],
+        choices=["triton", "flash_attn", "flash_attn_4", "ascend_eager"],
         default="flash_attn_4",
     )
     parser.add_argument("--prefill-devices", type=int, nargs="+", default=[0])

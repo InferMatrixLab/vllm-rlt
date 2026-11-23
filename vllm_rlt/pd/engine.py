@@ -1,9 +1,11 @@
-"""CPU coordinator for independent prefill/decode GPU pools.
+"""CPU coordinator for independent prefill/decode device pools.
 
-D reservations precede P computation. Control channels carry only metadata and
-outputs; NIXL moves KV directly between registered worker allocations.
+D reservations precede P computation. Control channels carry metadata and
+outputs while the selected device transport moves KV between worker pools.
 """
 
+import os
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -81,10 +83,23 @@ class PDEngine:
                 f"PD does not support {self.model_config.model_type} boundary-KV models"
             )
         self.config = pd_config or PDConfig()
+        if self.config.device_type == "npu":
+            import torch
+            import torch_npu  # noqa: F401
+
+            visible_count = torch.npu.device_count()
+            devices = (*self.config.prefill_devices, *self.config.decode_devices)
+            invalid = sorted({device for device in devices if device >= visible_count})
+            if invalid:
+                raise ValueError(
+                    f"PD NPU device index exceeds visible device count ({visible_count}): {invalid}"
+                )
         self.exit_config = exit_config or ExitConfig(
             "ouro" if speculative_config else "ouro_delayed"
         )
-        execution = execution_config or ExecutionConfig(async_scheduling=True)
+        execution = execution_config or ExecutionConfig(
+            async_scheduling=self.config.device_type != "npu"
+        )
         self._async_speculative = bool(speculative_config and execution.async_scheduling)
         p_scheduler = prefill_scheduler_config or SchedulerConfig(
             max_num_seqs=8, max_num_batched_tokens=2048, prefill_chunk_size=2048
@@ -98,8 +113,21 @@ class PDEngine:
             raise ValueError("P and D must use the same KV layout and block size")
         if p_cache.kv_cache_dtype != d_cache.kv_cache_dtype:
             raise ValueError("P and D must use the same KV cache dtype")
-        if attention_backend not in ("triton", "flash_attn", "flash_attn_4"):
-            raise ValueError("PD supports CUDA Triton or paged FA4 attention")
+        allowed_attention = (
+            ("ascend_eager",)
+            if self.config.device_type == "npu"
+            else ("triton", "flash_attn", "flash_attn_4")
+        )
+        if attention_backend not in allowed_attention:
+            raise ValueError(
+                "PD unsupported attention backend "
+                f"{attention_backend!r} for {self.config.device_type}"
+            )
+        if self.config.device_type == "npu" and (
+            p_scheduler.wavefront_chunked_prefill
+            or p_scheduler.prefill_chunk_size != p_scheduler.max_num_batched_tokens
+        ):
+            raise ValueError("Ascend HCCL PD requires full prefill without chunking")
         self.scheduling_policy = p_scheduler.policy
         self.peers = {}
         self.requests = {}
@@ -113,18 +141,32 @@ class PDEngine:
         self._profile_statuses = {}
         self._profile_recording = False
         self._profile_errors = []
+        self._distributed_init_method = None
+        self._distributed_store_path = None
+        if self.config.device_type == "npu":
+            if self.config.backend.upper() != "HCCL":
+                raise ValueError("Ascend PD requires backend='HCCL'")
+            if len(self.config.prefill_devices) != len(self.config.decode_devices):
+                raise ValueError("Ascend HCCL PD requires equal Prefill and Decode pool sizes")
+            handle, path = tempfile.mkstemp(prefix="vllm-rlt-hccl-")
+            os.close(handle)
+            os.unlink(path)
+            self._distributed_store_path = path
+            self._distributed_init_method = f"file://{path}"
         epoch = uuid.uuid4().hex
         try:
+            rank = 0
             for role, devices, cache, scheduler in (
                 ("prefill", self.config.prefill_devices, p_cache, p_scheduler),
                 ("decode", self.config.decode_devices, d_cache, d_scheduler),
             ):
                 for device in devices:
                     name = f"{epoch}-{role}-{device}"
+                    stage_device = f"{self.config.device_type}:{device}"
                     client = StageClient(
                         model,
                         model_config=self.model_config,
-                        device=device,
+                        device=stage_device,
                         stage_config=StageConfig(stage_id=name, role=role),
                         connector_factory=partial(PDStageConnector.create, config=self.config),
                         max_control_messages=self.config.max_control_messages,
@@ -146,25 +188,50 @@ class PDEngine:
                         speculative_config=speculative_config if role == "decode" else None,
                         execution_config=execution,
                         attention_backend=attention_backend,
+                        distributed_stage=True,
+                        distributed_backend=("hccl" if self.config.device_type == "npu" else None),
+                        distributed_rank=rank,
+                        distributed_world_size=(
+                            len(self.config.prefill_devices) + len(self.config.decode_devices)
+                        ),
+                        distributed_prefill_world_size=len(self.config.prefill_devices),
+                        distributed_init_method=self._distributed_init_method,
+                        distributed_timeout=self.config.startup_timeout,
                     )
                     self.peers[name] = Peer(name, role, client)
+                    rank += 1
             deadline = time.monotonic() + self.config.startup_timeout
             self._wait(lambda: all(p.client.ready for p in self.peers.values()), deadline)
             fingerprints = {p.client.info["fingerprint"] for p in self.peers.values()}
             if len(fingerprints) != 1:
                 raise ValueError("P/D model weights or KV configuration do not match")
             for peer in self.peers.values():
+                opposite = [p for p in self.peers.values() if p.role != peer.role]
+                if self.config.device_type == "npu":
+                    rank = peer.client.info["info"]["rank"]
+                    prefill_count = len(self.config.prefill_devices)
+                    paired_rank = (
+                        rank + prefill_count if peer.role == "prefill" else rank - prefill_count
+                    )
+                    opposite = [p for p in opposite if p.client.info["info"]["rank"] == paired_rank]
                 self._send(
                     peer.name,
                     "connect",
-                    peers=[
-                        p.client.info["info"] for p in self.peers.values() if p.role != peer.role
-                    ],
+                    peers=[p.client.info["info"] for p in opposite],
                 )
             self._wait(lambda: all(p.client.connected for p in self.peers.values()), deadline)
         except BaseException:
             self._terminate()
+            self._cleanup_distributed_store()
             raise
+
+    def _cleanup_distributed_store(self):
+        if self._distributed_store_path is not None:
+            try:
+                os.unlink(self._distributed_store_path)
+            except FileNotFoundError:
+                pass
+            self._distributed_store_path = None
 
     def _send(self, destination, kind, **fields):
         self.peers[destination].client.send(kind, **fields)
@@ -214,10 +281,17 @@ class PDEngine:
             )
         elif kind == "prefill_started":
             w.timings["prefill_started"] = now
+            if not w.cancelled:
+                self._send(w.d, "start_receive", tid=w.tid)
         elif kind == "prefill_complete":
             w.timings["prefill_compute_completed"] = now
             w.timings["prefill_transfer_boundaries"] = m["boundaries"]
             w.timings["prefill_transfer_overlaps"] = m["overlaps"]
+        elif kind == "transfer_started":
+            w.timings.setdefault("transfer_started", now)
+            # A submitted HCCL send must always get its matching receive, even
+            # when cancellation raced with the control-channel notification.
+            self._send(w.d, "start_receive", tid=w.tid, sequence=m["sequence"])
         elif kind == "commit":
             w.timings["prefill_submitted"] = now
             if not w.cancelled:
@@ -336,6 +410,13 @@ class PDEngine:
         # A bounded FIFO scan allows fitting requests to bypass temporary pressure.
         # Age protection stops new admissions after a waiting request's deadline
         # would otherwise be hidden by continuous small arrivals.
+        if self.config.device_type == "npu" and any(
+            transfer.phase != "waiting" and not transfer.cancelled
+            for transfer in self.transfers.values()
+        ):
+            # Ascend HCCL matches rank-pair operations globally. Keep one active
+            # generation until its receive and release handshake has completed.
+            return
         waiting = list(self.transfers.values())[: self.config.max_pending_requests]
         if self.scheduling_policy == "priority":
             waiting.sort(key=lambda w: (w.request.sampling_params.priority, w.created))
@@ -343,6 +424,7 @@ class PDEngine:
             if w.cancelled or w.phase != "waiting":
                 continue
             candidates = {}
+            eligible_by_role = {}
             for role in ("prefill", "decode"):
                 length = len(w.request.prompt_token_ids) + (
                     w.request.sampling_params.max_tokens - 1 if role == "decode" else 0
@@ -358,6 +440,7 @@ class PDEngine:
                 ]
                 if not eligible:
                     break
+                eligible_by_role[role] = eligible
                 candidates[role] = min(
                     eligible,
                     key=lambda p: (
@@ -365,6 +448,25 @@ class PDEngine:
                         p.slots / p.client.info["transfer_slots"],
                     ),
                 )
+            if self.config.device_type == "npu" and len(candidates) == 2:
+                prefill_count = len(self.config.prefill_devices)
+                pairs = [
+                    (prefill, decode)
+                    for prefill in eligible_by_role["prefill"]
+                    for decode in eligible_by_role["decode"]
+                    if decode.client.info["info"]["rank"]
+                    == prefill.client.info["info"]["rank"] + prefill_count
+                ]
+                if pairs:
+                    candidates["prefill"], candidates["decode"] = min(
+                        pairs,
+                        key=lambda pair: (
+                            pair[0].reserved_blocks / pair[0].client.info["num_blocks"],
+                            pair[0].slots / pair[0].client.info["transfer_slots"],
+                        ),
+                    )
+                else:
+                    candidates.clear()
             if len(candidates) != 2:
                 if time.monotonic() - w.created > self.config.request_timeout / 2:
                     break
@@ -390,6 +492,8 @@ class PDEngine:
                 trace_id=w.trace_id,
                 peer=p.client.info["info"]["agent"],
             )
+            if self.config.device_type == "npu":
+                break
 
     def abort_request(self, request_id):
         request = self.requests.pop(request_id)
@@ -433,7 +537,12 @@ class PDEngine:
                 time.monotonic() - w.created > self.config.request_timeout
                 for w in self.transfers.values()
             ):
-                raise TimeoutError("PD request/transfer deadline exceeded")
+                pending = ", ".join(
+                    f"{w.request.request_id}:{w.phase}"
+                    for w in self.transfers.values()
+                    if not w.finished
+                )
+                raise TimeoutError(f"PD request/transfer deadline exceeded ({pending})")
             self._admit()
             outputs = list(self.outputs)
             self.outputs.clear()
@@ -629,6 +738,8 @@ class PDEngine:
         except BaseException:
             self._terminate()
             raise
+        finally:
+            self._cleanup_distributed_store()
 
     def __enter__(self):
         return self

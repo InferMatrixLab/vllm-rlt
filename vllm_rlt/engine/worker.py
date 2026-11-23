@@ -10,6 +10,7 @@ import time
 import traceback
 from collections.abc import Callable
 from dataclasses import is_dataclass
+from datetime import timedelta
 
 import torch
 
@@ -44,6 +45,45 @@ class StageWorker:
             if device.index is None:
                 device = torch.device("npu", torch.npu.current_device())
             torch.npu.set_device(device)
+        self.distributed = False
+        distributed = options["engine"]
+        if distributed.get("distributed_backend") == "hccl":
+            import torch.distributed as dist
+            import torch_npu  # noqa: F401
+
+            dist.init_process_group(
+                backend="hccl",
+                init_method=distributed["distributed_init_method"],
+                rank=distributed["distributed_rank"],
+                world_size=distributed["distributed_world_size"],
+                timeout=timedelta(seconds=distributed["distributed_timeout"]),
+            )
+            prefill_world_size = distributed["distributed_prefill_world_size"]
+            warmup_buffers = []
+            warmup_ops = []
+            if distributed["distributed_rank"] < prefill_world_size:
+                peers = range(prefill_world_size, distributed["distributed_world_size"])
+                for peer in peers:
+                    buffer = torch.zeros(1, dtype=torch.uint8, device=device)
+                    warmup_buffers.append(buffer)
+                    warmup_ops.append(dist.P2POp(dist.isend, buffer, peer, tag=peer))
+            else:
+                peers = range(prefill_world_size)
+                for peer in peers:
+                    buffer = torch.empty(1, dtype=torch.uint8, device=device)
+                    warmup_buffers.append(buffer)
+                    warmup_ops.append(
+                        dist.P2POp(
+                            dist.irecv,
+                            buffer,
+                            peer,
+                            tag=distributed["distributed_rank"],
+                        )
+                    )
+            for work in dist.batch_isend_irecv(warmup_ops):
+                work.wait()
+            dist.barrier()
+            self.distributed = True
         torch.manual_seed(options["seed"])
         self.channel = channel
         self.max_control_messages = max_control_messages
@@ -65,6 +105,10 @@ class StageWorker:
                 model_config=model_config,
             )
         self.engine = StageEngine(self.model, stage_config=stage_config, **options["engine"])
+        if self.distributed:
+            import torch.distributed as dist
+
+            dist.barrier()
         self.connector = (
             connector_factory(self.engine, notify=self.send)
             if connector_factory is not None
@@ -201,6 +245,10 @@ class StageWorker:
                 time.sleep(0.001)
         self.engine.close()
         metrics = self.connector.close() if self.connector is not None else {}
+        if self.distributed:
+            import torch.distributed as dist
+
+            dist.destroy_process_group()
         self.send("stopped", used_blocks=self.engine.cache_manager.num_used_blocks, **metrics)
 
 

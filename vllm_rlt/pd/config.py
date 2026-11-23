@@ -6,6 +6,7 @@ from dataclasses import dataclass
 class PDConfig:
     prefill_devices: tuple[int, ...] = (0,)
     decode_devices: tuple[int, ...] = (1,)
+    device_type: str = "cuda"
     max_pending_requests: int = 256
     # KV chunks are submitted, and their completion observed, only between engine
     # steps, so a request whose KV exceeds the in-flight budget waits extra steps
@@ -28,8 +29,10 @@ class PDConfig:
         devices = (*self.prefill_devices, *self.decode_devices)
         if not self.prefill_devices or not self.decode_devices:
             raise ValueError("PD requires nonempty prefill and decode device pools")
+        if self.device_type not in ("cuda", "npu"):
+            raise ValueError("PD device_type must be cuda or npu")
         if any(type(d) is not int or d < 0 for d in devices) or len(set(devices)) != len(devices):
-            raise ValueError("PD devices must be distinct nonnegative CUDA device indices")
+            raise ValueError("PD devices must be distinct nonnegative device indices")
         for name in ("max_receiving_requests", "max_draining_requests"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
@@ -48,4 +51,4 @@ class PDConfig:
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive and finite")
         if not self.backend:
-            raise ValueError("NIXL backend must be specified")
+            raise ValueError("PD transport backend must be specified")
