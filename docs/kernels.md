@@ -29,10 +29,11 @@ are FP32, FP16 and BF16. The output owns new storage and preserves input shape,
 dtype and device. Neither input is modified. The Torch reference preserves
 the intermediate SiLU rounding of the existing MLP expression.
 
-Separate inputs avoid concatenating Ouro and Nanbeige's separate projection
-outputs. The reference also accepts Huginn's noncontiguous split-projection
-views. The native entry requires both inputs to be contiguous; it neither pads
-nor copies incompatible inputs.
+The native entry accepts contiguous inputs and 2D inputs with unit column
+strides. Ouro's fused gate/up projection produces two such views into one
+matrix. The kernel reads both row strides directly with 16-byte vector loads
+when the rows and their starts are aligned, or scalar loads otherwise.
+Inputs outside these layouts are rejected without copying.
 
 `silu_and_mul(gate, up)` uses PyTorch dispatch: CUDA inputs use the native kernel
 when the extension is installed; CPU inputs and installations without the

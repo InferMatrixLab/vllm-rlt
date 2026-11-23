@@ -117,7 +117,11 @@ def test_state_dict_is_unchanged_by_fusion():
 
 
 @requires_cuda
+@pytest.mark.gpu
 def test_mlp_output_is_bitwise_identical_to_the_unfused_expression():
+    from vllm_rlt.kernels._extension import load_extension
+
+    load_extension()
     torch.manual_seed(1)
     config = OuroConfig(
         vocab_size=64,
