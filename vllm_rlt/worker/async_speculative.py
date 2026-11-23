@@ -20,6 +20,7 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Operation, Request
 from vllm_rlt.worker.cuda_graph import (
     CodaGraphs,
+    CodaPairGraphs,
     DeviceRecurrentGraphs,
     PreludeGraphs,
     graph_capture_sizes,
@@ -375,15 +376,15 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             if execution.cuda_graphs and not self.ordered_pipeline_coda
             else None
         )
+        self.coda_pair_graphs = None
         if execution.cuda_graphs and self.ordered_pipeline_coda:
             sizes = graph_capture_sizes(execution, preferred=(scheduler.max_num_seqs,))
             self.prelude_graphs = PreludeGraphs(
                 model, execution, cache, bucketed=True, capture_sizes=sizes
             )
-            self.coda_graphs = CodaGraphs(
-                model, execution, cache, bucketed=True, capture_sizes=sizes
-            )
+            self.coda_pair_graphs = CodaPairGraphs(model, cache, sizes)
             self.prelude_graphs.prepare()
+            self.coda_pair_graphs.prepare()
         if self.graphs is not None:
             self.graphs.prepare()
         if self.coda_graphs is not None:
@@ -929,14 +930,20 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 depths[roots] + self.config.draft_loops == self.config.target_loops
             )
             # Write verified Coda history before the draft reads any earlier position.
-            target = self._coda(
-                hidden[roots],
-                self._device_kv(row_positions[roots], boundary_tables, allocations, target_rows),
-            ).argmax(-1)
-            draft = self._coda(
-                hidden[tails],
-                self._device_kv(row_positions[tails], boundary_tables, allocations, draft_rows),
-            ).argmax(-1)
+            target_kv = self._device_kv(
+                row_positions[roots], boundary_tables, allocations, target_rows
+            )
+            draft_kv = self._device_kv(
+                row_positions[tails], boundary_tables, allocations, draft_rows
+            )
+            if self.coda_pair_graphs is None:
+                target, draft = self.model.coda_pair(
+                    hidden[roots], target_kv, hidden[tails], draft_kv, self.cache
+                )
+            else:
+                target, draft = self.coda_pair_graphs.forward(
+                    hidden[roots], target_kv, hidden[tails], draft_kv
+                )
             choices = torch.zeros_like(tokens)
             choices[roots] = target
             choices[tails] = torch.where(draft_rows, draft, choices[tails])

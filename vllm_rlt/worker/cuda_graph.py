@@ -618,6 +618,76 @@ class CodaGraphs:
         return output
 
 
+class CodaPairGraphs:
+    """Replay ordered target/draft boundary work and their shared token projection."""
+
+    def __init__(self, model, cache, capture_sizes):
+        self.model, self.cache = model, cache
+        self.capture_sizes = capture_sizes
+        self.stream = torch.cuda.Stream(device=cache.device)
+        self.pool = torch.cuda.graph_pool_handle()
+        self.entries = {}
+        self.last_event = None
+        self.replays = self.fallbacks = 0
+
+    @torch.inference_mode()
+    def prepare(self):
+        model, cache = self.model, self.cache
+        parameter = next(model.parameters())
+        hidden = torch.empty(
+            (0, model.config.hidden_size),
+            dtype=getattr(model, "state_dtype", parameter.dtype),
+            device=cache.device,
+        )
+        empty = _empty_device_batch(cache)
+        proxy = _DeviceCache(cache)
+        for size in self.capture_sizes:
+            target, draft = (
+                _graph_entry(
+                    hidden,
+                    empty,
+                    cache,
+                    model.config.max_position_embeddings,
+                    count=size,
+                    bucketed=True,
+                )
+                for _ in range(2)
+            )
+            for entry in (target, draft):
+                _copy_graph_inputs(entry, hidden, empty, count=0)
+
+            def run():
+                return model.coda_pair(
+                    target.hidden, target.metadata, draft.hidden, draft.metadata, proxy
+                )
+
+            graph, tokens = _capture(target.hidden, self.stream, self.pool, run, startup=True)
+            self.entries[size] = (target, draft, graph, tokens)
+
+    def forward(self, target_hidden, target_kv, draft_hidden, draft_kv):
+        self.cache._require_live_batch(target_kv)
+        self.cache._require_live_batch(draft_kv)
+        count = len(target_hidden)
+        capacity = _bucket_size(self.capture_sizes, count)
+        if capacity not in self.entries:
+            self.fallbacks += 1
+            return self.model.coda_pair(
+                target_hidden, target_kv, draft_hidden, draft_kv, self.cache
+            )
+        target, draft, graph, tokens = self.entries[capacity]
+        stream = torch.cuda.current_stream(target_hidden.device)
+        if self.last_event is not None:
+            stream.wait_event(self.last_event)
+        _copy_graph_inputs(target, target_hidden, target_kv)
+        _copy_graph_inputs(draft, draft_hidden, draft_kv)
+        graph.replay()
+        result = tokens[:, :count].clone()
+        self.last_event = torch.cuda.Event()
+        self.last_event.record(stream)
+        self.replays += 1
+        return result
+
+
 class PreludeGraphs(CodaGraphs):
     """Decode-token input stage of a boundary-KV model: tokens in, carried state out.
 

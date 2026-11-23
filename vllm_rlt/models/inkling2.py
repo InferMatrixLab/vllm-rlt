@@ -265,6 +265,61 @@ class _Batch:
         return paged_attention(q, keys, values, bias, sink, batch, window)
 
 
+class _OrderedCodaBatch:
+    """Share independent projections while ordering each history write."""
+
+    def __init__(self, target, draft, target_rows):
+        self.segments = (
+            (target, slice(0, target_rows)),
+            (draft, slice(target_rows, None)),
+        )
+
+    def attend(self, layer, *projected):
+        # Both scopes use their own position, mask and page-table views.
+        return torch.cat(
+            [
+                batch.attend(
+                    layer, *(part[rows] if part is not None else None for part in projected)
+                )
+                for batch, rows in self.segments
+            ]
+        )
+
+    def conv_mix(
+        self,
+        layer,
+        offset,
+        hidden,
+        weight,
+        out,
+        stack,
+        last,
+        queries,
+        norm,
+        *,
+        residual=None,
+        addend=None,
+    ):
+        output = []
+        for batch, rows in self.segments:
+            output.append(
+                batch.conv_mix(
+                    layer,
+                    offset,
+                    hidden[rows],
+                    weight,
+                    out[rows],
+                    stack[:, rows],
+                    last[rows] if last is not None else None,
+                    queries,
+                    norm,
+                    residual=residual[rows] if residual is not None else None,
+                    addend=addend[rows] if addend is not None else None,
+                )
+            )
+        return torch.cat(output, dim=1)
+
+
 class _Layer(nn.Module):
     def __init__(self, config, index, read):
         super().__init__()
@@ -723,25 +778,54 @@ class Inkling2ForCausalLM(nn.Module):
             compute_gate=compute_gate,
         )
 
-    def coda_prepared(self, hidden, metadata, cache, *, compute_logits=True):
+    def _coda_inputs(self, hidden, metadata, cache):
         batch = self.batch_type(cache, metadata, self.config)
         blocks = hidden[: len(batch.positions), :-1].unflatten(-1, (-1, self.config.width))
-        if self.interleaved_kv and compute_logits:
+        return batch, blocks
+
+    def coda_hidden_prepared(self, hidden, metadata, cache):
+        """Update the boundary history and return the normalized LM head input."""
+        batch, blocks = self._coda_inputs(hidden, metadata, cache)
+        if self.interleaved_kv:
+            return self._run_native_layers(
+                blocks, self.coda_kv_layers, batch, None, None, final=True
+            )
+        blocks = self._run_layers(blocks, self.coda_kv_layers, batch)
+        return self.normalize(
+            self.mix(blocks, self.output_query)[:, 0], self.norm, self.config.rms_norm_eps
+        )
+
+    def project_coda(self, state):
+        if self.interleaved_kv:
+            logits = F.linear(state, self.head)[..., : self.config.vocab_size]
+        else:
+            logits = torch.mm(state, self.head.T, out_dtype=torch.float32)
+        cap = self.config.logit_softcap
+        return (logits / cap).tanh() * cap
+
+    def coda_prepared(self, hidden, metadata, cache, *, compute_logits=True):
+        if compute_logits:
+            return self.project_coda(self.coda_hidden_prepared(hidden, metadata, cache))
+        batch, blocks = self._coda_inputs(hidden, metadata, cache)
+        self._run_layers(blocks, self.coda_kv_layers, batch)
+        return None
+
+    def coda_pair(self, target_hidden, target_metadata, draft_hidden, draft_metadata, cache):
+        if not self.interleaved_kv:
+            target = self.coda_hidden_prepared(target_hidden, target_metadata, cache)
+            draft = self.coda_hidden_prepared(draft_hidden, draft_metadata, cache)
+            state = torch.cat((target, draft))
+        else:
+            target, target_blocks = self._coda_inputs(target_hidden, target_metadata, cache)
+            draft, draft_blocks = self._coda_inputs(draft_hidden, draft_metadata, cache)
+            # A draft can read the target's position in the current layer.
+            # Attention and convolution update target first everywhere else runs batched.
+            batch = _OrderedCodaBatch(target, draft, len(target_blocks))
+            blocks = torch.cat((target_blocks, draft_blocks))
             state = self._run_native_layers(
                 blocks, self.coda_kv_layers, batch, None, None, final=True
             )
-            logits = F.linear(state, self.head)[..., : self.config.vocab_size]
-            cap = self.config.logit_softcap
-            return (logits / cap).tanh() * cap
-        blocks = self._run_layers(blocks, self.coda_kv_layers, batch)
-        if compute_logits:
-            state = self.normalize(
-                self.mix(blocks, self.output_query)[:, 0], self.norm, self.config.rms_norm_eps
-            )
-            logits = torch.mm(state, self.head.T, out_dtype=torch.float32)
-            cap = self.config.logit_softcap
-            return (logits / cap).tanh() * cap
-        return None
+        return self.project_coda(state).argmax(-1).view(2, -1)
 
     @classmethod
     def from_pretrained(
