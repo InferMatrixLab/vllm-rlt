@@ -18,7 +18,8 @@ class FusedProjectionLayer(nn.Module):
             self.checkpoint_slices[f"{name}.weight"] = slice(offset, offset + width)
             offset += width
         self.input_weight = nn.Parameter(torch.empty(offset, in_features))
-        nn.init.kaiming_uniform_(self.input_weight, a=5**0.5)
+        for rows in self.checkpoint_slices.values():
+            nn.init.kaiming_uniform_(self.input_weight[rows], a=5**0.5)
 
     def project(self, hidden: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return F.linear(hidden, self.input_weight).split(self.projection_sizes, dim=-1)

@@ -235,13 +235,19 @@ class OuroForCausalLM(nn.Module):
         self.config = config
         self.model = OuroModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.apply(self._initialize)
+        # A fused layer owns the input projections, which precede its output
+        # projection in the checkpoint and the original RNG draw order.
+        for module in self.modules():
+            self._initialize(module)
         self.requires_grad_(False)
         self.eval()
 
     def _initialize(self, module: nn.Module) -> None:
         if isinstance(module, FusedProjectionLayer):
-            nn.init.normal_(module.input_weight, mean=0, std=self.config.initializer_range)
+            for rows in module.checkpoint_slices.values():
+                nn.init.normal_(
+                    module.input_weight[rows], mean=0, std=self.config.initializer_range
+                )
         elif isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, mean=0, std=self.config.initializer_range)
             if isinstance(module, nn.Linear) and module.bias is not None:
