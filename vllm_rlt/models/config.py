@@ -1,12 +1,13 @@
 """Entry-owned model configuration shared by deployment clients and workers."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from torch import nn
 
 from .dory import DoryConfig
 from .huginn import HuginnConfig
+from .inkling2 import Inkling2Config
 from .nanbeige import NanbeigeConfig
 from .ouro import OuroConfig
 
@@ -15,6 +16,7 @@ _CONFIG_TYPES = {
     "nanbeige": NanbeigeConfig,
     "huginn_raven": HuginnConfig,
     "dory": DoryConfig,
+    "inkling2_loop": Inkling2Config,
 }
 
 
@@ -26,7 +28,7 @@ class ModelConfig:
     limits remain properties of the concrete config rather than duplicated fields.
     """
 
-    model_specific_config: OuroConfig | NanbeigeConfig | HuginnConfig | DoryConfig
+    model_specific_config: OuroConfig | NanbeigeConfig | HuginnConfig | DoryConfig | Inkling2Config
 
     def __post_init__(self):
         if type(self.model_specific_config) not in _CONFIG_TYPES.values():
@@ -54,6 +56,21 @@ class ModelConfig:
     @property
     def max_position_embeddings(self):
         return self.model_specific_config.max_position_embeddings
+
+    def with_loop_num_passes(self, passes):
+        if passes is None:
+            return self
+        if not isinstance(self.model_specific_config, Inkling2Config):
+            raise ValueError("loop_num_passes requires an Inkling 2 Mini variable-loop checkpoint")
+        return ModelConfig(self.model_specific_config.with_loop_num_passes(passes))
+
+    def with_inkling_kernels(self, backend):
+        if backend is None:
+            return self
+        config = self.model_specific_config
+        if backend not in ("rlt", "vllm") or not isinstance(config, Inkling2Config):
+            raise ValueError("inkling_kernels requires an Inkling checkpoint and rlt or vllm")
+        return ModelConfig(replace(config, kernel_backend=backend))
 
 
 def prepare_model(model, *, revision=None, model_config=None):

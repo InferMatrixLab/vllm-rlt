@@ -58,6 +58,8 @@ def main():
     )
     parser.add_argument("--model", help="Local checkpoint path or HuggingFace repository ID")
     parser.add_argument("--revision")
+    parser.add_argument("--loop-num-passes", type=int, help="Inkling 2 Mini variable-loop passes")
+    parser.add_argument("--inkling-kernels", choices=["rlt", "vllm"])
     parser.add_argument("--prompt", action="append", help="Text prompt; repeat for a batch")
     parser.add_argument(
         "--toy", action="store_true", help="Use a tiny RANDOM model and token ID prompts"
@@ -122,6 +124,8 @@ def main():
     llm = LLM(
         model,
         revision=args.revision,
+        loop_num_passes=args.loop_num_passes,
+        inkling_kernels=args.inkling_kernels,
         device=args.device,
         dtype=getattr(torch, args.dtype),
         **runtime_configs(args),

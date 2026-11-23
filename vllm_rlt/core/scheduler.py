@@ -140,6 +140,7 @@ class Scheduler:
         total_ut_steps: int | None = None,
         eos_token_id=(),
         exit_mode: str = "ouro",
+        mixed_speculative: bool = False,
     ):
         self.config = config
         self.cache_manager = cache_manager
@@ -171,6 +172,7 @@ class Scheduler:
             config,
             speculative_config,
             produces_tokens=produces_tokens,
+            mixed_speculative=mixed_speculative,
         )
 
     def add_request(self, request: Request):
@@ -701,29 +703,31 @@ class Scheduler:
     def _take(self, phase: RequestPhase) -> SchedulerOutput | None:
         return self.take_phases((phase,))
 
-    def take_phases(self, phases, *, eligible=None):
+    def take_phases(self, phases, *, eligible=None, reserve_for_later=0):
         """Select compatible requests across queues under one budget/reservation set."""
         eligible = eligible if eligible is not None else self.execution_ready
         token_budget = self.config.max_num_batched_tokens
         scheduled_requests = []
         selected: set[str] = set()
-        for phase in phases:
+        for index, phase in enumerate(phases):
             queue = self.queues[phase]
+            reserved = reserve_for_later if index == 0 else 0
+            available = token_budget - reserved
             if self.wavefront_chunked_prefill and phase in (
                 RequestPhase.PREFILLING_PRELUDE,
                 RequestPhase.PREFILLING_RECURRENT,
             ):
-                token_budget = self._take_wavefront_phase(
+                token_budget = reserved + self._take_wavefront_phase(
                     phase,
                     queue,
-                    token_budget,
+                    available,
                     scheduled_requests,
                     selected,
                     eligible,
                 )
                 continue
             remaining = len(queue)
-            while queue and token_budget and len(selected) < self.config.max_num_seqs and remaining:
+            while queue and available and len(selected) < self.config.max_num_seqs and remaining:
                 remaining -= 1
                 request = self.requests[queue.popleft()]
                 if eligible is not None and not eligible(request):
@@ -740,7 +744,7 @@ class Scheduler:
                 ):
                     queue.append(request.request_id)
                     continue
-                scheduled_request = self._make_scheduled_request(request, phase, token_budget)
+                scheduled_request = self._make_scheduled_request(request, phase, available)
                 if (
                     phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
                     and scheduled_request.token_count <= 0
@@ -762,6 +766,7 @@ class Scheduler:
                 selected.add(request.request_id)
                 scheduled_requests.append(replace(scheduled_request, phase=phase))
                 token_budget -= scheduled_request.token_count
+                available -= scheduled_request.token_count
         if not scheduled_requests:
             return None
         # Fairness follows the requests actually selected, including a mixed attempt
@@ -769,7 +774,9 @@ class Scheduler:
         selected_phases = {scheduled_request.phase for scheduled_request in scheduled_requests}
         prompt_phases = selected_phases.intersection(self.policy.PREFILL_PHASES)
         recorded = (
-            RequestPhase.RECURRENT
+            RequestPhase.SPECULATIVE
+            if RequestPhase.SPECULATIVE in selected_phases
+            else RequestPhase.RECURRENT
             if RequestPhase.RECURRENT in selected_phases
             else next(iter(prompt_phases))
             if prompt_phases
@@ -799,6 +806,8 @@ class Scheduler:
         phases = {item.phase for item in scheduled_requests}
         if phases == {RequestPhase.PREFILL}:
             return self.total_ut_steps
+        if phases == {RequestPhase.SPECULATIVE, RequestPhase.PREFILLING_RECURRENT}:
+            return 1
         if RequestPhase.SPECULATIVE in phases or RequestPhase.CODA in phases:
             return 0
         if RequestPhase.PRELUDE in phases:
@@ -809,7 +818,12 @@ class Scheduler:
             # In mixed mode, stage just the embeddings when recurrent decode work
             # is ready so the next depth can join that batch. Without a reason to
             # yield, PRELUDE can execute the full prompt depth in this submission.
-            if self.config.mode == "mixed" and self.has_ready(RequestPhase.RECURRENT):
+            if self.config.mode == "mixed" and (
+                self.has_ready(RequestPhase.RECURRENT)
+                or (
+                    self.speculative_config is not None and self.has_ready(RequestPhase.SPECULATIVE)
+                )
+            ):
                 return 0
             return self.total_ut_steps
         if RequestPhase.PREFILLING_RECURRENT in phases:
@@ -1403,7 +1417,8 @@ class Scheduler:
                         request.loops_done = 0
                     if request.request_id not in self.queues[RequestPhase.SPECULATIVE]:
                         self.enqueue(request, RequestPhase.SPECULATIVE)
-                update.outputs.append(request)
+                if emitted:
+                    update.outputs.append(request)
         return update
 
     def update_after_submission(

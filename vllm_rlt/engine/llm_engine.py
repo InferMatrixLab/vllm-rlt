@@ -1,6 +1,7 @@
 """Single-stage deployment client and low-level engine import."""
 
 import copy
+import logging
 import time
 from collections import deque
 from dataclasses import replace
@@ -14,6 +15,7 @@ from vllm_rlt.engine.worker import start_stage_worker
 from vllm_rlt.models import prepare_model
 
 LLMEngine = StageEngine
+logger = logging.getLogger(__name__)
 
 
 class StageClient:
@@ -32,7 +34,7 @@ class StageClient:
         revision=None,
         model_config=None,
         seed=0,
-        startup_timeout=120,
+        startup_timeout=None,
         shutdown_timeout=30,
         stage_config=None,
         connector_factory=None,
@@ -61,7 +63,13 @@ class StageClient:
         self.trace_mode = getattr(engine_options.get("exit_config"), "mode", None) == "trace"
         self.closed = False
         self.failure = None
-        self.timeout = startup_timeout
+        self.timeout = 120 if startup_timeout is None else startup_timeout
+        execution = engine_options.get("execution_config")
+        self.startup_timeout = (
+            600
+            if startup_timeout is None and getattr(execution, "cuda_graph_warmup", False)
+            else self.timeout
+        )
         self.shutdown_timeout = shutdown_timeout
         self.requests = {}  # External ID -> unique execution generation, no Request copies.
         self.generations = {}
@@ -92,7 +100,7 @@ class StageClient:
                 raise
 
     def wait_ready(self):
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + self.startup_timeout
         while not self.ready:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -141,6 +149,13 @@ class StageClient:
             raise error(f"stage worker failed:\n{self.failure}")
         if kind == "ready":
             self.info, self.ready = message, True
+            warmup = message.get("graph_warmup")
+            if warmup is not None:
+                logger.info(
+                    "Inkling CUDA Graph warmup complete in %.2fs, entries=%s",
+                    warmup["elapsed_seconds"],
+                    warmup["entries"],
+                )
         elif kind == "connected":
             self.connected = True
         elif kind == "reply":

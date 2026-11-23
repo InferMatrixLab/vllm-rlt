@@ -1,6 +1,7 @@
 """Graph replay must update KV addresses, request identities and host progress."""
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,6 +21,116 @@ def test_cuda_graph_validation():
         LLMEngine(
             OuroForCausalLM(tiny_ouro_config()), execution_config=ExecutionConfig(cuda_graphs=True)
         )
+
+
+def test_inkling_packed_graph_plan_tracks_decode_split_and_fa4_launch(monkeypatch):
+    from vllm_rlt.kernels import inkling2_vllm
+
+    def plan_decode(_local, _requests, max_query, *_shape):
+        return 2 if max_query <= 2 else 0
+
+    def plan_prefill(local, _query, lengths, *_shape):
+        return (1 if local or max(lengths) < 32 else 2), False
+
+    attention = SimpleNamespace(
+        plan_decode_attention=plan_decode,
+        plan_attention=plan_prefill,
+        bucket_max_seqlen_q=lambda max_query: max_query,
+    )
+    monkeypatch.setattr(inkling2_vllm, "load_ops", lambda: SimpleNamespace(attention=attention))
+    config = SimpleNamespace(window=32, rel_extent=64, num_attention_heads=8, num_key_value_heads=4)
+
+    def plans(query, start=0):
+        rows = tuple(
+            (allocation, 0, position)
+            for allocation, count in zip((object(), object(), object()), query, strict=True)
+            for position in range(start, start + count)
+        )
+        metadata = SimpleNamespace(
+            rows=rows, max_seqlen_q=max(query), write_blocks=rows, context_lengths=query
+        )
+        return inkling2_vllm.packed_attention_plans(metadata, config)
+
+    short = plans((1, 4, 3))
+    assert short[0].decode_rows == 1
+    assert short == plans((1, 4, 3), start=16)
+    assert plans((2, 4, 2))[0].decode_rows == 0
+    long = plans((1, 4, 3), start=32)
+    assert short[0].prefill == (4, 1, False)
+    assert long[0].prefill == (4, 2, False)
+    assert long[1] == short[1]
+
+
+def test_warmed_graph_cache_allows_hits_and_falls_back_on_misses():
+    from vllm_rlt.worker.cuda_graph import _cache_full
+
+    owner = SimpleNamespace(entries={2: object()}, execution=ExecutionConfig(), allow_capture=False)
+    assert not _cache_full(owner, 2)
+    assert _cache_full(owner, 3)
+    assert tuple(owner.entries) == (2,)
+
+
+def test_packed_graph_capture_matches_vllm_throughput_grid():
+    from vllm_rlt.worker.packed_graph import packed_capture_sizes
+
+    sizes = (
+        1,
+        2,
+        4,
+        8,
+        16,
+        24,
+        32,
+        40,
+        48,
+        56,
+        64,
+        80,
+        96,
+        112,
+        128,
+        160,
+        192,
+        224,
+        256,
+        320,
+        384,
+        448,
+        512,
+        640,
+        768,
+        896,
+        1024,
+    )
+    assert packed_capture_sizes(1024) == sizes
+    assert packed_capture_sizes(1000) == (*sizes[:-1], 1000)
+    assert packed_capture_sizes(1) == (1,)
+
+
+@pytest.mark.gpu
+@torch.inference_mode()
+def test_packed_attention_segments_replay_with_live_inputs():
+    from vllm_rlt.worker.packed_graph import _AttentionSegments
+
+    static = torch.arange(4, device="cuda", dtype=torch.float32)
+    first = torch.ones_like(static)
+    second = torch.full_like(static, 7)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    segments = _AttentionSegments()
+    with torch.cuda.stream(stream):
+        torch.add(static, first, out=torch.empty_like(static))
+        stream.synchronize()
+        with segments.capture(first):
+            projected = static * 2
+            attended = torch.empty_like(projected)
+            segments.attention(lambda batch: torch.add(projected, batch, out=attended))
+            output = attended * 3
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.testing.assert_close(attended, static * 2 + first)
+    static.add_(4)
+    segments.replay(second)
+    torch.testing.assert_close(output, (static * 2 + second) * 3)
 
 
 @pytest.mark.gpu

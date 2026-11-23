@@ -912,8 +912,14 @@ There is no cross-stage handoff for each speculative step.
 
 Prompt bootstrap uses the ordinary runner. Refill scheduling returns to the
 scheduler after each prompt chunk, where ready speculative work can be selected.
-PD can import the completed prompt into the decode stage. These combinations do
-not enable mixed scheduling of prompt rows with speculative verification rows.
+PD can import the completed prompt into the decode stage. The single-stage
+native Inkling async token pipeline can also schedule mixed Core work. The
+VarLoop checkpoint uses a server-wide pass count equal to the target depth.
+A joined forward uses device-owned speculative addresses for the leading
+single-query rows and host-planned packed metadata for the prompt rows.
+Prompt progress uses the compute completion event. Speculative results keep
+their independent tickets and readback stream. Packed bucket graphs can replay
+the shared Core while attention uses the live query layout.
 
 
 The synchronous runner reads the acceptance result before constructing the next
@@ -986,6 +992,9 @@ token slots; the copy stream transfers compact results to pinned host storage.
 Collecting an older step never rewinds GPU state. Inactive slots have masked KV
 writes and zero attention lengths. Fixed-shape prelude/coda calls can include
 unused rows; this avoids a host dependency for selecting dynamic batch sizes.
+On Inkling with native vLLM kernels, speculative steps and new-request
+prefill share one compute stream because both use the same expert scratch.
+Result readback still runs on its own stream when multi-stream execution is enabled.
 Pending steps cannot be preempted. Waiting admissions drain outstanding steps so
 Scheduler can select a victim at a completed step boundary. At that boundary,
 preemption saves hidden states, loop depths and candidates with the existing KV

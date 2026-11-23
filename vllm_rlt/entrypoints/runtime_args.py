@@ -76,6 +76,16 @@ def add_runtime_args(parser):
     )
     parser.add_argument("--cuda-graph-max-graphs", type=int, default=16)
     parser.add_argument(
+        "--cuda-graph-warmup",
+        action="store_true",
+        help="Prewarm native Inkling CUDA Graphs at startup and run unseen shapes eagerly",
+    )
+    parser.add_argument(
+        "--packed-graph-buckets",
+        action="store_true",
+        help="Use vLLM token buckets and a shared graph pool for native Inkling packed CUDA Graphs",
+    )
+    parser.add_argument(
         "--cuda-graph-memory-reserve-bytes",
         type=int,
         default=1024**3,
@@ -137,8 +147,10 @@ def runtime_configs(args):
             packed_prefill=args.packed_prefill,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,
+            cuda_graph_warmup=args.cuda_graph_warmup,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,
             cuda_graph_max_graphs=args.cuda_graph_max_graphs,
+            packed_graph_buckets=args.packed_graph_buckets,
             cuda_graph_memory_reserve_bytes=args.cuda_graph_memory_reserve_bytes,
             async_scheduling=args.async_scheduling,
             multi_stream=not args.single_stream,

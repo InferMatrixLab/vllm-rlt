@@ -257,6 +257,8 @@ def _paged_prefill_kernel(
     OUT,
     KS,
     VS,
+    REL_BIAS,
+    SINKS,
     q_token_stride,
     q_head_stride,
     k_block_stride,
@@ -272,6 +274,8 @@ def _paged_prefill_kernel(
     s_token_stride,
     s_head_stride,
     HAS_SCALE: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    REL_EXTENT: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HEAD_GROUPS: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -310,6 +314,11 @@ def _paged_prefill_kernel(
     positions = prefix + rows
     maximum = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     normalizer = tl.zeros((BLOCK_M,), tl.float32)
+    if REL_EXTENT:
+        # The sink contributes one softmax logit and a zero value per query.
+        row_head = (q_begin + rows).to(tl.int64) * NUM_HEADS + head
+        maximum = tl.load(SINKS + row_head, row_valid, other=0).to(tl.float32)
+        normalizer = tl.full((BLOCK_M,), 1.0, tl.float32)
     accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
     # Bottom-right causal alignment: the last query row sees every key.
     end = tl.minimum(kv_len, prefix + (q_block + 1) * BLOCK_M)
@@ -344,6 +353,14 @@ def _paged_prefill_kernel(
         visible = key_valid[None, :] & (keys_pos[None, :] <= positions[:, None])
         if WINDOW:
             visible = visible & (keys_pos[None, :] >= positions[:, None] - WINDOW + 1)
+        if REL_EXTENT:
+            distance = positions[:, None] - keys_pos[None, :]
+            bias = tl.load(
+                REL_BIAS + row_head[:, None] * REL_EXTENT + distance,
+                row_valid[:, None] & visible & (distance < REL_EXTENT),
+                other=0,
+            )
+            scores += bias.to(tl.float32)
         scores = tl.where(visible, scores, -float("inf"))
         next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
         # Rows with no visible key in this tile keep -inf; avoid inf - inf.
@@ -396,6 +413,8 @@ def paged_prefill_attention(
     *,
     window=0,
     compensate=False,
+    relative_bias=None,
+    sinks=None,
 ):
     """Packed causal prefill over paged K/V, bottom-right aligned per sequence.
 
@@ -404,6 +423,8 @@ def paged_prefill_attention(
     block_tables[s]. Query i of a sequence sits at position
     context_length - query_length + i and attends keys up to that position.
     FP8 pools pass per-vector scales [physical block, token, KV head].
+    Optional relative bias is [query token, head, backward distance], with zero
+    bias past its extent. Sinks are [query token, head].
     """
     output = torch.empty_like(q)
     sequences = block_tables.shape[0]
@@ -416,6 +437,14 @@ def paged_prefill_attention(
             raise ValueError("paged prefill requires a contiguous head dimension")
     if q.stride(2) != 1:
         raise ValueError("paged prefill requires contiguous query rows")
+    if (relative_bias is None) != (sinks is None):
+        raise ValueError("paged prefill requires relative bias and sinks together")
+    if relative_bias is not None:
+        if relative_bias.ndim != 3 or relative_bias.shape[:2] != q.shape[:2]:
+            raise ValueError("relative bias must have shape [query tokens, heads, extent]")
+        if relative_bias.shape[-1] == 0 or sinks.shape != q.shape[:2]:
+            raise ValueError("relative bias requires a nonzero extent and one sink per query head")
+        relative_bias, sinks = relative_bias.contiguous(), sinks.contiguous()
     _launch_paged_prefill(
         q,
         key_cache,
@@ -429,6 +458,8 @@ def paged_prefill_attention(
         value_scale=value_scale,
         window=window,
         compensate=compensate,
+        relative_bias=relative_bias,
+        sinks=sinks,
     )
     return output
 
@@ -447,6 +478,8 @@ def _launch_paged_prefill(
     compensate,
     key_scale=None,
     value_scale=None,
+    relative_bias=None,
+    sinks=None,
     compile_only=False,
 ):
     block_m, block_n = _PACKED_WINDOW_TILE if compensate else (64, 64)
@@ -472,6 +505,8 @@ def _launch_paged_prefill(
         output,
         key_scale,
         value_scale,
+        relative_bias if relative_bias is not None else context_lengths,
+        sinks if sinks is not None else context_lengths,
         q.stride(0),
         q.stride(1),
         key_cache.stride(0),
@@ -485,6 +520,8 @@ def _launch_paged_prefill(
         output.stride(1),
         *scale_strides,
         HAS_SCALE=has_scale,
+        NUM_HEADS=q.shape[1],
+        REL_EXTENT=relative_bias.shape[-1] if relative_bias is not None else 0,
         HEAD_DIM=q.shape[-1],
         HEAD_GROUPS=q.shape[1] // key_cache.shape[2],
         PAGE_SIZE=key_cache.shape[1],

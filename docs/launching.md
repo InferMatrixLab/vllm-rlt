@@ -12,6 +12,92 @@ The release is for research/evaluation, not a production deployment guarantee.
 
 For Huawei Ascend NPU, follow the [Ascend setup](recipes/ouro_ascend.md) on `main`.
 
+### Inkling 2 Mini
+
+The fixed and variable-loop checkpoints share one text implementation. The fixed
+checkpoint uses three passes. The variable-loop checkpoint defaults to three and
+accepts `--loop-num-passes` when the worker starts.
+
+```bash
+python -m vllm_rlt.entrypoints.cli \
+  --model thinkingmachines/Inkling-2-Mini --device cuda --num-blocks 96 \
+  --prompt 'The capital of France is' --max-tokens 8
+
+python -m vllm_rlt.entrypoints.cli \
+  --model thinkingmachines/TML-d24-varloop-research --loop-num-passes 2 \
+  --device cuda --num-blocks 96 --prompt 'The capital of France is' --max-tokens 8
+```
+
+Both examples use synchronous NVIDIA CUDA execution and BF16 KV. The loader
+expands the checkpoint's NVFP4 and MXFP8 expert weights to BF16, requiring
+approximately 51 GiB of GPU memory for weights, plus KV and temporary buffers.
+The examples were exercised on B300 with PyTorch 2.14. The same checkpoint and
+pass arguments work with `vllm-rlt-serve` for text completions.
+
+Packed prefill is selected by default. Use `--packed-prefill` to require it or
+`--no-packed-prefill` to select per-query prefill for comparison. Both use the
+same chunk scheduler, relative position bias, attention sinks, BF16 KV, and
+per-pass convolution history. Decode continues to use per-query attention.
+
+Both checkpoints on SM10x can use the vLLM Inkling operators with
+`--inkling-kernels vllm`. Install a vLLM CUDA build that contains the native
+Inkling operators and its FlashInfer dependencies in the serving environment.
+The tested vLLM source revision is `3146a9df4140`. RLT loads the checkpoint
+and schedules requests, using native NVFP4/MXFP8 experts and the vLLM
+attention, short-convolution, and AttnRes kernels.
+
+Use `--packed-prefill --cuda-graphs` with this option. RLT captures decode
+prelude, recurrent pass, and coda separately. Packed prefill has its own graph
+entries for prelude, recurrent passes and KV-only coda, sized up to the
+scheduler's query-token budget. With the native kernels, add
+`--packed-graph-buckets` to round the query count up to the next vLLM throughput
+bucket and share a graph memory pool. Each bucket is captured on first use by default.
+Padding rows have no KV slots. Attention runs between graph segments with the
+real query count and batch metadata. Token padding can change BF16 rounding
+and the selected token when logits are close.
+
+`--mode mixed` lets Inkling combine staged prompt rows with decode rows in
+one recurrent submission. The vLLM kernel path dispatches the leading decode
+rows to relative decode attention and the remaining rows to packed FA4 when
+the batch needs both. With `--packed-graph-buckets`, packed mixed batches use
+the same token buckets as packed prefill. Otherwise, mixed batches within the
+decode row limit use their own full-graph cache. Pure decode has a separate
+full-graph cache. Each cache observes the configured entry limit. Uncached
+batches beyond these limits run eagerly. Mixed uses the single-stage scheduler.
+
+Add `--async-scheduling` for either checkpoint, including in mixed mode. The
+next decode prelude can use the Coda sample on the GPU while the CPU receives
+the previous output. The scheduler checks the previous token for EOS before
+sampling another token for the same request. Both attention and convolution
+use the normal per-pass KV layout. The default scheduler is synchronous.
+
+Add `--cuda-graph-warmup` to compile FA4 attention variants and pre-capture a
+bounded set of native Inkling decode and packed graphs before the worker becomes
+ready. Warmup uses temporary KV pages and releases them before serving. The
+token and row budgets and `--cuda-graph-max-graphs` bound startup coverage.
+Once ready, the worker replays captured entries and executes unseen shapes eagerly.
+For mixed mode, enabling `--packed-graph-buckets` lets small and large mixed
+batches use the same pre-captured packed entries.
+
+Use `--wavefront-chunked-prefill` with mixed or refill scheduling to put ready
+prompt chunks at different Core depths in the same batch. For Fixed with
+mixed scheduling, the W7 C32 run used `--min-coda-batch-size 32` to let ready
+Core work catch up to requests already waiting for Coda. Coda still runs below
+the threshold when there is no ready decode Core work.
+
+With the native kernels, refill supports the greedy token pipeline
+with `--speculative-mode pipeline --speculative-tokens 2 --draft-loops 1 --target-loops 3`.
+Add `--async-scheduling` to submit ahead of CPU acceptance and output delivery.
+For C32, a CUDA Graph row limit of 96 covers the pipeline's three slots per
+request. The pipeline requires preemption to be disabled.
+
+Use `--mode mixed --async-scheduling` with that pipeline on a single worker
+to run ready prompt and speculative rows in one Core forward. For VarLoop,
+set `--loop-num-passes` to the same value as `--target-loops`. This mode
+uses packed prefill and supports `--wavefront-chunked-prefill`. Add
+`--packed-graph-buckets --cuda-graph-warmup` to replay warmed packed Core
+buckets for the shared forward.
+
 ## 1. Check the machine
 
 Use Linux with Git, curl, [uv](https://docs.astral.sh/uv/getting-started/installation/),
@@ -333,8 +419,8 @@ insert a depth boundary when decode work can join a prompt recurrent batch.
 `--wavefront-chunked-prefill` enables per-depth chunk regrouping. These are
 batching choices, not PD disaggregation.
 
-Stage roles are `prefill`, `decode` and `prefill_decode`; `mixed` is a scheduling
-mode, not a stage role. Speculation requires refill scheduling and cannot join
-mixed recurrent batches. Model/backend restrictions still apply. See the
+Stage roles are `prefill`, `decode` and `prefill_decode`. Most speculative modes
+use refill scheduling. Inkling with the native async token pipeline also
+supports mixed recurrent batches. See the
 [runtime guide](runtime.md#execution-batches-and-mixed-scheduling) before
 combining optional features.

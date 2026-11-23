@@ -150,6 +150,7 @@ a fixed scale at startup. See the
 | Nanbeige4.2-3B | Native Nanbeige | [CUDA](docs/launching.md) | Fixed two-loop inference. [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |
 | Huginn-0125 | Native Huginn | [CUDA](docs/launching.md) | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda |
 | [NVIDIA-Nemotron-Labs-Dory1.0-4B](docs/dory.md) | Native Dory | [CUDA](docs/launching.md) | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified |
+| Inkling 2 Mini / TML-d24-varloop-research | Shared Inkling 2 Mini | [CUDA](docs/launching.md#inkling-2-mini) | Single-GPU text generation with optional async scheduling, packed prefill, and separate KV and convolution history per pass |
 
 The broader model roadmap is in [RFC #69](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
 
