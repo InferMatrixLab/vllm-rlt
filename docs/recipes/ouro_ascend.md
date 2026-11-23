@@ -1,9 +1,10 @@
 # Ouro on Ascend
 
-Run Ouro-1.4B on one Ascend NPU with BF16, greedy decoding and four recurrent
-loops. The Python runtime uses Torch's `scaled_dot_product_attention` through
-the `ascend_eager` backend, matching HF's SDPA entry point. Torch-NPU selects
-the device kernel according to the input shape, mask and hardware.
+Run Ouro-1.4B on one Ascend NPU with BF16 and greedy decoding. Decode uses four
+recurrent loops by default. The Python runtime uses Torch's
+`scaled_dot_product_attention` through the `ascend_eager` backend, matching HF's
+SDPA entry point. Torch-NPU selects the device kernel according to the input
+shape, mask and hardware.
 The example enables the optional asynchronous engine plan.
 
 ## Prepare the environment and model
@@ -88,8 +89,24 @@ curl --fail http://127.0.0.1:8123/v1/completions \
   -d '{"model":"ouro","prompt":"The capital of France is","max_tokens":8,"temperature":0,"min_loops":4,"max_loops":4,"exit_threshold":1}'
 ```
 
+### Adaptive decode depth
+
+Ouro on Ascend uses the shared CUDA and ROCm exit policies. Use `--exit-mode ouro`
+with synchronous scheduling for the original gate. Use `--exit-mode ouro_delayed`
+for the one-round delayed policy, which also supports `--async-scheduling`.
+The first output uses all four prefill loops. For subsequent tokens, specify
+`min_loops`, `max_loops` and an `exit_threshold` below `1` to
+enable the adaptive gate. Decode depth can also be capped with `max_loops` from
+`1` to `4`, subject to `min_loops <= max_loops`. Omit `max_loops` to use the
+model depth. Keep `temperature=0` on Ascend.
+
+For example, send `"min_loops": 2, "max_loops": 4, "exit_threshold": 0.5` in
+the completion request. Threshold `1` disables gate-driven exits and retains
+the requested decode cap. The [shared runtime guide](../runtime.md#reusing-the-trained-ouro-gate-ouro_delayed)
+describes how the two policies interpret the gate score.
+
 <a id="6-fixed-depth-asynchronous-engine-plan"></a>
-## Fixed-depth asynchronous engine plan
+## Asynchronous engine plan
 
 - **Scheduling.** Stream events track completion and protect buffer and request
   lifetimes. Decode PRELUDE and each recurrent loop are separate submissions,
@@ -107,8 +124,7 @@ curl --fail http://127.0.0.1:8123/v1/completions \
 The example uses private, fully reserved `last_exited` KV. Keep graphs,
 static buffers, padding, prefix caching, incremental KV allocation, preemption,
 speculation and prefill/decode disaggregation disabled in this configuration.
-Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs
-and adaptive exit.
+Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs.
 
 <a id="8-profile-guided-high-batch-scheduling"></a>
 ## Performance and correctness

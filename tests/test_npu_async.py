@@ -25,7 +25,7 @@ def test_fixed_depth_decode_keeps_each_loop_schedulable():
     assert request.phase == RequestPhase.CODA
 
 
-def make_engine(model, asynchronous, multi_stream):
+def make_engine(model, asynchronous, multi_stream, *, exit_mode=None):
     return StageEngine(
         model,
         attention_backend="ascend_eager",
@@ -41,7 +41,7 @@ def make_engine(model, asynchronous, multi_stream):
             use_uva=False,
             cuda_graphs=False,
         ),
-        exit_config=ExitConfig("ouro_delayed" if asynchronous else "ouro"),
+        exit_config=ExitConfig(exit_mode or ("ouro_delayed" if asynchronous else "ouro")),
     )
 
 
@@ -91,6 +91,86 @@ def test_async_npu_matches_sync_without_device_barriers(monkeypatch, multi_strea
                     assert actual == reference
         finally:
             engine.close()
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "exit_mode, async_schedule, multi_stream",
+    [("ouro", False, False), ("ouro_delayed", True, False), ("ouro_delayed", True, True)],
+    ids=["ouro-sync", "delayed-async-single", "delayed-async-multi"],
+)
+@torch.inference_mode()
+def test_npu_adaptive_exit_then_deeper_decode(monkeypatch, exit_mode, async_schedule, multi_stream):
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    recurrent = model.recurrent_prepared
+
+    def alternate_gate(hidden, batch, cache, **kwargs):
+        hidden, gate = recurrent(hidden, batch, cache, **kwargs)
+        if gate is not None:
+            # Decode starts at position 15. Walk into the next page at full
+            # depth, which needs the KV copied from the earlier exit.
+            gate = batch.position_ids.remainder(2).to(gate.dtype) * 20 - 10
+        return hidden, gate
+
+    monkeypatch.setattr(model, "recurrent_prepared", alternate_gate)
+    adaptive = SamplingParams(max_tokens=5, min_loops=2, exit_threshold=0.9, ignore_eos=True)
+    fixed = SamplingParams(max_tokens=5, ignore_eos=True)
+    capped = SamplingParams(max_tokens=5, min_loops=1, max_loops=1, ignore_eos=True)
+    early = 2 if exit_mode == "ouro" else 3
+
+    def run(asynchronous, use_multi_stream):
+        engine = make_engine(model, asynchronous, use_multi_stream, exit_mode=exit_mode)
+        try:
+            with pytest.raises(ValueError, match="exceed the model's supported depth"):
+                engine.add_request("invalid", [3], SamplingParams(max_loops=5))
+            with pytest.raises(ValueError, match="require greedy sampling"):
+                engine.add_request("invalid", [3], SamplingParams(temperature=0.5))
+            engine.add_request("adaptive", [3, 7, 11] * 5, adaptive)
+            for _ in range(30):
+                if any(out.token_ids for out in engine.step()):
+                    break
+            else:
+                pytest.fail("adaptive request did not produce its first token")
+            engine.add_request("fixed", [13, 17, 19], fixed)
+            engine.add_request("capped", [3, 5, 7], capped)
+            return drain(engine)
+        finally:
+            engine.close()
+
+    expected = run(False, False)
+    assert expected["adaptive"][1] == [4, early, 4, early, 4]
+    assert expected["fixed"][1] == [4] * 5
+    assert expected["capped"][1] == [4, 1, 1, 1, 1]
+    if async_schedule:
+        assert run(True, multi_stream) == expected
+
+
+@pytest.mark.npu
+@torch.inference_mode()
+def test_npu_adaptive_abort_discards_pending_gate_before_request_id_reuse():
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    model.model.early_exit_gate.weight.zero_()
+    model.model.early_exit_gate.bias.fill_(10)
+    params = SamplingParams(max_tokens=4, min_loops=2, exit_threshold=0.9, ignore_eos=True)
+    engine = make_engine(model, True, True)
+    try:
+        engine.add_request("a", [3, 7, 11], params)
+        for _ in range(30):
+            engine.step()
+            if "a" in engine._pending_exit_signals:
+                break
+        else:
+            pytest.fail("adaptive request did not retain a gate result")
+        engine.abort_request("a")
+        assert "a" not in engine._pending_exit_signals
+        engine.add_request("a", [13, 17, 19], params)
+        assert drain(engine)["a"][1] == [4, 3, 3, 3]
+    finally:
+        engine.close()
 
 
 @pytest.mark.npu

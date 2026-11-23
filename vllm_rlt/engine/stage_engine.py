@@ -457,10 +457,8 @@ class StageEngine:
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
         fixed_loop_count = getattr(self.model, "fixed_loop_count", False)
         target_loops, max_loops = self._resolve_loop_bounds(params)
-        if next(self.model.parameters()).device.type == "npu" and (
-            max_loops != 4 or params.exit_threshold != 1.0 or params.temperature != 0
-        ):
-            raise ValueError("NPU Ouro requests require four loops, exit_threshold=1 and greedy")
+        if next(self.model.parameters()).device.type == "npu" and params.temperature != 0:
+            raise ValueError("NPU Ouro requests require greedy sampling")
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
