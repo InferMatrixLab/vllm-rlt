@@ -1,7 +1,7 @@
 # Ouro on Ascend
 
-Run Ouro-1.4B or Ouro-2.6B on one Ascend NPU with BF16 and greedy decoding. Decode uses four
-recurrent loops by default. The Python runtime uses Torch's
+Run Ouro-1.4B or Ouro-2.6B on one Ascend NPU with BF16 and greedy decoding.
+Decode uses four recurrent loops by default. The Python runtime uses Torch's
 `scaled_dot_product_attention` through the `ascend_eager` backend, matching HF's
 SDPA entry point. Torch-NPU selects the device kernel according to the input
 shape, mask and hardware.
@@ -168,6 +168,24 @@ verifies candidate tokens at the target depth.
 
 A higher prefill quota lets more requests reach decode together and can delay
 decode for existing requests. The scheduler default is 1.
+
+### Ouro-2.6B accuracy screen
+
+On Ascend 910B3 with CANN 9.0 and Torch-NPU 2.10, a BF16 greedy run used the
+[GSM8K-87 question IDs](../../benchmarks/fixtures/gsm8k-87.json), three
+demonstrations, and the strict answer scorer. Each run used cohorts of up to
+eight requests and a 1,024-token output limit. Adaptive runs used
+`min_loops=2` and `max_loops=4`.
+
+| Mode | Threshold | Correct | Mean decode loops |
+| --- | ---: | ---: | ---: |
+| Fixed four loops | 1.0 | 61/87 | 4.00 |
+| Synchronous `ouro` | 0.2 | 59/87 | 2.09 |
+| Asynchronous multi-stream `ouro_delayed` | 0.2 | 67/87 | 3.10 |
+
+The paired result against fixed depth was four losses and two gains for
+`ouro`, and zero losses and six gains for `ouro_delayed`. These scores cover
+the fixed regression cohort.
 
 ### Full unified W1-W7 validation
 
