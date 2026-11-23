@@ -121,10 +121,11 @@ def test_npu_delayed_delivery_consumes_device_token_before_host_result():
             assert request.generated_token_ids == []
             engine.step()
             assert engine.last_schedule.phase == RequestPhase.PRELUDE
-            engine.step()
-            assert engine.last_schedule.phase == RequestPhase.RECURRENT
-            assert request.loops_done == 4
-            assert request.generated_token_ids == []
+            for depth in range(1, 5):
+                engine.step()
+                assert engine.last_schedule.phase == RequestPhase.RECURRENT
+                assert request.loops_done == depth
+                assert request.generated_token_ids == []
             assert ticket.device_values.device.type == "npu"
         finally:
             ticket.event = real_event
