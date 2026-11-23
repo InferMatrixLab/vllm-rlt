@@ -2,9 +2,12 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from tests.test_ascend import make_npu_model
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.device import resolve_device
 from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import RequestPhase
 
@@ -64,6 +67,58 @@ def test_prefix_refcounts_and_eviction():
     assert not c.lookup_prefix([1, 2, 3, 4, 5])
     c.free("all")
     assert c.num_free_blocks == 12
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "asynchronous,multi_stream,wavefront",
+    [(False, False, False), (True, False, True), (True, True, True)],
+    ids=["sync", "async-wavefront-single", "async-wavefront-multi"],
+)
+@torch.inference_mode()
+def test_npu_prefix_reuses_full_depth_pages_with_incremental_growth(
+    asynchronous, multi_stream, wavefront
+):
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    prefix = [3, 7, 11, 13] * 8
+    prompts = {"a": prefix + [5, 17], "b": prefix + [19]}
+    params = SamplingParams(max_tokens=4, min_loops=2, exit_threshold=0.2, ignore_eos=True)
+    results = []
+    for enabled in (False, True):
+        engine = StageEngine(
+            model,
+            attention_backend="ascend_eager",
+            cache_config=CacheConfig(
+                96, 16, enable_prefix_caching=enabled, incremental_allocation=enabled
+            ),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=48,
+                prefill_chunk_size=16,
+                wavefront_chunked_prefill=wavefront,
+            ),
+            exit_config=ExitConfig("ouro_delayed"),
+            execution_config=ExecutionConfig(
+                async_scheduling=asynchronous, multi_stream=multi_stream, use_uva=False
+            ),
+        )
+        try:
+            engine.add_request("seed", prefix + [23], SamplingParams(max_tokens=1))
+            assert finish(engine)["seed"].exit_depths == [4]
+            cache = engine.cache_manager
+            assert len(cache.lookup_prefix(prompts["a"])) == (2 if enabled else 0)
+            for request_id, prompt in prompts.items():
+                engine.add_request(request_id, prompt, params)
+            outputs = finish(engine)
+            assert len(outputs) == len(prompts)
+            results.append({key: (out.token_ids, out.exit_depths) for key, out in outputs.items()})
+            assert cache.prefix_hits == (2 * len(prefix) if enabled else 0)
+            assert cache.num_used_blocks == 0
+        finally:
+            engine.close()
+    assert results[0] == results[1]
 
 
 def test_incremental_growth_matches_reserved_generation():

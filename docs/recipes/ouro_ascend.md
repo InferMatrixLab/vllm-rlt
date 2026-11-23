@@ -122,9 +122,18 @@ describes how the two policies interpret the gate score.
   The Ascend backend gathers the visible KV rows for Torch SDPA.
 
 The example uses private, fully reserved `last_exited` KV. Keep graphs,
-static buffers, padding, prefix caching, incremental KV allocation, preemption,
-speculation and prefill/decode disaggregation disabled in this configuration.
+static buffers, padding, preemption, speculation and prefill/decode
+disaggregation disabled in this configuration.
 Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs.
+
+### Prompt reuse and KV growth
+
+Use `--enable-prefix-caching` to reuse completed prompt pages at every
+recurrent depth. The engine computes at least the last prompt token to obtain
+the first output. Use `--incremental-kv` to allocate pages as requests grow.
+Both options use the shared `last_exited` cache and work with synchronous
+or asynchronous eager execution. Use `--wavefront-chunked-prefill` to group
+ready prompt chunks by depth.
 
 <a id="8-profile-guided-high-batch-scheduling"></a>
 ## Performance and correctness
