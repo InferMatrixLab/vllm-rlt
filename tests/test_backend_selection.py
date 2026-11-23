@@ -64,6 +64,31 @@ def test_cpu_auto_reports_torch_and_runs_reference_attention(caplog):
     torch.testing.assert_close(selected(q, k, v, table, lengths), explicit(q, k, v, table, lengths))
 
 
+def test_npu_auto_selects_ascend_with_required_execution_capabilities():
+    device = SimpleNamespace(type="npu")
+    required = BackendCapabilities(packed_prefill=True, async_scheduling=True)
+    selected = create_backend(
+        "auto", device, torch.bfloat16, 128, 16, required_capabilities=required
+    )
+    assert selected.info["requested_backend"] == "auto"
+    assert selected.info["selected_backend"] == "ascend_eager"
+    assert selected.capabilities.packed_prefill and selected.capabilities.async_scheduling
+    explicit = create_backend("torch", device, torch.bfloat16, 128, 16)
+    assert explicit.info["selected_backend"] == "torch"
+    fallback = create_backend("auto", device, torch.float32, 128, 16)
+    assert fallback.info["selected_backend"] == "torch"
+    assert "BF16" in fallback.info["selection_reason"]
+    with pytest.raises(ValueError, match="no compatible attention backend.*cuda_graphs"):
+        create_backend(
+            "auto",
+            device,
+            torch.bfloat16,
+            128,
+            16,
+            required_capabilities=BackendCapabilities(cuda_graphs=True),
+        )
+
+
 @pytest.mark.parametrize(
     "sm,dtype,head_dim,supported",
     [

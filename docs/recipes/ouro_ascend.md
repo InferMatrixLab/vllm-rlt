@@ -65,11 +65,15 @@ sequence lengths, resident request count and available device memory. For
 whole-cohort prefill, the chunk size must fit each prompt and the batched token
 budget must fit the sum of prompt lengths in the cohort.
 
+The serving CLI defaults to `--attention-backend auto` on NPU. It prefers
+`ascend_eager` for compatible BF16 execution. Use `--attention-backend torch`
+for an explicit Torch reference run.
+
 ```bash
 TASK_QUEUE_ENABLE=2 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 python -m vllm_rlt.entrypoints.serve \
   --model "$MODEL" --tokenizer "$MODEL" --served-model-name ouro \
-  --device npu --dtype bfloat16 --attention-backend ascend_eager \
+  --device npu --dtype bfloat16 \
   --mode refill --exit-mode ouro_delayed \
   --async-scheduling --single-stream --no-uva \
   --block-size 16 --num-blocks 2064 --max-num-seqs 32 \

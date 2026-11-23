@@ -67,9 +67,9 @@ def test_npu_does_not_use_cpu_default_memory_budget():
     assert blocks == 17 and info["source"] == "blocks"
 
 
-@pytest.mark.parametrize("backend", ["auto", "triton", "flash_attn_4"])
-def test_npu_requires_explicit_torch_before_allocation(backend):
-    with pytest.raises(ValueError, match="explicit attention_backend='torch'"):
+@pytest.mark.parametrize("backend", ["triton", "flash_attn_4"])
+def test_npu_rejects_incompatible_attention_before_allocation(backend):
+    with pytest.raises(ValueError, match="NPU attention requires"):
         StageEngine(npu_model_stub(), attention_backend=backend)
 
 

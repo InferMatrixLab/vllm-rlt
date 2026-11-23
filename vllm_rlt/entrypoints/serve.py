@@ -98,7 +98,7 @@ def main():
             "flash_attn_3",
             "flash_attn_4",
         ],
-        default="triton",
+        help="Defaults to auto on NPU and Triton otherwise",
     )
     parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
     parser.add_argument("--num-blocks", type=int, help="Override automatic KV sizing")
@@ -116,6 +116,8 @@ def main():
 
     add_runtime_args(parser)
     args = parser.parse_args()
+    if args.attention_backend is None:
+        args.attention_backend = "auto" if args.device == "npu" else "triton"
     limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
     if args.device == "cpu" and args.attention_backend not in ("auto", "torch"):
         parser.error("CPU execution requires --attention-backend torch or auto")

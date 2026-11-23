@@ -118,10 +118,8 @@ def backend_capabilities(implementation) -> BackendCapabilities:
 
 
 def validate_backend_name(backend: str, *, device_type: str | None = None) -> None:
-    if device_type == "npu" and backend not in ("torch", "ascend_eager"):
-        raise ValueError(
-            "NPU execution requires explicit attention_backend='torch' or 'ascend_eager'"
-        )
+    if device_type == "npu" and backend not in ("auto", "torch", "ascend_eager"):
+        raise ValueError("NPU attention requires 'auto', 'ascend_eager' or 'torch'")
     if backend not in {"auto", "torch", "triton", "ascend_eager", *FLASH_BACKENDS}:
         raise ValueError("unknown attention backend")
 
@@ -186,7 +184,7 @@ def create_backend(
     packed_window_shape: PackedWindowShape | None = None,
     allow_fp8_calibration: bool = False,
 ) -> AttentionBackend:
-    """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
+    """Choose a compatible attention backend in device-specific priority order.
 
     Each candidate validates hardware/configuration and imports its implementation.
     Only compatibility and import failures permit auto to try the next candidate;
@@ -201,9 +199,12 @@ def create_backend(
     validate_backend_name(backend, device_type=device.type)
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
     skipped = []
-    if backend == "auto" and device.type != "cuda":
-        candidates = ("torch",)
-        skipped.append(f"{device.type.upper()} uses Torch reference attention")
+    if backend == "auto":
+        if device.type == "npu":
+            candidates = ("ascend_eager", "torch")
+        elif device.type != "cuda":
+            candidates = ("torch",)
+            skipped.append(f"{device.type.upper()} uses Torch reference attention")
     for candidate in candidates:
         try:
             implementation = _create_explicit(
@@ -254,7 +255,7 @@ def create_backend(
             f"flash_attn_{implementation.generation}" if candidate in FLASH_BACKENDS else candidate
         )
         reason = (
-            "first compatible candidate in FA4 > FA3 > FA2 > Triton > Torch priority"
+            f"first compatible candidate in {' > '.join(candidates)} priority"
             if backend == "auto"
             else f"explicitly requested {backend}"
         )
