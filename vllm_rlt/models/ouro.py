@@ -27,7 +27,7 @@ from vllm_rlt.layers import (
     apply_rotary_pos_emb,
     rotate_half,
 )
-from vllm_rlt.layers.fused_projections import FusedWeight
+from vllm_rlt.layers.fused_projections import FusedProjectionLayer
 
 if TYPE_CHECKING:
     from vllm_rlt.core.kv_cache_manager import KVCacheManager
@@ -152,26 +152,17 @@ OuroRotaryEmbedding = RotaryEmbedding
 _rotate_half = rotate_half
 
 
-class OuroAttention(nn.Module):
+class OuroAttention(FusedProjectionLayer):
     def __init__(self, config: OuroConfig, layer_idx: int) -> None:
-        super().__init__()
+        query_width = config.num_attention_heads * config.head_dim
+        kv_width = config.num_key_value_heads * config.head_dim
+        super().__init__(
+            config.hidden_size,
+            (("q_proj", query_width), ("k_proj", kv_width), ("v_proj", kv_width)),
+        )
         self.config = config
         self.layer_idx = layer_idx
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * config.head_dim, bias=False
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * config.head_dim, config.hidden_size, bias=False
-        )
-        # q/k/v read the same hidden row, so one fused GEMV streams 25.2 MB instead of
-        # three 8.4 MB matrices, which is where the bandwidth is (see fused_projections).
-        self.qkv_proj = FusedWeight(self, ("q_proj", "k_proj", "v_proj"))
+        self.o_proj = nn.Linear(query_width, config.hidden_size, bias=False)
 
     def forward(
         self,
@@ -181,14 +172,7 @@ class OuroAttention(nn.Module):
         cache: "KVCacheManager",
     ) -> torch.Tensor:
         shape = (hidden.shape[0], -1, self.config.head_dim)
-        fused = self.qkv_proj(hidden)
-        # The fused matrix is [q; k; v] stacked on the output axis, so the three results
-        # are contiguous column ranges of one GEMV output.
-        q_width = self.q_proj.out_features
-        kv_width = self.k_proj.out_features
-        q = fused[:, :q_width].view(shape)
-        k = fused[:, q_width : q_width + kv_width].view(shape)
-        v = fused[:, q_width + kv_width :].view(shape)
+        q, k, v = (part.view(shape) for part in self.project(hidden))
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         cache._write_prepared(self.layer_idx, batch, k, v)
@@ -196,17 +180,14 @@ class OuroAttention(nn.Module):
         return self.o_proj(output.reshape(hidden.shape[0], -1))
 
 
-class OuroMLP(nn.Module):
+class OuroMLP(FusedProjectionLayer):
     def __init__(self, config: OuroConfig) -> None:
-        super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        width = config.intermediate_size
+        super().__init__(config.hidden_size, (("gate_proj", width), ("up_proj", width)))
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        # gate and up share the input row; one 46.1 MB GEMV instead of two 23.1 MB ones.
-        self.gate_up_proj = FusedWeight(self, ("gate_proj", "up_proj"))
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        gate, up = self.gate_up_proj(hidden).split(self.gate_proj.out_features, dim=-1)
+        gate, up = self.project(hidden)
         return self.down_proj(silu_and_mul(gate, up))
 
 
@@ -247,7 +228,7 @@ class OuroModel(nn.Module):
 
 
 class OuroForCausalLM(nn.Module):
-    """Inference-only native Ouro-1.4B with checkpoint-compatible parameter names."""
+    """Inference-only native Ouro-1.4B with checkpoint-compatible state dict keys."""
 
     def __init__(self, config: OuroConfig) -> None:
         super().__init__()
@@ -259,7 +240,9 @@ class OuroForCausalLM(nn.Module):
         self.eval()
 
     def _initialize(self, module: nn.Module) -> None:
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        if isinstance(module, FusedProjectionLayer):
+            nn.init.normal_(module.input_weight, mean=0, std=self.config.initializer_range)
+        elif isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, mean=0, std=self.config.initializer_range)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -352,7 +335,7 @@ class OuroForCausalLM(nn.Module):
             )
         with torch.device("meta"):
             model = cls(config)
-        expected = {name: tuple(parameter.shape) for name, parameter in model.named_parameters()}
+        expected = {name: tuple(tensor.shape) for name, tensor in model.state_dict().items()}
         discovered: dict[str, Path] = {}
         # Validate every key and shape before allocating model weight memory.
         for shard in shards:
@@ -372,12 +355,24 @@ class OuroForCausalLM(nn.Module):
             raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")
         if index is not None and set(index) != set(expected):
             raise ValueError("Checkpoint index does not match Ouro parameter names")
+        fused_slices = {}
+        for prefix, module in model.named_modules():
+            if isinstance(module, FusedProjectionLayer):
+                module.input_weight = nn.Parameter(
+                    torch.empty_like(module.input_weight, device=device, dtype=dtype),
+                    requires_grad=False,
+                )
+                for name, rows in module.checkpoint_slices.items():
+                    fused_slices[f"{prefix}.{name}"] = module.input_weight[rows]
         for shard in shards:
             with safe_open(shard, framework="pt", device="cpu") as checkpoint:
                 for name in checkpoint.keys():
                     tensor = checkpoint.get_tensor(name)
                     if not tensor.is_floating_point():
                         raise ValueError(f"Checkpoint tensor must be floating point: {name}")
+                    if name in fused_slices:
+                        fused_slices[name].copy_(tensor)
+                        continue
                     module_path, parameter_name = name.rsplit(".", 1)
                     module = model.get_submodule(module_path)
                     setattr(

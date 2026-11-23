@@ -28,7 +28,7 @@ Cold-cache efficiency vs matrix size (M=1, K=2048, bf16, measured peak 1770 GB/s
 | 6144 (fused qkv) | 25.2 MB | 1168 | 66.0% |
 | 11264 (fused gate+up) | 46.1 MB | 1312 | 74.1% |
 
-## Implementation
+## Implementation in V002
 
 `vllm_rlt/layers/fused_projections.py::FusedWeight` holds a cached concatenation of the
 source weights. Wired in at `vllm_rlt/models/ouro.py`:
@@ -50,9 +50,26 @@ Three variants were tried; the first two were wrong and each was caught by a tes
 | cache tensor stored as `nn.Parameter` | extra `state_dict` key, `test_native_safetensors_roundtrip` failed |
 | **plain object, plain tensor, sources resolved per call** | correct |
 
-The signature check (`id`, `data_ptr`, `dtype`, `shape` per source) is what makes the cache
-rebuild after a dtype conversion or a checkpoint load instead of silently using stale
-weights.
+The cache signature detected changes to parameter identity, storage, dtype and shape.
+It missed in-place weight updates and kept both the original and fused allocations.
+
+### Single-copy fused weights
+
+Ouro now owns one QKV parameter and one gate/up parameter in each layer. The
+safetensors loader validates the original keys and shapes and copies each source
+tensor directly into its destination slice. The exported state dict exposes the
+original checkpoint keys as disjoint views and accepts the same keys on load.
+There is no first-forward concatenation. The fused GEMM still produces
+token-major rows, which the stride-aware SiLU kernel consumes directly.
+
+On one A100-SXM4-80GB with the real BF16 Ouro-1.4B checkpoint and CUDA
+graphs, PyTorch allocated 5.782 GiB after warmup with the cached weights
+and 4.188 GiB with single-copy weights. Both runs used 512 KV blocks.
+The difference was 1,711,276,032 bytes, equal to one copy of the fused
+projections across 24 layers. For eight fixed 128-token prompts with
+eight generated tokens each and four loops, all 64 greedy token IDs
+matched across two independent processes per version. Median throughput
+across six post-warmup runs per version was 216.6 versus 218.6 tok/s.
 
 ## Correctness
 
