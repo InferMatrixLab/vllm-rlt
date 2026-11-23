@@ -2,17 +2,19 @@
 
 import builtins
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from tests.helpers import tiny_ouro_model
-from vllm_rlt import CacheConfig, SchedulerConfig
+from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.attention.backend import BackendCapabilities
 from vllm_rlt.device import stream_module
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.layers.rotary_embedding import RotaryEmbedding
-from vllm_rlt.worker.executor import ModelRuntime
+from vllm_rlt.request import Operation
+from vllm_rlt.worker.executor import ForwardBatch, ForwardResult, ModelRuntime
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.sampler import Sampler
 
@@ -87,3 +89,33 @@ def test_default_engine_keeps_upstream_runtime_and_sampler(monkeypatch):
         assert type(engine.model_runner.sampler) is Sampler
     finally:
         engine.close()
+
+
+@pytest.mark.parametrize("compute_logits", [False, True])
+def test_npu_coda_uses_batched_sampling_only_for_materialized_logits(compute_logits):
+    logits = torch.tensor([[0.0, 1.0]]) if compute_logits else None
+    forward = ForwardBatch(Operation.CODA, compute_logits=torch.tensor([False, compute_logits]))
+    prepared = SimpleNamespace(
+        forwards=(SimpleNamespace(forward=forward, hidden_rows=None),),
+        sampling_params=(SamplingParams(),) if compute_logits else (),
+        sampling_generators=(None,) if compute_logits else (),
+        routing=None,
+    )
+    calls = []
+
+    def sample_batch(values, params, generators):
+        calls.append((values, params, generators))
+        return values.argmax(dim=-1)
+
+    runner = SimpleNamespace(
+        runtime=SimpleNamespace(forward=lambda batch: ForwardResult(hidden=None, logits=logits)),
+        device=SimpleNamespace(type="npu"),
+        sampler=SimpleNamespace(sample_batch=sample_batch),
+    )
+    actual = ModelRunner._execute_batch(runner, SimpleNamespace(), prepared)
+    if compute_logits:
+        assert actual.tolist() == [1]
+        assert len(calls) == 1
+    else:
+        assert actual is None
+        assert not calls

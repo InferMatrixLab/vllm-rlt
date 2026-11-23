@@ -202,6 +202,7 @@ class HuginnForCausalLM(nn.Module):
     """Huginn-0125 with eager KV boundaries and a graphable recurrent core."""
 
     requires_boundary_kv = True
+    requires_prefill_coda = True
 
     def __init__(self, config: HuginnConfig) -> None:
         super().__init__()
@@ -258,20 +259,15 @@ class HuginnForCausalLM(nn.Module):
         for block in self.transformer.prelude:
             hidden = block(hidden, freqs, batch, cache)
         state = torch.empty_like(hidden)
-        start = 0
-        while start < len(state):
-            end = start + 1
-            generator = generators[start] if generators is not None else None
-            while end < len(state) and (generators is None or generators[end] is generator):
-                end += 1
+        for row in range(len(state)):
+            generator = generators[row] if generators is not None else None
             torch.nn.init.trunc_normal_(
-                state[start:end],
+                state[row : row + 1],
                 std=self.config.initializer_range,
                 a=-3 * self.config.initializer_range,
                 b=3 * self.config.initializer_range,
                 generator=generator,
             )
-            start = end
         state = state * math.sqrt(self.config.n_embd)
         return torch.cat((state, hidden), dim=-1)
 
@@ -295,11 +291,23 @@ class HuginnForCausalLM(nn.Module):
     def coda_prepared(
         self, hidden, batch: "KVMetadata", cache: "KVCacheManager", *, compute_logits=True
     ):
+        if isinstance(compute_logits, torch.Tensor) and (
+            compute_logits.dtype != torch.bool
+            or compute_logits.ndim != 1
+            or compute_logits.numel() != len(hidden)
+        ):
+            raise ValueError("compute_logits must be a boolean mask for every CODA row")
         state, _ = hidden.split(self.config.n_embd, dim=-1)
         state = self.transformer.ln_f(state)
         freqs = self._freqs(batch)
         for block in self.transformer.coda:
             state = block(state, freqs, batch, cache)
+        if isinstance(compute_logits, torch.Tensor):
+            rows = torch.nonzero(compute_logits, as_tuple=True)[0]
+            if not rows.numel():
+                return None
+            state = state.index_select(0, rows.to(state.device))
+            compute_logits = True
         return self.lm_head(self.transformer.ln_f(state)) if compute_logits else None
 
     @classmethod

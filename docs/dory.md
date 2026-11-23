@@ -69,6 +69,13 @@ layer id rather than their physical sublayer index.
   `gate_up_proj` fails loudly instead of loading approximately.
 - Synchronous eager execution: full-prompt prefill followed by ordinary token
   decoding, with the configured fixed loop count.
+- Synchronous eager staged prefill with per-loop KV, including WCPB and mixed
+  prelude/recurrent batching. Each request may select a fixed target from one
+  through `total_ut_steps`, with the full model depth as the default. Prompt
+  CODA is a separate causal stage; its final prompt row produces the first token.
+  Tiny-model CPU and A100 CUDA regressions cover float32, BF16 and multi-stream
+  execution. A short BF16 real-checkpoint differential check is recorded below;
+  long-context and broader backend qualification remain outstanding.
 - `loops=` at load time to fix 1, 2 or 4 loops.
 - Greedy and sampled decoding, request seeds, EOS (`2`, `11`) and length
   stopping through the existing engine, covered by
@@ -134,14 +141,15 @@ even with per-query attention.
 
 These fail fast rather than degrade silently:
 
-- WCPB, mixed or staged prefill, and PD.
+- Staged prefill with CUDA Graphs, asynchronous scheduling, preemption,
+  speculation, shared/last-loop KV, or PD.
 - Prefix caching.
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
   preemption or `last_loop` KV, and sampled token-pipeline speculation. The
   synchronous eager form is supported; see below.
-- Per-request loop counts other than the configured full depth: Dory has no
-  trained exit gate, so the runtime refuses to invent one, including via
-  `min_loops` with `exit_threshold=0`.
+- Request loop counts below the configured full depth with ordinary atomic
+  prefill. Dory has no trained exit gate; its supported staged request target
+  is fixed rather than inferred from `exit_threshold`.
 
 Preemption and snapshots are **not qualified** rather than enforced: the
 generic KV snapshot mechanism copies every plane, so it may well work, but no
@@ -247,6 +255,19 @@ dense oracle; a greedy engine run whose tokens match the oracle; and
 path.
 
 ### Real checkpoint
+
+For the staged prefill change, a separate BF16 differential test compares the
+local `Dory1.0-4B-BF16` checkpoint on an A100 80GB PCIe (PyTorch 2.13.0+cu130,
+Triton 3.7.1) against independent atomic-prefill runs of the same weights. The
+two five- and ten-token prompts run together with fixed request depths 1 and 2,
+chunk size 2, and three greedy output tokens. Both mixed and WCPB scheduling
+match the atomic token IDs and depths. First-token top-20 overlap is 20/20 for
+the shallow request and 19/20 for the full-depth request; the largest top-20
+logit deviation is 0.1500. This checks neither long contexts nor throughput,
+and is a runtime-to-runtime differential, not an independent accuracy oracle.
+The checkpoint's `model.safetensors` SHA-256 is
+`207483664dfef54c4c4438863260d3ba423bf3d6009b43fe84264b281e9fda23`; its
+revision was not independently verified for this run.
 
 `tests/test_dory_real_checkpoint.py` runs the pinned snapshot
 `f6c832e6963ddb74f62c75813a3e8c74b1af67b1` on one `A100-SXM4-80GB`

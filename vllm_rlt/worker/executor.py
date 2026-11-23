@@ -13,7 +13,9 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import ExecutionBatch, Operation, RequestPhase, StateSpan
 
 
-def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -> ExecutionBatch:
+def build_execution_batch(
+    scheduled_batch: SchedulerOutput, total_depths: int, *, requires_prefill_coda: bool = False
+) -> ExecutionBatch:
     """Bind selected Request references to immutable operation/position/depth rows.
 
     This creates scalar execution descriptors, not new Requests or KV metadata.
@@ -26,13 +28,18 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
     for scheduled_request in scheduled_batch.requests:
         phase = scheduled_batch.phase_for(scheduled_request)
         request = scheduled_request.request
-        chunk = phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+        chunk = phase in (
+            RequestPhase.PREFILLING_PRELUDE,
+            RequestPhase.PREFILLING_RECURRENT,
+            RequestPhase.PREFILLING_CODA,
+        )
         prompt_input = phase in (RequestPhase.PREFILL, RequestPhase.PREFILLING_PRELUDE)
         operation = {
             RequestPhase.PREFILL: Operation.PRELUDE,
             RequestPhase.PREFILLING_PRELUDE: Operation.PRELUDE,
             RequestPhase.PRELUDE: Operation.PRELUDE,
             RequestPhase.PREFILLING_RECURRENT: Operation.RECURRENT,
+            RequestPhase.PREFILLING_CODA: Operation.CODA,
             RequestPhase.RECURRENT: Operation.RECURRENT,
             RequestPhase.CODA: Operation.CODA,
         }.get(phase)
@@ -64,8 +71,19 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
                 token_count=scheduled_request.token_count,
                 depth=depth,
                 chunk_start=scheduled_request.chunk_start if chunk else None,
-                retain_chunk=chunk and depth + execution_loops < total_depths,
-                retain_last=scheduled_request.completes_prompt if chunk else True,
+                retain_chunk=(
+                    chunk
+                    and operation != Operation.CODA
+                    and (
+                        requires_prefill_coda
+                        or depth + execution_loops < len(request.prefill_depth_ranges)
+                    )
+                ),
+                retain_last=(
+                    scheduled_request.completes_prompt and not requires_prefill_coda
+                    if chunk
+                    else True
+                ),
                 emit_gate=phase == RequestPhase.RECURRENT,
                 input_tokens=tuple(
                     request.prompt_token_ids[position : position + scheduled_request.token_count]
@@ -75,6 +93,8 @@ def build_execution_batch(scheduled_batch: SchedulerOutput, total_depths: int) -
                 prefill_hidden_row_offset=(
                     scheduled_request.prefill_hidden_row_offset if chunk else None
                 ),
+                compute_logits=phase != RequestPhase.PREFILLING_CODA
+                or scheduled_request.completes_prompt,
             )
         )
         operations.add(operation)
@@ -100,7 +120,11 @@ class Executor:
             if self.speculation is None:
                 raise ValueError("speculative submission requires a configured round controller")
             return self.speculation.submit(scheduled_batch)
-        batch = build_execution_batch(scheduled_batch, self.runner.model.config.total_ut_steps)
+        batch = build_execution_batch(
+            scheduled_batch,
+            self.runner.model.config.total_ut_steps,
+            requires_prefill_coda=getattr(self.runner.model, "requires_prefill_coda", False),
+        )
         return self.runner.submit(scheduled_batch, batch=batch)
 
 
@@ -113,9 +137,10 @@ class ForwardBatch:
     both phases, rather than being reconstructed from a separate loop-input type.
 
     PRELUDE can include a sequence of RECURRENT views. RECURRENT starts from supplied hidden.
-    CODA projects supplied hidden. KV views carry allocation identity and may
-    use host-planned or device-owned positions. Graph executors must match the
-    operation and gate mode. All tensors/results are borrowed, not snapshots.
+    CODA consumes supplied hidden and optionally produces logits. KV views carry
+    allocation identity and may use host-planned or device-owned positions.
+    Graph executors must match the operation and gate mode. All tensors/results
+    are borrowed, not snapshots.
     """
 
     operation: Operation
@@ -128,7 +153,7 @@ class ForwardBatch:
     compute_gate: bool = False
     graphs: object = None
     graph_calls: tuple = ()
-    compute_logits: bool = True
+    compute_logits: bool | torch.Tensor = True
 
 
 @dataclass(frozen=True)
@@ -152,6 +177,10 @@ class ModelRuntime:
         """
         if batch.graphs is None:
             return batch
+        if batch.operation == Operation.CODA and (
+            isinstance(batch.compute_logits, torch.Tensor) or not batch.compute_logits
+        ):
+            return replace(batch, graphs=None, graph_calls=())
         if batch.operation == Operation.PRELUDE:
             # Graph buffers hold the query rows only; padding has no KV address.
             kv = batch.prelude_coda_kv_metadata
@@ -184,6 +213,12 @@ class ModelRuntime:
                         self.cache,
                         compute_logits=batch.compute_logits,
                     )
+                elif isinstance(batch.compute_logits, torch.Tensor):
+                    mask = batch.compute_logits
+                    if mask.dtype != torch.bool or mask.ndim != 1 or mask.numel() != len(hidden):
+                        raise ValueError("compute_logits must be a boolean mask for every CODA row")
+                    rows = torch.nonzero(mask, as_tuple=True)[0].to(hidden.device)
+                    logits = self.model.coda(hidden.index_select(0, rows)) if rows.numel() else None
                 else:
                     logits = self.model.coda(hidden) if batch.compute_logits else None
                 return ForwardResult(hidden=hidden, logits=logits)

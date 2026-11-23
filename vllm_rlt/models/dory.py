@@ -480,6 +480,7 @@ class DoryForCausalLM(nn.Module):
     """Inference-only Dory with eager KV boundaries and a graphable recurrent core."""
 
     requires_boundary_kv = True
+    requires_prefill_coda = True
     # No Ouro-style learned exit gate: a request uses one fixed target depth.
     fixed_loop_count = True
     # Fixed loops need no exit signal, so ordinary asynchronous scheduling can
@@ -583,11 +584,23 @@ class DoryForCausalLM(nn.Module):
         )
         return torch.cat((state, injection), dim=-1), gate
 
-    def coda_prepared(self, hidden, batch, cache, *, compute_logits: bool = True):
+    def coda_prepared(self, hidden, batch, cache, *, compute_logits: bool | torch.Tensor = True):
         """Run the attention-bearing output stage and the scaled LM head."""
+        if isinstance(compute_logits, torch.Tensor) and (
+            compute_logits.dtype != torch.bool
+            or compute_logits.ndim != 1
+            or compute_logits.numel() != len(hidden)
+        ):
+            raise ValueError("compute_logits must be a boolean mask for every CODA row")
         state, _ = hidden.split(self.config.d_model, dim=-1)
         for index in self.backbone.output_layers:
             state = self.backbone.layers[index](state, batch.position_ids, batch, cache)
+        if isinstance(compute_logits, torch.Tensor):
+            rows = torch.nonzero(compute_logits, as_tuple=True)[0]
+            if not rows.numel():
+                return None
+            state = state.index_select(0, rows.to(state.device))
+            compute_logits = True
         return self.logits(state) if compute_logits else None
 
     def logits(self, state: torch.Tensor) -> torch.Tensor:

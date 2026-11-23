@@ -245,6 +245,104 @@ def test_dory_execution_modes_match_cpu_oracle(mode, max_num_seqs):
         assert runner.prelude_graphs is None
 
 
+@pytest.mark.parametrize("multi_stream", [False, True])
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_staged_prefill_fixed_depths_match_cpu_oracle(multi_stream, wavefront, monkeypatch):
+    reference, model = reference_pair()
+    shallow = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=1)).eval()
+    shallow.load_state_dict(reference.state_dict())
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=256, block_size=2),
+        scheduler_config=SchedulerConfig(
+            mode="mixed",
+            wavefront_chunked_prefill=wavefront,
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+        ),
+        execution_config=ExecutionConfig(multi_stream=multi_stream),
+    )
+    runner = engine.model_runner
+    original_execute = runner._execute
+    scratch = set()
+    delayed = False
+
+    def execute(batch, prepared):
+        nonlocal delayed
+        if prepared.batch_inputs is not None:
+            scratch.add(prepared.batch_inputs.buffers.hidden.data_ptr())
+        if multi_stream and not delayed and prepared.batch.operation.value == "recurrent":
+            torch.cuda._sleep(20_000_000)
+            delayed = True
+        return original_execute(batch, prepared)
+
+    monkeypatch.setattr(runner, "_execute", execute)
+    prompts = {"shallow": [4, 7, 9, 3, 12, 6, 5], "full": [8, 2, 10, 11, 4]}
+    for request_id, prompt in prompts.items():
+        target = 1 if request_id == "shallow" else 2
+        engine.add_request(
+            request_id, prompt, SamplingParams(max_tokens=3, target_loops=target, ignore_eos=True)
+        )
+    try:
+        results = drain(engine)
+        assert results["shallow"].token_ids == greedy_reference(shallow, prompts["shallow"], 3)
+        assert results["full"].token_ids == greedy_reference(reference, prompts["full"], 3)
+        assert results["shallow"].exit_depths == [1] * 3
+        assert results["full"].exit_depths == [2] * 3
+        assert len(scratch) == 2
+        assert delayed is multi_stream
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("multi_stream", [False, True])
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_staged_bfloat16_prefill_matches_atomic_cuda(multi_stream, wavefront):
+    model = make_gpu_model().to(dtype=torch.bfloat16)
+    shallow = DoryForCausalLM(tiny_dory_config(n_recurrent_loops=1)).to(
+        device=DEVICE, dtype=torch.bfloat16
+    )
+    shallow.load_state_dict(model.state_dict())
+    prompts = {"shallow": [4, 7, 9, 3, 12, 6, 5], "full": [8, 2, 10, 11, 4]}
+    targets = {"shallow": 1, "full": 2}
+
+    def run(selected_model, selected, *, staged):
+        engine = LLMEngine(
+            selected_model,
+            attention_backend="triton",
+            cache_config=CacheConfig(num_blocks=256, block_size=2),
+            scheduler_config=SchedulerConfig(
+                mode="mixed" if staged else "refill",
+                wavefront_chunked_prefill=wavefront if staged else False,
+                max_num_seqs=2,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=2,
+            ),
+            execution_config=ExecutionConfig(multi_stream=multi_stream),
+        )
+        try:
+            for request_id in selected:
+                engine.add_request(
+                    request_id,
+                    prompts[request_id],
+                    SamplingParams(max_tokens=3, target_loops=targets[request_id], ignore_eos=True),
+                )
+            outputs = drain(engine)
+            assert engine.cache_manager.num_used_blocks == 0
+            return {
+                request_id: (output.token_ids, output.exit_depths)
+                for request_id, output in outputs.items()
+            }
+        finally:
+            engine.close()
+
+    expected = run(shallow, ("shallow",), staged=False) | run(model, ("full",), staged=False)
+    assert run(model, ("shallow", "full"), staged=True) == expected
+
+
 @pytest.mark.parametrize("mode", EXECUTION_MODES)
 @pytest.mark.parametrize("after", [0, 1, 3, 6, 9])
 def test_dory_cancellation_releases_kv_in_every_execution_mode(mode, after):

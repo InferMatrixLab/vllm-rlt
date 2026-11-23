@@ -35,7 +35,9 @@ class ReadbackSlot:
 class BatchInputBuffers:
     """One event-owned snapshot; source tensors survive until the final reader."""
 
-    def __init__(self, max_seqs, max_tokens, device, hidden_dtype, *, use_uva=True):
+    def __init__(
+        self, max_seqs, max_tokens, device, hidden_dtype, *, use_uva=True, hidden_shape=None
+    ):
         self.segments = UvaBuffer((max_seqs, 5), torch.int64, device, use_uva=use_uva)
         self.segment_view = None
         self.token_input = pinned_tensor(max_tokens, torch.int64, device)
@@ -44,6 +46,11 @@ class BatchInputBuffers:
         self.hidden_gather = TensorTransfer(max_seqs, hidden_dtype, device, use_uva=use_uva)
         self.hidden_scatter = TensorTransfer(2 * max_seqs, hidden_dtype, device, use_uva=use_uva)
         self.hidden_outputs = []
+        self.hidden = (
+            torch.empty(hidden_shape, device=device, dtype=hidden_dtype)
+            if hidden_shape is not None
+            else None
+        )
 
     def reset(self):
         self.token_transfers.reset()
@@ -102,6 +109,8 @@ class PreparedExecution:
     packed_metadata: PackedMetadataBuffer | None = None
     sampling_params: tuple = ()
     sampling_generators: tuple = ()
+    sampling_spans: tuple[int, ...] = ()
+    logits_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -115,6 +124,7 @@ class Submission:
     depths: tuple[int, ...] = ()
     positions: tuple[int, ...] = ()
     output_indices: tuple[int, ...] = ()
+    output_rows: tuple[int, ...] | None = None
     operation: Operation | None = None
 
     def __del__(self):
@@ -142,6 +152,7 @@ class Submission:
             completion=self.event,
             depths=self.depths,
             output_indices=self.output_indices,
+            output_rows=self.output_rows,
         )
         self.values = None
         if self.slot is not None:
@@ -282,15 +293,6 @@ class ModelRunner:
         prefill_rows = scheduler.max_num_batched_tokens
         if self.execution_config.pad_to_power_of_two:
             prefill_rows = 1 << (prefill_rows - 1).bit_length()
-        self.prefill_hidden = (
-            torch.empty(
-                (prefill_rows, model.config.hidden_size),
-                device=self.device,
-                dtype=parameter.dtype,
-            )
-            if self.staged_prefill
-            else None
-        )
         self.batch_input_buffers = (
             [
                 BatchInputBuffers(
@@ -301,6 +303,7 @@ class ModelRunner:
                     self.device,
                     parameter.dtype,
                     use_uva=self.execution_config.use_uva,
+                    hidden_shape=(prefill_rows, model.config.hidden_size),
                 )
                 for _ in range(MAX_CONCURRENT_SUBMISSIONS)
             ]
@@ -480,7 +483,7 @@ class ModelRunner:
                 source = request.hidden_state
                 source = None if source is None else source.reshape(1, -1)
             last = None
-            if span.retain_last:
+            if span.retain_last and batch.operation != Operation.CODA:
                 if self.states is None:
                     last = torch.empty(
                         self.model.config.hidden_size,
@@ -491,9 +494,7 @@ class ModelRunner:
                     last = self.states[slot]
                 request.hidden_state = last
             if source is not None:
-                buffers.hidden_gather.append(
-                    source, self.prefill_hidden[row : row + span.token_count]
-                )
+                buffers.hidden_gather.append(source, buffers.hidden[row : row + span.token_count])
             buffers.hidden_outputs.append(
                 (
                     row,
@@ -519,7 +520,7 @@ class ModelRunner:
     def _gather_prefill(self, prepared):
         metadata = prepared.batch_inputs
         count = metadata.rows
-        hidden = self.prefill_hidden[:count]
+        hidden = metadata.buffers.hidden[:count]
         if metadata.mixed:
             self._mixed_hidden(hidden, prepared, scatter=False)
             return hidden
@@ -906,7 +907,24 @@ class ModelRunner:
                 prepared, gate_indices=self.input_buffers[torch.int64].append(gate_rows)
             )
         if batch.operation == Operation.CODA:
-            prepared = replace(prepared, sampling_params=tuple(r.sampling_params for r in requests))
+            sampling_spans = tuple(
+                index for index, span in enumerate(batch.spans) if span.compute_logits
+            )
+            logits_mask = None
+            if batch.has_chunks:
+                mask = [False] * batch.num_rows
+                row = 0
+                for span in batch.spans:
+                    row += span.token_count
+                    if span.compute_logits:
+                        mask[row - 1] = True
+                logits_mask = torch.tensor(mask, dtype=torch.bool)
+            prepared = replace(
+                prepared,
+                sampling_spans=sampling_spans,
+                sampling_params=tuple(requests[index].sampling_params for index in sampling_spans),
+                logits_mask=logits_mask,
+            )
         if batch.operation == Operation.PRELUDE and batch.loop_count:
             packed_metadata = (
                 self.packed_metadata_buffers[self.submissions.slot]
@@ -978,8 +996,10 @@ class ModelRunner:
                 sampling_generators=tuple(
                     None
                     if params.temperature == 0
-                    else self.rng.acquire(span.request.request_id, params, self.device)
-                    for span, params in zip(batch.spans, prepared.sampling_params)
+                    else self.rng.acquire(
+                        batch.spans[index].request.request_id, params, self.device
+                    )
+                    for index, params in zip(prepared.sampling_spans, prepared.sampling_params)
                 ),
             )
         if prepared.routing is not None:
@@ -1012,7 +1032,6 @@ class ModelRunner:
         batch, workspace = prepared.batch, prepared.workspace
         if batch.operation == Operation.PRELUDE and batch.loop_count:
             return replace(prepared, forwards=self._prepare_loop_forwards(prepared))
-        requests = [span.request for span in batch.spans]
         size = batch.num_rows if batch.has_chunks else self._size(batch.num_rows)
         inputs = prepared.forwards[0].forward
         metadata = inputs.metadata
@@ -1035,7 +1054,13 @@ class ModelRunner:
                 Operation.PRELUDE,
                 tokens=prepared.token_ids,
                 prelude_coda_kv_metadata=kv_metadata,
-                generators=self._prepare_generators(requests) if kv_metadata else None,
+                generators=(
+                    self._prepare_generators(
+                        [span.request for span in batch.spans for _ in range(span.token_count)]
+                    )
+                    if kv_metadata
+                    else None
+                ),
                 graphs=self.prelude_graphs if kv_metadata else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
@@ -1046,6 +1071,7 @@ class ModelRunner:
                 hidden=hidden[: batch.num_rows] if kv_metadata else hidden,
                 prelude_coda_kv_metadata=kv_metadata,
                 graphs=self.coda_graphs if kv_metadata else None,
+                compute_logits=prepared.logits_mask if prepared.logits_mask is not None else True,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
         graphs = self.graphs if batch.emit_gate else None
@@ -1147,7 +1173,7 @@ class ModelRunner:
                             else logits[: len(batch.spans)]
                         )
                         values = selected.float().sigmoid()
-            elif forward.compute_logits:
+            elif result.logits is not None:
                 if self.device.type == "npu":
                     values = self.sampler.sample_batch(
                         result.logits, prepared.sampling_params, prepared.sampling_generators
@@ -1295,6 +1321,7 @@ class ModelRunner:
                 depths=prepared.depths,
                 positions=prepared.positions,
                 output_indices=prepared.output_indices,
+                output_rows=prepared.sampling_spans if prepared.logits_mask is not None else None,
                 operation=batch.operation,
             )
         except Exception:

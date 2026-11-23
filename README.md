@@ -148,8 +148,8 @@ a fixed scale at startup. See the
 | [Ouro-1.4B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
 | [Ouro-2.6B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
 | Nanbeige4.2-3B | Native Nanbeige | [CUDA](docs/launching.md) | Fixed two-loop inference. [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |
-| Huginn-0125 | Native Huginn | [CUDA](docs/launching.md) | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda |
-| [NVIDIA-Nemotron-Labs-Dory1.0-4B](docs/dory.md) | Native Dory | [CUDA](docs/launching.md) | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified |
+| Huginn-0125 | Native Huginn | [CUDA](docs/launching.md) | Synchronous fixed-depth, LAST_EXITED KV, eager mixed/WCPB prefill, CUDA Graph decode core and coda |
+| [NVIDIA-Nemotron-Labs-Dory1.0-4B](docs/dory.md) | Native Dory | [CUDA](docs/launching.md) | Synchronous fixed-loop execution, per-loop and last-loop KV, eager staged prefill with per-loop KV, BF16 real-checkpoint checks on A100; long context, staged Graphs/async and reclamation not qualified |
 
 The broader model roadmap is in [RFC #69](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
 
@@ -157,16 +157,19 @@ Huginn uses native checkpoint loading and depth-aware KV for its recurrent
 core, with separate prelude and coda KV. It supports synchronous fixed-depth
 inference and CUDA Graphs for the recurrent core and decode coda.
 
-Huginn does **not** currently support WCPB/mixed staged prefill, asynchronous
-execution, self-speculation, or PD. Feature availability is not equivalent to
-validation of every model/backend/workload combination.
+Huginn supports synchronous eager WCPB and mixed staged prefill with per-loop KV.
+Asynchronous staged execution, self-speculation, prefix reuse, and PD are not
+supported. Feature availability is not equivalent to validation of every
+model/backend/workload combination.
 
 Dory runs the native normalized-GPT stack with attention-bearing input and
 output stages, so its boundary stages own their own KV. Synchronous
 fixed-loop execution is supported for both `per_loop` and `last_loop` KV
-modes. Sliding-window masking exists only in the Torch reference attention
-backend, and WCPB, CUDA Graphs, asynchronous execution, self-speculation,
-prefix reuse and PD are rejected. See the
+modes. Sliding-window masking is available in Torch and supported GPU attention
+backends. Synchronous eager WCPB and mixed staged prefill support per-request
+fixed loop counts with per-loop KV. Ordinary Graphs, asynchronous execution and
+synchronous self-speculation have separate configuration restrictions; staged
+Graphs/async, prefix reuse and PD are not supported. See the
 [Dory baseline notes](docs/dory.md) for the exact qualified scope.
 
 ## Documentation

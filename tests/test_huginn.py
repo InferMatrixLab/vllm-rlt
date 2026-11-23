@@ -248,7 +248,12 @@ def test_prefill_populates_history_without_projecting_unused_logits(model, padde
             SchedulerConfig(),
             "prefix caching",
         ),
-        (CacheConfig(), ExecutionConfig(), SchedulerConfig(mode="mixed"), "staged prefill"),
+        (
+            CacheConfig(),
+            ExecutionConfig(),
+            SchedulerConfig(mode="mixed", enable_preemption=True),
+            "staged prefill",
+        ),
         (
             CacheConfig(),
             ExecutionConfig(async_scheduling=True),
@@ -267,6 +272,54 @@ def test_unsupported_execution_rejected_before_cache_allocation(
             execution_config=execution,
             scheduler_config=scheduler,
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+@pytest.mark.parametrize("multi_stream", [False, True])
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_huginn_staged_prefill_matches_atomic_cuda(multi_stream, wavefront, temperature):
+    torch.manual_seed(42)
+    model = (
+        HuginnForCausalLM(tiny_huginn_config(n_embd=384, n_heads=4, intermediate_size=768))
+        .to(device="cuda", dtype=torch.bfloat16)
+        .eval()
+    )
+    prompts = {"a": [4], "b": [8, 2, 10, 11, 4, 3, 9]}
+
+    def run(selected, *, staged):
+        engine = LLMEngine(
+            model,
+            attention_backend="triton",
+            cache_config=CacheConfig(num_blocks=128, block_size=2),
+            scheduler_config=SchedulerConfig(
+                mode="mixed" if staged else "refill",
+                wavefront_chunked_prefill=wavefront if staged else False,
+                max_num_seqs=2,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=2,
+            ),
+            execution_config=ExecutionConfig(multi_stream=multi_stream),
+        )
+        try:
+            for request_id in selected:
+                engine.add_request(
+                    request_id,
+                    prompts[request_id],
+                    SamplingParams(max_tokens=3, seed=17, ignore_eos=True, temperature=temperature),
+                )
+            outputs = {}
+            while engine.has_unfinished_requests():
+                for output in engine.step():
+                    if output.finished:
+                        outputs[output.request_id] = (output.token_ids, output.exit_depths)
+            assert engine.cache_manager.num_used_blocks == 0
+            return outputs
+        finally:
+            engine.close()
+
+    expected = run(("a",), staged=False) | run(("b",), staged=False)
+    assert run(("a", "b"), staged=True) == expected
 
 
 @pytest.mark.gpu

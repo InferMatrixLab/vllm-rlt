@@ -68,15 +68,21 @@ def test_failed_submission_gap_drains_before_slot_reuse():
 
 
 def test_submission_slots_reuse_preallocated_prefill_storage():
-    buffers = [BatchInputBuffers(2, 4, torch.device("cpu"), torch.float32) for _ in range(2)]
+    buffers = [
+        BatchInputBuffers(2, 4, torch.device("cpu"), torch.float32, hidden_shape=(4, 8))
+        for _ in range(2)
+    ]
     queue = SubmissionQueue()
     queue.begin()
     first = buffers[queue.slot]
     first_ptr = first.segments.cpu.data_ptr()
+    first_hidden_ptr = first.hidden.data_ptr()
     queue.begin()
     second = buffers[queue.slot]
     assert second.segments.cpu.data_ptr() != first_ptr
+    assert second.hidden.data_ptr() != first_hidden_ptr
     queue.begin()
     assert buffers[queue.slot] is first
     first.reset()
     assert first.segments.cpu.data_ptr() == first_ptr
+    assert first.hidden.data_ptr() == first_hidden_ptr

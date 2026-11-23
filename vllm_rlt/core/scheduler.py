@@ -15,6 +15,7 @@ _SPAN_PHASES = (
     RequestPhase.PREFILL,
     RequestPhase.PREFILLING_PRELUDE,
     RequestPhase.PREFILLING_RECURRENT,
+    RequestPhase.PREFILLING_CODA,
     RequestPhase.SPECULATIVE,
 )
 # Stages that must reserve KV capacity for that frontier before selection.
@@ -138,12 +139,14 @@ class Scheduler:
         *,
         produces_tokens: bool = True,
         total_ut_steps: int | None = None,
+        requires_prefill_coda: bool = False,
         eos_token_id=(),
         exit_mode: str = "ouro",
     ):
         self.config = config
         self.cache_manager = cache_manager
         self.speculative_config = speculative_config
+        self.requires_prefill_coda = requires_prefill_coda
         self.total_ut_steps = (
             total_ut_steps if total_ut_steps is not None else getattr(cache_manager, "max_loops", 1)
         )
@@ -172,6 +175,8 @@ class Scheduler:
             speculative_config,
             produces_tokens=produces_tokens,
         )
+        if self.staged_prefill and self.requires_prefill_coda:
+            self.policy.PREFILL_PHASES += (RequestPhase.PREFILLING_CODA,)
 
     def add_request(self, request: Request):
         if request.request_id in self.requests:
@@ -364,6 +369,7 @@ class Scheduler:
                 RequestPhase.PREFILL,
                 RequestPhase.PREFILLING_PRELUDE,
                 RequestPhase.PREFILLING_RECURRENT,
+                RequestPhase.PREFILLING_CODA,
             ) and not (reserve_outputs and has_allocation):
                 continue
             tokens = len(request.prompt_token_ids)
@@ -451,6 +457,7 @@ class Scheduler:
         if not self._allocate(request, plan):
             return False
         request.num_prefilled_tokens = plan.cached_tokens
+        request.num_recurrent_prefilled_tokens = plan.cached_tokens
         # A reused prompt prefix is already prefilled at every depth, so the
         # staged window starts closed at that frontier and opens for the rest.
         request.num_preluded_tokens = plan.cached_tokens
@@ -564,7 +571,7 @@ class Scheduler:
                 token_budget, self.config.prefill_chunk_size, len(request.prompt_token_ids) - start
             )
             return ScheduledRequest(request, start, count)
-        # The two split phases are unreachable while atomic prefill is enabled.
+        # Staged phases are unreachable while atomic prefill is enabled.
         if phase == RequestPhase.PREFILLING_PRELUDE:
             start = request.num_preluded_tokens
             count = min(
@@ -574,7 +581,11 @@ class Scheduler:
             )
             return ScheduledRequest(request, start, count, chunk_start=start)
         if phase == RequestPhase.PREFILLING_RECURRENT:
-            start = request.num_prefilled_tokens
+            start = (
+                request.num_recurrent_prefilled_tokens
+                if self.requires_prefill_coda
+                else request.num_prefilled_tokens
+            )
             if start >= request.num_preluded_tokens:
                 return ScheduledRequest(
                     request, start, 0, depth=0, chunk_start=request.prefill_reclaimable_tokens
@@ -602,6 +613,28 @@ class Scheduler:
                     first_token_depth == len(request.prefill_depth_ranges) - 1
                     and start + count == len(request.prompt_token_ids)
                 ),
+            )
+        if phase == RequestPhase.PREFILLING_CODA:
+            start = request.num_prefilled_tokens
+            chunk_size = self.config.prefill_chunk_size
+            if self.wavefront_chunked_prefill:
+                origin = request.prefill_window_origin
+                chunk_start = origin + (start - origin) // chunk_size * chunk_size
+                slot = ((chunk_start - origin) // chunk_size) % len(request.prefill_depth_ranges)
+                offset = slot * chunk_size + start - chunk_start
+                chunk_end = min(len(request.prompt_token_ids), chunk_start + chunk_size)
+            else:
+                chunk_start = request.prefill_reclaimable_tokens
+                offset = start - chunk_start
+                chunk_end = request.num_preluded_tokens
+            end = min(start + token_budget, request.num_recurrent_prefilled_tokens, chunk_end)
+            return ScheduledRequest(
+                request,
+                start,
+                max(0, end - start),
+                chunk_start=chunk_start,
+                completes_prompt=end == len(request.prompt_token_ids),
+                prefill_hidden_row_offset=offset,
             )
         if phase == RequestPhase.SPECULATIVE:
             # K candidates plus one bonus distribution. At the output limit,
@@ -742,7 +775,12 @@ class Scheduler:
                     continue
                 scheduled_request = self._make_scheduled_request(request, phase, token_budget)
                 if (
-                    phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+                    phase
+                    in (
+                        RequestPhase.PREFILLING_PRELUDE,
+                        RequestPhase.PREFILLING_RECURRENT,
+                        RequestPhase.PREFILLING_CODA,
+                    )
                     and scheduled_request.token_count <= 0
                 ):
                     queue.append(request.request_id)
@@ -799,13 +837,17 @@ class Scheduler:
         phases = {item.phase for item in scheduled_requests}
         if phases == {RequestPhase.PREFILL}:
             return self.total_ut_steps
-        if RequestPhase.SPECULATIVE in phases or RequestPhase.CODA in phases:
+        if phases.intersection(
+            (RequestPhase.SPECULATIVE, RequestPhase.CODA, RequestPhase.PREFILLING_CODA)
+        ):
             return 0
         if RequestPhase.PRELUDE in phases:
             return 0
         if self.wavefront_chunked_prefill:
             return 1 if RequestPhase.PREFILLING_RECURRENT in phases else 0
         if RequestPhase.PREFILLING_PRELUDE in phases:
+            if self.requires_prefill_coda:
+                return 0
             # In mixed mode, stage just the embeddings when recurrent decode work
             # is ready so the next depth can join that batch. Without a reason to
             # yield, PRELUDE can execute the full prompt depth in this submission.
@@ -828,7 +870,14 @@ class Scheduler:
         phases = {batch.phase_for(item) for item in batch.requests}
         if RequestPhase.PREFILL in phases:
             return self.total_ut_steps
-        if phases.intersection((RequestPhase.PRELUDE, RequestPhase.CODA, RequestPhase.SPECULATIVE)):
+        if phases.intersection(
+            (
+                RequestPhase.PRELUDE,
+                RequestPhase.CODA,
+                RequestPhase.PREFILLING_CODA,
+                RequestPhase.SPECULATIVE,
+            )
+        ):
             return 0
         if phases.intersection((RequestPhase.PREFILLING_RECURRENT, RequestPhase.RECURRENT)):
             return 1
@@ -847,11 +896,13 @@ class Scheduler:
         return max(1, loops)
 
     def _scheduled_prefill_completes(self, scheduled_request, loop_count):
+        if self.requires_prefill_coda:
+            return False
         phase = scheduled_request.phase
         depth = scheduled_request.depth if phase == RequestPhase.PREFILLING_RECURRENT else 0
         return (
             loop_count > 0
-            and depth + loop_count == self.total_ut_steps
+            and depth + loop_count == len(scheduled_request.request.prefill_depth_ranges)
             and scheduled_request.token_start + scheduled_request.token_count
             == len(scheduled_request.request.prompt_token_ids)
         )
@@ -885,7 +936,7 @@ class Scheduler:
 
         added = set()
         blocked = set()
-        total_depths = len(candidates[0].prefill_depth_ranges)
+        total_depths = max(len(request.prefill_depth_ranges) for request in candidates)
 
         def accept_task(request: Request, scheduled_request: ScheduledRequest) -> bool:
             """Reserve capacity and commit one wavefront task to this batch."""
@@ -917,6 +968,8 @@ class Scheduler:
                     assert prelude_cursors is not None
                     start, end = prelude_cursors[request_id], len(request.prompt_token_ids)
                 else:
+                    if depth >= len(request.prefill_depth_ranges):
+                        continue
                     start, end = request.prefill_depth_ranges[depth]
                     end = min(end, request.num_preluded_tokens)
                 if start >= end:
@@ -971,11 +1024,47 @@ class Scheduler:
     ) -> bool:
         """Advance one submitted prompt span through one recurrent depth."""
         request.prefill_depth_ranges[depth][0] = token_end
-        if depth + 1 < self.total_ut_steps:
+        if depth + 1 < len(request.prefill_depth_ranges):
             request.prefill_depth_ranges[depth + 1][1] = token_end
             return False
-        request.num_prefilled_tokens = token_end
+        if self.requires_prefill_coda:
+            request.num_recurrent_prefilled_tokens = token_end
+        else:
+            request.num_prefilled_tokens = token_end
         return True
+
+    def _apply_prefill_coda_progress(self, scheduled_request, *, event=None):
+        request = scheduled_request.request
+        start = scheduled_request.token_start
+        end = start + scheduled_request.token_count
+        if start != request.num_prefilled_tokens or end > request.num_recurrent_prefilled_tokens:
+            raise RuntimeError("prefill CODA crosses an incomplete causal frontier")
+        request.num_prefilled_tokens = end
+        if self.wavefront_chunked_prefill:
+            chunk_end = min(
+                len(request.prompt_token_ids),
+                scheduled_request.chunk_start + self.config.prefill_chunk_size,
+            )
+        else:
+            chunk_end = request.num_preluded_tokens
+        chunk_complete = end == chunk_end
+        if chunk_complete:
+            if scheduled_request.chunk_start != request.prefill_reclaimable_tokens:
+                raise RuntimeError("prefill CODA completed chunks out of order")
+            request.prefill_reclaimable_tokens = end
+            self.cache_manager.publish_prefix(
+                request.request_id, request.prompt_token_ids, end, event
+            )
+        prompt_complete = end == len(request.prompt_token_ids)
+        if prompt_complete:
+            request.loops_done = len(request.prefill_depth_ranges)
+        elif end < request.num_recurrent_prefilled_tokens:
+            self.enqueue(request, RequestPhase.PREFILLING_CODA)
+        elif self._prelude_window_open(request):
+            self.enqueue(request, RequestPhase.PREFILLING_PRELUDE)
+        else:
+            self.enqueue(request, RequestPhase.PREFILLING_RECURRENT)
+        return PrefillProgress(chunk_complete, prompt_complete)
 
     def _apply_split_prefill_progress(
         self,
@@ -991,7 +1080,9 @@ class Scheduler:
         and consumers with that work; this transition does not wait for it.
         """
         request = scheduled_request.request
-        total_depths = self.total_ut_steps
+        if phase == RequestPhase.PREFILLING_CODA:
+            return self._apply_prefill_coda_progress(scheduled_request, event=event)
+        total_depths = len(request.prefill_depth_ranges)
         start = scheduled_request.token_start
         end = start + scheduled_request.token_count
         if loop_count is None:
@@ -1024,6 +1115,10 @@ class Scheduler:
                 depth=current_depth,
                 token_end=end,
             )
+
+        if self.requires_prefill_coda and final_depth_reached:
+            self.enqueue(request, RequestPhase.PREFILLING_CODA)
+            return PrefillProgress(False, False)
 
         chunk_complete = final_depth_reached and end == request.num_preluded_tokens
         if not final_depth_reached or not chunk_complete:
@@ -1126,6 +1221,9 @@ class Scheduler:
                 ):
                     continue
 
+                if self.requires_prefill_coda:
+                    continue
+
                 chunk_end = min(
                     len(request.prompt_token_ids),
                     item.chunk_start + self.config.prefill_chunk_size,
@@ -1146,7 +1244,11 @@ class Scheduler:
                     request.num_prefilled_tokens,
                     event,
                 )
-            if prompt_complete:
+            if self.requires_prefill_coda and (
+                request.num_prefilled_tokens < request.num_recurrent_prefilled_tokens
+            ):
+                next_phase = RequestPhase.PREFILLING_CODA
+            elif prompt_complete:
                 request.loops_done = self.total_ut_steps
                 next_phase = self._prompt_destination(request)
             else:
@@ -1213,6 +1315,7 @@ class Scheduler:
             RequestPhase.PREFILL,
             RequestPhase.PREFILLING_PRELUDE,
             RequestPhase.PREFILLING_RECURRENT,
+            RequestPhase.PREFILLING_CODA,
         ):
             event = (
                 request_events.get(request.request_id)
@@ -1296,6 +1399,11 @@ class Scheduler:
         update = SchedulerUpdate()
         wavefront_groups = self._wavefront_prefill_groups(batch)
         loop_count = self._batch_loop_count(batch)
+        output_rows = (
+            {batch_row: output_row for output_row, batch_row in enumerate(result.output_rows)}
+            if result.output_rows is not None
+            else None
+        )
         for row, scheduled_request in enumerate(batch.requests):
             request = scheduled_request.request
             # Ignore results for a request that is no longer registered: it may
@@ -1316,6 +1424,17 @@ class Scheduler:
                 request_events=request_events,
                 fallback_event=result.completion,
             ):
+                if phase == RequestPhase.PREFILLING_CODA and scheduled_request.completes_prompt:
+                    output_row = output_rows.get(row) if output_rows is not None else row
+                    if output_row is None or result.token_ids is None:
+                        raise RuntimeError("final prefill CODA did not produce a token")
+                    if self._record_token(
+                        request, result.token_ids[output_row], request.loops_done
+                    ):
+                        update.finished.append(request)
+                    else:
+                        self.enqueue(request, RequestPhase.PRELUDE)
+                    update.outputs.append(request)
                 continue
             if phase == RequestPhase.PRELUDE:
                 request.loops_done = 0
@@ -1347,6 +1466,7 @@ class Scheduler:
                     update.exited.append(request)
                 self.enqueue(request, RequestPhase.CODA if should_exit else RequestPhase.RECURRENT)
             elif phase == RequestPhase.CODA:
+                output_row = output_rows[row] if output_rows is not None else row
                 if delivered:
                     if not result.output_indices or result.output_indices[row] != len(
                         request.generated_token_ids
@@ -1356,7 +1476,7 @@ class Scheduler:
                         raise RuntimeError("invalid pending output count")
                     request.num_output_placeholders -= 1
                 depth = result.depths[row] if delivered else request.loops_done
-                if self._record_token(request, result.token_ids[row], depth):
+                if self._record_token(request, result.token_ids[output_row], depth):
                     update.finished.append(request)
                 elif not delivered:
                     self.enqueue(
