@@ -1,13 +1,10 @@
 """Paged GQA kernels using bounded-memory online softmax.
 
 Every query row receives its own physical block table. Single-query attention
-splits each row's context into equal parts (split-KV): one program per
-(row, head, split) produces a partial softmax state and a second kernel merges
-the parts. The split count comes from the batch shape (see `_split_count`), so
-it is still constant under CUDA graphs. A row's partition depends only on its
-own length, so its result does not depend on the batch it runs in. Without
-splitting, one long row serialized its whole context in one program and set the
-decode step time.
+splits long contexts into equal parts (split-KV). Each program produces a
+partial softmax state and a second kernel merges the parts. Grouped decode can
+write the final output directly for short rows. The launch grid remains fixed
+under CUDA graphs, and the active path is selected from device context lengths.
 
 FP8 e4m3 pools are read with one float32 scale per (block, token, KV head)
 vector; both kernels dequantize on load.
@@ -23,29 +20,45 @@ from triton.runtime import driver
 
 _PACKED_WINDOW_TILE = (32, 32)
 
-# Split-KV exists to fill an otherwise idle GPU on long single-row contexts. The split axis
-# only helps while the other two axes underfill the GPU: measured on 108 SMs, throughput peaks
-# near 512 programs, and 16 splits then costs 1.20x at rows=128 (length 2048) and 1.6x at
-# length 128. The bounds are per kernel because the axes carry different work: the grouped
-# kernel's second axis is one program per KV head and covers the whole query group, while the
-# per-head kernel's is one program per query head. The floor matters too: the per-head kernel
-# needs real splits even at rows=128 (1 vs 4 splits measured 1.37 vs 1.27 ms at length 2048),
-# while the grouped kernel prefers a single part there (4 splits cost 1.11x).
-_GROUPED_SPLITS = (1, 512)
-_PER_HEAD_SPLITS = (4, 2048)
 _MAX_SPLITS = 16
+_GROUPED_TARGET_PROGRAMS = 512
+_PER_HEAD_TARGET_PROGRAMS = 4096
+_GROUPED_DIRECT_MAX_CONTEXT = 128
 
 
-def _split_count(rows, head_axis, bounds):
-    """Splits per row chosen from the batch shape alone, so a captured graph stays valid.
+def _grouped_split_count(programs):
+    spare = max(1, _GROUPED_TARGET_PROGRAMS // programs)
+    return min(_MAX_SPLITS, triton.next_power_of_2(spare))
 
-    Depends only on tensor shapes, not on the context lengths of individual rows, so it needs
-    no host readback and no device sync.
-    """
-    low, target = bounds
-    # tl.arange in the merge kernel needs a power of two.
-    spare = max(1, target // max(1, rows * head_axis))
-    return max(low, min(_MAX_SPLITS, triton.next_power_of_2(spare)))
+
+@triton.jit
+def _covered_length(LENGTHS, row, WINDOW: tl.constexpr):
+    length = tl.load(LENGTHS + row)
+    return tl.minimum(length, WINDOW) if WINDOW else length
+
+
+@triton.jit
+def _split_width(covered, splits, BLOCK_T: tl.constexpr):
+    return tl.cdiv(covered, splits * BLOCK_T) * BLOCK_T
+
+
+@triton.jit
+def _grouped_row_schedule(
+    LENGTHS,
+    covered,
+    WINDOW: tl.constexpr,
+    ROWS: tl.constexpr,
+    CHECK_ROWS: tl.constexpr,
+    DIRECT_LIMIT: tl.constexpr,
+):
+    # A few long rows need more parallelism than a full batch of long rows.
+    idx = tl.arange(0, CHECK_ROWS)
+    lengths = tl.load(LENGTHS + idx, idx < ROWS, other=0)
+    if WINDOW:
+        lengths = tl.minimum(lengths, WINDOW)
+    long_rows = tl.sum((lengths > DIRECT_LIMIT).to(tl.int32), 0)
+    mixed = (long_rows > 0) & (long_rows <= ROWS // 4)
+    return mixed, mixed & (covered <= DIRECT_LIMIT)
 
 
 @triton.jit
@@ -95,10 +108,12 @@ def _paged_attention_kernel(
     # read, which is a sliding sublayer's mask. Out-of-window keys stay stored.
     covered = length if WINDOW == 0 else tl.minimum(length, WINDOW)
     # Equal tile-aligned parts of the covered range; trailing parts may be empty.
-    split_tokens = ((covered + SPLITS - 1) // SPLITS + BLOCK_T - 1) // BLOCK_T * BLOCK_T
+    split_tokens = _split_width(covered, SPLITS, BLOCK_T)
     window_start = length - covered
     begin = window_start + split * split_tokens
     end = tl.minimum(length, begin + split_tokens)
+    if end <= begin:
+        return
     dims = tl.arange(0, BLOCK_D)
     query = tl.load(
         Q + row * q_batch_stride + head * q_head_stride + dims * q_dim_stride,
@@ -156,7 +171,6 @@ def _paged_attention_kernel(
         accumulator = accumulator * correction + tl.sum(weights[:, None] * values, axis=0)
         normalizer = normalizer * correction + tl.sum(weights, axis=0)
         maximum = next_maximum
-    # An empty part stores (-inf, 0, 0), which the merge weights by zero.
     part = (row * NUM_HEADS + head) * SPLITS + split
     tl.store(PART_M + part, maximum)
     tl.store(PART_L + part, normalizer)
@@ -169,24 +183,44 @@ def _paged_attention_merge_kernel(
     PART_L,
     PART_O,
     OUT,
+    LENGTHS,
     out_batch_stride: tl.constexpr,
     out_head_stride: tl.constexpr,
     out_dim_stride: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     SPLITS: tl.constexpr,
+    WINDOW: tl.constexpr,
+    DIRECT_LIMIT: tl.constexpr,
+    ROWS: tl.constexpr,
+    CHECK_ROWS: tl.constexpr,
+    BASE_SPLITS: tl.constexpr,
 ):
     row = tl.program_id(0)
+    covered = _covered_length(LENGTHS, row, WINDOW)
+    split_width = _split_width(covered, SPLITS, BLOCK_T)
+    if CHECK_ROWS:
+        mixed, direct = _grouped_row_schedule(
+            LENGTHS, covered, WINDOW, ROWS, CHECK_ROWS, DIRECT_LIMIT
+        )
+        if direct:
+            return
+        split_width = tl.where(mixed, split_width, _split_width(covered, BASE_SPLITS, BLOCK_T))
     head = tl.program_id(1)
-    parts = (row * NUM_HEADS + head) * SPLITS + tl.arange(0, SPLITS)
+    split = tl.arange(0, SPLITS)
+    valid = split * split_width < covered
+    parts = (row * NUM_HEADS + head) * SPLITS + split
     dims = tl.arange(0, BLOCK_D)
-    maxima = tl.load(PART_M + parts)
+    maxima = tl.load(PART_M + parts, mask=valid, other=-float("inf"))
     top = tl.max(maxima, axis=0)
     # All parts empty (length 0) leaves top = -inf; zero weights give a zero row.
     scale = tl.where(maxima > -float("inf"), tl.exp(maxima - top), 0.0)
-    normalizer = tl.sum(tl.load(PART_L + parts) * scale, axis=0)
-    partial = tl.load(PART_O + parts[:, None] * BLOCK_D + dims[None, :])
+    normalizer = tl.sum(tl.load(PART_L + parts, mask=valid, other=0.0) * scale, axis=0)
+    partial = tl.load(
+        PART_O + parts[:, None] * BLOCK_D + dims[None, :], mask=valid[:, None], other=0.0
+    )
     accumulator = tl.sum(partial * scale[:, None], axis=0)
     tl.store(
         OUT + row * out_batch_stride + head * out_head_stride + dims * out_dim_stride,
@@ -207,6 +241,7 @@ def _paged_attention_group_kernel(
     PART_O,
     KS,
     VS,
+    OUT,
     q_batch_stride,
     q_head_stride,
     q_dim_stride,
@@ -222,6 +257,9 @@ def _paged_attention_group_kernel(
     s_block_stride,
     s_token_stride,
     s_head_stride,
+    out_batch_stride,
+    out_head_stride,
+    out_dim_stride,
     HAS_SCALE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HEAD_GROUPS: tl.constexpr,
@@ -234,6 +272,10 @@ def _paged_attention_group_kernel(
     WINDOW: tl.constexpr,
     BLOCK_H: tl.constexpr,
     PRECISION: tl.constexpr,
+    DIRECT_LIMIT: tl.constexpr,
+    ROWS: tl.constexpr,
+    CHECK_ROWS: tl.constexpr,
+    BASE_SPLITS: tl.constexpr,
 ):
     """GQA decode built on the paged-prefill kernel's shape.
 
@@ -266,11 +308,36 @@ def _paged_attention_group_kernel(
     # WINDOW=0 covers the full context, matching the per-head kernel's semantics.
     covered = length if WINDOW == 0 else tl.minimum(length, WINDOW)
     window_start = length - covered
-    # Tile-aligned equal parts of the covered range, as the per-head kernel splits them, so a
-    # row's result does not depend on the batch it ran in.
-    split_tokens = ((covered + SPLITS - 1) // SPLITS + BLOCK_T - 1) // BLOCK_T * BLOCK_T
+    if SPLITS == 1:
+        direct = True
+        split_tokens = covered
+    elif CHECK_ROWS:
+        if split >= BASE_SPLITS and covered <= DIRECT_LIMIT:
+            return
+        mixed, direct = _grouped_row_schedule(
+            LENGTHS, covered, WINDOW, ROWS, CHECK_ROWS, DIRECT_LIMIT
+        )
+        if direct and split != 0:
+            return
+        if split >= BASE_SPLITS and not mixed:
+            return
+        split_tokens = tl.where(
+            direct,
+            covered,
+            tl.where(
+                mixed,
+                _split_width(covered, SPLITS, BLOCK_T),
+                _split_width(covered, BASE_SPLITS, BLOCK_T),
+            ),
+        )
+    else:
+        direct = False
+        split_tokens = _split_width(covered, SPLITS, BLOCK_T)
     begin = window_start + split * split_tokens
     end = tl.minimum(length, begin + split_tokens)
+    if SPLITS > 1:
+        if not direct and end <= begin:
+            return
     dims = tl.arange(0, BLOCK_D)
     dim_valid = dims < HEAD_DIM
     query = tl.load(
@@ -337,19 +404,25 @@ def _paged_attention_group_kernel(
             accumulator = accumulator * correction[:, None] + partial
             normalizer = normalizer * correction + tl.sum(weights, axis=1)
             maximum = next_maximum
-    # The merge kernel weights the parts by their normalizers, so it needs the unnormalised
-    # numerator: the per-head kernel stores `accumulator` here, and dividing first would make
-    # the merge divide by the normalizer a second time.
-    # An empty part (or a padding lane) stores (-inf, 0, 0), which the merge weights by zero.
-    maximum = tl.where(normalizer > 0, maximum, -float("inf"))
-    part = (row * NUM_HEADS + heads) * SPLITS + split
-    tl.store(PART_M + part, maximum, mask=in_group)
-    tl.store(PART_L + part, normalizer, mask=in_group)
-    tl.store(
-        PART_O + part[:, None] * BLOCK_D + dims[None, :],
-        accumulator,
-        mask=in_group[:, None] & dim_valid[None, :],
-    )
+    if direct:
+        tl.store(
+            OUT
+            + row * out_batch_stride
+            + heads[:, None] * out_head_stride
+            + dims[None, :] * out_dim_stride,
+            accumulator / tl.maximum(normalizer[:, None], 1.0e-30),
+            mask=in_group[:, None] & dim_valid[None, :],
+        )
+    else:
+        # Merge only reads nonempty parts and needs their unnormalized numerator.
+        part = (row * NUM_HEADS + heads) * SPLITS + split
+        tl.store(PART_M + part, maximum, mask=in_group)
+        tl.store(PART_L + part, normalizer, mask=in_group)
+        tl.store(
+            PART_O + part[:, None] * BLOCK_D + dims[None, :],
+            accumulator,
+            mask=in_group[:, None] & dim_valid[None, :],
+        )
 
 
 def paged_attention(
@@ -380,21 +453,29 @@ def paged_attention(
     rows, heads = q.shape[0], q.shape[1]
     block_d = triton.next_power_of_2(q.shape[-1])
     head_groups = heads // key_cache.shape[2]
-    # The grouped kernel spends one program per KV head, the per-head kernel one per head.
-    splits = _split_count(
-        rows,
-        key_cache.shape[2] if head_groups > 1 else heads,
-        _GROUPED_SPLITS if head_groups > 1 else _PER_HEAD_SPLITS,
-    )
-    part_m = torch.empty((rows, heads, splits), device=q.device, dtype=torch.float32)
-    part_l = torch.empty_like(part_m)
-    part_o = torch.empty((rows, heads, splits, block_d), device=q.device, dtype=torch.float32)
-    if head_groups > 1:
+    grouped = 1 < head_groups <= 16
+    programs = rows * key_cache.shape[2]
+    if grouped:
+        base_splits = _grouped_split_count(programs)
+        check_rows = triton.next_power_of_2(rows) if 256 <= programs < 512 and rows <= 64 else 0
+        splits = 8 if check_rows else base_splits
+    else:
+        # More splits at medium batch sizes avoid a long-row tail on mixed MHA.
+        spare = max(1, _PER_HEAD_TARGET_PROGRAMS // (rows * heads))
+        splits = max(4, min(_MAX_SPLITS, triton.next_power_of_2(spare)))
+        base_splits = splits
+        check_rows = 0
+    if splits == 1:
+        part_m = part_l = part_o = output
+    else:
+        part_m = torch.empty((rows, heads, splits), device=q.device, dtype=torch.float32)
+        part_l = torch.empty_like(part_m)
+        part_o = torch.empty((rows, heads, splits, block_d), device=q.device, dtype=torch.float32)
+    if grouped:
         # GQA: reuse the prefill kernel's many-rows-one-tile structure with the query heads
         # of a KV group as the rows, so the tile is loaded once per group instead of once
         # per head. MHA keeps the per-head kernel, which measures faster there.
         # tl.dot needs at least 16 rows; groups of 4 or 6 pad up and mask the extra lanes.
-        block_h = max(16, triton.next_power_of_2(min(head_groups, 16)))
         _paged_attention_group_kernel[(rows, key_cache.shape[2], splits)](
             q,
             key_cache,
@@ -406,11 +487,13 @@ def paged_attention(
             part_o,
             key_scale,
             value_scale,
+            output,
             *q.stride(),
             *key_cache.stride(),
             *value_cache.stride(),
             block_tables.stride(0),
             *scale_strides,
+            *output.stride(),
             HAS_SCALE=has_scale,
             HEAD_DIM=q.shape[-1],
             HEAD_GROUPS=head_groups,
@@ -421,12 +504,28 @@ def paged_attention(
             BLOCK_T=32,
             SPLITS=splits,
             WINDOW=window,
-            BLOCK_H=block_h,
+            BLOCK_H=16,
             PRECISION="ieee" if q.dtype == torch.float32 else "tf32",
+            DIRECT_LIMIT=_GROUPED_DIRECT_MAX_CONTEXT,
+            ROWS=rows,
+            CHECK_ROWS=check_rows,
+            BASE_SPLITS=base_splits,
             num_warps=4,
             num_stages=2,
         )
-        _merge_parts(part_m, part_l, part_o, output, q, rows, heads, block_d, splits)
+        if splits > 1:
+            _merge_parts(
+                part_m,
+                part_l,
+                part_o,
+                output,
+                context_lengths,
+                block_d,
+                splits,
+                window,
+                check_rows,
+                base_splits,
+            )
         return output
     _paged_attention_kernel[(rows, heads, splits)](
         q,
@@ -456,22 +555,34 @@ def paged_attention(
         WINDOW=window,
         num_warps=4,
     )
-    _merge_parts(part_m, part_l, part_o, output, q, rows, heads, block_d, splits)
+    _merge_parts(
+        part_m, part_l, part_o, output, context_lengths, block_d, splits, window, 0, splits
+    )
     return output
 
 
-def _merge_parts(part_m, part_l, part_o, output, q, rows, heads, block_d, splits):
+def _merge_parts(
+    part_m, part_l, part_o, output, lengths, block_d, splits, window, check_rows, base_splits
+):
     """Collapse the split-KV partials into the output rows (shared by both decode kernels)."""
+    rows, heads, dim = output.shape
     _paged_attention_merge_kernel[(rows, heads)](
         part_m,
         part_l,
         part_o,
         output,
+        lengths,
         *output.stride(),
-        HEAD_DIM=q.shape[-1],
+        HEAD_DIM=dim,
         NUM_HEADS=heads,
         BLOCK_D=block_d,
+        BLOCK_T=32,
         SPLITS=splits,
+        WINDOW=window,
+        DIRECT_LIMIT=_GROUPED_DIRECT_MAX_CONTEXT,
+        ROWS=rows,
+        CHECK_ROWS=check_rows,
+        BASE_SPLITS=base_splits,
         num_warps=4,
     )
 

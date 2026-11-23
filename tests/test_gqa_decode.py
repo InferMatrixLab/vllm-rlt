@@ -111,3 +111,45 @@ def test_gqa_decode_zero_length_row_returns_zero(heads, kv_heads):
     out = paged_attention(q, key, val, tables, ctx).float()
     assert torch.isfinite(out).all()
     assert out[1].abs().max().item() == 0.0
+
+
+@requires_cuda
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("window", [0, 193])
+def test_mixed_gqa_decode_switches_paths_on_graph_replay(quantized, window):
+    if quantized and torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("Triton FP8 E4M3FN loads require SM89 or later")
+    q, key, val, tables, lengths = _make(32, 544, 48, 8, 128, 16, seed=29)
+    key_scale = value_scale = None
+    if quantized:
+        key_scale = key.abs().amax(-1).float() / 448
+        value_scale = val.abs().amax(-1).float() / 448
+        key = (key.float() / key_scale[..., None]).to(torch.float8_e4m3fn)
+        val = (val.float() / value_scale[..., None]).to(torch.float8_e4m3fn)
+    mixed = torch.tensor([0, 17, 128, 33] * 6 + [129, 193, 544, 512] * 2, device="cuda")
+    uniform = torch.full_like(mixed, 512)
+    lengths.copy_(mixed)
+    paged_attention(q, key, val, tables, lengths, key_scale, value_scale, window=window)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = paged_attention(q, key, val, tables, lengths, key_scale, value_scale, window=window)
+    for replay_lengths in (mixed, uniform, mixed.roll(3)):
+        lengths.copy_(replay_lengths)
+        graph.replay()
+        if window:
+            from vllm_rlt.kernels.paged_attention import torch_paged_attention_windowed
+
+            expected = torch_paged_attention_windowed(
+                q, key, val, tables, lengths, window, key_scale, value_scale
+            )
+        else:
+            expected = torch_paged_attention(q, key, val, tables, lengths, key_scale, value_scale)
+        torch.testing.assert_close(out, expected, rtol=0.02, atol=0.002)
+
+
+@requires_cuda
+def test_wide_gqa_group_produces_every_query_head():
+    q, key, val, tables, lengths = _make(3, 65, 32, 1, 64, 16, seed=31)
+    actual = paged_attention(q, key, val, tables, lengths)
+    expected = torch_paged_attention(q, key, val, tables, lengths)
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.0001)

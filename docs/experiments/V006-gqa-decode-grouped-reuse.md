@@ -179,3 +179,33 @@ change does not alter.
 
 Scripts are kept at `C:\Users\kunku\.pi-desktop\scratch\<session>\` locally and mirrored under
 `/root/kun/rlt-perf/` on `lyx`.
+
+## Follow-up: mixed decode lengths
+
+The original shape-only MHA policy selected four splits for 32 rows. A batch
+of 24 contexts of length 128, four of length 512 and four of length 2048 exposed
+a long-row tail. Eight splits recover the prior MHA latency. The grouped
+kernel reads the current device lengths in medium-sized batches. It uses
+eight splits for long rows when they occupy at most one quarter of the batch,
+and writes short rows directly. The merge skips rows already written and
+masks out unused splits. With a single split the grouped launch writes the
+output directly and skips the merge launch altogether.
+
+Measured on A100-SXM4-80GB with BF16, 16-token pages, head dimension 128,
+Torch 2.14.0+cu130, Triton 3.8.0 and vLLM 0.33.0. CUDA-event medians from
+five interleaved repetitions, rotating physical KV pools for cases with
+less than 96 MiB of KV.
+
+| Shape | Initial #205 | Updated | Best measured vLLM unified |
+| --- | ---: | ---: | ---: |
+| MHA 16/16, 32 mixed rows | 104.32 µs | 83.71 µs | 117.76 µs |
+| GQA 48/8, 32 mixed rows | 83.54 µs | 47.10 µs | 69.85 µs |
+| GQA 48/8, 32 rows × 128 | 18.15 µs | 21.16 µs | 18.46 µs |
+| GQA 48/8, 128 rows × 128 | 56.96 µs | 49.37 µs | 53.76 µs |
+| GQA 48/8, 128 rows × 2048 | 652.37 µs | 644.44 µs | 621.23 µs |
+
+The length test adds about 3 µs for the 32-row uniform short batch. A graph
+replay regression switches between uniform and mixed rows, including zero
+lengths and sliding windows. An A100 run passed 90 tests. Two E4M3FN tests
+require SM89 or newer. The sweep uses synthetic inputs and does not establish
+serving throughput.
