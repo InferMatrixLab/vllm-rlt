@@ -84,7 +84,6 @@ class StageEngine:
                 raise ValueError("NPU Ouro requires BF16 KV cache")
             if (
                 self.execution_config.cuda_graphs
-                or (self.execution_config.async_scheduling and self.execution_config.static_buffers)
                 or self.stage_config.role != "prefill_decode"
                 or cache_config.layout != "last_exited"
                 or self.exit_config.mode not in ("ouro", "ouro_delayed")

@@ -1,6 +1,6 @@
 # Ouro on Ascend
 
-Run Ouro-1.4B on one Ascend NPU with BF16 and greedy decoding. Decode uses four
+Run Ouro-1.4B or Ouro-2.6B on one Ascend NPU with BF16 and greedy decoding. Decode uses four
 recurrent loops by default. The Python runtime uses Torch's
 `scaled_dot_product_attention` through the `ascend_eager` backend, matching HF's
 SDPA entry point. Torch-NPU selects the device kernel according to the input
@@ -115,6 +115,8 @@ describes how the two policies interpret the gate score.
 - **Scheduling.** Stream events track completion and protect buffer and request
   lifetimes. Decode PRELUDE and each recurrent loop are separate submissions,
   so the scheduler can select a new batch at each boundary.
+- **Buffers.** `--static-buffers` opts into reusable eager workspaces.
+  Add `--pad-to-power-of-two` to bucket the submitted row counts.
 - **Reuse and batching.** Ascend uses the shared packed-prefill metadata by
   default with `ascend_eager`. Use `--no-packed-prefill` to select the per-query
   layout. Greedy sampling and compatible prefill are batched. Full prefill
@@ -125,9 +127,8 @@ describes how the two policies interpret the gate score.
   assignment using its own block table.
   The Ascend backend gathers the visible KV rows for Torch SDPA.
 
-The example uses private, fully reserved `last_exited` KV. Keep graphs,
-static buffers, padding and prefill/decode disaggregation disabled in this
-configuration.
+The example uses private, fully reserved `last_exited` KV. Graphs and
+prefill/decode disaggregation require separate platform support.
 Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs.
 
 ### Prompt reuse and KV growth
@@ -138,6 +139,14 @@ the first output. Use `--incremental-kv` to allocate pages as requests grow.
 Both options use the shared `last_exited` cache and work with synchronous
 or asynchronous eager execution. Use `--wavefront-chunked-prefill` to group
 ready prompt chunks by depth.
+
+For chunked-prefill parity checks, compare against HF SDPA using the same token
+IDs, chunk boundaries, and batch shapes. On Ascend 910B3, changing the number of
+rows in a BF16 `Linear` can change the projection even when the input rows and
+weights are identical. Compare full prefill with chunked prefill separately to
+measure sensitivity to chunk shape. The real-checkpoint regression checks exact
+logits and greedy tokens with packed and per-query metadata under identical
+127- and 128-token chunk boundaries.
 
 ### Priority preemption
 
@@ -153,14 +162,6 @@ Run with `--exit-mode ouro --speculative-tokens 3 --draft-loops 2 --target-loops
 and select `--speculative-mode block` or `--speculative-mode pipeline`.
 Use synchronous scheduling and fixed four-loop greedy requests. The engine
 verifies candidate tokens at the target depth.
-
-For chunked-prefill parity checks, compare against HF SDPA using the same token
-IDs, chunk boundaries, and batch shapes. On Ascend 910B3, changing the number of
-rows in a BF16 `Linear` can change the projection even when the input rows and
-weights are identical. Compare full prefill with chunked prefill separately to
-measure sensitivity to chunk shape. The real-checkpoint regression checks exact
-logits and greedy tokens with packed and per-query metadata under identical
-127- and 128-token chunk boundaries.
 
 <a id="8-profile-guided-high-batch-scheduling"></a>
 ## Performance and correctness

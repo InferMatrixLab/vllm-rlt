@@ -306,7 +306,10 @@ def test_npu_preemption_restores_adaptive_decode(asynchronous, offload):
         scheduler_config=SchedulerConfig(max_num_seqs=1, policy="priority", enable_preemption=True),
         exit_config=ExitConfig("ouro_delayed"),
         execution_config=ExecutionConfig(
-            async_scheduling=asynchronous, multi_stream=asynchronous, use_uva=False
+            async_scheduling=asynchronous,
+            multi_stream=asynchronous,
+            static_buffers=asynchronous,
+            use_uva=False,
         ),
     )
     reference = StageEngine(model, **configs)

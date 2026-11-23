@@ -25,7 +25,9 @@ def test_fixed_depth_decode_keeps_each_loop_schedulable():
     assert request.phase == RequestPhase.CODA
 
 
-def make_engine(model, asynchronous, multi_stream, *, exit_mode=None):
+def make_engine(
+    model, asynchronous, multi_stream, *, exit_mode=None, static_buffers=False, pad=False
+):
     return StageEngine(
         model,
         attention_backend="ascend_eager",
@@ -36,8 +38,8 @@ def make_engine(model, asynchronous, multi_stream, *, exit_mode=None):
         execution_config=ExecutionConfig(
             async_scheduling=asynchronous,
             multi_stream=multi_stream,
-            static_buffers=False,
-            pad_to_power_of_two=False,
+            static_buffers=static_buffers,
+            pad_to_power_of_two=pad,
             use_uva=False,
             cuda_graphs=False,
         ),
@@ -63,8 +65,15 @@ def drain(engine):
 
 @pytest.mark.npu
 @pytest.mark.parametrize("multi_stream", [False, True])
+@pytest.mark.parametrize(
+    "static_buffers,pad",
+    [(False, False), (True, False), (True, True)],
+    ids=["dynamic", "static", "static-padded"],
+)
 @torch.inference_mode()
-def test_async_npu_matches_sync_without_device_barriers(monkeypatch, multi_stream):
+def test_async_npu_matches_sync_without_device_barriers(
+    monkeypatch, multi_stream, static_buffers, pad
+):
     resolve_device("npu")
     torch.npu.set_device(0)
     model = make_npu_model(torch.device("npu:0"))
@@ -72,8 +81,15 @@ def test_async_npu_matches_sync_without_device_barriers(monkeypatch, multi_strea
     params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
     reference = None
     for asynchronous in (False, True):
-        engine = make_engine(model, asynchronous, multi_stream)
+        engine = make_engine(
+            model,
+            asynchronous,
+            multi_stream,
+            static_buffers=asynchronous and static_buffers,
+            pad=asynchronous and pad,
+        )
         try:
+            assert bool(engine.model_runner.requestspaces) == (asynchronous and static_buffers)
             for repeat in range(2):
                 for i, prompt in enumerate(prompts):
                     engine.add_request(str(i), prompt, params)
