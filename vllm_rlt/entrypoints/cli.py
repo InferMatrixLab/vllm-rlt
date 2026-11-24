@@ -81,7 +81,11 @@ def main():
     )
     parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
     parser.add_argument("--max-tokens", type=int, default=16)
-    parser.add_argument("--max-loops", type=int, default=None)
+    parser.add_argument(
+        "--max-loops",
+        type=int,
+        help="Request loop limit. For Inkling VarLoop, also sets the instance depth.",
+    )
     parser.add_argument("--request-target-loops", type=int, default=None)
     parser.add_argument("--min-loops", type=int, default=None)
     parser.add_argument("--exit-threshold", type=float, default=1.0)
@@ -122,6 +126,7 @@ def main():
     llm = LLM(
         model,
         revision=args.revision,
+        max_loops=args.max_loops,
         device=args.device,
         dtype=getattr(torch, args.dtype),
         **runtime_configs(args),
@@ -133,6 +138,7 @@ def main():
             mode=args.mode,
             prefill_chunk_size=getattr(args, "prefill_chunk_size", 128),
             wavefront_chunked_prefill=getattr(args, "wavefront_chunked_prefill", False),
+            adaptive_wavefront_prefill=getattr(args, "adaptive_wavefront_prefill", False),
             max_prefill_batches_before_decode=getattr(args, "max_prefill_batches_before_decode", 1),
             admission_scan_limit=getattr(args, "admission_scan_limit", 64),
             max_admission_bypasses=getattr(args, "max_admission_bypasses", 8),

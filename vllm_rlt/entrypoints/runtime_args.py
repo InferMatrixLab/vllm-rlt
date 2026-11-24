@@ -17,6 +17,12 @@ def add_runtime_args(parser):
         help="Enable fixed-loop self-speculation with K draft tokens",
     )
     parser.add_argument("--speculative-mode", choices=["block", "pipeline"], default="block")
+    parser.add_argument(
+        "--speculative-pipeline-graph",
+        choices=["off", "transition", "full"],
+        default="off",
+        help="Pre-capture native asynchronous pipeline state updates or dense decode rounds",
+    )
     parser.add_argument("--draft-loops", type=int, default=2)
     parser.add_argument("--target-loops", type=int, default=4)
     parser.add_argument("--enable-prefix-caching", action="store_true")
@@ -76,6 +82,16 @@ def add_runtime_args(parser):
     )
     parser.add_argument("--cuda-graph-max-graphs", type=int, default=16)
     parser.add_argument(
+        "--cuda-graph-warmup",
+        action="store_true",
+        help="Prewarm native Inkling CUDA Graphs at startup and run unseen shapes eagerly",
+    )
+    parser.add_argument(
+        "--packed-graph-buckets",
+        action="store_true",
+        help="Use vLLM token buckets and a shared graph pool for native Inkling packed CUDA Graphs",
+    )
+    parser.add_argument(
         "--cuda-graph-memory-reserve-bytes",
         type=int,
         default=1024**3,
@@ -94,6 +110,11 @@ def add_runtime_args(parser):
         action="store_true",
         help="Batch ready prompt chunks across recurrence depths",
     )
+    parser.add_argument(
+        "--adaptive-wavefront-prefill",
+        action="store_true",
+        help="Adapt wavefront chunk and batch sizes within the configured upper limits",
+    )
     parser.add_argument("--max-prefill-batches-before-decode", type=int, default=1)
     parser.add_argument("--admission-scan-limit", type=int, default=64)
     parser.add_argument("--max-admission-bypasses", type=int, default=8)
@@ -105,12 +126,15 @@ def runtime_configs(args):
     parser = argparse.ArgumentParser(add_help=False)
     add_runtime_args(parser)
     args = SimpleNamespace(**(vars(parser.parse_args([])) | vars(args)))
+    if args.speculative_pipeline_graph != "off" and args.speculative_tokens is None:
+        raise ValueError("--speculative-pipeline-graph requires --speculative-tokens")
     return dict(
         speculative_config=SpeculativeConfig(
             num_speculative_tokens=args.speculative_tokens,
             draft_loops=args.draft_loops,
             target_loops=args.target_loops,
             mode=args.speculative_mode,
+            pipeline_graph=args.speculative_pipeline_graph,
         )
         if args.speculative_tokens is not None
         else None,
@@ -137,8 +161,10 @@ def runtime_configs(args):
             packed_prefill=args.packed_prefill,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,
+            cuda_graph_warmup=args.cuda_graph_warmup,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,
             cuda_graph_max_graphs=args.cuda_graph_max_graphs,
+            packed_graph_buckets=args.packed_graph_buckets,
             cuda_graph_memory_reserve_bytes=args.cuda_graph_memory_reserve_bytes,
             async_scheduling=args.async_scheduling,
             multi_stream=not args.single_stream,
