@@ -11,6 +11,7 @@ write and dequantized by the attention backends on read.
 """
 
 import hashlib
+import heapq
 import struct
 import weakref
 from collections import OrderedDict
@@ -317,6 +318,16 @@ class KVCacheManager:
         self.watermark_blocks = int(watermark_ratio * num_blocks) if incremental_allocation else 0
         self._refs = [0] * num_blocks
         self._prefixes = OrderedDict()
+        # Prefix keys chain: each page's digest covers every page before it, so
+        # a cached entry is reachable only while its ancestors are cached too.
+        self._prefix_parents = {}
+        self._prefix_child_counts = {}
+        # Chain tails, heapped by use time so eviction takes the oldest one
+        # without scanning the entries that have successors. Reuse and new
+        # successors leave stale heap entries, which eviction skips.
+        self._prefix_leaves = []
+        self._prefix_used = {}
+        self._prefix_clock = 0
         self._pending_prefixes = []
         self.prefix_hits = self.prefix_queries = 0
         if enable_prefix_caching and layout != "last_exited":
@@ -374,14 +385,61 @@ class KVCacheManager:
         if len(self._free_blocks) < count and self.num_free_blocks < count:
             return None
         while len(self._free_blocks) < count and self._prefixes:
-            _, blocks = self._prefixes.popitem(last=False)
-            self._drop_refs(blocks)
+            self._drop_refs(self._evict_prefix())
         if len(self._free_blocks) < count:
             return None
         blocks = [self._free_blocks.pop() for _ in range(count)]
         for b in blocks:
             assert self._refs[b] == 0
             self._refs[b] = 1
+        return blocks
+
+    def _touch_prefix(self, key):
+        """Record a publication or hit, queueing the entry while it is a tail."""
+        self._prefix_clock += 1
+        self._prefix_used[key] = self._prefix_clock
+        if not self._prefix_child_counts.get(key):
+            heapq.heappush(self._prefix_leaves, (self._prefix_clock, key))
+            # Repeated hits supersede their own records; rebuild once they
+            # outnumber the cache instead of holding them until eviction.
+            if len(self._prefix_leaves) > 2 * len(self._prefixes) + 8:
+                self._prefix_leaves = [
+                    (used, cached)
+                    for cached, used in self._prefix_used.items()
+                    if not self._prefix_child_counts.get(cached)
+                ]
+                heapq.heapify(self._prefix_leaves)
+
+    def _evict_prefix(self):
+        """Drop the least recently used entry that no cached entry extends.
+
+        Evicting an entry strands every page chained behind it: lookup stops
+        at the first missing page, so those pages hold memory no request can
+        reuse. Taking a chain's tail keeps its leading pages reachable, and
+        each tail is evicted by its own use time.
+        """
+        while self._prefix_leaves:
+            used, key = heapq.heappop(self._prefix_leaves)
+            # Reused or extended since it was queued; a current entry follows.
+            if self._prefix_used.get(key) != used or self._prefix_child_counts.get(key):
+                continue
+            return self._pop_prefix(key)
+        return self._pop_prefix(next(iter(self._prefixes)))
+
+    def _pop_prefix(self, key):
+        """Remove one entry, re-queueing the tail its removal exposes."""
+        blocks = self._prefixes.pop(key)
+        self._prefix_child_counts.pop(key, None)
+        self._prefix_used.pop(key, None)
+        parent = self._prefix_parents.pop(key, None)
+        if parent is not None:
+            remaining = self._prefix_child_counts.get(parent, 0) - 1
+            if remaining > 0:
+                self._prefix_child_counts[parent] = remaining
+            else:
+                self._prefix_child_counts.pop(parent, None)
+                # The exposed tail keeps its own use time.
+                heapq.heappush(self._prefix_leaves, (self._prefix_used.get(parent, 0), parent))
         return blocks
 
     def _prefix_keys(self, tokens):
@@ -417,8 +475,10 @@ class KVCacheManager:
         # Leave at least the last prompt token to recompute on a cache hit;
         # full-page alignment may leave additional tokens to recompute.
         publishable_tokens = min(length, len(tokens) - 1)
+        parent = None
         for index, key in enumerate(self._prefix_keys(tokens[:publishable_tokens])):
             if key in self._prefixes:
+                parent = key
                 continue
             end = (index + 1) * self.block_size
             # Every depth and layer must have a contiguous written prefix.
@@ -429,6 +489,11 @@ class KVCacheManager:
             for b in blocks:
                 self._refs[b] += 1
             self._prefixes[key] = blocks
+            if parent is not None:
+                self._prefix_parents[key] = parent
+                self._prefix_child_counts[parent] = self._prefix_child_counts.get(parent, 0) + 1
+            self._touch_prefix(key)
+            parent = key
 
     def lookup_prefix(self, tokens):
         if not self.enable_prefix_caching:
@@ -440,6 +505,7 @@ class KVCacheManager:
             if blocks is None:
                 break
             self._prefixes.move_to_end(key)
+            self._touch_prefix(key)
             found.append(blocks)
         return tuple(found)
 

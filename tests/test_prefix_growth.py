@@ -66,6 +66,137 @@ def test_prefix_refcounts_and_eviction():
     assert c.num_free_blocks == 12
 
 
+def test_eviction_takes_chain_tails_and_keeps_leading_pages():
+    # Pages chain: a page is reachable only while every earlier page is cached.
+    # Evicting a chain head would strand its successors, so eviction has to
+    # take tails while still retiring the least recently used chain first.
+    c = KVCacheManager(1, 1, 4, 12, 2, 2, enable_prefix_caching=True)
+    old_prompt, new_prompt = [1, 2, 3, 4, 5], [7, 8, 9, 10, 11]
+    for name, prompt in (("old", old_prompt), ("new", new_prompt)):
+        assert c.allocate(name, 5)
+        c.mark_imported_prefix(name, 5)
+        c.publish_prefix(name, prompt, 5)
+        c.free(name)
+    assert len(c.lookup_prefix(old_prompt)) == len(c.lookup_prefix(new_prompt)) == 2
+    # The older chain loses its tail first, so its head still serves a hit.
+    assert c.allocate("tail", 5)
+    assert len(c.lookup_prefix(old_prompt)) == 1
+    assert len(c.lookup_prefix(new_prompt)) == 2
+    c.free("tail")
+    # Only once the older chain is gone does the newer one lose its tail.
+    assert c.allocate("more", 9)
+    assert c.lookup_prefix(old_prompt) == ()
+    assert len(c.lookup_prefix(new_prompt)) == 1
+    c.free("more")
+
+
+def test_draining_a_long_chain_does_not_rescan_the_cache():
+    # Tails are queued by use time, so eviction takes one without repeatedly
+    # scanning the cache for entries that still have successors.
+    pages = 256
+    c = KVCacheManager(1, 1, 4, 2 * pages + 16, 2, 2, enable_prefix_caching=True)
+    tokens = [(7 * i + 3) % 60 + 2 for i in range(pages * 2 + 2)]
+    assert c.allocate("publisher", len(tokens))
+    c.mark_imported_prefix("publisher", len(tokens))
+    c.publish_prefix("publisher", tokens, len(tokens))
+    c.free("publisher")
+    entries = len(c._prefixes)
+    assert entries == pages
+    probes = 0
+    counts = c._prefix_child_counts
+
+    class Counting(dict):
+        def get(self, key, default=None):
+            nonlocal probes
+            probes += 1
+            return dict.get(self, key, default)
+
+    c._prefix_child_counts = Counting(counts)
+    while c._prefixes:
+        c._drop_refs(c._evict_prefix())
+    # A scanning eviction would re-walk the cache for every page it drops.
+    assert probes <= 8 * entries
+
+
+def test_repeated_hits_do_not_grow_the_eviction_queue():
+    # Each hit queues a fresh eviction record; without pruning, the queue grows
+    # without bound on a cache whose contents never change.
+    c = KVCacheManager(1, 1, 4, 12, 2, 2, enable_prefix_caching=True)
+    prompt = [1, 2, 3, 4, 5]
+    assert c.allocate("publisher", 5)
+    c.mark_imported_prefix("publisher", 5)
+    c.publish_prefix("publisher", prompt, 5)
+    c.free("publisher")
+    for _ in range(2000):
+        assert len(c.lookup_prefix(prompt)) == 2
+    assert len(c._prefix_leaves) <= 2 * len(c._prefixes) + 8
+    # Pruning keeps the chain reachable: pressure still trims from the tail.
+    assert c.allocate("grower", 9)
+    assert len(c.lookup_prefix(prompt)) == 1
+    c.free("grower")
+
+
+def test_a_hit_leading_page_outlives_its_own_tail():
+    # A hit reaches only the leading page, so the tail it leaves behind is the
+    # older record. Exposing that tail must not reset the leading page's use
+    # time, or eviction takes the page a request just reused.
+    hit, other = [1, 2, 3, 4, 5], [101, 102, 103, 104, 105]
+    c = KVCacheManager(1, 1, 4, 12, 2, 2, enable_prefix_caching=True)
+    for name, prompt in (("hit", hit), ("other", other)):
+        assert c.allocate(name, 5)
+        c.mark_imported_prefix(name, 5)
+        c.publish_prefix(name, prompt, 5)
+        c.free(name)
+    assert len(c.lookup_prefix(hit[:3])) == 1
+    # Both chains lose their tail; neither leading page is retired.
+    assert c.allocate("grower", 7)
+    assert len(c.lookup_prefix(hit)) == 1
+    assert len(c.lookup_prefix(other)) == 1
+    c.free("grower")
+
+
+def test_a_hit_chain_outlives_a_newer_one():
+    # A hit refreshes every page it reached, and exposing a chain's tail must
+    # keep that tail's own use time. The hit chain is published first, so only
+    # correct ordering lets it survive while the newer chain is fully retired.
+    hit, newer = [1, 2, 3, 4, 5], [101, 102, 103, 104, 105]
+    c = KVCacheManager(1, 1, 4, 16, 2, 2, enable_prefix_caching=True)
+    for name, prompt in (("hit", hit), ("newer", newer)):
+        assert c.allocate(name, 5)
+        c.mark_imported_prefix(name, 5)
+        c.publish_prefix(name, prompt, 5)
+        c.free(name)
+    assert len(c.lookup_prefix(hit)) == 2
+    # Pressure that must retire both newer pages before either hit page.
+    assert c.allocate("grower", 11)
+    assert len(c.lookup_prefix(hit)) == 2
+    assert c.lookup_prefix(newer) == ()
+    c.free("grower")
+
+
+def test_evicted_chain_tail_still_serves_the_leading_prefix():
+    e = LLMEngine(
+        model(),
+        cache_config=CacheConfig(90, 2, enable_prefix_caching=True, incremental_allocation=True),
+        scheduler_config=SchedulerConfig(prefill_chunk_size=4),
+    )
+    p = SamplingParams(max_tokens=4, exit_threshold=0, ignore_eos=True)
+    cache = e.cache_manager
+    first = [(7 * i + 3) % 60 + 2 for i in range(35)]
+    second = [(11 * i + 41) % 60 + 2 for i in range(35)]
+    e.add_request("first", list(first), p)
+    cold = finish(e)["first"].token_ids
+    e.add_request("second", list(second), p)
+    finish(e)
+    # The second prompt evicted part of the first chain, not its head.
+    reachable = len(cache.lookup_prefix(first))
+    assert 0 < reachable < 17
+    hits = cache.prefix_hits
+    e.add_request("again", list(first), p)
+    assert finish(e)["again"].token_ids == cold
+    assert cache.prefix_hits == hits + reachable * cache.block_size
+
+
 def test_incremental_growth_matches_reserved_generation():
     m = model()
     p = SamplingParams(max_tokens=9, exit_threshold=0, ignore_eos=True)
