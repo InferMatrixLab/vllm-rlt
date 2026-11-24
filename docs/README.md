@@ -29,6 +29,7 @@ setup on `v0.2.0`. The Ascend guide below uses `main`.
 | [HTTP serving](serving.md) | Device setup, completions API, streaming, and service lifecycle |
 | [Ouro on Ascend](recipes/ouro_ascend.md) | Huawei Ascend NPU setup on `main`, serving commands, and validation scope |
 | [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
+| [Ouro-2.6B on L4](recipes/ouro_2_6b_l4.md) | Bounded BF16 fixed-four-loop L4 setup, C=8 eager vs CUDA Graphs validation and limits |
 | [Ouro-Thinking recipe](recipes/ouro_thinking.md) | Shared 1.4B/2.6B setup, JSON/SSE client, budgets and validation limits |
 | [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |
 
