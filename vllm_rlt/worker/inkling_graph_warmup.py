@@ -7,7 +7,7 @@ import time
 import torch
 
 from vllm_rlt.config import cuda_graph_rows
-from vllm_rlt.kernels.inkling2_vllm import warmup_fa4
+from vllm_rlt.kernels.inkling2mini import warmup_fa4
 from vllm_rlt.request import Operation
 from vllm_rlt.worker.packed_graph import packed_capture_sizes
 

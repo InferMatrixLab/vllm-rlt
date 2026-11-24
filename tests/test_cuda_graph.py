@@ -24,7 +24,7 @@ def test_cuda_graph_validation():
 
 
 def test_inkling_packed_graph_plan_tracks_decode_split_and_fa4_launch(monkeypatch):
-    from vllm_rlt.kernels import inkling2_vllm
+    from vllm_rlt.kernels import inkling2mini
 
     def plan_decode(_local, _requests, max_query, *_shape):
         return 2 if max_query <= 2 else 0
@@ -37,7 +37,7 @@ def test_inkling_packed_graph_plan_tracks_decode_split_and_fa4_launch(monkeypatc
         plan_attention=plan_prefill,
         bucket_max_seqlen_q=lambda max_query: max_query,
     )
-    monkeypatch.setattr(inkling2_vllm, "load_ops", lambda: SimpleNamespace(attention=attention))
+    monkeypatch.setattr(inkling2mini, "load_ops", lambda: SimpleNamespace(attention=attention))
     config = SimpleNamespace(window=32, rel_extent=64, num_attention_heads=8, num_key_value_heads=4)
 
     def plans(query, start=0):
@@ -49,7 +49,7 @@ def test_inkling_packed_graph_plan_tracks_decode_split_and_fa4_launch(monkeypatc
         metadata = SimpleNamespace(
             rows=rows, max_seqlen_q=max(query), write_blocks=rows, context_lengths=query
         )
-        return inkling2_vllm.packed_attention_plans(metadata, config)
+        return inkling2mini.packed_attention_plans(metadata, config)
 
     short = plans((1, 4, 3))
     assert short[0].decode_rows == 1

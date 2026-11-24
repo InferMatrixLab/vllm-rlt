@@ -11,7 +11,7 @@ from safetensors import safe_open
 from torch import nn
 from torch.nn import functional as F
 
-from vllm_rlt.kernels.inkling2_vllm import (
+from vllm_rlt.kernels.inkling2mini import (
     KernelBatch,
     QuantizedExperts,
     attention_residual,
