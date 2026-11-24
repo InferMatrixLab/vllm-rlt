@@ -346,6 +346,12 @@ class StageEngine:
             eos_token_id=config.eos_token_id,
             exit_mode=self.exit_config.mode,
             mixed_speculative=mixed_speculative,
+            prioritize_prefill_continuations=(
+                getattr(model, "interleaved_kv", False)
+                and getattr(model, "fixed_loop_count", False)
+                and connector is None
+                and not scheduler_config.enable_preemption
+            ),
         )
         self.connector = connector
         # One RNG registry per engine, shared by both runners: the CODA and

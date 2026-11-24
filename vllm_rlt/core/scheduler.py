@@ -141,6 +141,7 @@ class Scheduler:
         eos_token_id=(),
         exit_mode: str = "ouro",
         mixed_speculative: bool = False,
+        prioritize_prefill_continuations: bool = False,
     ):
         self.config = config
         self.cache_manager = cache_manager
@@ -168,6 +169,11 @@ class Scheduler:
         # recurrent batches. Other prompt chunks execute all depths atomically.
         self.wavefront_chunked_prefill = config.wavefront_chunked_prefill
         self.staged_prefill = requires_staged_prefill(config, produces_tokens=produces_tokens)
+        self.prioritize_prefill_continuations = (
+            prioritize_prefill_continuations
+            and config.mode == "mixed"
+            and not self.wavefront_chunked_prefill
+        )
         self.policy = create_scheduling_policy(
             config,
             speculative_config,
@@ -183,7 +189,19 @@ class Scheduler:
 
     def enqueue(self, request: Request, phase: RequestPhase):
         request.phase = phase
-        self.queues[phase].append(request.request_id)
+        queue = self.queues[phase]
+        if (
+            self.prioritize_prefill_continuations
+            and request.num_prefilled_tokens > 0
+            and phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+        ):
+            # Continue prompts with a completed chunk first. Preserve queue
+            # order within each group.
+            for index, request_id in enumerate(queue):
+                if self.requests[request_id].num_prefilled_tokens == 0:
+                    queue.insert(index, request.request_id)
+                    return
+        queue.append(request.request_id)
 
     def suspend_for_transfer(self, request):
         """Stop scheduling without freeing resources that a transfer still borrows."""
