@@ -669,9 +669,7 @@ class ModelRunner:
                 [ids[row] for row in rows],
                 [[0] * len(rows)],
                 [positions[row] for row in rows],
-                packed=self.cache_manager.attention_capabilities.packed_prefill
-                if packed is None
-                else packed,
+                packed=self._can_pack_prefill() if packed is None else packed,
             )[0]
         return ForwardBatch(
             Operation.CODA, prelude_coda_kv_metadata=kv_metadata, compute_logits=False
@@ -707,12 +705,16 @@ class ModelRunner:
         cache = self.cache_manager
         spans = sorted(batch.spans, key=lambda span: span.token_count, reverse=True)
         ids = [span.request.request_id for span in spans]
-        base = self._stage_metadata(
-            ids,
-            [[span.depth for span in spans]],
-            [span.token_start + span.token_count - 1 for span in spans],
-            padded_rows=self._size(len(spans)),
-        )[0]
+        base = (
+            None
+            if cache.grouped
+            else self._stage_metadata(
+                ids,
+                [[span.depth for span in spans]],
+                [span.token_start + span.token_count - 1 for span in spans],
+                padded_rows=self._size(len(spans)),
+            )[0]
+        )
         groups, positions, blocks, tokens, contexts = [], [], [], [], []
         for offset in range(spans[0].token_count):
             active = [span for span in spans if offset < span.token_count]
@@ -720,13 +722,15 @@ class ModelRunner:
             for row, span in enumerate(active):
                 position = span.token_start + offset
                 positions.append(position)
-                blocks.append(base.rows[row][0].block_tables[0][position // cache.block_size])
+                if not cache.grouped:
+                    blocks.append(base.rows[row][0].block_tables[0][position // cache.block_size])
                 tokens.append(span.input_tokens[offset])
                 contexts.append(position + 1)
             size = self._size(len(active))
             padding = size - len(active)
             positions.extend([0] * padding)
-            blocks.extend([0] * padding)
+            if not cache.grouped:
+                blocks.extend([0] * padding)
             tokens.extend([0] * padding)
             contexts.extend([0] * padding)
             outputs = tuple(
@@ -736,24 +740,33 @@ class ModelRunner:
             )
             groups.append((start, size, active, outputs))
         n = len(positions)
-        wide = self.input_buffers[torch.int64].append(
-            positions + blocks + [p % cache.block_size for p in positions]
-        )
-        lengths = self.input_buffers[torch.int32].append(contexts)
+        if not cache.grouped:
+            wide = self.input_buffers[torch.int64].append(
+                positions + blocks + [p % cache.block_size for p in positions]
+            )
+            lengths = self.input_buffers[torch.int32].append(contexts)
         token_ids = self.input_buffers[torch.int64].append(tokens)
         inputs = []
         for start, size, active, outputs in groups:
             count, end = len(active), start + size
-            metadata = self.metadata.prepare_shared_rows(
-                base,
-                active,
-                positions[start : start + count],
-                position_ids=wide[start:end],
-                write_blocks=wide[n + start : n + start + count],
-                write_offsets=wide[2 * n + start : 2 * n + start + count],
-                context_lengths=lengths[start:end],
-                loop_count=batch.loop_count,
-            )
+            if cache.grouped:
+                metadata = self._stage_metadata(
+                    ids[:count],
+                    [[span.depth + loop for span in active] for loop in range(batch.loop_count)],
+                    positions[start : start + count],
+                    padded_rows=size,
+                )
+            else:
+                metadata = self.metadata.prepare_shared_rows(
+                    base,
+                    active,
+                    positions[start : start + count],
+                    position_ids=wide[start:end],
+                    write_blocks=wide[n + start : n + start + count],
+                    write_offsets=wide[2 * n + start : 2 * n + start + count],
+                    context_lengths=lengths[start:end],
+                    loop_count=batch.loop_count,
+                )
             kv = metadata[0]
             requests = tuple(span.request for span in active)
             coda, coda_rows = self._prepare_prefill_coda(
@@ -773,6 +786,16 @@ class ModelRunner:
                 inputs.append(PreparedForward(coda, outputs=(), hidden_rows=coda_rows))
         return tuple(inputs)
 
+    def _can_pack_prefill(self):
+        # Packed metadata needs last_exited all-layer pages. Native-packing
+        # backends advertise it regardless of the cache layout.
+        cache = self.cache_manager
+        return (
+            cache.attention_capabilities.packed_prefill
+            and cache.layout == "last_exited"
+            and not cache.grouped
+        )
+
     def _uses_packed_loop_inputs(self, batch):
         capabilities = self.cache_manager.attention_capabilities
         return (
@@ -791,7 +814,7 @@ class ModelRunner:
         cache = self.cache_manager
         if cache.layout == "shared":
             return self._prepare_shared_loop_inputs(batch)
-        packed = cache.attention_capabilities.packed_prefill and (
+        packed = self._can_pack_prefill() and (
             not cache.attention_capabilities.packed_sliding_window
             or all(len(span.request.prompt_token_ids) > 64 for span in batch.spans)
         )
@@ -909,7 +932,7 @@ class ModelRunner:
         metadata, boundary_metadata = (), None
         followups = ()
         boundary_kv = getattr(self.model, "requires_boundary_kv", False)
-        packed = batch.has_chunks and self.cache_manager.attention_capabilities.packed_prefill
+        packed = batch.has_chunks and self._can_pack_prefill()
         if batch.operation == Operation.RECURRENT:
             start = 1 if prepared.kv is not None else 0
             if not packed and (start < batch.loop_count or (boundary_kv and batch.has_chunks)):
@@ -1038,6 +1061,7 @@ class ModelRunner:
         prepared = replace(prepared, workspace=workspace)
         if (
             workspace is not None
+            and not self.cache_manager.grouped
             and batch.operation == Operation.RECURRENT
             and not (batch.emit_gate and self.graphs is not None)
             and batch.loop_count == 1
@@ -1162,10 +1186,11 @@ class ModelRunner:
                 and metadata[0].cu_seqlens_q is not None
             ):
                 graphs = None
+        # Grouped views omit padding even when the hidden workspace includes it.
         forward = ForwardBatch(
             Operation.RECURRENT,
             hidden=hidden[: batch.num_rows]
-            if graphs is not None or batch.loop_count > 1
+            if graphs is not None or batch.loop_count > 1 or self.cache_manager.grouped
             else hidden,
             metadata=metadata,
             graphs=graphs,

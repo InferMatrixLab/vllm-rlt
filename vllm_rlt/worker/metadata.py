@@ -7,7 +7,7 @@ launching device work. Storage, transfers and completion belong to the callers.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,6 +36,8 @@ class KVMetadata:
     no write address. Packed query boundaries describe layout, not request stage.
     Host rows and allocation identities are captured independently of caller
     lists. Device tensors are private, read-only inputs to the cache operations.
+    Read tables and context lengths are backend-local spans: native SWA views
+    may start at a window page boundary. Rows and position_ids remain absolute.
     """
 
     owner: KVCacheManager
@@ -50,6 +52,31 @@ class KVMetadata:
     cu_seqlens_q: torch.Tensor | None = None
     max_seqlen_q: int = 1
     packed_ranges: tuple[PackedKVRange, ...] | None = None
+
+
+@dataclass(frozen=True)
+class GroupedKVLayout:
+    """Logical rows only; physical addresses depend on the attention layer."""
+
+    owner: KVCacheManager
+    rows: tuple[tuple[_Allocation, int, int], ...]
+    allocations: tuple[tuple[str, _Allocation], ...]
+    positions: list[int]
+    writable: bool
+
+
+@dataclass(frozen=True, eq=False)
+class GroupedKVMetadata:
+    """Borrowed logical traversal with descriptor-local resolved layer views."""
+
+    owner: KVCacheManager
+    rows: tuple[tuple[_Allocation, int, int], ...]
+    allocations: tuple[tuple[str, _Allocation], ...]
+    position_ids: torch.Tensor
+    writable: bool
+    layer_views: dict[int, tuple[tuple[int, ...], KVMetadata]] = field(default_factory=dict)
+    cu_seqlens_q: None = None
+    max_seqlen_q: int = 1
 
 
 @dataclass(frozen=True, eq=False)
@@ -168,6 +195,8 @@ class MetadataBuilder:
         until GPU completion. This does not advance host written-position state.
         Allocation identity also rejects descriptors from another cache manager.
         """
+        if self.cache.grouped:
+            raise NotImplementedError("grouped KV does not support device-owned metadata")
         batch = DeviceKVMetadata(
             allocations=tuple(allocations),
             position_ids=position_ids,
@@ -226,6 +255,8 @@ class MetadataBuilder:
 
     def resolve_rows(self, ids, depths, positions):
         """Validate host-known rows for device routing without building host tables."""
+        if self.cache.grouped:
+            raise NotImplementedError("grouped KV does not support device routing")
         rows = tuple(self.cache._validate_rows(ids, depths, positions))
         self._write_addresses(rows)
         return rows
@@ -321,9 +352,11 @@ class MetadataBuilder:
         *,
         packed=False,
         for_write=True,
-    ) -> tuple[KVLayout, ...]:
+    ) -> tuple[KVLayout | GroupedKVLayout, ...]:
         """Calculate all requested depth layouts without selecting a storage path."""
         cache = self.cache
+        if cache.grouped and packed:
+            raise NotImplementedError("grouped KV supports ordinary host-planned rows only")
         if not depth_sets:
             raise ValueError("at least one depth assignment is required")
         if packed and (
@@ -348,6 +381,12 @@ class MetadataBuilder:
         allocations = tuple(dict(zip(request_ids, (a for a, _, _ in first))).items())
         layouts = []
         for rows in row_sets:
+            if cache.grouped:
+                identities = [(id(a), cache._plane(d), p) for a, d, p in rows]
+                if for_write and len(set(identities)) != len(rows):
+                    raise ValueError("duplicate logical KV write rows")
+                layouts.append(GroupedKVLayout(cache, rows, allocations, positions, for_write))
+                continue
             blocks, _ = self._write_addresses(rows, offsets=offsets, for_write=for_write)
             attention = plan_attention_metadata(
                 AttentionRows(
@@ -429,6 +468,8 @@ class MetadataBuilder:
                 tensor.shape, tensor.stride(), tensor.storage_offset()
             )
 
+        if isinstance(metadata, GroupedKVMetadata):
+            return replace(metadata, position_ids=view(metadata.position_ids), layer_views={})
         return replace(
             metadata,
             position_ids=view(metadata.position_ids),
@@ -442,6 +483,13 @@ class MetadataBuilder:
     @staticmethod
     def slice_rows(metadata, start, end):
         """Select contiguous single-query rows, e.g. a dependent coda subset."""
+        if isinstance(metadata, GroupedKVMetadata):
+            return replace(
+                metadata,
+                rows=metadata.rows[start:end],
+                position_ids=metadata.position_ids[start:end],
+                layer_views={},
+            )
         if metadata.cu_seqlens_q is not None:
             raise ValueError("packed query boundaries must be rebuilt when selecting rows")
         return replace(
@@ -456,6 +504,10 @@ class MetadataBuilder:
 
     @staticmethod
     def without_padding(metadata):
+        if isinstance(metadata, GroupedKVMetadata):
+            return replace(
+                metadata, position_ids=metadata.position_ids[: len(metadata.rows)], layer_views={}
+            )
         if metadata.cu_seqlens_q is not None:
             return metadata
         count = len(metadata.rows)
@@ -479,6 +531,8 @@ class MetadataBuilder:
         loop_count,
     ):
         """Reuse one shared-plane table across token groups and loop assignments."""
+        if isinstance(base, GroupedKVMetadata):
+            raise NotImplementedError("grouped KV does not support shared device row routing")
         count = len(spans)
         rows = tuple(
             (base.rows[row][0], span.depth, positions[row]) for row, span in enumerate(spans)

@@ -5,7 +5,13 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from vllm_rlt.worker.metadata import KVLayout, KVMetadata, PackedKVRange
+from vllm_rlt.worker.metadata import (
+    GroupedKVLayout,
+    GroupedKVMetadata,
+    KVLayout,
+    KVMetadata,
+    PackedKVRange,
+)
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import UvaBackedTensor, copy_tensor, use_uva_on
 
@@ -102,6 +108,8 @@ class Workspace:
 
     def store_metadata(self, layout: KVLayout, size):
         """Fill fixed host buffers from a storage-independent layout."""
+        if isinstance(layout, GroupedKVLayout):
+            raise NotImplementedError("grouped KV does not support UVA metadata workspaces")
         n = len(layout.rows)
         attention = layout.attention
         if attention.cu_seqlens_q is not None:
@@ -162,6 +170,18 @@ class Workspace:
 def stage_metadata(layouts, stage, *, padded_rows=None):
     """Store computed layouts in two typed buffers using caller-owned staging."""
     first = layouts[0]
+    if isinstance(first, GroupedKVLayout):
+        n = len(first.rows)
+        size = n if padded_rows is None else padded_rows
+        if size < n:
+            raise ValueError("padding requires at least the real row count")
+        positions = stage(first.positions + [0] * (size - n), torch.int64)
+        return tuple(
+            GroupedKVMetadata(
+                layout.owner, layout.rows, layout.allocations, positions, layout.writable
+            )
+            for layout in layouts
+        )
     n = len(first.rows)
     size = n if padded_rows is None else padded_rows
     if size < n or (size != n and first.attention.cu_seqlens_q is not None):

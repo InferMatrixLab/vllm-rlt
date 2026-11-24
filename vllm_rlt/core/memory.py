@@ -147,14 +147,24 @@ def plan_cache(
     staged_prefill=None,
     fp8_scale=None,
     attention=None,
+    layer_windows,
+    reclaim_swa,
 ):
     parameter = next(model.parameters())
     config, device = model.config, parameter.device
     # Models whose physical stack mixes KV-owning and KV-free sublayers (Dory)
     # expose the compact count; everything else keeps the layer count.
     kv_layers = getattr(config, "num_kv_layers", config.num_hidden_layers)
+    # The engine picks the layout: grouped windows, or None for all-layer blocks.
+    grouped = layer_windows is not None
+    unit = "physical_layer_page" if grouped else "all_layer_block"
+    recurrent = set(getattr(model, "recurrent_kv_layers", range(kv_layers)))
+    depths = config.total_ut_steps if cache.layout == "last_exited" else 1
+    page_factor = (
+        sum(depths if layer in recurrent else 1 for layer in layer_windows) if grouped else depths
+    )
     per_block = kv_bytes_per_block(
-        kv_layers,
+        1 if grouped else kv_layers,
         cache.block_size,
         config.num_key_value_heads,
         config.head_dim,
@@ -164,14 +174,25 @@ def plan_cache(
     auxiliary_width = getattr(config, "auxiliary_cache_width", 0)
     per_block += kv_layers * cache.block_size * auxiliary_width * parameter.element_size()
     if cache.num_blocks is not None:
-        return cache.num_blocks, {"source": "blocks", "bytes_per_block": per_block}
+        blocks = cache.num_blocks * (kv_layers if grouped else 1)
+        return blocks, {
+            "source": "blocks",
+            "bytes_per_block": per_block,
+            "block_unit": unit,
+            "configured_num_blocks": cache.num_blocks,
+        }
     if cache.kv_cache_memory_bytes is not None:
         blocks = budget_blocks(cache.kv_cache_memory_bytes, per_block)
-        return blocks, {"source": "bytes", "bytes_per_block": per_block}
+        return blocks, {"source": "bytes", "bytes_per_block": per_block, "block_unit": unit}
     if device.type == "npu":
         raise ValueError("NPU requires explicit num_blocks or kv_cache_memory_bytes")
     if device.type != "cuda":
-        return 256, {"source": "cpu_default", "bytes_per_block": per_block}
+        return 256 * (kv_layers if grouped else 1), {
+            "source": "cpu_default",
+            "bytes_per_block": per_block,
+            "block_unit": unit,
+            "configured_num_blocks": 256,
+        }
     torch.cuda.synchronize(device)
     # Return unused allocator segments before measuring driver-free memory.
     # In particular, a previous engine may have left its KV pool cached here.
@@ -196,8 +217,7 @@ def plan_cache(
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         max_loops=config.total_ut_steps,
-        num_blocks=sum(math.ceil(length / cache.block_size) for length in lengths)
-        * (config.total_ut_steps if cache.layout == "last_exited" else 1),
+        num_blocks=sum(math.ceil(length / cache.block_size) for length in lengths) * page_factor,
         block_size=cache.block_size,
         layout=cache.layout,
         device=device,
@@ -209,6 +229,7 @@ def plan_cache(
         fp8_scale=fp8_scale,
         auxiliary_width=auxiliary_width,
         interleaved_kv=getattr(model, "interleaved_kv", False),
+        layer_windows=layer_windows,
     )
     ids, positions = [], []
     for index, length in enumerate(lengths):
@@ -261,15 +282,37 @@ def plan_cache(
     )
     # More blocks than all concurrent full-context requests can use only waste
     # memory, particularly for tiny-model GPU tests with very small pages.
-    useful_blocks = (
-        math.ceil(config.max_position_embeddings / cache.block_size)
-        * (config.total_ut_steps if cache.layout == "last_exited" else 1)
-        * scheduler.max_num_seqs
-    )
+    if reclaim_swa and cache.incremental_allocation:
+        submission = min(scheduler.prefill_chunk_size, scheduler.max_num_batched_tokens)
+        pages = math.ceil(config.max_position_embeddings / cache.block_size)
+        useful_blocks = (
+            sum(
+                (
+                    min(
+                        pages,
+                        math.ceil(
+                            (window - 1 + submission + cache.block_size - 1) / cache.block_size
+                        ),
+                    )
+                    if window is not None
+                    else pages
+                )
+                * (depths if layer in recurrent else 1)
+                for layer, window in layer_windows.items()
+            )
+            * scheduler.max_num_seqs
+        )
+    else:
+        useful_blocks = (
+            math.ceil(config.max_position_embeddings / cache.block_size)
+            * page_factor
+            * scheduler.max_num_seqs
+        )
     blocks = min(budget_blocks(budget, per_block), useful_blocks)
     return blocks, dict(
         source="cuda_profile",
         bytes_per_block=per_block,
+        block_unit=unit,
         profile_peak_bytes=peak,
         concurrent_peak_bytes=concurrent_peak,
         max_useful_blocks=useful_blocks,
