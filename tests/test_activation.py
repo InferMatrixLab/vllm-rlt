@@ -307,9 +307,26 @@ def test_silu_and_mul_cuda_special_values_and_underflow(dtype, offsets):
 
 
 @pytest.mark.gpu
-def test_silu_and_mul_cuda_rejects_noncontiguous_input_without_copying():
-    gate, up = torch.randn(2, 14, device="cuda").chunk(2, dim=-1)
-    with pytest.raises(RuntimeError, match="contiguous inputs"):
+@pytest.mark.parametrize("rows,width", [(8, 5632), (32, 5632), (128, 5632), (3, 13)])
+def test_silu_and_mul_cuda_consumes_packed_projection_without_repacking(rows, width):
+    packed = torch.randn((rows, 2 * width), device="cuda", dtype=torch.bfloat16)
+    gate, up = packed.split(width, dim=-1)
+    assert not gate.is_contiguous() and not up.is_contiguous()
+    actual = silu_and_mul(gate, up)
+    torch.testing.assert_close(actual, silu_and_mul_reference(gate, up), rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = silu_and_mul(gate, up)
+    packed.normal_()
+    graph.replay()
+    torch.testing.assert_close(actual, silu_and_mul_reference(gate, up), rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+def test_silu_and_mul_cuda_rejects_nonunit_column_stride_without_copying():
+    gate, up = torch.randn(2, 28, device="cuda")[:, ::2].chunk(2, dim=-1)
+    with pytest.raises(RuntimeError, match="contiguous rows"):
         silu_and_mul(gate, up)
 
 

@@ -22,7 +22,8 @@ def silu_and_mul_reference(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor
 
     Inputs have equal shape, dtype and device. The result has the same shape,
     dtype and device and owns new storage. Noncontiguous inputs are supported
-    by this reference; the native entry requires contiguous inputs.
+    by this reference; the native entry supports contiguous tensors and 2D
+    tensors with contiguous rows.
     """
     _validate_inputs(gate, up)
     return F.silu(gate) * up

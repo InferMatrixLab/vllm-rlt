@@ -8,6 +8,7 @@ import textwrap
 import pytest
 import torch
 from safetensors.torch import save_file
+from torch.nn import functional as F
 
 from tests.helpers import make_cpu_cache, tiny_ouro_config
 from tests.reference import dense_reference
@@ -21,6 +22,13 @@ def model():
     return OuroForCausalLM(tiny_ouro_config())
 
 
+def _unfused_mlp(layer, hidden):
+    weights = layer.state_dict()
+    gate = F.linear(hidden, weights["gate_proj.weight"])
+    up = F.linear(hidden, weights["up_proj.weight"])
+    return F.linear(F.silu(gate) * up, weights["down_proj.weight"])
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("rows", [1, 7, 32])
@@ -28,10 +36,8 @@ def test_cuda_mlp_matches_torch_expression(dtype, rows):
     torch.manual_seed(72)
     layer = OuroMLP(tiny_ouro_config(intermediate_size=17)).to(device="cuda", dtype=dtype)
     layer.requires_grad_(False)
-    hidden = torch.randn(rows, layer.gate_proj.in_features, device="cuda", dtype=dtype)
-    expected = layer.down_proj(
-        torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
-    )
+    hidden = torch.randn(rows, layer.input_weight.shape[1], device="cuda", dtype=dtype)
+    expected = _unfused_mlp(layer, hidden)
     torch.testing.assert_close(layer(hidden), expected, rtol=0, atol=0)
 
 
@@ -55,10 +61,10 @@ def test_cuda_mlp_selects_native_or_missing_extension_fallback(native_available)
         assert torch._C._dispatch_has_kernel_for_dispatch_key(
             'vllm_rlt::silu_and_mul', 'CUDA') == {native_available}
         layer = OuroMLP(tiny_ouro_config()).cuda().bfloat16().requires_grad_(False)
-        hidden = torch.randn(3, layer.gate_proj.in_features,
+        hidden = torch.randn(3, layer.input_weight.shape[1],
                              device='cuda', dtype=torch.bfloat16)
-        expected = layer.down_proj(
-            torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden))
+        from tests.test_ouro import _unfused_mlp
+        expected = _unfused_mlp(layer, hidden)
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
             actual = layer(hidden)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -74,7 +80,7 @@ def test_cuda_mlp_graph_replays_updated_hidden():
     layer = OuroMLP(tiny_ouro_config(intermediate_size=17)).cuda().bfloat16().requires_grad_(False)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        hidden = torch.randn(3, layer.gate_proj.in_features, device="cuda", dtype=torch.bfloat16)
+        hidden = torch.randn(3, layer.input_weight.shape[1], device="cuda", dtype=torch.bfloat16)
         for _ in range(3):
             layer(hidden)
     stream.synchronize()
@@ -83,9 +89,7 @@ def test_cuda_mlp_graph_replays_updated_hidden():
         actual = layer(hidden)
     hidden.fill_(0.5)
     graph.replay()
-    expected = layer.down_proj(
-        torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
-    )
+    expected = _unfused_mlp(layer, hidden)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -226,7 +230,7 @@ def test_official_repo_is_pinned_and_remote_code_is_not_requested(tmp_path, mode
     )
     monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
     loaded = OuroForCausalLM.from_pretrained("test-org/checkpoint", revision="test-revision")
-    for name, parameter in loaded.named_parameters():
+    for name, parameter in loaded.state_dict().items():
         torch.testing.assert_close(parameter, model.state_dict()[name].bfloat16(), atol=0, rtol=0)
     assert loaded.model.rotary_emb.inv_freq.dtype == torch.float32
     assert called["revision"] == "test-revision"

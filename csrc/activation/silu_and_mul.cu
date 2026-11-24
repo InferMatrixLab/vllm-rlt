@@ -171,8 +171,36 @@ __global__ void silu_and_mul_kernel(const T* gate, const T* up, T* out, int64_t 
   }
 }
 
+template <typename T, bool aligned>
+__global__ void silu_and_mul_rows(const T* gate, const T* up, T* out,
+                                 int64_t width, int64_t rows, int64_t gate_stride,
+                                 int64_t up_stride, int64_t work_per_row) {
+  const int64_t first = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = first; i < rows * work_per_row; i += stride) {
+    const int64_t row = i / work_per_row;
+    const int64_t col = i % work_per_row;
+    if constexpr (aligned) {
+      constexpr int elements = 16 / sizeof(T);
+      constexpr int pairs = 16 / sizeof(typename Math<T>::Pair);
+      const int64_t offset = col * elements;
+      Vector<T> g = load_vector<T, true>(gate + row * gate_stride, offset, width);
+      Vector<T> u = load_vector<T, true>(up + row * up_stride, offset, width);
+      Vector<T> result;
+#pragma unroll
+      for (int j = 0; j < pairs; ++j) {
+        result.pairs[j] = Math<T>::compute(g.pairs[j], u.pairs[j]);
+      }
+      *reinterpret_cast<uint4*>(out + row * width + offset) =
+          *reinterpret_cast<const uint4*>(&result);
+    } else {
+      out[i] = compute_scalar(gate[row * gate_stride + col], up[row * up_stride + col]);
+    }
+  }
+}
+
 template <typename T>
-void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
+void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out, bool contiguous) {
   const T* g = reinterpret_cast<const T*>(gate.const_data_ptr());
   const T* u = reinterpret_cast<const T*>(up.const_data_ptr());
   T* result = reinterpret_cast<T*>(out.mutable_data_ptr());
@@ -182,6 +210,27 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
                             reinterpret_cast<uintptr_t>(result)) & 15) == 0;
   const int64_t count = gate.numel();
   constexpr int threads = 256;
+  auto stream = c10::cuda::getCurrentCUDAStream(gate.get_device());
+  if (!contiguous) {
+    const int64_t width = gate.size(1);
+    const int64_t rows = gate.size(0);
+    const int64_t gs = gate.stride(0);
+    const int64_t us = up.stride(0);
+    constexpr int elements = 16 / sizeof(T);
+    const bool aligned = vectorized && (width | gs | us) % elements == 0;
+    const int64_t work_per_row = aligned ? width / elements : width;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (rows * work_per_row + threads - 1) / threads, 4096));
+    if (aligned) {
+      silu_and_mul_rows<T, true><<<blocks, threads, 0, stream>>>(
+          g, u, result, width, rows, gs, us, work_per_row);
+    } else {
+      silu_and_mul_rows<T, false><<<blocks, threads, 0, stream>>>(
+          g, u, result, width, rows, gs, us, work_per_row);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
   bool scalar = false;
   if (!vectorized) {
     // Use 160 reference vector blocks per SM to determine the element cutoff.
@@ -204,7 +253,6 @@ void launch(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out) {
     }
   }
   const int blocks = static_cast<int>(std::min<int64_t>((work + threads - 1) / threads, max_blocks));
-  auto stream = c10::cuda::getCurrentCUDAStream(gate.get_device());
   if (vectorized) {
     silu_and_mul_kernel<T, AccessMode::Aligned><<<blocks, threads, 0, stream>>>(g, u, result, count);
   } else if (scalar) {
@@ -227,8 +275,10 @@ at::Tensor silu_and_mul_cuda(const at::Tensor& gate, const at::Tensor& up) {
                   gate.scalar_type() == at::kBFloat16,
               "silu_and_mul supports float32, float16 and bfloat16");
 
-  TORCH_CHECK(gate.is_contiguous() && up.is_contiguous(),
-              "silu_and_mul expects contiguous inputs");
+  const bool contiguous = gate.is_contiguous() && up.is_contiguous();
+  TORCH_CHECK(contiguous ||
+                  (gate.dim() == 2 && gate.stride(1) == 1 && up.stride(1) == 1),
+              "silu_and_mul expects contiguous inputs or 2D inputs with contiguous rows");
   TORCH_CHECK(!at::GradMode::is_enabled() || (!gate.requires_grad() && !up.requires_grad()),
               "silu_and_mul is inference-only; use torch.no_grad() or silu_and_mul_reference");
 
@@ -238,9 +288,9 @@ at::Tensor silu_and_mul_cuda(const at::Tensor& gate, const at::Tensor& up) {
     return out;
   }
   switch (gate.scalar_type()) {
-    case at::kHalf: launch<__half>(gate, up, out); break;
-    case at::kBFloat16: launch<__nv_bfloat16>(gate, up, out); break;
-    case at::kFloat: launch<float>(gate, up, out); break;
+    case at::kHalf: launch<__half>(gate, up, out, contiguous); break;
+    case at::kBFloat16: launch<__nv_bfloat16>(gate, up, out, contiguous); break;
+    case at::kFloat: launch<float>(gate, up, out, contiguous); break;
     default: TORCH_CHECK(false, "unsupported dtype");
   }
   return out;
