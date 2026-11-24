@@ -11,7 +11,6 @@ from vllm_rlt.request import Operation
 from vllm_rlt.worker.cuda_graph import (
     _bucket_size,
     _cache_full,
-    _capture,
     _copy_graph_inputs,
     _DeviceCache,
     _graph_entry,
@@ -97,8 +96,7 @@ class PackedGraphs:
         self.max_rows = scheduler.max_num_batched_tokens
         self.max_sequences = scheduler.max_num_seqs
         self.speculative_core = False
-        self.piecewise = model.interleaved_kv
-        self.bucketed = execution.packed_graph_buckets and self.piecewise
+        self.bucketed = execution.packed_graph_buckets
         self.min_rows = (
             1
             if self.bucketed
@@ -173,8 +171,6 @@ class PackedGraphs:
         )
         size = _bucket_size(self.capture_sizes, count)
         key = (operation, size, variant, compute_gate)
-        if not self.piecewise:
-            key += (sequences, batch.max_seqlen_q)
         if (
             not self.min_rows <= count <= self.max_rows
             or sequences > max_sequences
@@ -205,25 +201,24 @@ class PackedGraphs:
                 self.model.config.max_position_embeddings,
                 count=size,
                 bucketed=self.bucketed,
-                table_count=min(size, max_sequences) if self.piecewise else None,
+                table_count=min(size, max_sequences),
                 masked=masked,
             )
             entry.metadata.graph_variant = variant
             entry.graph = None
-            entry.segments = _AttentionSegments(self.pool) if self.piecewise else None
+            entry.segments = _AttentionSegments(self.pool)
         stream = torch.cuda.current_stream(inputs.device)
         if self.last_event is not None:
             stream.wait_event(self.last_event)
         _copy_graph_inputs(entry, inputs, batch)
-        if self.piecewise:
-            # Live attention between existing graph segments uses the fused
-            # row mapping. Capture uses the staged query table and pad mask.
-            live = self.model.batch_type(
-                self.proxy,
-                batch,
-                self.model.config,
-                fused_sconv_metadata=entry.graph is not None and not startup,
-            )
+        # Live attention between existing graph segments uses the fused
+        # row mapping. Capture uses the staged query table and pad mask.
+        live = self.model.batch_type(
+            self.proxy,
+            batch,
+            self.model.config,
+            fused_sconv_metadata=entry.graph is not None and not startup,
+        )
         if entry.graph is None:
 
             def run():
@@ -231,30 +226,21 @@ class PackedGraphs:
                     operation, entry.hidden, entry.metadata, self.proxy, compute_gate=compute_gate
                 )
 
-            if self.piecewise:
-
-                def warm():
-                    return self._forward(
-                        operation, inputs, batch, self.proxy, compute_gate=compute_gate
-                    )
-
-                entry.output = self._capture_pieces(entry, live, warm, run, startup=startup)
-                entry.graph = entry.segments
-                if self.bucketed:
-                    if isinstance(entry.output, tuple):
-                        entry.output = tuple(_borrow_graph_tensor(value) for value in entry.output)
-                    else:
-                        entry.output = _borrow_graph_tensor(entry.output)
-            else:
-                entry.graph, entry.output = _capture(
-                    entry.hidden, self.stream, torch.cuda.graph_pool_handle(), run
+            def warm():
+                return self._forward(
+                    operation, inputs, batch, self.proxy, compute_gate=compute_gate
                 )
+
+            entry.output = self._capture_pieces(entry, live, warm, run, startup=startup)
+            entry.graph = entry.segments
+            if self.bucketed:
+                if isinstance(entry.output, tuple):
+                    entry.output = tuple(_borrow_graph_tensor(value) for value in entry.output)
+                else:
+                    entry.output = _borrow_graph_tensor(entry.output)
             self.entries[key] = entry
             self.captures += 1
-        if self.piecewise:
-            entry.graph.replay(live)
-        else:
-            entry.graph.replay()
+        entry.graph.replay(live)
         output = entry.output
         if isinstance(output, tuple):
             output = tuple(value[:count].clone() if value is not None else None for value in output)

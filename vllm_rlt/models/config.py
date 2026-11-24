@@ -1,6 +1,6 @@
 """Entry-owned model configuration shared by deployment clients and workers."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from torch import nn
@@ -71,14 +71,6 @@ class ModelConfig:
                 f"max_loops must match the Fixed Inkling depth ({config.total_ut_steps})"
             )
         return ModelConfig(config.with_loop_num_passes(max_loops))
-
-    def with_inkling_kernels(self, backend):
-        if backend is None:
-            return self
-        config = self.model_specific_config
-        if backend not in ("rlt", "vllm") or not isinstance(config, Inkling2Config):
-            raise ValueError("inkling_kernels requires an Inkling checkpoint and rlt or vllm")
-        return ModelConfig(replace(config, kernel_backend=backend))
 
 
 def prepare_model(model, *, revision=None, model_config=None):

@@ -152,61 +152,6 @@ def test_triton_paged_prefill_matches_per_query_reference(head_dim, heads, kv_he
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("window", [0, 33])
-def test_packed_prefill_with_relative_bias_and_sinks(window):
-    from vllm_rlt.kernels.triton_attention import paged_prefill_attention
-
-    torch.manual_seed(7)
-    device, dtype = "cuda", torch.bfloat16
-    lengths = [107, 3, 52]
-    starts = [0, 39, 42, 59]
-    pages = torch.randperm(16, device=device).to(torch.int32)
-    tables = torch.full((3, 7), -1, device=device, dtype=torch.int32)
-    tables[0], tables[1, :1], tables[2, :4] = pages[:7], pages[7:8], pages[8:12]
-    k = torch.randn(16, 16, 8, 128, device=device, dtype=dtype)
-    v = torch.randn_like(k)
-    q = torch.randn(starts[-1], 24, 128, device=device, dtype=dtype)
-    bias = torch.randn(starts[-1], 24, 24, device=device, dtype=dtype)
-    sinks = torch.randn(starts[-1], 24, device=device, dtype=dtype)
-    actual = paged_prefill_attention(
-        q,
-        k,
-        v,
-        tables,
-        torch.tensor(lengths, device=device, dtype=torch.int32),
-        torch.tensor(starts, device=device, dtype=torch.int32),
-        39,
-        window=window,
-        compensate=True,
-        relative_bias=bias,
-        sinks=sinks,
-    )
-
-    expected = []
-    for seq, (start, end) in enumerate(zip(starts, starts[1:])):
-        length = lengths[seq]
-        keys = torch.arange(length, device=device)
-        slots = tables[seq, keys // 16].long(), keys % 16
-        key = k[slots].float().repeat_interleave(3, dim=1)
-        value = v[slots].float().repeat_interleave(3, dim=1)
-        distance = keys[length - (end - start) :, None] - keys[None, :]
-        relative = (
-            bias[start:end]
-            .float()
-            .gather(-1, distance.clamp(0, 23)[:, None, :].expand(-1, q.shape[1], -1))
-        )
-        scores = torch.einsum("qhd,khd->qhk", q[start:end].float(), key) * 128**-0.5
-        scores += relative.masked_fill((distance >= 24)[:, None, :], 0)
-        visible = distance >= 0
-        if window:
-            visible &= distance < window
-        scores = scores.masked_fill(~visible[:, None, :], -torch.inf)
-        weights = torch.cat((scores, sinks[start:end, :, None].float()), dim=-1).softmax(dim=-1)
-        expected.append(torch.einsum("qhk,khd->qhd", weights[..., :-1], value))
-    torch.testing.assert_close(actual, torch.cat(expected).to(dtype), rtol=8e-3, atol=2e-3)
-
-
-@pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_split_kv_decode_matches_reference_and_is_batch_invariant(dtype):
     from vllm_rlt.kernels.paged_attention import torch_paged_attention

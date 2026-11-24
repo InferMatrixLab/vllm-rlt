@@ -80,8 +80,8 @@ class StageEngine:
             raise ValueError("CUDA Graph warmup requires native Inkling kernels")
         if auxiliary_width:
             if attention_backend not in ("auto", "torch", "triton"):
-                raise ValueError("Inkling 2 Mini requires its Triton relative-bias attention")
-            # Inkling uses Triton's KV layouts and supplies its own relative bias and sinks.
+                raise ValueError("Inkling 2 Mini requires the Triton KV backend")
+            # Inkling uses Triton for KV layout and vLLM for model attention.
             attention_backend = "triton"
             if (
                 cache_config.kv_cache_dtype != "auto"
@@ -169,7 +169,7 @@ class StageEngine:
                     raise ValueError("boundary-KV speculative decoding is not yet supported")
                 if ordered_pipeline:
                     if self.execution_config.async_scheduling and not device_boundary_pipeline:
-                        raise ValueError("async Inkling pipeline requires --inkling-kernels vllm")
+                        raise ValueError("async boundary pipeline requires interleaved KV")
                     if scheduler_config.enable_preemption:
                         raise ValueError("Inkling pipeline requires preemption to be disabled")
                 elif (

@@ -58,7 +58,6 @@ def main():
     )
     parser.add_argument("--model", help="Local checkpoint path or HuggingFace repository ID")
     parser.add_argument("--revision")
-    parser.add_argument("--inkling-kernels", choices=["rlt", "vllm"])
     parser.add_argument("--prompt", action="append", help="Text prompt; repeat for a batch")
     parser.add_argument(
         "--toy", action="store_true", help="Use a tiny RANDOM model and token ID prompts"
@@ -128,7 +127,6 @@ def main():
         model,
         revision=args.revision,
         max_loops=args.max_loops,
-        inkling_kernels=args.inkling_kernels,
         device=args.device,
         dtype=getattr(torch, args.dtype),
         **runtime_configs(args),

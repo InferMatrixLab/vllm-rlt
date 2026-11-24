@@ -48,9 +48,7 @@ def load_engine(args):
         raise ValueError("serve --max-loops sets the startup depth of an Inkling checkpoint")
     engine = StageClient(
         source,
-        model_config=ModelConfig.from_dict(config)
-        .with_max_loops(max_loops)
-        .with_inkling_kernels(getattr(args, "inkling_kernels", None)),
+        model_config=ModelConfig.from_dict(config).with_max_loops(max_loops),
         revision=revision,
         device=args.device,
         dtype=args.dtype,
@@ -87,7 +85,6 @@ def main():
     )
     parser.add_argument("--revision")
     parser.add_argument("--max-loops", type=int, help="Startup depth for Inkling VarLoop")
-    parser.add_argument("--inkling-kernels", choices=["rlt", "vllm"])
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokenizer-revision")
     parser.add_argument("--served-model-name")

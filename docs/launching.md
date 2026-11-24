@@ -17,7 +17,9 @@ For Huawei Ascend NPU, follow the [Ascend setup](recipes/ouro_ascend.md) on `mai
 The fixed and variable-loop checkpoints share one text implementation. The fixed
 checkpoint uses three passes. The variable-loop checkpoint defaults to three and
 accepts `--max-loops` to set the worker's depth in the CLI and server. For the
-fixed checkpoint, an explicit `--max-loops` must match its depth.
+fixed checkpoint, an explicit `--max-loops` must match its depth. Both require
+an NVIDIA SM10x GPU, a vLLM CUDA build with Inkling 2 operators, and its
+FlashInfer dependencies. The tested vLLM source revision is `3146a9df4140`.
 
 ```bash
 python -m vllm_rlt.entrypoints.cli \
@@ -29,28 +31,20 @@ python -m vllm_rlt.entrypoints.cli \
   --device cuda --num-blocks 96 --prompt 'The capital of France is' --max-tokens 8
 ```
 
-Both examples use synchronous NVIDIA CUDA execution and BF16 KV. The loader
-expands the checkpoint's NVFP4 and MXFP8 expert weights to BF16, requiring
-approximately 51 GiB of GPU memory for weights, plus KV and temporary buffers.
-The examples were exercised on B300 with PyTorch 2.14. The same checkpoint and
-pass arguments work with `vllm-rlt-serve` for text completions.
+Both examples use synchronous CUDA execution and BF16 KV. RLT loads the
+checkpoint and schedules requests. The model uses native NVFP4 and MXFP8
+experts and the vLLM attention, short-convolution, and AttnRes operators.
+The same checkpoint and pass arguments work with `vllm-rlt-serve` for text completions.
 
 Packed prefill is selected by default. Use `--packed-prefill` to require it or
 `--no-packed-prefill` to select per-query prefill for comparison. Both use the
 same chunk scheduler, relative position bias, attention sinks, BF16 KV, and
 per-pass convolution history. Decode continues to use per-query attention.
 
-Both checkpoints on SM10x can use the vLLM Inkling operators with
-`--inkling-kernels vllm`. Install a vLLM CUDA build that contains the native
-Inkling operators and its FlashInfer dependencies in the serving environment.
-The tested vLLM source revision is `3146a9df4140`. RLT loads the checkpoint
-and schedules requests, using native NVFP4/MXFP8 experts and the vLLM
-attention, short-convolution, and AttnRes kernels.
-
-Use `--packed-prefill --cuda-graphs` with this option. RLT captures decode
+Use `--packed-prefill --cuda-graphs` to enable Graph execution. RLT captures decode
 prelude, recurrent pass, and coda separately. Packed prefill has its own graph
 entries for prelude, recurrent passes and KV-only coda, sized up to the
-scheduler's query-token budget. With the native kernels, add
+scheduler's query-token budget. Add
 `--packed-graph-buckets` to round the query count up to the next vLLM throughput
 bucket and share a graph memory pool. Each bucket is captured on first use by default.
 Padding rows have no KV slots. Attention runs between graph segments with the
