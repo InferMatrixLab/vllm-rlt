@@ -64,6 +64,7 @@ class SchedulerConfig:
     policy: str = "fcfs"
     enable_preemption: bool = False
     wavefront_chunked_prefill: bool = False
+    adaptive_wavefront_prefill: bool = False
 
     def __post_init__(self):
         for name in (
@@ -80,6 +81,10 @@ class SchedulerConfig:
             raise ValueError("enable_preemption must be a boolean")
         if type(self.wavefront_chunked_prefill) is not bool:
             raise ValueError("wavefront_chunked_prefill must be a boolean")
+        if type(self.adaptive_wavefront_prefill) is not bool:
+            raise ValueError("adaptive_wavefront_prefill must be a boolean")
+        if self.adaptive_wavefront_prefill and not self.wavefront_chunked_prefill:
+            raise ValueError("adaptive_wavefront_prefill requires wavefront_chunked_prefill")
         if self.policy not in ("fcfs", "priority"):
             raise ValueError("policy must be fcfs or priority")
         if self.mode not in ("refill", "no_refill", "mixed"):
@@ -158,6 +163,10 @@ class ExecutionConfig:
     # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
     # support and compatible synchronous eager execution; off otherwise.
     packed_prefill: bool | None = None
+    # Opt in to the vLLM token grid for native Inkling packed CUDA Graphs.
+    packed_graph_buckets: bool = False
+    # Prepare native Inkling graphs before serving and keep the cache fixed.
+    cuda_graph_warmup: bool = False
 
     def __post_init__(self):
         if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
@@ -169,11 +178,15 @@ class ExecutionConfig:
             "static_buffers",
             "pad_to_power_of_two",
             "cuda_graphs",
+            "packed_graph_buckets",
+            "cuda_graph_warmup",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if self.cuda_graph_max_batch_size is not None:
             _positive("cuda_graph_max_batch_size", self.cuda_graph_max_batch_size)
+        if self.cuda_graph_warmup and not self.cuda_graphs:
+            raise ValueError("CUDA Graph warmup requires cuda_graphs")
         for name in ("cuda_graph_max_graphs", "cuda_graph_memory_reserve_bytes"):
             _positive(name, getattr(self, name))
         if self.pad_to_power_of_two and not self.static_buffers:
@@ -188,12 +201,17 @@ class SpeculativeConfig:
     draft_loops: int = 2
     target_loops: int = 4
     mode: str = "block"
+    pipeline_graph: str = "off"
 
     def __post_init__(self):
         for name in ("num_speculative_tokens", "draft_loops", "target_loops"):
             _positive(name, getattr(self, name))
         if self.mode not in ("block", "pipeline"):
             raise ValueError("speculative mode must be block or pipeline")
+        if self.pipeline_graph not in ("off", "transition", "full"):
+            raise ValueError("pipeline_graph must be off, transition, or full")
+        if self.pipeline_graph != "off" and self.mode != "pipeline":
+            raise ValueError("pipeline_graph requires speculative pipeline mode")
         if self.mode == "pipeline" and self.target_loops % self.draft_loops:
             raise ValueError("pipeline draft_loops must divide target_loops")
         if self.draft_loops >= self.target_loops:

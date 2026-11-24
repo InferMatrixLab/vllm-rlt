@@ -11,6 +11,9 @@ from tests.helpers import tiny_ouro_config
 from vllm_rlt.attention import BackendCapabilities
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.models import OuroForCausalLM
+from vllm_rlt.request import ExecutionBatch, Operation, Request, StateSpan
+from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.worker.buffers import stage_metadata
 
 
 @pytest.fixture(autouse=True)
@@ -320,3 +323,49 @@ def test_depth_batches_share_depth_independent_metadata(packed):
         cache._prepare_batches(ids, [[0] * 5, [4] * 5], positions)
     with pytest.raises(ValueError, match="equal lengths"):
         cache._prepare_batches(ids, [[0] * 5, [1] * 4], positions)
+
+
+def test_packed_spans_match_row_planning_across_depths():
+    cache = make_cache(num_blocks=64)
+    cache.attention = SimpleNamespace(capabilities=BackendCapabilities(packed_prefill=True))
+    a, b = (Request(name, [1], SamplingParams()) for name in ("a", "b"))
+    assert cache.allocate("a", 8) and cache.allocate("b", 6)
+    spans = (StateSpan(a, 1, 2, 0), StateSpan(a, 3, 4, 0), StateSpan(b, 4, 1, 1))
+    ids, depths, positions = ExecutionBatch(Operation.RECURRENT, spans).addresses()
+    offsets = (0, 1, 2)
+    packed = cache.metadata_builder.build_packed(spans, offsets)
+    rows = cache.metadata_builder.build(
+        ids, [[depth + offset for depth in depths] for offset in offsets], positions, packed=True
+    )
+    assert packed == rows
+    assert [len(layout.packed_ranges) for layout in packed] == [2] * len(offsets)
+    assert packed[0].attention.cu_seqlens_q == [0, 6, 7]
+    assert packed[0].attention.cu_seqlens_q is packed[-1].attention.cu_seqlens_q
+    with pytest.raises(ValueError, match="contiguous"):
+        cache.metadata_builder.build_packed((StateSpan(a, 0, 2, 0), spans[1]), (0,))
+
+
+def test_packed_external_kv_registration_preserves_holes_and_depths():
+    cache = make_cache(num_blocks=64)
+    cache.attention = SimpleNamespace(capabilities=BackendCapabilities(packed_prefill=True))
+    request = Request("r", [1], SamplingParams())
+    assert cache.allocate("r", 8)
+    builder = cache.metadata_builder
+    late_layout = builder.build_packed((StateSpan(request, 2, 5, 1),), (0,))
+    early_layout = builder.build_packed((StateSpan(request, 0, 2, 1),), (0,))
+    late = stage_metadata(late_layout, cache._stage)[0]
+    early = stage_metadata(early_layout, cache._stage)[0]
+    allocation = late.packed_ranges[0].allocation
+    cache.record_external_kv(0, late)
+    with pytest.raises(RuntimeError, match="uninitialized KV history"):
+        cache._require_prefix(allocation, 0, 1, 7)
+    cache.record_external_kv(0, early)
+    cache._require_prefix(allocation, 0, 1, 7)
+    with pytest.raises(RuntimeError, match="uninitialized KV history"):
+        cache._require_prefix(allocation, 0, 0, 1)
+    with pytest.raises(RuntimeError, match="uninitialized KV history"):
+        cache._require_prefix(allocation, 1, 1, 1)
+    cache.free("r")
+    assert cache.allocate("r", 8)
+    with pytest.raises(RuntimeError, match="stale prepared KV batch"):
+        cache.record_external_kv(0, late)

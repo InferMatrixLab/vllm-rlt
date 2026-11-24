@@ -13,9 +13,19 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm_rlt.attention import AttentionMetadataValues, AttentionRows, plan_attention_metadata
+from vllm_rlt.attention.metadata import assemble_attention_metadata
 
 if TYPE_CHECKING:
     from vllm_rlt.core.kv_cache_manager import KVCacheManager, _Allocation
+    from vllm_rlt.request import StateSpan
+
+
+@dataclass(frozen=True)
+class PackedKVRange:
+    allocation: _Allocation
+    depth: int
+    start: int
+    end: int
 
 
 @dataclass(frozen=True, eq=False)
@@ -41,6 +51,7 @@ class KVMetadata:
     writable: bool
     cu_seqlens_q: torch.Tensor | None = None
     max_seqlen_q: int = 1
+    packed_ranges: tuple[PackedKVRange, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +106,14 @@ class DeviceKVMetadata:
     max_seqlen_q: int = 1
 
 
+@dataclass(frozen=True, eq=False, kw_only=True)
+class MixedRecurrentKVMetadata(DeviceKVMetadata):
+    """Speculative single-query rows followed by host-planned prompt ranges."""
+
+    decode_rows: int
+    prompt: KVMetadata
+
+
 @dataclass(frozen=True)
 class KVLayout:
     """Host values for one depth assignment, independent of destination storage.
@@ -111,11 +130,53 @@ class KVLayout:
     write_offsets: list[int]
     attention: AttentionMetadataValues
     writable: bool
+    packed_ranges: tuple[PackedKVRange, ...] | None = None
+
+
+def _packed_ranges(rows, cumulative):
+    if cumulative is None:
+        return None
+    return tuple(
+        PackedKVRange(*rows[start], rows[end - 1][2] + 1)
+        for start, end in zip(cumulative, cumulative[1:])
+    )
 
 
 class MetadataBuilder:
     def __init__(self, cache):
         self.cache = cache
+
+    def join_recurrent(self, decode, prompt):
+        """Join device-owned decode addresses and packed prompt addresses on-stream."""
+        decode_rows = len(decode.position_ids)
+        prompt_rows = len(prompt.rows)
+        decode_width = decode.block_tables.shape[1]
+        prompt_width = prompt.block_tables.shape[1]
+        tables = decode.block_tables.new_zeros(
+            (decode_rows + len(prompt.context_lengths), max(decode_width, prompt_width))
+        )
+        tables[:decode_rows, :decode_width].copy_(decode.block_tables)
+        tables[decode_rows:, :prompt_width].copy_(prompt.block_tables)
+        cu_seqlens = torch.cat(
+            (
+                torch.arange(decode_rows, device=tables.device, dtype=torch.int32),
+                prompt.cu_seqlens_q + decode_rows,
+            )
+        )
+        mask = torch.cat((decode.write_mask, decode.write_mask.new_ones(prompt_rows)))
+        return MixedRecurrentKVMetadata(
+            allocations=decode.allocations + prompt.allocations,
+            position_ids=torch.cat((decode.position_ids, prompt.position_ids[:prompt_rows])),
+            write_blocks=torch.cat((decode.write_blocks, prompt.write_blocks)),
+            write_offsets=torch.cat((decode.write_offsets, prompt.write_offsets)),
+            block_tables=tables,
+            context_lengths=torch.cat((decode.context_lengths, prompt.context_lengths)),
+            write_mask=mask,
+            cu_seqlens_q=cu_seqlens,
+            max_seqlen_q=prompt.max_seqlen_q,
+            decode_rows=decode_rows,
+            prompt=prompt,
+        )
 
     def prepare_device(
         self,
@@ -200,6 +261,89 @@ class MetadataBuilder:
         self._write_addresses(rows)
         return rows
 
+    def build_packed(
+        self, spans: Sequence[StateSpan], loop_offsets: Sequence[int], *, for_write=True
+    ) -> tuple[KVLayout, ...]:
+        """Plan packed ranges once and resolve physical pages for each core visit."""
+        cache = self.cache
+        if not loop_offsets:
+            raise ValueError("at least one depth assignment is required")
+        if cache.layout != "last_exited" or not cache.attention_capabilities.packed_prefill:
+            raise ValueError("packed queries require a compatible attention backend and KV layout")
+        allocations, seen, ranges = {}, set(), []
+        cumulative = [0]
+        previous = None
+        for span in spans:
+            request_id = span.request.request_id
+            allocation = allocations.get(request_id)
+            if allocation is None:
+                allocation = allocations[request_id] = cache._get_allocation(request_id)
+            start, end = span.token_start, span.token_start + span.token_count
+            if end <= start:
+                raise ValueError("packed queries require nonempty ranges")
+            cache._validate_depth(span.depth)
+            cache._validate_position(allocation, start)
+            cache._validate_position(allocation, end - 1)
+            key = (request_id, span.depth)
+            if key == previous:
+                if start != ranges[-1].end:
+                    raise ValueError("packed prefill positions must be contiguous")
+                ranges[-1] = replace(ranges[-1], end=end)
+                cumulative[-1] += span.token_count
+            else:
+                if key in seen:
+                    raise ValueError("packed prefill request/depth must form one sequence")
+                seen.add(key)
+                ranges.append(PackedKVRange(allocation, span.depth, start, end))
+                cumulative.append(cumulative[-1] + span.token_count)
+            previous = key
+
+        block_size = cache.block_size
+        positions = [position for seq in ranges for position in range(seq.start, seq.end)]
+        offsets = [position % block_size for position in positions]
+        lengths = [seq.end for seq in ranges]
+        max_query = max((seq.end - seq.start for seq in ranges), default=1)
+        owners = tuple(allocations.items())
+        layouts = []
+        for offset in loop_offsets:
+            depth_ranges, tables, blocks = [], [], []
+            for seq in ranges:
+                depth = seq.depth + offset
+                cache._validate_depth(depth)
+                depth_ranges.append(replace(seq, depth=depth) if offset else seq)
+                table = seq.allocation.block_tables[cache._plane(depth)]
+                tables.append(table)
+                for page in range(seq.start // block_size, (seq.end - 1) // block_size + 1):
+                    start = max(seq.start, page * block_size)
+                    end = min(seq.end, (page + 1) * block_size)
+                    blocks.extend([table[page]] * (end - start))
+            if for_write and len(set(zip(blocks, offsets))) != len(positions):
+                raise ValueError("duplicate KV write addresses for request/depth/position rows")
+            layouts.append(
+                KVLayout(
+                    owner=cache,
+                    rows=tuple(
+                        (seq.allocation, seq.depth, position)
+                        for seq in depth_ranges
+                        for position in range(seq.start, seq.end)
+                    ),
+                    allocations=owners,
+                    positions=positions,
+                    write_blocks=blocks,
+                    write_offsets=offsets,
+                    attention=assemble_attention_metadata(
+                        tables,
+                        lengths,
+                        block_size=block_size,
+                        cu_seqlens_q=cumulative,
+                        max_seqlen_q=max_query,
+                    ),
+                    writable=for_write,
+                    packed_ranges=tuple(depth_ranges),
+                )
+            )
+        return tuple(layouts)
+
     def build(
         self,
         request_ids: Sequence[str],
@@ -263,6 +407,7 @@ class MetadataBuilder:
                     write_offsets=offsets,
                     attention=attention,
                     writable=for_write,
+                    packed_ranges=_packed_ranges(rows, attention.cu_seqlens_q),
                 )
             )
         return tuple(layouts)
@@ -311,6 +456,7 @@ class MetadataBuilder:
             write_offsets=[layout.write_offsets[row] for row in rows],
             attention=attention,
             writable=layout.writable,
+            packed_ranges=_packed_ranges(selected, attention.cu_seqlens_q),
         )
 
     @staticmethod

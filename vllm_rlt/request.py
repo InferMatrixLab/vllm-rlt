@@ -68,6 +68,8 @@ class Request:
     finish_reason: FinishReason | None = None
     exit_trace: tuple[int, ...] = field(default=(), repr=False)
     _target_loops: int | None = field(default=None, repr=False)
+    # Fixed at wavefront admission so in-flight ring offsets keep their meaning.
+    prefill_chunk_size: int | None = None
 
     def __post_init__(self):
         if self._target_loops is not None and (
