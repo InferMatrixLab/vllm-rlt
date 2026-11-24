@@ -7,7 +7,7 @@ from torch import nn
 
 from .dory import DoryConfig
 from .huginn import HuginnConfig
-from .inkling2 import Inkling2Config
+from .inkling2mini import Inkling2Config
 from .nanbeige import NanbeigeConfig
 from .ouro import OuroConfig
 

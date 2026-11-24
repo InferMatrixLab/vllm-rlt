@@ -11,7 +11,7 @@ import torch
 from .config import ModelConfig, prepare_model
 from .dory import DoryConfig, DoryForCausalLM
 from .huginn import HuginnConfig, HuginnForCausalLM
-from .inkling2 import Inkling2Config, Inkling2ForCausalLM
+from .inkling2mini import Inkling2Config, Inkling2ForCausalLM
 from .nanbeige import NanbeigeConfig, NanbeigeForCausalLM
 from .ouro import OuroConfig, OuroForCausalLM
 
