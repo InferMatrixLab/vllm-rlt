@@ -14,7 +14,15 @@ import pytest
 import torch
 
 from tests.helpers import make_prefill_engine, tiny_ouro_config, tiny_ouro_model
-from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import (
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    SamplingParams,
+    SchedulerConfig,
+    SpeculativeConfig,
+)
+from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.core.scheduling_policy import (
     MixedPolicy,
     NoRefillPolicy,
@@ -1822,6 +1830,53 @@ def test_scheduling_policies_declare_their_prefill_stages():
         RequestPhase.PREFILLING_PRELUDE,
         RequestPhase.PREFILLING_RECURRENT,
     )
+
+
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_mixed_speculative_schedule_reserves_prompt_rows_under_the_shared_budget(wavefront):
+    engine = make_prefill_engine()
+    try:
+        scheduler = Scheduler(
+            SchedulerConfig(
+                mode="mixed",
+                max_num_seqs=3,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=4,
+                wavefront_chunked_prefill=wavefront,
+            ),
+            engine.cache_manager,
+            SpeculativeConfig(2, 1, 3, "pipeline"),
+            total_ut_steps=3,
+            mixed_speculative=True,
+        )
+        for request_id in ("decode-a", "decode-b"):
+            request = Request(request_id, [1], SamplingParams(max_tokens=8))
+            scheduler.requests[request_id] = request
+            assert engine.cache_manager.allocate(request_id, 8)
+            scheduler.enqueue(request, RequestPhase.SPECULATIVE)
+        prompt = Request(
+            "prompt",
+            [1, 2, 3, 4],
+            SamplingParams(max_tokens=8),
+            num_preluded_tokens=4,
+            prefill_depth_ranges=Request.prefill_boundaries(4, 3),
+        )
+        scheduler.requests[prompt.request_id] = prompt
+        assert engine.cache_manager.allocate(prompt.request_id, 4)
+        scheduler.enqueue(prompt, RequestPhase.PREFILLING_RECURRENT)
+        scheduler.policy.prefill_batches_since_recurrent = 1
+
+        batch = scheduler.schedule()
+
+        assert batch.is_mixed and batch.loop_count == 1 and batch.num_tokens == 4
+        assert [(batch.phase_for(span), span.token_count) for span in batch.requests] == [
+            (RequestPhase.SPECULATIVE, 3),
+            (RequestPhase.PREFILLING_RECURRENT, 1),
+        ]
+        assert scheduler.policy.prefill_batches_since_recurrent == 0
+        assert list(scheduler.queues[RequestPhase.SPECULATIVE]) == ["decode-b"]
+    finally:
+        engine.close()
 
 
 @pytest.mark.parametrize(
