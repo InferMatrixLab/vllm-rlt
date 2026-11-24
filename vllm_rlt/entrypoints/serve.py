@@ -38,14 +38,18 @@ def load_engine(args):
             else (args.revision if args.tokenizer else revision)
         ),
     )
-    if config["model_type"].lower() == "ouro":
+    model_type = config["model_type"].lower()
+    if model_type == "ouro":
         decoder = getattr(getattr(tokenizer, "backend_tokenizer", None), "decoder", None)
         if not isinstance(decoder, ByteLevel):
             raise ValueError("serving requires the Ouro byte-level tokenizer")
+    max_loops = getattr(args, "max_loops", None)
+    if max_loops is not None and model_type != "inkling2_loop":
+        raise ValueError("serve --max-loops sets the startup depth of an Inkling checkpoint")
     engine = StageClient(
         source,
         model_config=ModelConfig.from_dict(config)
-        .with_loop_num_passes(getattr(args, "loop_num_passes", None))
+        .with_max_loops(max_loops)
         .with_inkling_kernels(getattr(args, "inkling_kernels", None)),
         revision=revision,
         device=args.device,
@@ -82,7 +86,7 @@ def main():
         "--model", help="Local checkpoint path or HuggingFace repository ID", required=True
     )
     parser.add_argument("--revision")
-    parser.add_argument("--loop-num-passes", type=int, help="Inkling 2 Mini variable-loop passes")
+    parser.add_argument("--max-loops", type=int, help="Startup depth for Inkling VarLoop")
     parser.add_argument("--inkling-kernels", choices=["rlt", "vllm"])
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokenizer-revision")

@@ -58,7 +58,6 @@ def main():
     )
     parser.add_argument("--model", help="Local checkpoint path or HuggingFace repository ID")
     parser.add_argument("--revision")
-    parser.add_argument("--loop-num-passes", type=int, help="Inkling 2 Mini variable-loop passes")
     parser.add_argument("--inkling-kernels", choices=["rlt", "vllm"])
     parser.add_argument("--prompt", action="append", help="Text prompt; repeat for a batch")
     parser.add_argument(
@@ -83,7 +82,11 @@ def main():
     )
     parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
     parser.add_argument("--max-tokens", type=int, default=16)
-    parser.add_argument("--max-loops", type=int, default=None)
+    parser.add_argument(
+        "--max-loops",
+        type=int,
+        help="Request loop limit. For Inkling VarLoop, also sets the instance depth.",
+    )
     parser.add_argument("--request-target-loops", type=int, default=None)
     parser.add_argument("--min-loops", type=int, default=None)
     parser.add_argument("--exit-threshold", type=float, default=1.0)
@@ -124,7 +127,7 @@ def main():
     llm = LLM(
         model,
         revision=args.revision,
-        loop_num_passes=args.loop_num_passes,
+        max_loops=args.max_loops,
         inkling_kernels=args.inkling_kernels,
         device=args.device,
         dtype=getattr(torch, args.dtype),

@@ -57,12 +57,20 @@ class ModelConfig:
     def max_position_embeddings(self):
         return self.model_specific_config.max_position_embeddings
 
-    def with_loop_num_passes(self, passes):
-        if passes is None:
+    def with_max_loops(self, max_loops):
+        """Set the Inkling instance depth. Other models use max_loops per request."""
+        config = self.model_specific_config
+        if max_loops is None or not isinstance(config, Inkling2Config):
             return self
-        if not isinstance(self.model_specific_config, Inkling2Config):
-            raise ValueError("loop_num_passes requires an Inkling 2 Mini variable-loop checkpoint")
-        return ModelConfig(self.model_specific_config.with_loop_num_passes(passes))
+        if type(max_loops) is not int or max_loops < 1:
+            raise ValueError("max_loops must be a positive integer")
+        if max_loops == config.total_ut_steps:
+            return self
+        if not config.is_varloop:
+            raise ValueError(
+                f"max_loops must match the Fixed Inkling depth ({config.total_ut_steps})"
+            )
+        return ModelConfig(config.with_loop_num_passes(max_loops))
 
     def with_inkling_kernels(self, backend):
         if backend is None:

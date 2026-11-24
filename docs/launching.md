@@ -16,7 +16,8 @@ For Huawei Ascend NPU, follow the [Ascend setup](recipes/ouro_ascend.md) on `mai
 
 The fixed and variable-loop checkpoints share one text implementation. The fixed
 checkpoint uses three passes. The variable-loop checkpoint defaults to three and
-accepts `--loop-num-passes` when the worker starts.
+accepts `--max-loops` to set the worker's depth in the CLI and server. For the
+fixed checkpoint, an explicit `--max-loops` must match its depth.
 
 ```bash
 python -m vllm_rlt.entrypoints.cli \
@@ -24,7 +25,7 @@ python -m vllm_rlt.entrypoints.cli \
   --prompt 'The capital of France is' --max-tokens 8
 
 python -m vllm_rlt.entrypoints.cli \
-  --model thinkingmachines/TML-d24-varloop-research --loop-num-passes 2 \
+  --model thinkingmachines/TML-d24-varloop-research --max-loops 2 \
   --device cuda --num-blocks 96 --prompt 'The capital of France is' --max-tokens 8
 ```
 
@@ -93,7 +94,7 @@ request. The pipeline requires preemption to be disabled.
 
 Use `--mode mixed --async-scheduling` with that pipeline on a single worker
 to run ready prompt and speculative rows in one Core forward. For VarLoop,
-set `--loop-num-passes` to the same value as `--target-loops`. This mode
+set `--max-loops` to the same value as `--target-loops`. This mode
 uses packed prefill and supports `--wavefront-chunked-prefill`. Add
 `--packed-graph-buckets --cuda-graph-warmup` to replay warmed packed Core
 buckets for the shared forward.
