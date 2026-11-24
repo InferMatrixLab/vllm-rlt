@@ -32,7 +32,7 @@ class StageClient:
         revision=None,
         model_config=None,
         seed=0,
-        startup_timeout=None,
+        startup_timeout=120,
         shutdown_timeout=30,
         stage_config=None,
         connector_factory=None,
@@ -61,8 +61,7 @@ class StageClient:
         self.trace_mode = getattr(engine_options.get("exit_config"), "mode", None) == "trace"
         self.closed = False
         self.failure = None
-        self.timeout = 120 if startup_timeout is None else startup_timeout
-        self.startup_timeout = 600 if startup_timeout is None else startup_timeout
+        self.timeout = startup_timeout
         self.shutdown_timeout = shutdown_timeout
         self.requests = {}  # External ID -> unique execution generation, no Request copies.
         self.generations = {}
@@ -93,7 +92,7 @@ class StageClient:
                 raise
 
     def wait_ready(self):
-        deadline = time.monotonic() + self.startup_timeout
+        deadline = time.monotonic() + self.timeout
         while not self.ready:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

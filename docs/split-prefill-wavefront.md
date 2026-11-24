@@ -37,8 +37,8 @@ batch still contains one operation type.
 
 WCPB is opt-in through `SchedulerConfig.wavefront_chunked_prefill` or the
 `--wavefront-chunked-prefill` CLI flag. `prefill_chunk_size` controls the prompt
-chunk size. The option works with refill or mixed scheduling. The native
-Inkling async token pipeline can also share recurrent work with prompt chunks.
+chunk size. The option works with refill or mixed scheduling; mixed scheduling
+does not support speculative work.
 
 ## Progress and dependencies
 
@@ -93,9 +93,9 @@ per-depth frontiers; it does not introduce a generic `PrefillTask` registry.
 Preemption rewinds staged work to the request's completed prompt frontier and
 recomputes unfinished work after resume. PD transfer progress is reported for
 completed chunks, and imported prompt state initializes the same frontiers.
-Speculative execution is supported with compatible refill scheduling and the
-single-stage native Inkling mixed token pipeline. CUDA graph and asynchronous
-paths use the existing runner machinery.
+Speculative execution is supported with compatible refill scheduling; mixed
+mode rejects speculative configuration. CUDA graph and asynchronous paths use
+the existing runner machinery.
 
 `SHARED` KV is rejected for WCPB. Its position-major dependencies do not permit
 the same cross-chunk/depth ordering as `LAST_EXITED` without a different

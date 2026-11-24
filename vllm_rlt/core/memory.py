@@ -28,13 +28,9 @@ def graph_memory_reserve(model, scheduler, execution, speculative=None):
     if not execution.cuda_graphs:
         return 0
     pools = 1 + bool(getattr(model, "requires_boundary_kv", False))
-    if getattr(model, "supports_packed_prefill_graphs", False):
-        pools += (execution.packed_prefill is not False) + (scheduler.mode == "mixed")
     retained_logits = 0
     if speculative is not None:
         pools += 2
-        if execution.async_scheduling and getattr(model, "requires_ordered_pipeline_coda", False):
-            pools += 1
         rows = min(
             cuda_graph_rows(execution),
             scheduler.max_num_seqs * (speculative.num_speculative_tokens + 1),
@@ -56,13 +52,6 @@ def graph_memory_reserve(model, scheduler, execution, speculative=None):
 
 def _probe_forward(model, cache, tokens, ids, positions):
     count = len(ids)
-    if getattr(model, "interleaved_kv", False):
-        depth_sets = [[depth] * count for depth in range(model.config.total_ut_steps)]
-        metadata = cache._prepare_batches(ids, depth_sets, positions, packed_prefill=True)
-        hidden = model.prelude_prepared(tokens, metadata[0], cache)
-        for batch in metadata:
-            hidden, _ = model.recurrent_prepared(hidden, batch, cache)
-        return model.coda_prepared(hidden, metadata[0], cache)
     boundary = None
     if getattr(model, "requires_boundary_kv", False):
         boundary = cache._prepare_batch(ids, [0] * count, positions)
@@ -160,8 +149,6 @@ def plan_cache(
         parameter.element_size(),
         cache.kv_cache_dtype,
     )
-    auxiliary_width = getattr(config, "auxiliary_cache_width", 0)
-    per_block += kv_layers * cache.block_size * auxiliary_width * parameter.element_size()
     if cache.num_blocks is not None:
         return cache.num_blocks, {"source": "blocks", "bytes_per_block": per_block}
     if cache.kv_cache_memory_bytes is not None:
@@ -205,8 +192,6 @@ def plan_cache(
         recurrent_layers=getattr(model, "recurrent_kv_layers", None),
         kv_cache_dtype=cache.kv_cache_dtype,
         fp8_scale=fp8_scale,
-        auxiliary_width=auxiliary_width,
-        interleaved_kv=getattr(model, "interleaved_kv", False),
     )
     ids, positions = [], []
     for index, length in enumerate(lengths):
@@ -222,7 +207,7 @@ def plan_cache(
     # Profiling includes a conservative temporary KV allocation. Also budget for
     # long-context reference attention (Triton's online softmax has bounded scratch).
     context_scratch = 0
-    if backend == "torch" and not auxiliary_width:
+    if backend == "torch":
         context_scratch = (
             config.max_position_embeddings
             * config.num_attention_heads
@@ -234,9 +219,8 @@ def plan_cache(
         scheduler,
         cache,
         execution,
-        torch.empty((), dtype=getattr(model, "state_dtype", parameter.dtype)).element_size(),
+        parameter.element_size(),
         staged_prefill=staged_prefill,
-        device_kv_metadata=getattr(model, "supports_device_kv_metadata", True),
     )
     # Dynamic metadata at the largest supported context is small but not zero.
     metadata_width = math.ceil(config.max_position_embeddings / cache.block_size)

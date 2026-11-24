@@ -159,9 +159,11 @@ for the selection order, shared budget and per-request progress.
 ### Wavefront chunked prefill
 
 `SchedulerConfig(wavefront_chunked_prefill=True)` opts into WCPB and requires
-LAST_EXITED KV. It can run with refill or mixed scheduling. Speculation in
-mixed mode is available for the single-stage native Inkling async token
-pipeline. Asynchronous block speculation uses refill and rejects preemption.
+LAST_EXITED KV. It can run with
+refill or mixed scheduling. When combined with speculation, use refill mode;
+asynchronous block speculation rejects preemption. Synchronous block and
+pipeline modes have different support constraints; do not infer that every
+combination is validated.
 
 The scheduler stages up to `total_ut_steps` chunks per request, then batches one
 ready chunk for each prompt depth. For four depths and chunk size two, recurrent

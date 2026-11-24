@@ -61,6 +61,7 @@ def plan_attention_metadata(
     if packed_prefill and rows.sequence_keys is not None:
         if len(rows.sequence_keys) != len(rows.positions):
             raise ValueError("packed attention keys and positions must have equal lengths")
+    width = max((position // block_size + 1 for position in rows.positions), default=0)
     table_rows = range(len(rows.positions))
     cumulative = None
     max_query = 1
@@ -82,33 +83,18 @@ def plan_attention_metadata(
                 cumulative.append(index + 1)
         table_rows = ends
         max_query = max((b - a for a, b in zip(cumulative, cumulative[1:])), default=1)
-    return assemble_attention_metadata(
-        (rows.block_tables[index] for index in table_rows),
-        [rows.positions[index] + 1 for index in table_rows],
-        block_size=block_size,
-        cu_seqlens_q=cumulative,
-        max_seqlen_q=max_query,
-    )
-
-
-def assemble_attention_metadata(
-    block_tables, context_lengths, *, block_size, cu_seqlens_q=None, max_seqlen_q=1
-) -> AttentionMetadataValues:
-    """Serialize the tables of already grouped and validated queries."""
-    max_length = max(context_lengths, default=0)
-    width = (max_length + block_size - 1) // block_size
     tables = []
-    for blocks in block_tables:
-        table = blocks[:width]
+    for index in table_rows:
+        table = rows.block_tables[index][:width]
         tables.extend(table)
         tables.extend([-1] * (width - len(table)))
     return AttentionMetadataValues(
         block_tables=tables,
-        num_rows=len(context_lengths),
+        num_rows=len(table_rows),
         table_width=width,
-        context_lengths=context_lengths,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=max_seqlen_q,
+        context_lengths=[rows.positions[index] + 1 for index in table_rows],
+        cu_seqlens_q=cumulative,
+        max_seqlen_q=max_query,
     )
 
 

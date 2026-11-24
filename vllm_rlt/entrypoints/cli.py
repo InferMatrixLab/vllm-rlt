@@ -81,11 +81,7 @@ def main():
     )
     parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
     parser.add_argument("--max-tokens", type=int, default=16)
-    parser.add_argument(
-        "--max-loops",
-        type=int,
-        help="Request loop limit. For Inkling VarLoop, also sets the instance depth.",
-    )
+    parser.add_argument("--max-loops", type=int, default=None)
     parser.add_argument("--request-target-loops", type=int, default=None)
     parser.add_argument("--min-loops", type=int, default=None)
     parser.add_argument("--exit-threshold", type=float, default=1.0)
@@ -126,7 +122,6 @@ def main():
     llm = LLM(
         model,
         revision=args.revision,
-        max_loops=args.max_loops,
         device=args.device,
         dtype=getattr(torch, args.dtype),
         **runtime_configs(args),
