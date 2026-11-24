@@ -85,12 +85,13 @@ class StageEngine:
             if (
                 self.execution_config.cuda_graphs
                 or self.stage_config.role != "prefill_decode"
+                or cache_config.enable_prefix_caching
                 or cache_config.layout != "last_exited"
                 or self.exit_config.mode not in ("ouro", "ouro_delayed")
             ):
                 raise ValueError(
                     "NPU Ouro requires local execution, ouro/ouro_delayed exit mode and "
-                    "last_exited KV without graphs"
+                    "last_exited KV without graphs or prefix caching"
                 )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens

@@ -37,6 +37,7 @@ def npu_model_stub(**overrides):
     "options",
     [
         dict(execution_config=ExecutionConfig(cuda_graphs=True)),
+        dict(cache_config=CacheConfig(num_blocks=32, enable_prefix_caching=True)),
         dict(exit_config=ExitConfig(mode="random_lookahead")),
     ],
 )

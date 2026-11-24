@@ -76,23 +76,18 @@ def test_prefix_refcounts_and_eviction():
     ids=["sync", "async-wavefront-single", "async-wavefront-multi"],
 )
 @torch.inference_mode()
-def test_npu_prefix_reuses_full_depth_pages_with_incremental_growth(
-    asynchronous, multi_stream, wavefront
-):
+def test_npu_incremental_growth_matches_reserved_generation(asynchronous, multi_stream, wavefront):
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
     model = make_npu_model(device)
-    prefix = [3, 7, 11, 13] * 8
-    prompts = {"a": prefix + [5, 17], "b": prefix + [19]}
+    prompts = {"a": [3, 7, 11] * 5, "b": [13, 17, 19] * 6}
     params = SamplingParams(max_tokens=4, min_loops=2, exit_threshold=0.2, ignore_eos=True)
     results = []
-    for enabled in (False, True):
+    for incremental in (False, True):
         engine = StageEngine(
             model,
             attention_backend="ascend_eager",
-            cache_config=CacheConfig(
-                96, 16, enable_prefix_caching=enabled, incremental_allocation=enabled
-            ),
+            cache_config=CacheConfig(96, 16, incremental_allocation=incremental),
             scheduler_config=SchedulerConfig(
                 max_num_seqs=2,
                 max_num_batched_tokens=48,
@@ -105,16 +100,15 @@ def test_npu_prefix_reuses_full_depth_pages_with_incremental_growth(
             ),
         )
         try:
-            engine.add_request("seed", prefix + [23], SamplingParams(max_tokens=1))
-            assert finish(engine)["seed"].exit_depths == [4]
-            cache = engine.cache_manager
-            assert len(cache.lookup_prefix(prompts["a"])) == (2 if enabled else 0)
             for request_id, prompt in prompts.items():
                 engine.add_request(request_id, prompt, params)
+            engine.step()
+            cache = engine.cache_manager
+            assert cache.allocated_blocks("a") == (4 if incremental else 8)
             outputs = finish(engine)
-            assert len(outputs) == len(prompts)
+            assert outputs.keys() == prompts.keys()
+            assert all(len(out.token_ids) == params.max_tokens for out in outputs.values())
             results.append({key: (out.token_ids, out.exit_depths) for key, out in outputs.items()})
-            assert cache.prefix_hits == (2 * len(prefix) if enabled else 0)
             assert cache.num_used_blocks == 0
         finally:
             engine.close()

@@ -131,14 +131,12 @@ The example uses private, fully reserved `last_exited` KV. Graphs and
 prefill/decode disaggregation require separate platform support.
 Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs.
 
-### Prompt reuse and KV growth
+### Incremental KV and chunked prefill
 
-Use `--enable-prefix-caching` to reuse completed prompt pages at every
-recurrent depth. The engine computes at least the last prompt token to obtain
-the first output. Use `--incremental-kv` to allocate pages as requests grow.
-Both options use the shared `last_exited` cache and work with synchronous
-or asynchronous eager execution. Use `--wavefront-chunked-prefill` to group
-ready prompt chunks by depth.
+Use `--incremental-kv` to allocate pages as requests grow with the shared
+`last_exited` cache. The option works with synchronous or asynchronous eager
+execution. Use `--wavefront-chunked-prefill` to group ready prompt chunks by
+depth.
 
 For chunked-prefill parity checks, compare against HF SDPA using the same token
 IDs, chunk boundaries, and batch shapes. On Ascend 910B3, changing the number of

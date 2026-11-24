@@ -16,7 +16,7 @@ pytestmark = pytest.mark.npu
 
 
 @pytest.mark.parametrize(
-    ("backend", "asynchronous", "reuse_and_preemption"),
+    ("backend", "asynchronous", "combined_execution"),
     [
         ("torch", False, False),
         ("ascend_eager", False, False),
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.npu
     ],
 )
 def test_checkpoint_http_completions_stream_and_disconnect(
-    tmp_path, backend, asynchronous, reuse_and_preemption
+    tmp_path, backend, asynchronous, combined_execution
 ):
     import aiohttp
 
@@ -41,7 +41,7 @@ def test_checkpoint_http_completions_stream_and_disconnect(
     if not source:
         pytest.skip("set VLLM_RLT_OURO_CHECKPOINT to the pinned local Ouro-1.4B checkpoint")
     mode = (backend or "default") + ("-async" if asynchronous else "-sync")
-    if reuse_and_preemption:
+    if combined_execution:
         mode += "-multi-kv"
     folder = Path(os.environ.get("VLLM_RLT_ASCEND_RESULTS", tmp_path)) / mode
     folder.mkdir(parents=True, exist_ok=True)
@@ -73,12 +73,11 @@ def test_checkpoint_http_completions_stream_and_disconnect(
         command.extend(["--attention-backend", backend])
     if asynchronous:
         command.extend(["--async-scheduling", "--exit-mode", "ouro_delayed"])
-        if not reuse_and_preemption:
+        if not combined_execution:
             command.append("--single-stream")
-    if reuse_and_preemption:
+    if combined_execution:
         command.extend(
             [
-                "--enable-prefix-caching",
                 "--incremental-kv",
                 "--static-buffers",
                 "--pad-to-power-of-two",
@@ -116,9 +115,9 @@ def test_checkpoint_http_completions_stream_and_disconnect(
                         prompt=prompt,
                         max_tokens=4,
                         temperature=0,
-                        min_loops=2 if reuse_and_preemption else 4,
+                        min_loops=2 if combined_execution else 4,
                         max_loops=4,
-                        exit_threshold=0.2 if reuse_and_preemption else 1,
+                        exit_threshold=0.2 if combined_execution else 1,
                         ignore_eos=True,
                         **extra,
                     )
@@ -131,9 +130,9 @@ def test_checkpoint_http_completions_stream_and_disconnect(
                         return result
 
                 prompts = ["The capital of France is", "One plus one equals"]
-                if reuse_and_preemption:
-                    prefix = "Paris is the capital of France and is known for its museums. " * 3
-                    prompts = [prefix + prompt for prompt in prompts]
+                if combined_execution:
+                    context = "Paris is the capital of France and is known for its museums. " * 3
+                    prompts = [context + prompt for prompt in prompts]
                 normal = await asyncio.gather(*(complete(prompt) for prompt in prompts))
                 events = []
                 async with client.post(
