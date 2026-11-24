@@ -1,0 +1,161 @@
+"""FlashInfer XQA paged decode kernels; no packed prefill in this backend.
+
+Decode uses independent single-query rows, exactly like the Triton path.
+SM120 (RTX 50) is the tested target. The installed FlashInfer version and
+CUDA toolkit determine which architectures the XQA JIT can build.
+"""
+
+import importlib
+import logging
+from importlib.metadata import PackageNotFoundError, version
+
+import torch
+
+FLASHINFER_PAGE_SIZES = (16, 32, 64, 128)
+FLASHINFER_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _check_sm120_jit_target(package_version):
+    # Use the same architecture list as XQA's JIT. Older releases can import
+    # normally with an empty list when nvcc cannot target the current GPU.
+    context = importlib.import_module("flashinfer.compilation_context").CompilationContext()
+    targets = context.TARGET_CUDA_ARCHS
+    if not {(12, "0"), (12, "0a"), (12, "0f")}.intersection(targets):
+        raise ValueError(
+            f"FlashInfer {package_version} has no XQA JIT target for SM120 "
+            f"(targets: {sorted(targets)}). Check CUDA_HOME and FLASHINFER_CUDA_ARCH_LIST."
+        )
+    # An explicitly suffixed FLASHINFER_CUDA_ARCH_LIST bypasses FlashInfer's
+    # toolkit check. All requested targets are passed to nvcc.
+    minimum = "12.9" if (12, "0f") in targets else "12.8"
+    if not importlib.import_module("flashinfer.jit.cpp_ext").is_cuda_version_at_least(minimum):
+        raise ValueError(f"Configured FlashInfer XQA target for SM120 requires CUDA >= {minimum}")
+
+
+class FlashInferPagedAttention:
+    def __init__(self, device, dtype, head_dim, block_size):
+        if device.type != "cuda" or torch.version.hip:
+            raise ValueError("flashinfer currently requires an NVIDIA CUDA device")
+        # float16 kernels compute correctly, but flashinfer-python 0.7.0.post1
+        # crashes the process (host SIGFPE) while building the f16 JIT module
+        # on first in-process use; reject instead of shipping that.
+        if dtype is torch.float16:
+            raise ValueError("the flashinfer backend is not validated with float16; use bfloat16")
+        if dtype is not torch.bfloat16:
+            raise ValueError("flashinfer requires bfloat16")
+        # The XQA JIT module generator rejects anything else at first call;
+        # validate here so the failure is an explicit startup error instead.
+        if head_dim % 16 or not 16 <= head_dim <= 512:
+            raise ValueError(
+                "flashinfer requires head_dim divisible by 16 and in [16, 512] (XQA kernels)"
+            )
+        # XQA kernels are compiled per page size and only these variants ship.
+        if block_size not in FLASHINFER_PAGE_SIZES:
+            raise ValueError(
+                "flashinfer requires --block-size one of "
+                f"{FLASHINFER_PAGE_SIZES} (XQA page-size variants)"
+            )
+        major, minor = torch.cuda.get_device_capability(device)
+        if major not in (9, 10, 12):
+            raise ValueError(f"flashinfer is not supported on SM{major}{minor}")
+        self.supports_fp8_static = (major, minor) == (12, 0)
+        try:
+            package_version = version("flashinfer-python")
+            self.kernel = getattr(
+                importlib.import_module("flashinfer.decode"),
+                "trtllm_batch_decode_with_kv_cache",
+            )
+            if (major, minor) == (12, 0):
+                _check_sm120_jit_target(package_version)
+        except (ImportError, AttributeError, PackageNotFoundError) as error:
+            raise ImportError(
+                "install flashinfer with: pip install 'flashinfer-python>=0.7.0' "
+                "and configure a compatible CUDA toolkit for its XQA JIT"
+            ) from error
+        except RuntimeError as error:
+            # FlashInfer can also initialize its compilation context at import.
+            raise ValueError(
+                f"FlashInfer XQA initialization on SM{major}{minor} failed: {error}"
+            ) from error
+        if (major, minor) != (12, 0):
+            logging.getLogger(__name__).warning(
+                "flashinfer attention was tested on SM120; SM%d%d is unvalidated",
+                major,
+                minor,
+            )
+        # Allocate scratch on the first nonempty call. Graph warmup initializes
+        # it before capture, including engines using an explicit KV capacity.
+        self.workspace = None
+        self.info = dict(
+            backend="flashinfer",
+            package="flashinfer-python",
+            version=package_version,
+            kernel="xqa",
+            page_size=block_size,
+        )
+        logging.getLogger(__name__).warning("Attention implementation: %s", self.info)
+
+    def __call__(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        *,
+        key_scale=None,
+        value_scale=None,
+    ):
+        # An empty batch host-crashes (SIGFPE, not an exception) inside the
+        # FlashInfer dispatch; return the same empty shape the other backends do.
+        if q.shape[0] == 0:
+            return torch.empty_like(q)
+        bmm1_scale = q.shape[-1] ** -0.5
+        bmm2_scale = 1.0
+        if key_cache.dtype != value_cache.dtype:
+            raise ValueError("XQA K and V cache dtypes must match")
+        if key_cache.dtype == torch.float8_e4m3fn:
+            if not self.supports_fp8_static:
+                raise ValueError("fixed-scale FP8 KV requires SM120")
+            for scale in (key_scale, value_scale):
+                if (
+                    scale is None
+                    or scale.ndim != 0
+                    or scale.dtype != torch.float32
+                    or scale.device != q.device
+                ):
+                    raise ValueError("XQA FP8 KV requires scalar FP32 scales on the query device")
+            # Descale K before softmax and V in the weighted sum.
+            bmm1_scale = key_scale * bmm1_scale
+            bmm2_scale = value_scale
+        elif key_scale is not None or value_scale is not None:
+            raise ValueError("XQA KV scales require an E4M3 cache")
+
+        if self.workspace is None:
+            self.workspace = torch.zeros(
+                FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device=q.device
+            )
+        # XQA takes a raw query pointer and assumes dense [row, head, dim] strides.
+        q = q.contiguous()
+        out = torch.empty_like(q)
+        self.kernel(
+            q,
+            (key_cache, value_cache),
+            self.workspace,
+            # Padding columns hold -1 (synchronous), 0 (async), or stale valid
+            # ids (graph replay beyond the current width). The kernel bounds
+            # reads by seq_lens, and clamped ids keep any full-width access on
+            # allocated memory regardless.
+            block_tables=block_tables.clamp_min(0),
+            seq_lens=context_lengths.to(torch.uint32),
+            max_seq_len=block_tables.shape[1] * key_cache.shape[1],
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=out,
+            q_len_per_req=1,
+            # The engine pool is [blocks, page, heads, dim]; the API default is
+            # HND and silently misreads NHD data.
+            kv_layout="NHD",
+            backend="xqa",
+        )
+        return out

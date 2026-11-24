@@ -617,14 +617,24 @@ def test_compare_reports_exit_policies_between_native_runs(tmp_path):
     depth = depth_summary([{"exit_depths": [4, 2]}])
     for backend, extra in (
         ("transformers", {"backend": "native"}),
-        ("native", {"exit": adaptive, "depth": depth}),
+        ("native", {"exit": adaptive, "depth": depth, "attention_backend": "flashinfer"}),
     ):
         path = tmp_path / backend / "summary.json"
         path.write_text(json.dumps({**json.loads(path.read_text()), **extra}))
     result = compare(args)
     # A summary without exit settings predates them and used the fixed four-loop recipe.
-    assert result["reference"] == {"backend": "native", "exit": fixed_exit(4), "depth": None}
-    assert result["candidate"] == {"backend": "native", "exit": adaptive, "depth": depth}
+    assert result["reference"] == {
+        "backend": "native",
+        "attention_backend": "triton",
+        "exit": fixed_exit(4),
+        "depth": None,
+    }
+    assert result["candidate"] == {
+        "backend": "native",
+        "attention_backend": "flashinfer",
+        "exit": adaptive,
+        "depth": depth,
+    }
     assert (result["reference_correct"], result["candidate_correct"]) == (1, 1)
     # Backend-named keys would mislabel a native-vs-native comparison, so they are omitted.
     assert not any(key.startswith(("transformers_", "native_")) for key in result)
@@ -632,7 +642,13 @@ def test_compare_reports_exit_policies_between_native_runs(tmp_path):
 
 
 def test_compare_keeps_backend_named_keys_for_hf_vs_native(tmp_path):
-    result = compare(comparison_fixture(tmp_path, native_correct=False))
+    args = comparison_fixture(tmp_path, native_correct=False)
+    path = args.transformers / "summary.json"
+    summary = json.loads(path.read_text())
+    # Legacy HF runs recorded the native CLI default even though the model used eager.
+    path.write_text(json.dumps({**summary, "attention_backend": "triton"}))
+    result = compare(args)
+    assert result["reference"]["attention_backend"] == "eager"
     assert result["reference_correct_candidate_wrong"] == 1
     assert result["transformers_correct"] == result["reference_correct"] == 1
     assert result["native_correct"] == result["candidate_correct"] == 0

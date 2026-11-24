@@ -147,7 +147,13 @@ def test_native_generator_owns_logits_check_and_releases_it(monkeypatch):
     engine = Mock()
     factory = Mock(return_value=engine)
     monkeypatch.setattr(backends, "StageEngine", factory)
-    generator = backends.Generator("native", "unused", None, 128, fixed_exit(4))
+    engine.cache_manager.backend = "flashinfer"
+    generator = backends.Generator(
+        "native", "unused", None, 128, fixed_exit(4), "flashinfer", no_packed_prefill=True
+    )
+    assert generator.attention_backend == "flashinfer"
+    assert factory.call_args.kwargs["attention_backend"] == "flashinfer"
+    assert factory.call_args.kwargs["execution_config"].packed_prefill is False
     assert factory.call_args.args == (model,)
     model.lm_head(torch.zeros(1, model.config.hidden_size))
     with pytest.raises(FloatingPointError, match="Non-finite"):

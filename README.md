@@ -139,11 +139,14 @@ including Dory sliding attention, uses `flash-attn-4==4.0.0b39` and calibrates
 a fixed scale at startup. See the
 [hardware and calibration requirements](docs/runtime.md#experimental-fa4-static-scale-adapter).
 
+On SM120, FlashInfer XQA supports BF16 attention with BF16 KV or calibrated
+fixed-scale E4M3 KV. See the [FlashInfer guide](docs/flashinfer.md).
+
 ## Model Support
 
 | Checkpoint | Implementation | Platforms | Documented validation scope |
 | --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | [CUDA](docs/launching.md)<br>[Ascend](docs/recipes/ouro_ascend.md) | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. |
+| Ouro-1.4B | Native Ouro | [CUDA](docs/launching.md)<br>[RTX 5090 XQA recipe](docs/recipes/ouro_xqa_sm120.md)<br>[Ascend](docs/recipes/ouro_ascend.md) | RTX 5090 XQA runs BF16 and calibrated E4M3 KV. The BF16 GSM8K-87 run is below the accuracy gate. Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved on Ascend. |
 | Ouro-2.6B | Shared Ouro | [CUDA](docs/launching.md) | Shares the Ouro implementation. [Separate quality and performance qualification](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) remains open. |
 | [Ouro-1.4B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
 | [Ouro-2.6B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |

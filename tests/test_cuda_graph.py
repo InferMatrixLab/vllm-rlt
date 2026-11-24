@@ -12,6 +12,14 @@ from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 
 
+@pytest.fixture
+def backend(request):
+    name = request.param
+    if name == "flashinfer":
+        request.getfixturevalue("flashinfer_gpu")
+    return name
+
+
 def test_cuda_graph_validation():
     with pytest.raises(ValueError, match="positive"):
         ExecutionConfig(cuda_graph_max_graphs=0)
@@ -134,7 +142,7 @@ def test_packed_attention_segments_replay_with_live_inputs():
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("backend", ["triton", "flash_attn"])
+@pytest.mark.parametrize("backend", ["triton", "flash_attn", "flashinfer"], indirect=True)
 @pytest.mark.parametrize("mode", ["sync", "async", "multi"])
 @pytest.mark.parametrize("layout", ["last_exited", "shared"])
 @pytest.mark.parametrize("static", [False, True])
@@ -184,7 +192,8 @@ def test_graph_replay_matches_eager_and_reuses_requests(backend, mode, layout, s
 
 
 @pytest.mark.gpu
-def test_graph_cache_limit_fallback_and_abort():
+@pytest.mark.parametrize("backend", ["triton", "flashinfer"], indirect=True)
+def test_graph_cache_limit_fallback_and_abort(backend):
     torch.manual_seed(19)
     model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
     engine = LLMEngine(
@@ -200,7 +209,7 @@ def test_graph_cache_limit_fallback_and_abort():
             async_scheduling=True,
         ),
         exit_config=ExitConfig("ouro_delayed"),
-        attention_backend="triton",
+        attention_backend=backend,
     )
     for count in [1, 2, 3]:
         for i in range(count):

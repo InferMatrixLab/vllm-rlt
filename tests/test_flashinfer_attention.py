@@ -1,0 +1,328 @@
+"""FlashInfer paged attention: gates, padding states, graphs and mixed depths."""
+
+import pytest
+import torch
+
+from tests.helpers import tiny_ouro_config
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.attention import BackendCapabilities, create_backend
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.kernels.flashinfer_attention import FlashInferPagedAttention
+from vllm_rlt.kernels.paged_attention import torch_paged_attention
+from vllm_rlt.models import OuroForCausalLM
+
+
+def _cuda_like(monkeypatch, sm):
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
+
+
+def test_unsupported_architecture_rejected_before_import(monkeypatch):
+    from vllm_rlt.kernels import flashinfer_attention
+
+    _cuda_like(monkeypatch, (7, 5))
+
+    def unexpected_import(name):
+        pytest.fail(f"unsupported architecture reached dependency import: {name}")
+
+    monkeypatch.setattr(flashinfer_attention.importlib, "import_module", unexpected_import)
+    with pytest.raises(ValueError, match="not supported on SM75"):
+        FlashInferPagedAttention(torch.device("cuda"), torch.bfloat16, 128, 16)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.float32, torch.complex64], ids=["fp16", "fp32", "complex"]
+)
+def test_unvalidated_dtypes_rejected(monkeypatch, dtype):
+    _cuda_like(monkeypatch, (12, 0))
+    with pytest.raises(ValueError):
+        FlashInferPagedAttention(torch.device("cuda"), dtype, 128, 16)
+
+
+def test_geometry_and_page_size_rejections(monkeypatch):
+    _cuda_like(monkeypatch, (12, 0))
+    with pytest.raises(ValueError, match="divisible by 16"):
+        FlashInferPagedAttention(torch.device("cuda"), torch.bfloat16, 100, 16)
+    with pytest.raises(ValueError, match="divisible by 16"):
+        FlashInferPagedAttention(torch.device("cuda"), torch.bfloat16, 8, 16)
+    with pytest.raises(ValueError, match="page-size variants"):
+        FlashInferPagedAttention(torch.device("cuda"), torch.bfloat16, 128, 17)
+    with pytest.raises(ValueError, match="NVIDIA"):
+        FlashInferPagedAttention(torch.device("cpu"), torch.bfloat16, 128, 16)
+
+
+def test_missing_package_raises_import_error_without_fallback(monkeypatch):
+    from importlib.metadata import PackageNotFoundError
+
+    from vllm_rlt.kernels import flashinfer_attention
+
+    _cuda_like(monkeypatch, (12, 0))
+
+    def missing(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(flashinfer_attention, "version", missing)
+    with pytest.raises(ImportError, match="install flashinfer"):
+        FlashInferPagedAttention(torch.device("cuda"), torch.bfloat16, 128, 16)
+
+
+def test_kernel_call_explicitly_selects_xqa(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    output, workspace, uint32 = object(), object(), object()
+    empty_like = Mock(return_value=output)
+    fake_torch = SimpleNamespace(empty_like=empty_like, uint32=uint32, float8_e4m3fn=object())
+    monkeypatch.setitem(FlashInferPagedAttention.__call__.__globals__, "torch", fake_torch)
+    attention = FlashInferPagedAttention.__new__(FlashInferPagedAttention)
+    attention.workspace = workspace
+    attention.kernel = Mock()
+    q = torch.empty(2, 4, 64)
+    keys = SimpleNamespace(shape=(8, 16, 2, 64), dtype=torch.bfloat16)
+    values = SimpleNamespace(shape=keys.shape, dtype=keys.dtype)
+    tables = Mock(shape=(2, 3))
+    lengths = Mock()
+
+    for _ in range(2):
+        assert attention(q, keys, values, tables, lengths) is output
+        attention.kernel.assert_called_with(
+            q,
+            (keys, values),
+            workspace,
+            block_tables=tables.clamp_min.return_value,
+            seq_lens=lengths.to.return_value,
+            max_seq_len=48,
+            bmm1_scale=0.125,
+            bmm2_scale=1.0,
+            out=output,
+            q_len_per_req=1,
+            kv_layout="NHD",
+            backend="xqa",
+        )
+    assert attention.kernel.call_count == 2
+    assert attention.workspace is workspace
+    tables.clamp_min.assert_called_with(0)
+    lengths.to.assert_called_with(uint32)
+
+    attention.kernel.reset_mock()
+    assert attention(SimpleNamespace(shape=(0, 4, 64)), keys, values, tables, lengths) is output
+    attention.kernel.assert_not_called()
+
+
+def test_xqa_fixed_fp8_call_on_cpu():
+    from unittest.mock import Mock
+
+    attention = FlashInferPagedAttention.__new__(FlashInferPagedAttention)
+    attention.supports_fp8_static = True
+    attention.kernel = Mock()
+    attention.workspace = object()
+    q = torch.empty(1, 2, 64, dtype=torch.bfloat16)
+    k = torch.empty((1, 16, 2, 64), dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    table = torch.zeros((1, 1), dtype=torch.int32)
+    lengths = torch.ones(1, dtype=torch.int32)
+    scale = torch.tensor(0.25)
+    attention(q, k, v, table, lengths, key_scale=scale, value_scale=scale)
+    kwargs = attention.kernel.call_args.kwargs
+    torch.testing.assert_close(kwargs["bmm1_scale"], scale / 8)
+    assert kwargs["bmm2_scale"] is scale
+    assert kwargs["backend"] == "xqa"
+    with pytest.raises(ValueError, match="scalar FP32"):
+        attention(q, k, v, table, lengths, key_scale=scale.expand(2), value_scale=scale)
+
+
+@pytest.mark.gpu
+def test_backend_contract_anchors(flashinfer_gpu):
+    attention = FlashInferPagedAttention(torch.device("cuda"), torch.bfloat16, 128, 16)
+    assert attention.info["backend"] == "flashinfer"
+    assert attention.info["package"] == "flashinfer-python"
+    assert attention.info["page_size"] == 16
+    assert attention.info["kernel"] == "xqa"
+    # StageEngine selects packed prefill from the registered backend capabilities.
+    wrapper = create_backend("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
+    assert wrapper.info["selected_backend"] == "flashinfer"
+    assert wrapper.capabilities == BackendCapabilities(
+        cuda_graphs=True,
+        async_scheduling=True,
+        fp8_kv_static=torch.cuda.get_device_capability() == (12, 0),
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("heads", [2, 4])
+def test_ragged_strided_paged_attention_with_zero_length_row(heads, flashinfer_gpu):
+    torch.manual_seed(9)
+    # Layer slicing leaves a non-contiguous block stride, as in the real cache.
+    keys = torch.randn(12, 3, 16, 2, 128, device="cuda", dtype=torch.bfloat16)[:, 1]
+    values = torch.randn(12, 3, 16, 2, 128, device="cuda", dtype=torch.bfloat16)[:, 1]
+    q = torch.randn(4, heads, 128, device="cuda", dtype=torch.bfloat16)
+    tables = torch.tensor(
+        [[7, 2, 9], [3, 0, 0], [1, 8, 6], [0, 0, 0]], device="cuda", dtype=torch.int32
+    )
+    lengths = torch.tensor([35, 1, 47, 0], device="cuda", dtype=torch.int32)
+    attention = FlashInferPagedAttention(q.device, torch.bfloat16, 128, 16)
+    expected = torch_paged_attention(q, keys, values, tables, lengths)
+    actual = attention(q, keys, values, tables, lengths)
+    torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.02)
+    assert torch.isfinite(actual).all()
+    # Zero-length rows are async padding rows; they must read as exact zeros,
+    # not small garbage, so downstream masking stays optional.
+    assert torch.count_nonzero(actual[-1]) == 0
+
+
+@pytest.mark.gpu
+def test_cache_attend_accepts_strided_query_rows(flashinfer_gpu):
+    cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=16,
+        head_dim=128,
+        num_blocks=2,
+        block_size=16,
+        max_loops=1,
+        device="cuda",
+        dtype=torch.bfloat16,
+        backend="flashinfer",
+    )
+    for request in ("a", "b"):
+        assert cache.allocate(request, 2)
+    backing = torch.ones(4, 16, 128, dtype=torch.bfloat16, device="cuda")
+    backing[1::2].fill_(-1)
+    values = torch.zeros_like(backing)
+    values[1::2].fill_(1)
+    cache.write(0, ["a", "a", "b", "b"], [0] * 4, [0, 1, 0, 1], -backing, values)
+    q = backing[::2]
+    assert not q.is_contiguous()
+    dense = cache.attend(0, ["a", "b"], [0, 0], [1, 1], q.contiguous())
+    from_view = cache.attend(0, ["a", "b"], [0, 0], [1, 1], q)
+    assert torch.equal(dense, torch.ones_like(dense))
+    assert torch.equal(from_view, dense)
+
+
+@pytest.mark.gpu
+def test_padding_states_are_invisible(flashinfer_gpu):
+    torch.manual_seed(11)
+    keys = torch.randn(24, 3, 16, 2, 64, device="cuda", dtype=torch.bfloat16)[:, 1]
+    values = torch.randn(24, 3, 16, 2, 64, device="cuda", dtype=torch.bfloat16)[:, 1]
+    q = torch.randn(3, 2, 64, device="cuda", dtype=torch.bfloat16)
+    lengths = torch.tensor([16, 31, 20], device="cuda", dtype=torch.int32)
+    attention = FlashInferPagedAttention(q.device, torch.bfloat16, 64, 16)
+    outputs = []
+    for fill in (-1, 0, 19):  # sync pad, async pad, stale-but-valid replay id
+        tables = torch.full((3, 4), fill, device="cuda", dtype=torch.int32)
+        for row in range(3):
+            tables[row, :2] = torch.arange(row * 2, row * 2 + 2, device="cuda")
+        outputs.append(attention(q, keys, values, tables, lengths))
+    assert torch.equal(outputs[0], outputs[1])
+    assert torch.equal(outputs[0], outputs[2])
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("kv_heads", [4, 16], ids=["gqa", "ouro-1.4b"])
+def test_flashinfer_decode_same_queries_across_batch_sizes(kv_heads, flashinfer_gpu):
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    dtype = torch.bfloat16
+    # Keep the cache's layer stride. Ouro-1.4B uses 16 Q heads and 16 KV heads.
+    keys = torch.randn(260, 2, 16, kv_heads, 128, generator=generator, device="cuda", dtype=dtype)[
+        :, 1
+    ]
+    values = torch.randn(
+        260, 2, 16, kv_heads, 128, generator=generator, device="cuda", dtype=dtype
+    )[:, 1]
+    q = torch.randn(4, 16, 128, generator=generator, device="cuda", dtype=dtype)
+    tables = torch.arange(260, device="cuda", dtype=torch.int32).view(4, 65)
+    lengths = torch.tensor([1025, 1029, 1025, 1031], device="cuda", dtype=torch.int32)
+    attention = FlashInferPagedAttention(q.device, dtype, 128, 16)
+    together = attention(q, keys, values, tables, lengths)
+    reference = torch_paged_attention(q.float(), keys, values, tables, lengths)
+    # Same BF16 operator tolerances as the ragged paged-reference test above.
+    torch.testing.assert_close(together.float(), reference, atol=0.015, rtol=0.02)
+    assert torch.equal(attention(q, keys, values, tables, lengths), together)
+    perm = [3, 0, 2, 1]
+    assert torch.equal(
+        attention(q[perm], keys, values, tables[perm], lengths[perm]), together[perm]
+    )
+    for rows in ([2, 3], [3, 0], [1]):
+        separate = attention(q[rows], keys, values, tables[rows], lengths[rows])
+        torch.testing.assert_close(separate.float(), reference[rows], atol=0.015, rtol=0.02)
+        if kv_heads == 4:
+            # The original GQA regression is bitwise stable for these inputs.
+            assert torch.equal(separate, together[rows])
+
+
+@pytest.mark.gpu
+def test_graph_replay_updates_buffers(flashinfer_gpu):
+    torch.manual_seed(5)
+    keys = torch.randn(24, 3, 16, 2, 64, device="cuda", dtype=torch.bfloat16)[:, 1]
+    values = torch.randn(24, 3, 16, 2, 64, device="cuda", dtype=torch.bfloat16)[:, 1]
+    rows, width = 4, 4
+    q = torch.randn(rows, 2, 64, device="cuda", dtype=torch.bfloat16)
+    static_tables = torch.zeros(rows, width, device="cuda", dtype=torch.int32)
+    static_lengths = torch.full((rows,), 16, device="cuda", dtype=torch.int32)
+    attention = FlashInferPagedAttention(q.device, torch.bfloat16, 64, 16)
+    # Warm JIT modules and workspace outside the capture region.
+    attention(q, keys, values, static_tables, static_lengths)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = attention(q, keys, values, static_tables, static_lengths)
+    generator = torch.Generator().manual_seed(21)
+    for trial in range(3):
+        for row in range(rows):
+            start = (row * 3 + trial * 5) % 16
+            static_tables[row] = torch.arange(start, start + width, dtype=torch.int32)
+        static_lengths.copy_(
+            torch.randint(1, width * 16, (rows,), generator=generator, dtype=torch.int32)
+        )
+        graph.replay()
+        expected = torch_paged_attention(q, keys, values, static_tables, static_lengths)
+        torch.testing.assert_close(out, expected, atol=0.015, rtol=0.02)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("layout", ["last_exited", "shared"])
+@pytest.mark.parametrize("static", [False, True])
+def test_flashinfer_sync_async_mixed_depths(layout, static, flashinfer_gpu):
+    torch.manual_seed(123)
+    config = tiny_ouro_config(head_dim=64)
+    model = OuroForCausalLM(config).to(device="cuda", dtype=torch.bfloat16)
+    traces = {str(i): [4, 2 + i % 3, 4, 2, 3, 4] for i in range(3)}
+    outputs = []
+    for backend, asynchronous, multi in [
+        ("triton", False, False),
+        ("flashinfer", False, False),
+        ("flashinfer", True, False),
+        ("flashinfer", True, True),
+    ]:
+        engine = LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=48, block_size=16, layout=layout),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=3, max_num_batched_tokens=8, prefill_chunk_size=4
+            ),
+            execution_config=ExecutionConfig(
+                async_scheduling=asynchronous,
+                multi_stream=multi,
+                static_buffers=static,
+                pad_to_power_of_two=static,
+            ),
+            exit_config=ExitConfig("trace", depths_by_request=traces),
+            attention_backend=backend,
+        )
+        for i in range(3):
+            engine.add_request(
+                str(i),
+                [2, 3, 4, 5] * (i + 1),
+                SamplingParams(max_tokens=6, min_loops=1, ignore_eos=True),
+            )
+        finished = {}
+        for _ in range(300):
+            if not engine.has_unfinished_requests():
+                break
+            for out in engine.step():
+                if out.finished:
+                    finished[out.request_id] = (out.token_ids, out.exit_depths)
+        assert len(finished) == 3
+        assert engine.cache_manager.num_used_blocks == 0
+        outputs.append(finished)
+    assert all(value == outputs[0] for value in outputs)

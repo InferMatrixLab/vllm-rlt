@@ -15,7 +15,7 @@ from vllm_rlt.models import OuroForCausalLM
 
 @pytest.fixture
 def packages(monkeypatch):
-    from vllm_rlt.kernels import flash_attention
+    from vllm_rlt.kernels import flash_attention, flashinfer_attention
 
     installed = {
         "flash_attn",
@@ -23,6 +23,7 @@ def packages(monkeypatch):
         "flash_attn.cute",
         "TensorwiseScales",
         "triton",
+        "flashinfer",
     }
     original_import = flash_attention.importlib.import_module
 
@@ -41,12 +42,23 @@ def packages(monkeypatch):
             if name == "flash_attn.cute" and "TensorwiseScales" in installed:
                 result.TensorwiseScales = SimpleNamespace
             return result
+        if name == "flashinfer.decode":
+            if "flashinfer" not in installed:
+                raise ImportError("flashinfer is not installed")
+            return SimpleNamespace(trtllm_batch_decode_with_kv_cache=lambda *args, **kwargs: None)
+        if name == "flashinfer.compilation_context":
+            return SimpleNamespace(
+                CompilationContext=lambda: SimpleNamespace(TARGET_CUDA_ARCHS={(12, "0f")})
+            )
+        if name == "flashinfer.jit.cpp_ext":
+            return SimpleNamespace(is_cuda_version_at_least=lambda version: True)
         return original_import(name)
 
     monkeypatch.setattr(flash_attention.importlib, "import_module", import_module)
     monkeypatch.setattr(
         flash_attention, "version", lambda name: "4.0.0b39" if name == "flash-attn-4" else "test"
     )
+    monkeypatch.setattr(flashinfer_attention, "version", lambda name: "test")
     monkeypatch.setattr(torch.version, "hip", None)
     return installed
 
@@ -87,6 +99,16 @@ def test_fa4_static_fp8_selection(packages, monkeypatch, sm, dtype, head_dim, su
         create_backend(*args, required_capabilities=BackendCapabilities(fp8_kv=True))
     selected = create_backend("auto", *args[1:], required_capabilities=requirement)
     assert selected.info["selected_backend"] == "flash_attn_4"
+
+
+def test_xqa_static_fp8_selection(packages, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    args = ("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
+    required = BackendCapabilities(fp8_kv=True)
+    selected = create_backend(*args, required_capabilities=required, allow_fp8_calibration=True)
+    assert selected.capabilities.fp8_kv_static and not selected.capabilities.fp8_kv
+    with pytest.raises(ValueError, match="fp8_kv"):
+        create_backend(*args, required_capabilities=required)
 
 
 def test_fa4_static_fp8_requires_public_scale_api(packages, monkeypatch):
@@ -173,7 +195,18 @@ def test_dory_requirements_select_native_fa4_and_reject_old_hd256(packages, monk
             "flash_attn_2",
         ),
         ((10, 0), torch.bfloat16, 128, 16, (), "flash_attn_4"),
-        ((12, 0), torch.bfloat16, 128, 16, (), "triton"),
+        (
+            (9, 0),
+            torch.bfloat16,
+            128,
+            16,
+            ("flash_attn.cute", "flash_attn_3.flash_attn_interface"),
+            "triton",
+        ),
+        ((10, 0), torch.bfloat16, 128, 16, ("flash_attn.cute",), "triton"),
+        ((12, 0), torch.bfloat16, 128, 16, (), "flashinfer"),
+        ((12, 1), torch.bfloat16, 128, 16, (), "triton"),
+        ((12, 0), torch.bfloat16, 128, 16, ("flashinfer",), "triton"),
         ((7, 5), torch.float16, 128, 256, (), "torch"),
     ],
 )
@@ -187,6 +220,85 @@ def test_auto_selection_constraints(
     assert selected.info["selection_reason"]
     if expected == "flash_attn_4":
         assert backend_capabilities(selected).packed_prefill
+
+
+def test_flashinfer_wide_head_group_limit(packages, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    args = (torch.device("cuda"), torch.bfloat16, 512, 16)
+    assert create_backend("auto", *args).info["selected_backend"] == "torch"
+    assert create_backend("flashinfer", *args).info["selected_backend"] == "flashinfer"
+    assert (
+        create_backend("auto", *args, head_group_ratio=16).info["selected_backend"] == "flashinfer"
+    )
+    assert (
+        create_backend("auto", args[0], args[1], 256, 16).info["selected_backend"] == "flashinfer"
+    )
+    assert create_backend("flashinfer", *args, head_group_ratio=16).info["kernel"] == "xqa"
+    with pytest.raises(ValueError, match="head_group_ratio <= 16"):
+        create_backend("flashinfer", *args, head_group_ratio=32)
+    assert create_backend("auto", *args, head_group_ratio=32).info["selected_backend"] == "torch"
+
+
+@pytest.mark.parametrize("targets", [set(), {(9, "0a"), (12, "1a")}, {(12, "0a")}])
+def test_flashinfer_selection_requires_a_jit_target_for_the_device(packages, monkeypatch, targets):
+    from vllm_rlt.kernels import flashinfer_attention
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    original_import = flashinfer_attention.importlib.import_module
+
+    def import_module(name):
+        if name == "flashinfer.compilation_context":
+            return SimpleNamespace(
+                CompilationContext=lambda: SimpleNamespace(TARGET_CUDA_ARCHS=targets)
+            )
+        return original_import(name)
+
+    monkeypatch.setattr(flashinfer_attention.importlib, "import_module", import_module)
+    args = (torch.device("cuda"), torch.bfloat16, 128, 16)
+    selected = create_backend("auto", *args)
+    if (12, "0a") in targets:
+        assert selected.info["selected_backend"] == "flashinfer"
+    else:
+        assert selected.info["selected_backend"] == "triton"
+        assert "no XQA JIT target for SM120" in selected.info["selection_reason"]
+        with pytest.raises(ValueError, match="no XQA JIT target for SM120"):
+            create_backend("flashinfer", *args)
+
+
+@pytest.mark.parametrize("reject_at_import", [True, False], ids=["import", "forced-120f"])
+def test_flashinfer_jit_toolkit_failure_before_first_launch(
+    packages, monkeypatch, reject_at_import
+):
+    from vllm_rlt.kernels import flashinfer_attention
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    original_import = flashinfer_attention.importlib.import_module
+
+    def import_module(name):
+        if name == "flashinfer.decode" and reject_at_import:
+            raise RuntimeError("SM 12.x requires CUDA >= 12.9")
+        if name == "flashinfer.jit.cpp_ext":
+            return SimpleNamespace(is_cuda_version_at_least=lambda minimum: minimum == "12.8")
+        return original_import(name)
+
+    monkeypatch.setattr(flashinfer_attention.importlib, "import_module", import_module)
+    args = (torch.device("cuda"), torch.bfloat16, 128, 16)
+    selected = create_backend("auto", *args)
+    assert selected.info["selected_backend"] == "triton"
+    assert "CUDA >= 12.9" in selected.info["selection_reason"]
+    with pytest.raises(ValueError, match="CUDA >= 12.9"):
+        create_backend("flashinfer", *args)
+
+
+@pytest.mark.parametrize("sm", [(9, 0), (12, 1)])
+def test_explicit_flashinfer_opt_in_outside_sm120(packages, monkeypatch, caplog, sm):
+    caplog.set_level(logging.WARNING, logger="vllm_rlt.kernels.flashinfer_attention")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
+    selected = create_backend("flashinfer", torch.device("cuda"), torch.bfloat16, 128, 16)
+    assert selected.info["selected_backend"] == "flashinfer"
+    assert selected.capabilities.cuda_graphs and selected.capabilities.async_scheduling
+    assert not selected.capabilities.packed_prefill
+    assert "unvalidated" in caplog.text
 
 
 def test_rocm_auto_uses_triton(packages, monkeypatch):
@@ -208,12 +320,15 @@ def test_auto_reports_missing_packages_and_configuration(packages, monkeypatch):
     assert "multiple of 256" in reason and "triton" in reason
 
 
-@pytest.mark.parametrize("backend", ["flash_attn_2", "triton"])
-def test_explicit_missing_package_never_falls_back(packages, monkeypatch, backend):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+@pytest.mark.parametrize(
+    "backend,sm,block_size",
+    [("flash_attn_2", (8, 9), 256), ("triton", (8, 9), 256), ("flashinfer", (12, 0), 16)],
+)
+def test_explicit_missing_package_never_falls_back(packages, monkeypatch, backend, sm, block_size):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
     packages.clear()
     with pytest.raises(ImportError):
-        create_backend(backend, torch.device("cuda"), torch.bfloat16, 128, 256)
+        create_backend(backend, torch.device("cuda"), torch.bfloat16, 128, block_size)
 
 
 def test_explicit_flash_incompatibility_is_not_overridden(packages, monkeypatch):

@@ -24,6 +24,7 @@ setup on `v0.2.0`. The Ascend guide below uses `main`.
 | [Self-speculation](async-speculative.md) | Cross-round asynchronous block execution, token pipelines, and acceptance/rejection timelines |
 | [Asynchronous scheduling](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
 | [FlashAttention](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
+| [FlashInfer](flashinfer.md) | XQA installation, configuration and limitations, with an [Ouro-1.4B RTX 5090 recipe](recipes/ouro_xqa_sm120.md) |
 | [Cache and scheduling features](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
 | [Prefill/decode disaggregation](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
 | [HTTP serving](serving.md) | Device setup, completions API, streaming, and service lifecycle |

@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS, FlashPagedAttention
+from vllm_rlt.kernels.flashinfer_attention import FlashInferPagedAttention
 from vllm_rlt.kernels.paged_attention import (
     PackedWindowShape,
     TorchPagedAttention,
@@ -110,11 +111,24 @@ _FLASH_CAPABILITIES = {
         device_context_lengths=True,
     ),
 }
-_AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")
+_FLASHINFER_CAPABILITIES = BackendCapabilities(cuda_graphs=True, async_scheduling=True)
+_AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "flashinfer", "triton", "torch")
 
 
 def backend_capabilities(implementation) -> BackendCapabilities:
     return implementation.capabilities
+
+
+def _auto_flashinfer_supported(device) -> bool:
+    """Limit automatic FlashInfer selection to the tested SM120 target.
+
+    Other architectures the kernel accepts remain reachable through explicit
+    `--attention-backend flashinfer` opt-in; auto keeps its pre-FlashInfer
+    fallback behavior everywhere else.
+    """
+    if device.type != "cuda" or torch.version.hip:
+        return False
+    return torch.cuda.get_device_capability(device) == (12, 0)
 
 
 def validate_backend_name(backend: str, *, device_type: str | None = None) -> None:
@@ -122,7 +136,7 @@ def validate_backend_name(backend: str, *, device_type: str | None = None) -> No
         raise ValueError(
             "NPU execution requires explicit attention_backend='torch' or 'ascend_eager'"
         )
-    if backend not in {"auto", "torch", "triton", "ascend_eager", *FLASH_BACKENDS}:
+    if backend not in {"auto", "torch", "triton", "ascend_eager", "flashinfer", *FLASH_BACKENDS}:
         raise ValueError("unknown attention backend")
 
 
@@ -162,6 +176,10 @@ def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, pa
         return AttentionBackend(
             kernel, capabilities, {"backend": backend, "packed_prefill_tile": tile}
         )
+    if backend == "flashinfer":
+        kernel = FlashInferPagedAttention(device, dtype, head_dim, block_size)
+        capabilities = replace(_FLASHINFER_CAPABILITIES, fp8_kv_static=kernel.supports_fp8_static)
+        return AttentionBackend(kernel, capabilities, dict(kernel.info))
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         capabilities = replace(
@@ -182,11 +200,13 @@ def create_backend(
     block_size: int,
     *,
     required_capabilities: BackendCapabilities = BackendCapabilities(),
+    head_group_ratio: int | None = None,
     prefer_packed_prefill: bool = False,
     packed_window_shape: PackedWindowShape | None = None,
     allow_fp8_calibration: bool = False,
 ) -> AttentionBackend:
-    """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
+    """Explicit choices fail without fallback; auto tries FA4/3/2, FlashInfer
+    (SM120 only), Triton, then Torch.
 
     Each candidate validates hardware/configuration and imports its implementation.
     Only compatibility and import failures permit auto to try the next candidate;
@@ -205,7 +225,21 @@ def create_backend(
         candidates = ("torch",)
         skipped.append(f"{device.type.upper()} uses Torch reference attention")
     for candidate in candidates:
+        if (
+            backend == "auto"
+            and candidate == "flashinfer"
+            and not _auto_flashinfer_supported(device)
+        ):
+            skipped.append("flashinfer: automatic selection is limited to SM120")
+            continue
         try:
+            if candidate == "flashinfer" and head_dim > 256:
+                if backend == "auto" and head_group_ratio is None:
+                    raise ValueError(
+                        "XQA auto selection needs a known head_group_ratio for head_dim > 256"
+                    )
+                if head_group_ratio is not None and head_group_ratio > 16:
+                    raise ValueError("XQA with head_dim > 256 requires head_group_ratio <= 16")
             implementation = _create_explicit(
                 candidate,
                 device,
@@ -254,7 +288,7 @@ def create_backend(
             f"flash_attn_{implementation.generation}" if candidate in FLASH_BACKENDS else candidate
         )
         reason = (
-            "first compatible candidate in FA4 > FA3 > FA2 > Triton > Torch priority"
+            "first compatible candidate in FA4 > FA3 > FA2 > FlashInfer > Triton > Torch priority"
             if backend == "auto"
             else f"explicitly requested {backend}"
         )

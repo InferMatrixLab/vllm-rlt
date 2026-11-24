@@ -297,6 +297,7 @@ class StageEngine:
                 fp8_kv=cache_config.kv_cache_dtype == "fp8_e4m3",
                 sliding_window=sliding_window,
             ),
+            head_group_ratio=config.num_attention_heads // config.num_key_value_heads,
             prefer_packed_prefill=prefer_packed and not sliding_window,
             packed_window_shape=packed_window_shape,
             allow_fp8_calibration=True,

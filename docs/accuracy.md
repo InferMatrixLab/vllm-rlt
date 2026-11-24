@@ -34,7 +34,7 @@ attention and the standard Transformers `DynamicCache` with one slot per layer a
 loop (96 here), plus `exit_at_step = total_ut_steps - 1` (3) for last-loop logits.
 This cache setup accommodates the
 pinned release's older cache interface; the model source is not patched.
-The candidate uses the existing native engine and Triton attention. Both use
+The default native candidate uses Triton attention. Both use
 BF16 weights and activations, retaining each backend's existing FP32 reductions
 and other operations that need higher precision. The evaluator changes no
 inference arithmetic.
@@ -192,6 +192,31 @@ them), how many questions differ and where each first diverges. An exit-depth di
 counts as `identical_context` when the two runs chose different depths for a position
 whose preceding tokens were still identical. These fields are diagnostic; the accuracy
 gate does not use them.
+
+## Attention-backend runs
+
+`run --backend native` selects the attention kernel with `--attention-backend`
+(default `triton`). The Transformers reference always uses eager attention.
+Run metadata and comparison reports identify the attention implementation.
+Native metadata also records the effective packed-prefill setting and, for XQA,
+the FlashInfer version.
+
+Use the same frozen protocol and disable packed prefill for both native runs:
+
+```bash
+python -m benchmarks.gsm8k run --backend native --attention-backend triton \
+  --no-packed-prefill --protocol "$PROTOCOL" --output "$RESULTS/triton"
+python -m benchmarks.gsm8k run --backend native --attention-backend flashinfer \
+  --no-packed-prefill --protocol "$PROTOCOL" --output "$RESULTS/flashinfer"
+python -m benchmarks.gsm8k compare --reference "$RESULTS/triton" \
+  --candidate "$RESULTS/flashinfer" --output "$RESULTS/comparison.json"
+```
+
+On RTX 5090 the matched BF16 runs scored **Triton 62/87 and FlashInfer 58/87**.
+The stored HF reference scored 59/87. The XQA run completed and failed the
+one-percentage-point gate. Both `run` and `compare` write their results before
+returning a failing gate status. See the [per-question results](flashinfer.md#accuracy-note-gsm8k-87-single-greedy-pass)
+and the [RTX 5090 recipe with matched throughput](recipes/ouro_xqa_sm120.md).
 
 Dataset: [GSM8K](https://huggingface.co/datasets/openai/gsm8k).
 The [Ouro evaluation settings](https://arxiv.org/html/2510.25741v5#A3.T16) do not
