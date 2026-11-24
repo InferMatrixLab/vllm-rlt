@@ -206,6 +206,7 @@ def _graph_entry(
     bucketed=False,
     table_count=None,
     masked=False,
+    block_tables=None,
 ):
     count = _query_count(batch) if count is None else count
     packed = batch.cu_seqlens_q is not None if packed is None else packed
@@ -226,7 +227,11 @@ def _graph_entry(
             position_ids=torch.empty(count, device=cache.device, dtype=torch.long),
             write_blocks=torch.empty(count, device=cache.device, dtype=torch.long),
             write_offsets=torch.empty(count, device=cache.device, dtype=torch.long),
-            block_tables=torch.zeros((tables, width), device=cache.device, dtype=torch.int32),
+            block_tables=(
+                torch.zeros((tables, width), device=cache.device, dtype=torch.int32)
+                if block_tables is None
+                else block_tables
+            ),
             context_lengths=torch.empty(tables, device=cache.device, dtype=torch.int32),
             cu_seqlens_q=(
                 torch.empty(tables + 1, device=cache.device, dtype=torch.int32) if packed else None
@@ -241,7 +246,7 @@ def _graph_entry(
     )
 
 
-def _copy_graph_inputs(entry, hidden, batch, *, count=None):
+def _copy_graph_inputs(entry, hidden, batch, *, count=None, copy_tables=True):
     count = _query_count(batch) if count is None else count
     metadata = entry.metadata
     if metadata.active_rows is not None:
@@ -270,7 +275,8 @@ def _copy_graph_inputs(entry, hidden, batch, *, count=None):
         if len(metadata.cu_seqlens_q) > tables + 1:
             # searchsorted over a fixed capacity still maps the actual query rows.
             metadata.cu_seqlens_q[tables + 1 :].fill_(count)
-    metadata.block_tables[:tables, : batch.block_tables.shape[1]].copy_(batch.block_tables)
+    if copy_tables:
+        metadata.block_tables[:tables, : batch.block_tables.shape[1]].copy_(batch.block_tables)
 
 
 @dataclass
@@ -619,7 +625,11 @@ class CodaGraphs:
 
 
 class CodaPairGraphs:
-    """Replay ordered target/draft boundary work and their shared token projection."""
+    """Replay the ordered pair on the speculative runner's single compute stream.
+
+    Returned tokens borrow graph storage. The runner enqueues all consumers on
+    that same stream before another replay can overwrite them.
+    """
 
     def __init__(self, model, cache, capture_sizes):
         self.model, self.cache = model, cache
@@ -627,7 +637,6 @@ class CodaPairGraphs:
         self.stream = torch.cuda.Stream(device=cache.device)
         self.pool = torch.cuda.graph_pool_handle()
         self.entries = {}
-        self.last_event = None
         self.replays = self.fallbacks = 0
 
     @torch.inference_mode()
@@ -642,16 +651,22 @@ class CodaPairGraphs:
         empty = _empty_device_batch(cache)
         proxy = _DeviceCache(cache)
         for size in self.capture_sizes:
-            target, draft = (
-                _graph_entry(
-                    hidden,
-                    empty,
-                    cache,
-                    model.config.max_position_embeddings,
-                    count=size,
-                    bucketed=True,
-                )
-                for _ in range(2)
+            target = _graph_entry(
+                hidden,
+                empty,
+                cache,
+                model.config.max_position_embeddings,
+                count=size,
+                bucketed=True,
+            )
+            draft = _graph_entry(
+                hidden,
+                empty,
+                cache,
+                model.config.max_position_embeddings,
+                count=size,
+                bucketed=True,
+                block_tables=target.metadata.block_tables,
             )
             for entry in (target, draft):
                 _copy_graph_inputs(entry, hidden, empty, count=0)
@@ -669,23 +684,17 @@ class CodaPairGraphs:
         self.cache._require_live_batch(draft_kv)
         count = len(target_hidden)
         capacity = _bucket_size(self.capture_sizes, count)
-        if capacity not in self.entries:
+        if capacity not in self.entries or target_kv.block_tables is not draft_kv.block_tables:
             self.fallbacks += 1
             return self.model.coda_pair(
                 target_hidden, target_kv, draft_hidden, draft_kv, self.cache
             )
         target, draft, graph, tokens = self.entries[capacity]
-        stream = torch.cuda.current_stream(target_hidden.device)
-        if self.last_event is not None:
-            stream.wait_event(self.last_event)
         _copy_graph_inputs(target, target_hidden, target_kv)
-        _copy_graph_inputs(draft, draft_hidden, draft_kv)
+        _copy_graph_inputs(draft, draft_hidden, draft_kv, copy_tables=False)
         graph.replay()
-        result = tokens[:, :count].clone()
-        self.last_event = torch.cuda.Event()
-        self.last_event.record(stream)
         self.replays += 1
-        return result
+        return tokens[:, :count]
 
 
 class PreludeGraphs(CodaGraphs):
