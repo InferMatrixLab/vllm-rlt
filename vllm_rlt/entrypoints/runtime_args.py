@@ -17,6 +17,12 @@ def add_runtime_args(parser):
         help="Enable fixed-loop self-speculation with K draft tokens",
     )
     parser.add_argument("--speculative-mode", choices=["block", "pipeline"], default="block")
+    parser.add_argument(
+        "--speculative-pipeline-graph",
+        choices=["off", "transition", "full"],
+        default="off",
+        help="Pre-capture native asynchronous pipeline state updates or dense decode rounds",
+    )
     parser.add_argument("--draft-loops", type=int, default=2)
     parser.add_argument("--target-loops", type=int, default=4)
     parser.add_argument("--enable-prefix-caching", action="store_true")
@@ -115,12 +121,15 @@ def runtime_configs(args):
     parser = argparse.ArgumentParser(add_help=False)
     add_runtime_args(parser)
     args = SimpleNamespace(**(vars(parser.parse_args([])) | vars(args)))
+    if args.speculative_pipeline_graph != "off" and args.speculative_tokens is None:
+        raise ValueError("--speculative-pipeline-graph requires --speculative-tokens")
     return dict(
         speculative_config=SpeculativeConfig(
             num_speculative_tokens=args.speculative_tokens,
             draft_loops=args.draft_loops,
             target_loops=args.target_loops,
             mode=args.speculative_mode,
+            pipeline_graph=args.speculative_pipeline_graph,
         )
         if args.speculative_tokens is not None
         else None,

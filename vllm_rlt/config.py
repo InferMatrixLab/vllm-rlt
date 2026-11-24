@@ -198,12 +198,17 @@ class SpeculativeConfig:
     draft_loops: int = 2
     target_loops: int = 4
     mode: str = "block"
+    pipeline_graph: str = "off"
 
     def __post_init__(self):
         for name in ("num_speculative_tokens", "draft_loops", "target_loops"):
             _positive(name, getattr(self, name))
         if self.mode not in ("block", "pipeline"):
             raise ValueError("speculative mode must be block or pipeline")
+        if self.pipeline_graph not in ("off", "transition", "full"):
+            raise ValueError("pipeline_graph must be off, transition, or full")
+        if self.pipeline_graph != "off" and self.mode != "pipeline":
+            raise ValueError("pipeline_graph requires speculative pipeline mode")
         if self.mode == "pipeline" and self.target_loops % self.draft_loops:
             raise ValueError("pipeline draft_loops must divide target_loops")
         if self.draft_loops >= self.target_loops:

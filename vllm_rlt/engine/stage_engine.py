@@ -189,6 +189,14 @@ class StageEngine:
         )
         self.async_speculative = bool(speculative_config and self.execution_config.async_scheduling)
         if speculative_config is not None:
+            if speculative_config.pipeline_graph != "off" and not (
+                device_boundary_pipeline
+                and self.async_speculative
+                and self.execution_config.cuda_graphs
+            ):
+                raise ValueError(
+                    "pipeline_graph requires native Inkling, async scheduling and CUDA Graphs"
+                )
             if cache_config.layout != "last_exited":
                 raise ValueError("speculative decoding requires last_exited KV")
             if speculative_config.target_loops != config.total_ut_steps:

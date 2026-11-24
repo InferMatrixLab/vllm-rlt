@@ -1008,6 +1008,16 @@ comparing the two modes.
 `--speculative-tokens` bounds the reserved lookahead window in pipeline mode;
 a smaller scheduler token budget may discard descendants and reduce overlap.
 
+With native Inkling and asynchronous CUDA Graphs, `--speculative-pipeline-graph transition`
+pre-captures GPU acceptance and state updates for selected request counts.
+`--speculative-pipeline-graph full` also captures an entire dense decode step
+from prelude through the state update. Mixed prefill/decode and decode batches
+outside the dense graph's shape or page-table capacity use the stage graphs.
+Both modes capture before serving. Two leased input banks reuse unchanged page
+tables and routing plans. Changed inputs are staged from pinned host memory
+on the input stream when multi-stream execution is enabled. `--no-uva` uses
+asynchronous CUDA copies from the same banks.
+
 ### Accepted tokens
 
 ![Block and pipeline speculation at token granularity](diagrams/pipeline-token-batches.png)

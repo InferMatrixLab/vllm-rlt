@@ -15,6 +15,7 @@ from typing import Literal, NamedTuple
 import numpy as np
 import torch
 
+from vllm_rlt.config import cuda_graph_rows
 from vllm_rlt.core.kv_cache_manager import _Allocation
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Operation, Request
@@ -28,6 +29,12 @@ from vllm_rlt.worker.cuda_graph import (
 )
 from vllm_rlt.worker.executor import ForwardBatch
 from vllm_rlt.worker.output import ModelRunnerOutput, SpeculativeResult
+from vllm_rlt.worker.pipeline_graph import (
+    PipelineRoundGraph,
+    PipelineTransitionGraphs,
+    pipeline_transition,
+    publish_pipeline,
+)
 from vllm_rlt.worker.sampler import RngRegistry
 from vllm_rlt.worker.speculative import (
     PipelineState,
@@ -412,6 +419,27 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             else 0
         )
         self.pipeline_lanes = torch.arange(self.pipeline_capacity, device=self.device)
+        self.transition_graph = self.round_graph = None
+        if config.pipeline_graph != "off":
+            request_capacity = min(
+                scheduler.max_num_seqs,
+                scheduler.max_num_batched_tokens,
+                cuda_graph_rows(execution),
+            )
+            request_sizes = graph_capture_sizes(execution, preferred=(request_capacity,))
+            self.transition_graph = PipelineTransitionGraphs(
+                self.device, request_sizes, self.pipeline_capacity, config
+            )
+            if config.pipeline_graph == "full":
+                dense_requests = min(
+                    request_capacity,
+                    scheduler.max_num_batched_tokens // self.pipeline_capacity,
+                    cuda_graph_rows(execution) // self.pipeline_capacity,
+                )
+                if dense_requests:
+                    self.round_graph = PipelineRoundGraph(
+                        model, cache, dense_requests, self.pipeline_capacity, config
+                    )
         self.compute_stream.wait_stream(torch.cuda.current_stream(self.device))
         self.buffers = [
             SpeculativeRoundBuffer(self, scheduler, pipeline_capacity=self.pipeline_capacity)
@@ -557,9 +585,8 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         size = math.prod(shape)
         host_tables = buffer.host_tables[:size].view(shape)
         tables = buffer.tables[:size].view(shape)
-        buffer.tables_dirty = (
-            buffer.table_shape != shape
-            or any(old is not new for old, new in zip(buffer.table_versions, versions, strict=True))
+        buffer.tables_dirty = buffer.table_shape != shape or any(
+            old is not new for old, new in zip(buffer.table_versions, versions, strict=True)
         )
         if buffer.tables_dirty:
             table_view = host_tables.numpy()
@@ -943,6 +970,13 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         )
 
     def _pipeline_step(self, spans, states, tables, allocations, buffer, *, prompt=None):
+        graph = self.round_graph
+        if graph is not None and prompt is None and graph.supports(buffer.plan_key[0], tables):
+            graph.forward(states, tables, buffer)
+            for state in states:
+                state.submitted += 1
+            return len(buffer.plan[3])
+
         pipelines = [state.pipeline for state in states]
         pipeline = DevicePipelineState(
             torch.stack([state.tokens for state in pipelines]),
@@ -951,7 +985,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             torch.stack([state.candidates for state in pipelines]),
             torch.stack([state.active for state in pipelines]),
         )
-        num_requests, capacity = pipeline.tokens.shape
+        num_requests = len(states)
         widths, output_limits, roots, rows, owners = buffer.plan
         num_rows = len(rows)
         lanes = self.pipeline_lanes
@@ -1011,67 +1045,32 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         predictions = torch.zeros_like(pipeline.tokens)
         predictions.flatten().index_copy_(0, rows, choices)
         pipeline.hidden.flatten(0, 1).index_copy_(0, rows, hidden)
-        new_depths = pipeline.depths + valid.long() * self.config.draft_loops
-        drafted = valid & (new_depths == self.config.draft_loops)
-        candidates = torch.where(drafted, predictions, pipeline.candidates)
-        emitted = valid[:, 0] & (new_depths[:, 0] == self.config.target_loops)
-        accepted = emitted & (candidates[:, 0] == predictions[:, 0])
-        reject = emitted & ~accepted
-        committed = emitted.long()
         input_tokens = torch.stack([state.token for state in states])
-        next_tokens = torch.where(emitted, predictions[:, 0], input_tokens)
-        next_positions = positions + committed
-        # Shift after target completion. Rejecting a candidate invalidates its
-        # descendants, while shrinking the reservation masks excess slots.
-        source = (lanes + committed[:, None]).clamp_max(capacity - 1)
-        remaining = lengths - committed
-        surviving = (lanes < remaining[:, None]) & ~reject[:, None]
-        tail = (lengths - 1).clamp_min(0)[:, None]
-        append = drafted.gather(1, tail).squeeze(1) & ~reject
-        restart = reject | (emitted & (remaining == 0))
-        newborn = (lanes == remaining[:, None]) & append[:, None]
-        newborn = torch.where(restart[:, None], lanes == 0, newborn)
-        within_limit = next_positions[:, None] + lanes < output_limits[:, None]
-        newborn &= (lanes < widths[:, None]) & within_limit
-        candidate = candidates.gather(1, tail).squeeze(1)
-        newborn_tokens = torch.where(restart, next_tokens, candidate)
-        shifted_tokens = pipeline.tokens.gather(1, source)
-        shifted_depths = new_depths.gather(1, source)
-        shifted_hidden = pipeline.hidden.gather(
-            1, source[:, :, None].expand(-1, -1, pipeline.hidden.shape[2])
-        )
-        # Publish the device state before the next submission on this stream.
-        torch._foreach_copy_([state.token for state in states], next_tokens.unbind())
-        torch._foreach_copy_([state.position for state in states], next_positions.unbind())
-        torch._foreach_copy_(
-            [state.tokens for state in pipelines],
-            torch.where(newborn, newborn_tokens[:, None], shifted_tokens).unbind(),
-        )
-        torch._foreach_copy_(
-            [state.depths for state in pipelines], shifted_depths.masked_fill_(newborn, 0).unbind()
-        )
-        torch._foreach_copy_([state.hidden for state in pipelines], shifted_hidden.unbind())
-        torch._foreach_copy_(
-            [state.candidates for state in pipelines], candidates.gather(1, source).unbind()
-        )
-        torch._foreach_copy_(
-            [state.active for state in pipelines], ((surviving | newborn) & within_limit).unbind()
-        )
-        # Per-request wire order matches SpeculativeRoundTicket.collect().
-        # Each pipeline step verifies at most one token per request.
-        buffer.result[: 6 * num_requests].view(num_requests, 6).copy_(
-            torch.stack(
-                (
-                    predictions[:, 0],
-                    accepted.long(),
-                    committed,
-                    next_positions,
-                    drafted.sum(1),
-                    committed,
-                ),
-                dim=1,
+        transition = self.transition_graph
+        if transition is not None and num_requests in transition.entries:
+            update = transition.forward(
+                pipeline, predictions, valid, widths, positions, output_limits, input_tokens
             )
+        else:
+            update = pipeline_transition(
+                pipeline.tokens,
+                pipeline.depths,
+                pipeline.candidates,
+                predictions,
+                valid,
+                widths,
+                positions,
+                output_limits,
+                input_tokens,
+                lanes,
+                lengths,
+                self.config.draft_loops,
+                self.config.target_loops,
+            )
+        shifted_hidden = pipeline.hidden.gather(
+            1, update.source[:, :, None].expand(-1, -1, pipeline.hidden.shape[2])
         )
+        publish_pipeline(states, shifted_hidden, update, buffer)
         for state in states:
             state.submitted += 1
         return num_rows
