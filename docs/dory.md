@@ -227,9 +227,10 @@ These fail fast rather than degrade silently:
 - Self-speculation combined with CUDA Graphs, asynchronous scheduling,
   preemption or `last_loop` KV, and sampled token-pipeline
   speculation. The synchronous eager form is supported; see below.
-- Per-request loop counts other than the configured full depth: Dory has no
-  trained exit gate, so the runtime refuses to invent one, including via
-  `min_loops` with `exit_threshold=0`.
+- A `target_loops` below the configured full depth: shallower per-request
+  depth needs per-request prefill, which is not implemented yet. Dory accepts
+  `target_loops`, `min_loops` and `exit_threshold`, but runs the full depth
+  regardless, since it has no trained exit gate.
 
 `enable_preemption` selects the all-layer fallback, so suspend, CPU offload and
 restore work, with or without prefix caching, in execution modes that accept

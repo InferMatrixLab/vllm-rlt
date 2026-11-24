@@ -400,3 +400,13 @@ def test_non_ouro_exit_keeps_grouped_storage_without_reclamation():
         assert engine.cache_manager.grouped and not engine.cache_manager.reclaim_swa
     finally:
         engine.close()
+
+
+def test_full_attention_keeps_grouped_storage_without_reclamation():
+    layer_types = ("full_attention", "mlp") * 4
+    model = DoryForCausalLM(tiny_dory_config(layer_types=layer_types, sliding_window=None)).eval()
+    engine = LLMEngine(model, cache_config=CacheConfig(num_blocks=64, block_size=2))
+    try:
+        assert engine.cache_manager.grouped and not engine.cache_manager.reclaim_swa
+    finally:
+        engine.close()

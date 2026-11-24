@@ -343,6 +343,7 @@ class StageEngine:
         # Grouped pages expire only when every token runs all loops in ouro order.
         reclaim_swa = (
             layer_windows is not None
+            and any(window is not None for window in layer_windows.values())
             and getattr(model, "fixed_loop_count", False)
             and self.exit_config.mode == "ouro"
         )

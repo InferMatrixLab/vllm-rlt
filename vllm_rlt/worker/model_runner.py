@@ -669,7 +669,7 @@ class ModelRunner:
                 [ids[row] for row in rows],
                 [[0] * len(rows)],
                 [positions[row] for row in rows],
-                packed=self._packs_prefill() if packed is None else packed,
+                packed=self._can_pack_prefill() if packed is None else packed,
             )[0]
         return ForwardBatch(
             Operation.CODA, prelude_coda_kv_metadata=kv_metadata, compute_logits=False
@@ -786,7 +786,7 @@ class ModelRunner:
                 inputs.append(PreparedForward(coda, outputs=(), hidden_rows=coda_rows))
         return tuple(inputs)
 
-    def _packs_prefill(self):
+    def _can_pack_prefill(self):
         # Packed metadata needs last_exited all-layer pages. Native-packing
         # backends advertise it regardless of the cache layout.
         cache = self.cache_manager
@@ -814,7 +814,7 @@ class ModelRunner:
         cache = self.cache_manager
         if cache.layout == "shared":
             return self._prepare_shared_loop_inputs(batch)
-        packed = self._packs_prefill() and (
+        packed = self._can_pack_prefill() and (
             not cache.attention_capabilities.packed_sliding_window
             or all(len(span.request.prompt_token_ids) > 64 for span in batch.spans)
         )
@@ -932,7 +932,7 @@ class ModelRunner:
         metadata, boundary_metadata = (), None
         followups = ()
         boundary_kv = getattr(self.model, "requires_boundary_kv", False)
-        packed = batch.has_chunks and self._packs_prefill()
+        packed = batch.has_chunks and self._can_pack_prefill()
         if batch.operation == Operation.RECURRENT:
             start = 1 if prepared.kv is not None else 0
             if not packed and (start < batch.loop_count or (boundary_kv and batch.has_chunks)):
