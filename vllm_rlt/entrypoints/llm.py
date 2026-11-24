@@ -20,7 +20,6 @@ class LLM:
         *,
         tokenizer=None,
         revision=None,
-        max_loops=None,
         device=None,
         dtype=None,
         cache_config=None,
@@ -32,7 +31,6 @@ class LLM:
     ):
         tokenizer_source = resolve_model_source(model) if isinstance(model, str) else None
         model, revision, model_config = prepare_model(model, revision=revision)
-        model_config = model_config.with_max_loops(max_loops)
         self._tokenizer_source = (
             (tokenizer_source, revision)
             if tokenizer is None and tokenizer_source is not None

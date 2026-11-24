@@ -86,8 +86,6 @@ class StageWorker:
         )
         if self.connector is not None:
             info.update(self.connector.startup_info())
-        if self.engine.graph_warmup is not None:
-            info["graph_warmup"] = self.engine.graph_warmup
         self.send("ready", **info)
 
     def send(self, kind, **fields):

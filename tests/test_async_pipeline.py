@@ -83,23 +83,10 @@ def test_delayed_delivery_uses_snapshot_depths_and_bounds_placeholders(
     assert not engine._pending_coda
 
 
-@pytest.mark.parametrize(
-    ("device", "use_device_metadata"),
-    [
-        ("cpu", False),
-        pytest.param("cuda", True, marks=pytest.mark.gpu),
-        pytest.param("cuda", False, marks=pytest.mark.gpu),
-    ],
-)
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 @pytest.mark.parametrize("multi_stream", [False, True])
-def test_prelude_consumes_device_sample_before_cpu_delivery(
-    monkeypatch, device, use_device_metadata, multi_stream
-):
-    monkeypatch.setattr(
-        OuroForCausalLM, "supports_device_kv_metadata", use_device_metadata, raising=False
-    )
+def test_prelude_consumes_device_sample_before_cpu_delivery(monkeypatch, device, multi_stream):
     engine = make_engine(device=device, multi_stream=multi_stream)
-    assert (engine.model_runner.async_state is not None) == use_device_metadata
     engine.add_request("a", [2], SamplingParams(max_tokens=3, ignore_eos=True, exit_threshold=1))
     engine.step()
     engine.step()

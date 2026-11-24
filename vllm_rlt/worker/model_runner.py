@@ -1,13 +1,13 @@
 """Request-phase execution, random lookahead signals and event-owned CUDA submissions."""
 
 import math
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import torch
 
-from vllm_rlt.config import ExecutionConfig, ExitConfig, SchedulerConfig, cuda_graph_rows
+from vllm_rlt.config import ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.device import stream_module
 from vllm_rlt.request import ExecutionBatch, Operation, Request
@@ -20,7 +20,6 @@ from vllm_rlt.worker.buffers import (
 from vllm_rlt.worker.cuda_graph import CodaGraphs, PreludeGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
 from vllm_rlt.worker.output import ModelRunnerOutput
-from vllm_rlt.worker.packed_graph import PackedGraphs
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import StagedInputTensor, TensorTransfer, UvaBuffer, pinned_tensor
@@ -166,8 +165,8 @@ class ModelRunner:
         self.model = model.eval()
         self.cache_manager = cache_manager
         self.metadata = cache_manager.metadata_builder
+        self.runtime = ModelRuntime(self.model, cache_manager)
         parameter = next(model.parameters())
-        self.state_dtype = getattr(model, "state_dtype", parameter.dtype)
         self.device = parameter.device
         self.device_ops = stream_module(self.device)
         self.sampler = Sampler()
@@ -176,11 +175,7 @@ class ModelRunner:
         self.rng = rng if rng is not None else RngRegistry()
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
-        use_async_state = (
-            self.execution_config.async_scheduling
-            and self.device.type == "cuda"
-            and getattr(model, "supports_device_kv_metadata", True)
-        )
+        use_async_state = self.execution_config.async_scheduling and self.device.type == "cuda"
         scheduler = scheduler_config or SchedulerConfig()
         self.graphs = (
             RecurrentGraphs(
@@ -202,21 +197,6 @@ class ModelRunner:
             if self.coda_graphs is not None and hasattr(model, "prelude_kv_layers")
             else None
         )
-        self.mixed_graphs = (
-            RecurrentGraphs(model, cache_manager, self.execution_config, self.graphs.compute_gate)
-            if self.graphs is not None
-            and scheduler.mode == "mixed"
-            and getattr(model, "supports_packed_recurrent_graphs", False)
-            else None
-        )
-        self.packed_graphs = (
-            PackedGraphs(model, cache_manager, self.execution_config, scheduler)
-            if self.graphs is not None
-            and self.execution_config.packed_prefill is not False
-            and getattr(model, "supports_packed_prefill_graphs", False)
-            else None
-        )
-        self.runtime = ModelRuntime(self.model, cache_manager, packed_graphs=self.packed_graphs)
         self.input_buffers: dict[torch.dtype, StagedInputTensor] = {
             dtype: StagedInputTensor(dtype, self.device, use_uva=self.execution_config.use_uva)
             for dtype in (torch.int64, torch.int32)
@@ -294,7 +274,7 @@ class ModelRunner:
             torch.empty(
                 (scheduler.max_num_seqs, stage_rows, model.config.hidden_size),
                 device=self.device,
-                dtype=self.state_dtype,
+                dtype=parameter.dtype,
             )
             if self.staged_prefill
             else None
@@ -306,7 +286,7 @@ class ModelRunner:
             torch.empty(
                 (prefill_rows, model.config.hidden_size),
                 device=self.device,
-                dtype=self.state_dtype,
+                dtype=parameter.dtype,
             )
             if self.staged_prefill
             else None
@@ -319,7 +299,7 @@ class ModelRunner:
                     else scheduler.max_num_seqs,
                     max(scheduler.max_num_batched_tokens, scheduler.prefill_chunk_size),
                     self.device,
-                    self.state_dtype,
+                    parameter.dtype,
                     use_uva=self.execution_config.use_uva,
                 )
                 for _ in range(MAX_CONCURRENT_SUBMISSIONS)
@@ -352,7 +332,7 @@ class ModelRunner:
                         width,
                         model.config.hidden_size,
                         self.device,
-                        self.state_dtype,
+                        parameter.dtype,
                         use_uva=self.execution_config.use_uva,
                     )
                     for _ in range(2)
@@ -361,7 +341,7 @@ class ModelRunner:
                 self.states = torch.empty(
                     (scheduler.max_num_seqs, model.config.hidden_size),
                     device=self.device,
-                    dtype=self.state_dtype,
+                    dtype=parameter.dtype,
                 )
             # Buffers allocated after stream creation must be visible there too.
             for stream in (self.core_stream, self.boundary_stream):
@@ -648,16 +628,13 @@ class ModelRunner:
             hidden[row].copy_(request.hidden_state)
         return hidden
 
-    def _prepare_prefill_coda(
-        self, ids, positions, requests, kv=None, *, packed=None, eligible=None
-    ):
+    def _prepare_prefill_coda(self, ids, positions, requests, kv=None, *, packed=None):
         if not getattr(self.model, "requires_boundary_kv", False):
             return None, None
         rows = [
             row
             for row, (position, request) in enumerate(zip(positions, requests))
-            if (eligible is None or row in eligible)
-            and position < len(request.prompt_token_ids) - 1
+            if position < len(request.prompt_token_ids) - 1
         ]
         if not rows:
             return None, None
@@ -676,32 +653,6 @@ class ModelRunner:
         return ForwardBatch(
             Operation.CODA, prelude_coda_kv_metadata=kv_metadata, compute_logits=False
         ), index
-
-    def _prepare_packed_prefill_coda(self, spans, *, loops=None):
-        if not getattr(self.model, "requires_boundary_kv", False):
-            return None, None
-        selected, rows = [], []
-        offset = 0
-        for span in spans:
-            if loops is None or (
-                span.chunk_start is not None
-                and span.depth + loops == self.model.config.total_ut_steps
-            ):
-                # The last prompt row is consumed by the logits-producing CODA.
-                count = min(
-                    span.token_count, len(span.request.prompt_token_ids) - 1 - span.token_start
-                )
-                if count > 0:
-                    selected.append(replace(span, token_count=count, depth=0))
-                    rows.extend(range(offset, offset + count))
-            offset += span.token_count
-        if not rows:
-            return None, None
-        layout = self.metadata.build_packed(selected, (0,))
-        kv = stage_metadata(layout, self._append_input)[0]
-        index = self.input_buffers[torch.int64].append(rows)
-        forward = ForwardBatch(Operation.CODA, prelude_coda_kv_metadata=kv, compute_logits=False)
-        return forward, index
 
     def _prepare_shared_loop_inputs(self, batch):
         cache = self.cache_manager
@@ -791,37 +742,35 @@ class ModelRunner:
         cache = self.cache_manager
         if cache.layout == "shared":
             return self._prepare_shared_loop_inputs(batch)
+        ids, positions, tokens, requests, outputs, depths = [], [], [], [], [], []
+        for span in batch.spans:
+            count, request = span.token_count, span.request
+            ids.extend([request.request_id] * count)
+            depths.extend([span.depth] * count)
+            positions.extend(range(span.token_start, span.token_start + count))
+            tokens.extend(span.input_tokens)
+            requests.extend([request] * count)
+            outputs.append((len(tokens) - 1, request))
         packed = cache.attention_capabilities.packed_prefill and (
             not cache.attention_capabilities.packed_sliding_window
             or all(len(span.request.prompt_token_ids) > 64 for span in batch.spans)
         )
-        tokens, requests, outputs = [], [], []
-        for span in batch.spans:
-            tokens.extend(span.input_tokens)
-            requests.extend([span.request] * span.token_count)
-            outputs.append((len(tokens) - 1, span.request))
-        loop_offsets = range(batch.loop_count)
-        if packed:
-            layouts = self.metadata.build_packed(batch.spans, loop_offsets)
-            if packed_metadata is not None:
-                packed_metadata.store(layouts, tokens)
-                tensor, metadata = None, ()
-            else:
-                tensor = self.input_buffers[torch.int64].append(tokens)
-                metadata = stage_metadata(layouts, self._append_input)
-            coda, coda_rows = self._prepare_packed_prefill_coda(batch.spans)
+        size = len(tokens) if packed else self._size(len(tokens))
+        depth_sets = [[depth + offset for depth in depths] for offset in range(batch.loop_count)]
+        if packed_metadata is not None:
+            layouts = self.metadata.build(ids, depth_sets, positions, packed=True)
+            packed_metadata.store(layouts, tokens)
+            tensor, metadata = None, ()
         else:
-            ids, depths, positions = batch.addresses()
-            size = self._size(len(tokens))
             tensor = self.input_buffers[torch.int64].append(tokens + [0] * (size - len(tokens)))
-            depth_sets = [[depth + offset for depth in depths] for offset in loop_offsets]
             metadata = self._stage_metadata(
                 ids,
                 depth_sets,
                 positions,
+                packed=packed,
                 padded_rows=size,
             )
-            coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests, packed=False)
+        coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests, packed=packed)
         forwards = [
             PreparedForward(
                 ForwardBatch(Operation.PRELUDE, tokens=tensor, metadata=metadata),
@@ -884,7 +833,7 @@ class ModelRunner:
                         storage = torch.empty(
                             (capacity, self.model.config.hidden_size),
                             device=self.device,
-                            dtype=self.state_dtype,
+                            dtype=next(self.model.parameters()).dtype,
                         )
                         self.loop_hidden[slot] = storage
                     hidden_buffer = storage[:size]
@@ -907,55 +856,27 @@ class ModelRunner:
         if batch.operation == Operation.PRELUDE and batch.loop_count:
             return prepared
         metadata, boundary_metadata = (), None
-        followups = ()
-        boundary_kv = getattr(self.model, "requires_boundary_kv", False)
-        packed = batch.has_chunks and self.cache_manager.attention_capabilities.packed_prefill
         if batch.operation == Operation.RECURRENT:
             start = 1 if prepared.kv is not None else 0
-            if not packed and (start < batch.loop_count or (boundary_kv and batch.has_chunks)):
-                ids, depths, positions = batch.addresses()
             if start < batch.loop_count:
-                offsets = range(start, batch.loop_count)
-                if packed:
-                    layouts = self.metadata.build_packed(batch.spans, offsets)
-                    metadata = stage_metadata(layouts, self._append_input)
-                else:
-                    metadata = self._stage_metadata(
-                        ids, [[depth + offset for depth in depths] for offset in offsets], positions
-                    )
-            if packed:
-                coda, rows = self._prepare_packed_prefill_coda(batch.spans, loops=batch.loop_count)
-                if coda is not None:
-                    followups = (PreparedForward(coda, outputs=(), hidden_rows=rows),)
-            elif boundary_kv and batch.has_chunks:
-                complete, requests = set(), []
-                row = 0
-                for span in batch.spans:
-                    end = row + span.token_count
-                    if (
-                        span.chunk_start is not None
-                        and span.depth + batch.loop_count == self.model.config.total_ut_steps
-                    ):
-                        complete.update(range(row, end))
-                    requests.extend([span.request] * span.token_count)
-                    row = end
-                if complete:
-                    coda, rows = self._prepare_prefill_coda(
-                        ids, positions, requests, packed=packed, eligible=complete
-                    )
-                    if coda is not None:
-                        followups = (PreparedForward(coda, outputs=(), hidden_rows=rows),)
-        elif boundary_kv:
-            if packed:
-                layouts = self.metadata.build_packed(batch.spans, (0,))
-                boundary_metadata = stage_metadata(layouts, self._append_input)[0]
-            else:
                 ids, depths, positions = batch.addresses()
-                boundary_metadata = self._stage_metadata(ids, (depths,), positions)[0]
+                metadata = self._stage_metadata(
+                    ids,
+                    [
+                        [depth + offset for depth in depths]
+                        for offset in range(start, batch.loop_count)
+                    ],
+                    positions,
+                    packed=batch.has_chunks
+                    and self.cache_manager.attention_capabilities.packed_prefill,
+                )
+        elif getattr(self.model, "requires_boundary_kv", False):
+            ids, depths, positions = batch.addresses()
+            boundary_metadata = self._stage_metadata(ids, (depths,), positions)[0]
         forward = ForwardBatch(
             batch.operation, metadata=metadata, prelude_coda_kv_metadata=boundary_metadata
         )
-        return replace(prepared, forwards=(PreparedForward(forward), *followups))
+        return replace(prepared, forwards=(PreparedForward(forward),))
 
     def _prepare_cpu_inputs(self, batch: ExecutionBatch):
         """Snapshot request inputs and acquire the storage used by this submission."""
@@ -1094,45 +1015,28 @@ class ModelRunner:
         requests = [span.request for span in batch.spans]
         size = batch.num_rows if batch.has_chunks else self._size(batch.num_rows)
         inputs = prepared.forwards[0].forward
-        followups = prepared.forwards[1:]
         metadata = inputs.metadata
         kv_metadata = inputs.prelude_coda_kv_metadata
         if metadata or kv_metadata is not None or prepared.gate_indices is not None:
             uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
-
-            def input_view(indices):
-                return uploaded[indices.dtype].as_strided(
-                    indices.shape, indices.stride(), indices.storage_offset()
-                )
-
             if prepared.gate_indices is not None:
+                indices = prepared.gate_indices
                 prepared = replace(
                     prepared,
-                    gate_indices=input_view(prepared.gate_indices),
+                    gate_indices=uploaded[indices.dtype].as_strided(
+                        indices.shape, indices.stride(), indices.storage_offset()
+                    ),
                 )
             metadata = tuple(self.metadata.bind(kv, uploaded) for kv in metadata)
             if kv_metadata is not None:
                 kv_metadata = self.metadata.bind(kv_metadata, uploaded)
-            followups = tuple(
-                replace(
-                    entry,
-                    forward=replace(
-                        entry.forward,
-                        prelude_coda_kv_metadata=self.metadata.bind(
-                            entry.forward.prelude_coda_kv_metadata, uploaded
-                        ),
-                    ),
-                    hidden_rows=input_view(entry.hidden_rows),
-                )
-                for entry in followups
-            )
         if batch.operation == Operation.PRELUDE:
             forward = ForwardBatch(
                 Operation.PRELUDE,
                 tokens=prepared.token_ids,
                 prelude_coda_kv_metadata=kv_metadata,
                 generators=self._prepare_generators(requests) if kv_metadata else None,
-                graphs=self.prelude_graphs if kv_metadata and not batch.has_chunks else None,
+                graphs=self.prelude_graphs if kv_metadata else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
         hidden = self._load_hidden(batch, prepared, workspace, size)
@@ -1144,24 +1048,10 @@ class ModelRunner:
                 graphs=self.coda_graphs if kv_metadata else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
-        boundary_kv = getattr(self.model, "requires_boundary_kv", False)
-        supports_packed_graphs = getattr(self.model, "supports_packed_recurrent_graphs", False)
-        graph_eligible = supports_packed_graphs or not (boundary_kv and batch.has_chunks)
-        graphs = self.graphs if batch.emit_gate and graph_eligible else None
+        graphs = self.graphs if batch.emit_gate else None
         kv = prepared.kv
         if kv is not None:
             metadata = (kv,) + metadata
-        if graphs is not None and batch.has_chunks:
-            graphs = self.mixed_graphs or graphs
-            if (
-                self.packed_graphs is not None
-                and (
-                    self.packed_graphs.bucketed
-                    or batch.num_rows > cuda_graph_rows(self.execution_config)
-                )
-                and metadata[0].cu_seqlens_q is not None
-            ):
-                graphs = None
         forward = ForwardBatch(
             Operation.RECURRENT,
             hidden=hidden[: batch.num_rows]
@@ -1172,9 +1062,7 @@ class ModelRunner:
             compute_gate=batch.emit_gate and self.exit_config.mode in ("ouro", "ouro_delayed"),
         )
         return replace(
-            prepared,
-            kv=metadata[0],
-            forwards=(PreparedForward(self.runtime.prepare(forward)), *followups),
+            prepared, kv=metadata[0], forwards=(PreparedForward(self.runtime.prepare(forward)),)
         )
 
     def _load_hidden(self, batch, prepared, workspace, size):
@@ -1315,32 +1203,6 @@ class ModelRunner:
                 dependencies.add(event)
             if span.request.hidden_state is not None:
                 span.request.hidden_state.record_stream(stream)
-
-    @contextmanager
-    def prepare_mixed_recurrent(self, batch):
-        """Lease the regular prompt inputs until the joined Core finishes reading them."""
-        stream = self.core_stream
-        if self.submissions.begin():
-            self.split_prefill_submission_waits += 1
-        prepared = self.prepare_on_cpu(batch)
-        source_stream = torch.cuda.current_stream(self.device)
-        with torch.cuda.stream(stream):
-            if source_stream != stream:
-                stream.wait_stream(source_stream)
-            self._wait_for_requests(batch, stream)
-            yield self.prepare_on_gpu(prepared)
-            event = torch.cuda.Event()
-            event.record(stream)
-            for span in batch.spans:
-                self.events[span.request.request_id] = event
-            self.submissions.complete(event)
-        self.split_prefill_submissions += 1
-
-    def finish_mixed_recurrent(self, prepared, hidden):
-        """Save the prompt slice and enqueue the ordinary KV-only Coda follows."""
-        self._store_hidden(prepared.batch, hidden, prepared)
-        for entry in prepared.forwards[1:]:
-            self.runtime.forward(replace(entry.forward, hidden=hidden[entry.hidden_rows]))
 
     @torch.inference_mode()
     def submit(self, scheduled_batch: SchedulerOutput | None = None, *, batch: ExecutionBatch):

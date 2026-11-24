@@ -140,8 +140,6 @@ class Scheduler:
         total_ut_steps: int | None = None,
         eos_token_id=(),
         exit_mode: str = "ouro",
-        mixed_speculative: bool = False,
-        prioritize_prefill_continuations: bool = False,
     ):
         self.config = config
         self.cache_manager = cache_manager
@@ -169,16 +167,10 @@ class Scheduler:
         # recurrent batches. Other prompt chunks execute all depths atomically.
         self.wavefront_chunked_prefill = config.wavefront_chunked_prefill
         self.staged_prefill = requires_staged_prefill(config, produces_tokens=produces_tokens)
-        self.prioritize_prefill_continuations = (
-            prioritize_prefill_continuations
-            and config.mode == "mixed"
-            and not self.wavefront_chunked_prefill
-        )
         self.policy = create_scheduling_policy(
             config,
             speculative_config,
             produces_tokens=produces_tokens,
-            mixed_speculative=mixed_speculative,
         )
 
     def add_request(self, request: Request):
@@ -189,19 +181,7 @@ class Scheduler:
 
     def enqueue(self, request: Request, phase: RequestPhase):
         request.phase = phase
-        queue = self.queues[phase]
-        if (
-            self.prioritize_prefill_continuations
-            and request.num_prefilled_tokens > 0
-            and phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
-        ):
-            # Continue prompts with a completed chunk first. Preserve queue
-            # order within each group.
-            for index, request_id in enumerate(queue):
-                if self.requests[request_id].num_prefilled_tokens == 0:
-                    queue.insert(index, request.request_id)
-                    return
-        queue.append(request.request_id)
+        self.queues[phase].append(request.request_id)
 
     def suspend_for_transfer(self, request):
         """Stop scheduling without freeing resources that a transfer still borrows."""
@@ -721,31 +701,29 @@ class Scheduler:
     def _take(self, phase: RequestPhase) -> SchedulerOutput | None:
         return self.take_phases((phase,))
 
-    def take_phases(self, phases, *, eligible=None, reserve_for_later=0):
+    def take_phases(self, phases, *, eligible=None):
         """Select compatible requests across queues under one budget/reservation set."""
         eligible = eligible if eligible is not None else self.execution_ready
         token_budget = self.config.max_num_batched_tokens
         scheduled_requests = []
         selected: set[str] = set()
-        for index, phase in enumerate(phases):
+        for phase in phases:
             queue = self.queues[phase]
-            reserved = reserve_for_later if index == 0 else 0
-            available = token_budget - reserved
             if self.wavefront_chunked_prefill and phase in (
                 RequestPhase.PREFILLING_PRELUDE,
                 RequestPhase.PREFILLING_RECURRENT,
             ):
-                token_budget = reserved + self._take_wavefront_phase(
+                token_budget = self._take_wavefront_phase(
                     phase,
                     queue,
-                    available,
+                    token_budget,
                     scheduled_requests,
                     selected,
                     eligible,
                 )
                 continue
             remaining = len(queue)
-            while queue and available and len(selected) < self.config.max_num_seqs and remaining:
+            while queue and token_budget and len(selected) < self.config.max_num_seqs and remaining:
                 remaining -= 1
                 request = self.requests[queue.popleft()]
                 if eligible is not None and not eligible(request):
@@ -762,7 +740,7 @@ class Scheduler:
                 ):
                     queue.append(request.request_id)
                     continue
-                scheduled_request = self._make_scheduled_request(request, phase, available)
+                scheduled_request = self._make_scheduled_request(request, phase, token_budget)
                 if (
                     phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
                     and scheduled_request.token_count <= 0
@@ -784,7 +762,6 @@ class Scheduler:
                 selected.add(request.request_id)
                 scheduled_requests.append(replace(scheduled_request, phase=phase))
                 token_budget -= scheduled_request.token_count
-                available -= scheduled_request.token_count
         if not scheduled_requests:
             return None
         # Fairness follows the requests actually selected, including a mixed attempt
@@ -792,9 +769,7 @@ class Scheduler:
         selected_phases = {scheduled_request.phase for scheduled_request in scheduled_requests}
         prompt_phases = selected_phases.intersection(self.policy.PREFILL_PHASES)
         recorded = (
-            RequestPhase.SPECULATIVE
-            if RequestPhase.SPECULATIVE in selected_phases
-            else RequestPhase.RECURRENT
+            RequestPhase.RECURRENT
             if RequestPhase.RECURRENT in selected_phases
             else next(iter(prompt_phases))
             if prompt_phases
@@ -824,8 +799,6 @@ class Scheduler:
         phases = {item.phase for item in scheduled_requests}
         if phases == {RequestPhase.PREFILL}:
             return self.total_ut_steps
-        if phases == {RequestPhase.SPECULATIVE, RequestPhase.PREFILLING_RECURRENT}:
-            return 1
         if RequestPhase.SPECULATIVE in phases or RequestPhase.CODA in phases:
             return 0
         if RequestPhase.PRELUDE in phases:
@@ -836,12 +809,7 @@ class Scheduler:
             # In mixed mode, stage just the embeddings when recurrent decode work
             # is ready so the next depth can join that batch. Without a reason to
             # yield, PRELUDE can execute the full prompt depth in this submission.
-            if self.config.mode == "mixed" and (
-                self.has_ready(RequestPhase.RECURRENT)
-                or (
-                    self.speculative_config is not None and self.has_ready(RequestPhase.SPECULATIVE)
-                )
-            ):
+            if self.config.mode == "mixed" and self.has_ready(RequestPhase.RECURRENT):
                 return 0
             return self.total_ut_steps
         if RequestPhase.PREFILLING_RECURRENT in phases:
@@ -1435,8 +1403,7 @@ class Scheduler:
                         request.loops_done = 0
                     if request.request_id not in self.queues[RequestPhase.SPECULATIVE]:
                         self.enqueue(request, RequestPhase.SPECULATIVE)
-                if emitted:
-                    update.outputs.append(request)
+                update.outputs.append(request)
         return update
 
     def update_after_submission(

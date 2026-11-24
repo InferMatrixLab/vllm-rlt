@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from vllm_rlt.worker.metadata import KVLayout, KVMetadata, PackedKVRange
+from vllm_rlt.worker.metadata import KVLayout, KVMetadata
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import UvaBackedTensor, copy_tensor, use_uva_on
 
@@ -26,14 +26,7 @@ def prefill_stage_rows(config, scheduler, *, staged_prefill=None) -> int:
 
 
 def execution_buffer_bytes(
-    config,
-    scheduler,
-    cache,
-    execution,
-    element_size,
-    *,
-    staged_prefill=None,
-    device_kv_metadata=True,
+    config, scheduler, cache, execution, element_size, *, staged_prefill=None
 ):
     rows = scheduler.max_num_batched_tokens
     if execution.pad_to_power_of_two:
@@ -44,7 +37,7 @@ def execution_buffer_bytes(
     if execution.static_buffers:
         # Existing prefill/eager workspaces remain separate from async buffer sets.
         total += 4 * rows * (hidden + 4 * width + 36)
-    if execution.async_scheduling and device_kv_metadata:
+    if execution.async_scheduling:
         planes = config.total_ut_steps if cache.layout == "last_exited" else 1
         # Four routing buffer sets, including capacity for an H2D descriptor fallback.
         total += 4 * rows * (hidden + 4 * width + 68)
@@ -203,7 +196,6 @@ def stage_metadata(layouts, stage, *, padded_rows=None):
                     else None
                 ),
                 max_seqlen_q=attention.max_seqlen_q,
-                packed_ranges=layout.packed_ranges,
             )
         )
     return tuple(batches)
@@ -218,7 +210,6 @@ class PackedLayout:
     """
 
     rows: tuple
-    packed_ranges: tuple[PackedKVRange, ...] | None
     writable: bool
     sequence_start: int
     lengths_start: int
@@ -274,7 +265,6 @@ class PackedMetadataBuffer:
             layouts.append(
                 PackedLayout(
                     rows=item.rows,
-                    packed_ranges=item.packed_ranges,
                     writable=item.writable,
                     sequence_start=sequence_start,
                     lengths_start=lengths_start,
@@ -357,7 +347,6 @@ class PackedMetadataBuffer:
                         layout.cumulative_start : layout.cumulative_start + q + 1
                     ],
                     max_seqlen_q=layout.max_query,
-                    packed_ranges=layout.packed_ranges,
                 )
             )
         return self.targets[torch.int64][: self.token_count], tuple(metadata)

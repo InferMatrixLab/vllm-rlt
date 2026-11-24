@@ -31,12 +31,7 @@ from vllm_rlt.attention import (
 from vllm_rlt.device import resolve_device
 from vllm_rlt.request import ExecutionBatch
 from vllm_rlt.worker.buffers import stage_metadata
-from vllm_rlt.worker.metadata import (
-    DeviceKVMetadata,
-    KVMetadata,
-    MetadataBuilder,
-    MixedRecurrentKVMetadata,
-)
+from vllm_rlt.worker.metadata import DeviceKVMetadata, KVMetadata, MetadataBuilder
 
 KV_CACHE_DTYPES = ("auto", "fp8_e4m3")
 FP8_E4M3_MAX = 448.0
@@ -199,8 +194,6 @@ class KVCacheManager:
         attention: AttentionBackend | None = None,
         kv_cache_dtype: str = "auto",
         fp8_scale: float | None = None,
-        auxiliary_width: int = 0,
-        interleaved_kv: bool = False,
     ):
         for name, value in (
             ("num_layers", num_layers),
@@ -267,24 +260,8 @@ class KVCacheManager:
             )
         shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
         storage = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else dtype
-        if interleaved_kv:
-            # The relative decode kernel reads K and V from one row per head.
-            combined = torch.empty(
-                (num_layers, num_blocks, num_kv_heads, block_size, 2 * head_dim),
-                device=self.device,
-                dtype=storage,
-            )
-            self.key_cache, self.value_cache = combined.permute(1, 0, 3, 2, 4).split(
-                head_dim, dim=-1
-            )
-        else:
-            self.key_cache = torch.empty(shape, device=self.device, dtype=storage)
-            self.value_cache = torch.empty_like(self.key_cache)
-        self.auxiliary_cache = (
-            torch.empty((*shape[:3], auxiliary_width), device=self.device, dtype=dtype)
-            if auxiliary_width
-            else None
-        )
+        self.key_cache = torch.empty(shape, device=self.device, dtype=storage)
+        self.value_cache = torch.empty_like(self.key_cache)
         # One scale per stored vector; None for an unquantized pool.
         self.key_scale = self.value_scale = None
         if kv_cache_dtype == "fp8_e4m3":
@@ -338,7 +315,7 @@ class KVCacheManager:
 
     @property
     def bytes_per_block(self) -> int:
-        size = kv_bytes_per_block(
+        return kv_bytes_per_block(
             self.num_layers,
             self.block_size,
             self.num_kv_heads,
@@ -346,9 +323,6 @@ class KVCacheManager:
             self.key_cache.element_size(),
             self.kv_cache_dtype,
         )
-        if self.auxiliary_cache is not None:
-            size += self.auxiliary_cache.stride(0) * self.auxiliary_cache.element_size()
-        return size
 
     def required_blocks(self, max_tokens: int) -> int:
         if not isinstance(max_tokens, Integral) or isinstance(max_tokens, bool) or max_tokens <= 0:
@@ -903,27 +877,7 @@ class KVCacheManager:
         if not rows:
             return
         self._store_layer(layer, batch.write_blocks, batch.write_offsets, k[:rows], v[:rows])
-        self._mark_prepared_write(layer, batch, coverage)
-
-    def record_external_kv(self, layer, batch):
-        """Record host coverage after a fused backend has enqueued its KV writes."""
-        self._validate_layer(layer)
-        coverage = self._require_live_batch(batch)
-        if isinstance(batch, MixedRecurrentKVMetadata):
-            batch = batch.prompt
-            coverage = self._require_live_batch(batch)
-        if isinstance(batch, DeviceKVMetadata):
-            return
-        if not batch.writable:
-            raise ValueError("a read-only prepared KV batch cannot be written")
-        self._mark_prepared_write(layer, batch, coverage)
-
-    def _mark_prepared_write(self, layer, batch, coverage):
-        if batch.packed_ranges is not None:
-            for seq in batch.packed_ranges:
-                written = seq.allocation.written[self._plane(seq.depth)][layer]
-                written.add_range(seq.start, seq.end)
-        elif coverage is None:
+        if coverage is None:
             for allocation, depth, position in batch.rows:
                 allocation.written[self._plane(depth)][layer].add(position)
         else:
@@ -1046,10 +1000,7 @@ class KVCacheManager:
             )
         if not batch.rows:
             return torch.empty_like(q)
-        if batch.packed_ranges is not None:
-            for seq in batch.packed_ranges:
-                self._require_prefix(seq.allocation, layer, seq.depth, seq.end)
-        elif coverage is None:
+        if coverage is None:
             for allocation, depth, position in batch.rows:
                 self._require_prefix(allocation, layer, depth, position + 1)
         else:
