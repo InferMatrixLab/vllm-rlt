@@ -1,0 +1,122 @@
+{
+  "native_cache4": {
+    "library": "_C.cpython-312-x86_64-linux-gnu.so",
+    "symbol": "_ZN8vllm_rlt44_GLOBAL__N__a41860c7_11_rms_norm_cu_2545e3b615rms_norm_kernelIfLi256ELb0ELb1ELi0ELi4EEEvPT_PKS2_S5_S5_NS0_9RowLayoutEf",
+    "resources": "REG:40 STACK:0 SHARED:1072 LOCAL:0 CONSTANT[0]:1028 TEXTURE:0 SURFACE:0 SAMPLER:0",
+    "sass_static_instruction_counts": {
+      "LDG": 10,
+      "STG": 5,
+      "FFMA": 17,
+      "FMUL": 5,
+      "FADD": 18,
+      "F2F": 0,
+      "FADD2": 8,
+      "FMUL2": 24,
+      "HADD2": 0,
+      "HMUL2": 0,
+      "SHFL": 5,
+      "BAR": 2,
+      "LDS": 4,
+      "STS": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "note": "Static instruction counts; loops, predicates and active warps change dynamic execution."
+  },
+  "native_stream": {
+    "library": "_C.cpython-312-x86_64-linux-gnu.so",
+    "symbol": "_ZN8vllm_rlt44_GLOBAL__N__a41860c7_11_rms_norm_cu_2545e3b615rms_norm_kernelIfLi256ELb0ELb1ELi0ELi0EEEvPT_PKS2_S5_S5_NS0_9RowLayoutEf",
+    "resources": "REG:32 STACK:0 SHARED:1072 LOCAL:0 CONSTANT[0]:1028 TEXTURE:0 SURFACE:0 SAMPLER:0",
+    "sass_static_instruction_counts": {
+      "LDG": 41,
+      "STG": 6,
+      "FFMA": 17,
+      "FMUL": 5,
+      "FADD": 18,
+      "F2F": 0,
+      "FADD2": 58,
+      "FMUL2": 78,
+      "HADD2": 0,
+      "HMUL2": 0,
+      "SHFL": 5,
+      "BAR": 2,
+      "LDS": 4,
+      "STS": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "note": "Static instruction counts; loops, predicates and active warps change dynamic execution."
+  },
+  "vllm_float4": {
+    "library": "vllm_rms_review.so",
+    "symbol": "_ZN4vllm15rms_norm_kernelIfLi4ELi2ELb1EEEvPT_PKS1_lllllS4_lfii",
+    "resources": "REG:32 STACK:0 SHARED:1192 LOCAL:0 CONSTANT[0]:980 TEXTURE:0 SURFACE:0 SAMPLER:0",
+    "sass_static_instruction_counts": {
+      "LDG": 41,
+      "STG": 5,
+      "FFMA": 63,
+      "FMUL": 42,
+      "FADD": 75,
+      "F2F": 0,
+      "FADD2": 0,
+      "FMUL2": 0,
+      "HADD2": 0,
+      "HMUL2": 0,
+      "SHFL": 10,
+      "BAR": 3,
+      "LDS": 19,
+      "STS": 3,
+      "LDL": 0,
+      "STL": 0
+    },
+    "note": "Static instruction counts; loops, predicates and active warps change dynamic execution."
+  },
+  "scalar_cache4": {
+    "library": "rms_reg_scalar.so",
+    "symbol": "_ZN14rms_reg_scalar50_GLOBAL__N__cafa7628_17_rms_reg_scalar_cu_8b6463cd15rms_norm_kernelIfLi256ELb0ELb1ELi0ELi4EEEvPT_PKS2_S5_S5_NS0_9RowLayoutEf",
+    "resources": "REG:40 STACK:0 SHARED:1072 LOCAL:0 CONSTANT[0]:1028 TEXTURE:0 SURFACE:0 SAMPLER:0",
+    "sass_static_instruction_counts": {
+      "LDG": 10,
+      "STG": 5,
+      "FFMA": 17,
+      "FMUL": 53,
+      "FADD": 34,
+      "F2F": 0,
+      "FADD2": 0,
+      "FMUL2": 0,
+      "HADD2": 0,
+      "HMUL2": 0,
+      "SHFL": 5,
+      "BAR": 2,
+      "LDS": 4,
+      "STS": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "note": "Static instruction counts; loops, predicates and active warps change dynamic execution."
+  },
+  "variant_threads512": {
+    "library": "rms_reg_pair.so",
+    "symbol": "_ZN12rms_reg_pair48_GLOBAL__N__267a318c_15_rms_reg_pair_cu_9023ccff15rms_norm_kernelIfLi512ELb0ELb1ELi0ELi0EEEvPT_PKS2_S5_S5_NS0_9RowLayoutEf",
+    "resources": "REG:32 STACK:0 SHARED:1112 LOCAL:0 CONSTANT[0]:1028 TEXTURE:0 SURFACE:0 SAMPLER:0",
+    "sass_static_instruction_counts": {
+      "LDG": 41,
+      "STG": 6,
+      "FFMA": 17,
+      "FMUL": 5,
+      "FADD": 26,
+      "F2F": 0,
+      "FADD2": 58,
+      "FMUL2": 78,
+      "HADD2": 0,
+      "HMUL2": 0,
+      "SHFL": 5,
+      "BAR": 2,
+      "LDS": 5,
+      "STS": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "note": "Static instruction counts; loops, predicates and active warps change dynamic execution."
+  }
+}

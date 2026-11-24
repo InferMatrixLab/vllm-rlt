@@ -1,0 +1,248 @@
+[
+  {
+    "case": [
+      "bfloat16",
+      3073,
+      1024,
+      true
+    ],
+    "index": [
+      345,
+      107
+    ],
+    "input": -1.9453125,
+    "weight": 1.03125,
+    "residual": 2.15625,
+    "sum_of_squares_fp64_fsum": 3067.7674220691297,
+    "mean_squares_fp64_fsum": 0.9982972411549397,
+    "torch_fp32_row_sum_squares": 3067.767578125,
+    "torch_fp32_mean": 0.9982972741127014,
+    "torch_fp32_scale": 1.0008518695831299,
+    "torch_fp32_weighted_before_cast": -2.0078125,
+    "fp64_weighted_before_cast": -2.0078126495358384,
+    "torch_standalone": -2.0,
+    "torch_after_residual": 0.15625,
+    "old_standalone": -2.0,
+    "old_after_residual": 0.15625,
+    "old_separate_add": 0.15625,
+    "old_fused_equals_standalone_plus_residual": true,
+    "vllm_standalone": -2.015625,
+    "vllm_after_residual": 0.140625,
+    "standalone_output_midpoints": [
+      {
+        "lo": -2.015625,
+        "hi": -2.0,
+        "midpoint": -2.0078125,
+        "fp64_distance": -1.495358383785117e-07,
+        "torch32_distance": 0.0
+      }
+    ],
+    "arms": {
+      "nostatic": {
+        "standalone": -2.0,
+        "with_residual": 0.15625,
+        "separate_add": 0.15625,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "conservative": {
+        "standalone": -2.0,
+        "with_residual": 0.15625,
+        "separate_add": 0.15625,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "balanced": {
+        "standalone": -2.0,
+        "with_residual": 0.15625,
+        "separate_add": 0.15625,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "moderate": {
+        "standalone": -2.0,
+        "with_residual": 0.15625,
+        "separate_add": 0.15625,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "replica_static": {
+        "standalone": -2.0,
+        "with_residual": 0.15625,
+        "separate_add": 0.15625,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      }
+    },
+    "torch_cpu_fp64_to_bf16": -2.015625,
+    "torch_cpu_fp64_to_bf16_after_residual": 0.140625,
+    "direct_fp64_to_bf16_by_adjacent_midpoint": -2.015625,
+    "direct_fp64_to_bf16_after_bf16_residual": 0.140625,
+    "direct_rounding_method": "Select nearest of the two adjacent representable BF16 standalone values by FP64 comparison to their exact midpoint; ties use even BF16 significand. This avoids intermediate FP32 rounding.",
+    "conversion_caution": "The separate torch_cpu_fp64_to_bf16 field records the actual CPU conversion, which can double-round via FP32 and is not used as direct FP64 quantization."
+  },
+  {
+    "case": [
+      "bfloat16",
+      4095,
+      1024,
+      true
+    ],
+    "index": [
+      813,
+      1655
+    ],
+    "input": 2.4375,
+    "weight": 0.99609375,
+    "residual": -2.546875,
+    "sum_of_squares_fp64_fsum": 4037.1454462079128,
+    "mean_squares_fp64_fsum": 0.9858719038358761,
+    "torch_fp32_row_sum_squares": 4037.1455078125,
+    "torch_fp32_mean": 0.9858719706535339,
+    "torch_fp32_scale": 1.0071392059326172,
+    "torch_fp32_weighted_before_cast": 2.445312261581421,
+    "fp64_weighted_before_cast": 2.4453125358963073,
+    "torch_standalone": 2.4375,
+    "torch_after_residual": -0.109375,
+    "old_standalone": 2.453125,
+    "old_after_residual": -0.09375,
+    "old_separate_add": -0.09375,
+    "old_fused_equals_standalone_plus_residual": true,
+    "vllm_standalone": 2.4375,
+    "vllm_after_residual": -0.109375,
+    "standalone_output_midpoints": [
+      {
+        "lo": 2.4375,
+        "hi": 2.453125,
+        "midpoint": 2.4453125,
+        "fp64_distance": 3.5896307259974947e-08,
+        "torch32_distance": -2.384185791015625e-07
+      }
+    ],
+    "arms": {
+      "nostatic": {
+        "standalone": 2.453125,
+        "with_residual": -0.09375,
+        "separate_add": -0.09375,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "conservative": {
+        "standalone": 2.453125,
+        "with_residual": -0.09375,
+        "separate_add": -0.09375,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "balanced": {
+        "standalone": 2.453125,
+        "with_residual": -0.09375,
+        "separate_add": -0.09375,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "moderate": {
+        "standalone": 2.453125,
+        "with_residual": -0.09375,
+        "separate_add": -0.09375,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "replica_static": {
+        "standalone": 2.453125,
+        "with_residual": -0.09375,
+        "separate_add": -0.09375,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      }
+    },
+    "torch_cpu_fp64_to_bf16": 2.4375,
+    "torch_cpu_fp64_to_bf16_after_residual": -0.109375,
+    "direct_fp64_to_bf16_by_adjacent_midpoint": 2.453125,
+    "direct_fp64_to_bf16_after_bf16_residual": -0.09375,
+    "direct_rounding_method": "Select nearest of the two adjacent representable BF16 standalone values by FP64 comparison to their exact midpoint; ties use even BF16 significand. This avoids intermediate FP32 rounding.",
+    "conversion_caution": "The separate torch_cpu_fp64_to_bf16 field records the actual CPU conversion, which can double-round via FP32 and is not used as direct FP64 quantization."
+  },
+  {
+    "case": [
+      "bfloat16",
+      8192,
+      296,
+      true
+    ],
+    "index": [
+      110,
+      6967
+    ],
+    "input": -1.9921875,
+    "weight": 1.046875,
+    "residual": 2.109375,
+    "sum_of_squares_fp64_fsum": 8313.190327209531,
+    "mean_squares_fp64_fsum": 1.0147937411144448,
+    "torch_fp32_row_sum_squares": 8313.1904296875,
+    "torch_fp32_mean": 1.014793872833252,
+    "torch_fp32_scale": 0.9926837086677551,
+    "torch_fp32_weighted_before_cast": -2.0703125,
+    "fp64_weighted_before_cast": -2.0703126489244053,
+    "torch_standalone": -2.0625,
+    "torch_after_residual": 0.046875,
+    "old_standalone": -2.078125,
+    "old_after_residual": 0.03125,
+    "old_separate_add": 0.03125,
+    "old_fused_equals_standalone_plus_residual": true,
+    "vllm_standalone": -2.078125,
+    "vllm_after_residual": 0.03125,
+    "standalone_output_midpoints": [
+      {
+        "lo": -2.078125,
+        "hi": -2.0625,
+        "midpoint": -2.0703125,
+        "fp64_distance": -1.4892440525215989e-07,
+        "torch32_distance": 0.0
+      }
+    ],
+    "arms": {
+      "nostatic": {
+        "standalone": -2.078125,
+        "with_residual": 0.03125,
+        "separate_add": 0.03125,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "conservative": {
+        "standalone": -2.078125,
+        "with_residual": 0.03125,
+        "separate_add": 0.03125,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "balanced": {
+        "standalone": -2.078125,
+        "with_residual": 0.03125,
+        "separate_add": 0.03125,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "moderate": {
+        "standalone": -2.078125,
+        "with_residual": 0.03125,
+        "separate_add": 0.03125,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      },
+      "replica_static": {
+        "standalone": -2.078125,
+        "with_residual": 0.03125,
+        "separate_add": 0.03125,
+        "fused_equals_standalone_plus_residual": true,
+        "unequal_to_old_fused": 0
+      }
+    },
+    "torch_cpu_fp64_to_bf16": -2.078125,
+    "torch_cpu_fp64_to_bf16_after_residual": 0.03125,
+    "direct_fp64_to_bf16_by_adjacent_midpoint": -2.078125,
+    "direct_fp64_to_bf16_after_bf16_residual": 0.03125,
+    "direct_rounding_method": "Select nearest of the two adjacent representable BF16 standalone values by FP64 comparison to their exact midpoint; ties use even BF16 significand. This avoids intermediate FP32 rounding.",
+    "conversion_caution": "The separate torch_cpu_fp64_to_bf16 field records the actual CPU conversion, which can double-round via FP32 and is not used as direct FP64 quantization."
+  }
+]

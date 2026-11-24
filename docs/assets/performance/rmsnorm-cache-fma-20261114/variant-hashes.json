@@ -1,0 +1,14 @@
+{
+  "rms_cache_old": {
+    "source_sha256": "542310f69b2453adb48fc4f98087ff28f3a2aa233d32dd0b7cb8007a4c640397",
+    "wrapper_sha256": "0eacd62a421597b1ba90c91529203f072482ff45ed4afb94fef75df5e925f5da"
+  },
+  "rms_cache_fixed": {
+    "source_sha256": "b5e81d259f1d65c4e5abc9fb9b3ed9b8dc6c8130b84bbe842d62cf607d1d3260",
+    "wrapper_sha256": "9e3b44fd2d90dfe0804e2c4a5c5e88ae5ca761bdeee7e980c1cb0bd7b9a74f22"
+  },
+  "rms_cache_fma": {
+    "source_sha256": "e5ca8ea7c9ef46bcbce27098e70094e477a2b53a5f4db7b4574a053c75a41165",
+    "wrapper_sha256": "2bde31663becefc2e56ed9f385140ca8554fde1cad96431014232238df4ab80e"
+  }
+}
