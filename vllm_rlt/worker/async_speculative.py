@@ -41,6 +41,7 @@ from vllm_rlt.worker.speculative_sampling import (
     categorical,
     speculative_accept,
 )
+from vllm_rlt.worker.tensors import copy_tensor, pinned_tensor
 
 # Float plan arrays travel in the int64 upload as float64 bit patterns.
 _FLOAT_UPLOADS = frozenset({"r_temperature", "r_top_p", "v_temperature", "v_top_p"})
@@ -227,12 +228,22 @@ class SpeculativeRequestState:
 
 
 class SpeculativeRoundBuffer:
-    def __init__(self, runner, scheduler):
+    def __init__(self, runner, scheduler, *, pipeline_capacity=0):
         cache = runner.cache
         width = math.ceil(runner.model.config.max_position_embeddings / cache.block_size)
         shape = (scheduler.max_num_seqs, cache.max_loops, width)
-        self.host_tables = torch.empty(math.prod(shape), dtype=torch.int32, pin_memory=True)
+        self.host_tables = pinned_tensor((math.prod(shape),), torch.int32, cache.device)
+        self.table_versions = ()
+        self.table_shape = ()
+        self.tables_dirty = False
         self.tables = torch.empty(math.prod(shape), dtype=torch.int32, device=cache.device)
+        self.plan_key = None
+        self.plan = None
+        if pipeline_capacity:
+            size = ((3 + 2 * pipeline_capacity) * scheduler.max_num_seqs,)
+            self.host_plan = pinned_tensor(size, torch.int64, cache.device)
+            self.device_plan = torch.empty(size, dtype=torch.int64, device=cache.device)
+        self.inputs_ready = None
         # Result capacity in int64 elements (not bytes), for one submission.
         # Block layout: [result token IDs for all verification rows,
         #                accepted counts per request, next positions per request,
@@ -391,8 +402,24 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             self.coda_graphs.prepare()
         self.compute_stream = compute_stream
         self.copy_stream = copy_stream
+        self.input_stream = (
+            torch.cuda.Stream(device=self.device) if execution.multi_stream else compute_stream
+        )
+        self.use_uva = execution.use_uva
+        self.pipeline_capacity = (
+            min(config.num_speculative_tokens + 1, config.target_loops // config.draft_loops)
+            if config.mode == "pipeline"
+            else 0
+        )
+        self.pipeline_lanes = torch.arange(self.pipeline_capacity, device=self.device)
         self.compute_stream.wait_stream(torch.cuda.current_stream(self.device))
-        self.buffers = [SpeculativeRoundBuffer(self, scheduler) for _ in range(2)]
+        self.buffers = [
+            SpeculativeRoundBuffer(self, scheduler, pipeline_capacity=self.pipeline_capacity)
+            for _ in range(2)
+        ]
+        if self.input_stream is not self.compute_stream:
+            for buffer in self.buffers:
+                buffer.inputs_ready = torch.cuda.Event()
         self.states: dict[str, SpeculativeRequestState] = {}
         # Device (input token, next position) per live request. A round gathers
         # and scatters these rows in one operation each instead of per request.
@@ -428,10 +455,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 request, allocation, self.slot_values[slot, 0], self.slot_values[slot, 1], slot=slot
             )
         if self.config.mode == "pipeline":
-            width = min(
-                self.config.num_speculative_tokens + 1,
-                self.config.target_loops // self.config.draft_loops,
-            )
+            width = self.pipeline_capacity
             parameter = next(self.model.parameters())
             state.pipeline = DevicePipelineState(
                 state.token.expand(width).clone(),
@@ -516,28 +540,64 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             )
             for scheduled_request in scheduled_requests
         )
-        page_counts = []
+        width, versions = 0, []
         for scheduled_request, (_, allocation) in zip(scheduled_requests, allocations):
             upper = scheduled_request.token_start + scheduled_request.token_count
             if upper > allocation.max_tokens or upper <= 0:
                 raise ValueError("speculative round exceeds reserved context")
             pages = math.ceil(upper / self.cache.block_size)
-            if any(len(table) < pages for table in allocation.block_tables):
+            version = allocation.block_tables
+            if any(len(table) < pages for table in version):
                 raise ValueError("speculative round has unallocated KV pages")
-            page_counts.append(pages)
+            width = max(width, pages)
+            versions.append(version)
         # A prefix of flat reusable storage provides contiguous active views even
         # as request count/page width change. The previous copy must be retired.
-        shape = (len(scheduled_requests), self.cache.max_loops, max(page_counts))
+        shape = (len(scheduled_requests), self.cache.max_loops, width)
         size = math.prod(shape)
         host_tables = buffer.host_tables[:size].view(shape)
         tables = buffer.tables[:size].view(shape)
-        table_view = host_tables.numpy()
-        table_view.fill(0)
-        for i, ((_, allocation), pages) in enumerate(zip(allocations, page_counts)):
-            for depth, table in enumerate(allocation.block_tables):
-                table_view[i, depth, :pages] = table[:pages]
+        buffer.tables_dirty = (
+            buffer.table_shape != shape
+            or any(old is not new for old, new in zip(buffer.table_versions, versions, strict=True))
+        )
+        if buffer.tables_dirty:
+            table_view = host_tables.numpy()
+            table_view.fill(0)
+            # Upload allocated pages through this batch's width. Device context
+            # lengths still limit each row. Advancing within these pages is free.
+            for i, version in enumerate(versions):
+                for depth, table in enumerate(version):
+                    pages = min(width, len(table))
+                    table_view[i, depth, :pages] = table[:pages]
+            # Retain immutable tuples for identity checks, including across KV growth.
+            buffer.table_versions = tuple(versions)
+            buffer.table_shape = shape
         buffer.leased = True
         return buffer, allocations, host_tables, tables
+
+    def _stage_pipeline_plan(self, spans, buffer):
+        capacity = self.pipeline_capacity
+        widths = tuple(min(span.token_count, capacity) for span in spans)
+        limits = tuple(
+            len(span.request.prompt_token_ids) + span.request.sampling_params.max_tokens - 1
+            for span in spans
+        )
+        key = (widths, limits)
+        if key == buffer.plan_key:
+            return False
+        roots, rows, owners = [], [], []
+        for index, width in enumerate(widths):
+            roots.append(len(rows))
+            rows.extend(range(index * capacity, index * capacity + width))
+            owners.extend([index] * width)
+        n, num_rows = len(widths), len(rows)
+        size = 3 * n + 2 * num_rows
+        host = buffer.host_plan[:size]
+        host.numpy()[:] = (*widths, *limits, *roots, *rows, *owners)
+        buffer.plan = buffer.device_plan[:size].split((n, n, n, num_rows, num_rows))
+        buffer.plan_key = key
+        return True
 
     def _round_plan(self, items, states, buffer):
         """Host-built gather/scatter indices for a round, uploaded in one copy.
@@ -805,10 +865,29 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         # 1. Reserve a slot and prepare only the active CPU page tables.
         buffer, allocations, host_tables, tables = self._prepare_round(batch)
         scheduled_requests = batch.requests
+        plan_dirty = self.config.mode == "pipeline" and self._stage_pipeline_plan(
+            scheduled_requests, buffer
+        )
+        upload = buffer.tables_dirty or plan_dirty
+        if upload:
+            # The ticket keeps this bank immutable through readback. Upload can
+            # overlap earlier compute and uses neither the compute nor D2H stream.
+            with torch.cuda.stream(self.input_stream):
+                if buffer.tables_dirty:
+                    copy_tensor(host_tables, tables, use_uva=self.use_uva)
+                if plan_dirty:
+                    size = sum(t.numel() for t in buffer.plan)
+                    copy_tensor(
+                        buffer.host_plan[:size], buffer.device_plan[:size], use_uva=self.use_uva
+                    )
+                if buffer.inputs_ready is not None:
+                    buffer.inputs_ready.record(self.input_stream)
         # A partial submission may not record events. The engine drains both
         # owned streams before releasing allocations or recycling the slot.
         # 2. Submit computation; device state joins successive rounds.
         with torch.cuda.stream(self.compute_stream):
+            if upload and buffer.inputs_ready is not None:
+                self.compute_stream.wait_event(buffer.inputs_ready)
             states = tuple(
                 self._state(scheduled_request.request, buffer)
                 for scheduled_request in scheduled_requests
@@ -816,7 +895,6 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             rounds = tuple(s.submitted for s in states)
             if any(s.submitted > s.delivered for s in states):
                 self.submitted_before_collect += 1
-            tables.copy_(host_tables, non_blocking=True)
             error_flags = False
             if self.config.mode == "pipeline":
                 args = (scheduled_requests, states, tables, allocations, buffer)
@@ -874,28 +952,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             torch.stack([state.active for state in pipelines]),
         )
         num_requests, capacity = pipeline.tokens.shape
-        widths = [min(span.token_count, capacity) for span in spans]
-        output_limits = [
-            len(span.request.prompt_token_ids) + span.request.sampling_params.max_tokens - 1
-            for span in spans
-        ]
-        starts, packed_rows, row_owners = [], [], []
-        for index, width in enumerate(widths):
-            starts.append(len(packed_rows))
-            packed_rows.extend(range(index * capacity, index * capacity + width))
-            row_owners.extend([index] * width)
-        num_rows = len(packed_rows)
-        # Keep a dense request window for state updates and pack the model
-        # inputs to the scheduler's actual per-request reservations.
-        host = torch.tensor(
-            widths + output_limits + starts + packed_rows + row_owners, pin_memory=True
-        )
-        buffer.keepalive.append(host)
-        widths, output_limits, roots, rows, owners = host.to(self.device, non_blocking=True).split(
-            (num_requests, num_requests, num_requests, num_rows, num_rows)
-        )
-
-        lanes = torch.arange(capacity, device=self.device)
+        widths, output_limits, roots, rows, owners = buffer.plan
+        num_rows = len(rows)
+        lanes = self.pipeline_lanes
         valid = pipeline.active & (lanes < widths[:, None])
         lengths = valid.sum(1)
         active = valid.flatten()[rows]
@@ -1119,7 +1178,11 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         for buffer in self.buffers:
             buffer.keepalive.clear()
             buffer.leased = False
+            buffer.table_shape = ()
+            buffer.plan_key = None
 
     def synchronize(self):
+        if self.input_stream is not self.compute_stream:
+            self.input_stream.synchronize()
         self.compute_stream.synchronize()
         self.copy_stream.synchronize()

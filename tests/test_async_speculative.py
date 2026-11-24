@@ -359,6 +359,8 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
         leased=False,
         host_tables=torch.full((128,), -91, dtype=torch.int32),
         tables=torch.full((128,), -92, dtype=torch.int32),
+        table_versions=(),
+        table_shape=(),
     )
     runner.buffers = [buffer]
     requests = [Request(rid, [2], SamplingParams()) for rid in ("short", "long")]
@@ -383,12 +385,20 @@ def test_active_page_tables_are_contiguous_and_do_not_touch_inactive_storage():
     assert (buffer.tables == -92).all()  # CPU preparation does not upload.
     with pytest.raises(RuntimeError, match="exhausted"):
         runner._prepare_round(batch)
+    buffer.leased = False
+    same_width = SchedulerOutput(
+        RequestPhase.SPECULATIVE,
+        [ScheduledRequest(requests[0], 0, 1), batch.requests[1]],
+    )
+    runner._prepare_round(same_width)
+    assert not buffer.tables_dirty
     # Simulate retirement, then shrink both dimensions using the same storage.
     buffer.leased = False
     before = buffer.host_tables.clone()
     smaller = SchedulerOutput(RequestPhase.SPECULATIVE, [ScheduledRequest(requests[0], 0, 1)])
     _, _, host, device = runner._prepare_round(smaller)
     assert host.shape == device.shape == (1, 4, 1)
+    assert buffer.tables_dirty
     assert host.is_contiguous() and device.is_contiguous()
     assert torch.equal(buffer.host_tables[4:], before[4:])
 
