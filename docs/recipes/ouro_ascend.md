@@ -88,6 +88,31 @@ curl --fail http://127.0.0.1:8123/v1/completions \
   -d '{"model":"ouro","prompt":"The capital of France is","max_tokens":8,"temperature":0,"min_loops":4,"max_loops":4,"exit_threshold":1}'
 ```
 
+## Same-host 2P2D PD
+
+The PD path supports an experimental same-host 2P2D deployment for Ouro-1.4B.
+Use BF16, fixed four loops, greedy decoding, full prefill and `last_exited` KV.
+Prefill and decode workers run on separate NPU pools and exchange device
+buffers through asynchronous HCCL point-to-point operations.
+
+Expose four physical NPUs and use their logical indices inside the process.
+The benchmark writes request outputs, lifecycle timings and per-worker byte
+accounting to a JSON file.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3  # replace with four free NPUs
+# If another HCCL job uses the default interface, set HCCL_IF_IP and
+# HCCL_SOCKET_IFNAME to the host's dedicated HCCL interface before launching.
+python benchmarks/ascend_pd_2p2d.py \
+  --model "$MODEL" \
+  --output /tmp/ascend-pd-2p2d.json \
+  --prefill-devices 0 1 \
+  --decode-devices 2 3
+```
+
+The qualified scope excludes FP8 KV, prefix caching, preemption, speculation,
+CUDA graphs, WCPB, chunked prefill and cross-host transport.
+
 <a id="6-fixed-depth-asynchronous-engine-plan"></a>
 ## Fixed-depth asynchronous engine plan
 

@@ -57,9 +57,22 @@ class StageEngine:
         speculative_config=None,
         stage_config=None,
         connector: StageConnector | None = None,
+        distributed_stage=False,
+        distributed_backend=None,
+        distributed_rank=None,
+        distributed_world_size=None,
+        distributed_prefill_world_size=None,
+        distributed_init_method=None,
+        distributed_timeout=None,
     ):
         self.model = model
         self.stage_config = stage_config or StageConfig()
+        self.distributed_backend = distributed_backend
+        self.distributed_rank = distributed_rank
+        self.distributed_world_size = distributed_world_size
+        self.distributed_prefill_world_size = distributed_prefill_world_size
+        self.distributed_init_method = distributed_init_method
+        self.distributed_timeout = distributed_timeout
         self.profiling = Profiler(next(model.parameters()).device)
         cache_config = cache_config or CacheConfig()
         scheduler_config = scheduler_config or SchedulerConfig()
@@ -104,7 +117,7 @@ class StageEngine:
                 self.execution_config.cuda_graphs
                 or (self.execution_config.async_scheduling and self.execution_config.static_buffers)
                 or speculative_config is not None
-                or self.stage_config.role != "prefill_decode"
+                or (self.stage_config.role != "prefill_decode" and not distributed_stage)
                 or scheduler_config.enable_preemption
                 or cache_config.enable_prefix_caching
                 or cache_config.layout != "last_exited"

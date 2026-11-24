@@ -8,9 +8,10 @@ from dataclasses import asdict, dataclass, field, replace
 
 import torch
 
+from vllm_rlt.device import stream_module
 from vllm_rlt.request import Request, RequestPhase
 
-from .transport import NixlConnector, kv_segments, partition_segments
+from .transport import HcclTransport, NixlConnector, kv_segments, partition_segments
 
 
 @dataclass
@@ -43,6 +44,7 @@ class RequestTransfer:
     compute_done: bool = False
     last_event: object = None
     acknowledged: bool = False
+    wire_started: bool = False
     started: float = field(default_factory=time.monotonic)
 
 
@@ -58,6 +60,7 @@ class PDStageConnector:
         self.free_slots = list(reversed(range(len(hidden))))
         self.transfer_cursor = 0
         self.prefill_tokens = 0
+        self.wire_owner = None
 
     @classmethod
     def create(cls, engine, *, config, notify):
@@ -72,7 +75,18 @@ class PDStageConnector:
         hidden = torch.empty(
             (limit, engine.model.config.hidden_size), device=parameter.device, dtype=parameter.dtype
         )
-        transport = NixlConnector(stage.stage_id, engine.cache_manager, hidden, config)
+        if config.device_type == "npu":
+            transport = HcclTransport(
+                stage.stage_id,
+                engine.cache_manager,
+                hidden,
+                config,
+                rank=engine.distributed_rank,
+                world_size=engine.distributed_world_size,
+                prefill_world_size=len(config.prefill_devices),
+            )
+        else:
+            transport = NixlConnector(stage.stage_id, engine.cache_manager, hidden, config)
         return cls(engine, hidden, transport, config, notify=notify)
 
     def startup_info(self):
@@ -124,6 +138,8 @@ class PDStageConnector:
             self.cancel(command["tid"])
         elif kind == "cancel_safe":
             self.cancel_safe(command["tid"])
+        elif kind == "start_receive":
+            self.transport.start_receive(command["tid"], command.get("sequence"))
         elif kind == "commit":
             self.commit(command["tid"], command["count"])
         elif kind == "ack":
@@ -143,6 +159,7 @@ class PDStageConnector:
             bytes_sent=self.transport.bytes_sent,
             transfers=self.transport.transfers,
             transfer_seconds=self.transport.transfer_seconds,
+            transfer_stats=getattr(self.transport, "transfer_stats", {}),
         )
 
     def _remove(self, transfer):
@@ -202,18 +219,37 @@ class PDStageConnector:
         if not progress.chunk_complete:
             transfer.last_event = event
             return
-        stream = stream or torch.cuda.current_stream(self.cache.device)
-        with torch.cuda.stream(stream):
+        if getattr(self.transport, "preserve_segments", False) and not progress.prompt_complete:
+            # Ascend HCCL receives are registered against the complete prompt
+            # geometry. Defer intermediate recurrent boundaries until the full
+            # prefill has produced the final hidden state.
+            transfer.last_event = event
+            return
+        device_ops = stream_module(self.cache.device) or torch.cuda
+        stream = stream or device_ops.current_stream(self.cache.device)
+        with device_ops.stream(stream):
             if event is not None:
                 stream.wait_event(event)
             if progress.prompt_complete:
                 self.hidden[transfer.slot].copy_(request.hidden_state)
-            ready = torch.cuda.Event()
+            ready = device_ops.Event()
             ready.record(stream)
         transfer.last_event = ready
         self.prefill_tokens += request.num_prefilled_tokens - start
+        if getattr(self.transport, "preserve_segments", False):
+            start = transfer.target_cached_tokens
+            end = len(request.prompt_token_ids)
+        queue_end = (
+            end
+            if getattr(self.transport, "preserve_segments", False)
+            else request.num_prefilled_tokens
+        )
         self.queue_chunk(
-            transfer, start, request.num_prefilled_tokens, ready, progress.prompt_complete
+            transfer,
+            start,
+            queue_end,
+            ready,
+            progress.prompt_complete,
         )
         transfer.compute_done = progress.prompt_complete
 
@@ -239,9 +275,36 @@ class PDStageConnector:
                 )
             )
             target.append((peer["hidden_ptr"] + transfer.target_slot * size, size, peer["device"]))
-        for local, remote, size in partition_segments(
-            source, target, self.config.transfer_chunk_bytes, self.config.max_transfer_descriptors
-        ):
+        partitions = []
+        if getattr(self.transport, "preserve_segments", False) and final and start < end:
+            kv_count = len(source) - 1 if final else len(source)
+            partitions.extend(
+                partition_segments(
+                    source[:kv_count],
+                    target[:kv_count],
+                    self.config.transfer_chunk_bytes,
+                    self.config.max_transfer_descriptors,
+                    coalesce=False,
+                )
+            )
+            partitions.extend(
+                partition_segments(
+                    source[kv_count:],
+                    target[kv_count:],
+                    self.config.transfer_chunk_bytes,
+                    self.config.max_transfer_descriptors,
+                    coalesce=False,
+                )
+            )
+        else:
+            partitions = partition_segments(
+                source,
+                target,
+                self.config.transfer_chunk_bytes,
+                self.config.max_transfer_descriptors,
+                coalesce=not getattr(self.transport, "preserve_segments", False),
+            )
+        for local, remote, size in partitions:
             transfer.chunks.append((event, transfer.next_sequence, local, remote, size))
             transfer.next_sequence += 1
 
@@ -295,12 +358,23 @@ class PDStageConnector:
                 slot=transfer.slot,
                 cached_tokens=hit,
             )
+            if hasattr(self.transport, "prepare_receive"):
+                self.transport.prepare_receive(
+                    tid,
+                    peer,
+                    self.cache.plane_block_tables(tid),
+                    transfer.slot,
+                    hit,
+                    len(tokens),
+                    True,
+                )
         else:
             transfer.target_tables, transfer.target_slot = target_tables, target_slot
             transfer.target_cached_tokens = target_cached_tokens
             if hit > transfer.target_cached_tokens:
-                event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream(self.cache.device))
+                device_ops = stream_module(self.cache.device) or torch.cuda
+                event = device_ops.Event()
+                event.record(device_ops.current_stream(self.cache.device))
                 self.queue_chunk(transfer, transfer.target_cached_tokens, hit, event, False)
             self.notify("prefill_started", tid=tid)
 
@@ -310,11 +384,19 @@ class PDStageConnector:
             self.notify("released", tid=transfer_id, role=self.engine.stage_config.role)
             return
         transfer.cancelled = True
+        if (
+            transfer.outgoing
+            and self.wire_owner == transfer_id
+            and not self.transport.busy(transfer_id)
+        ):
+            self.wire_owner = None
         if transfer.outgoing:
             transfer.chunks.clear()
             self.engine.suspend_transfer(transfer.request)
         elif transfer.ready:
             self._remove(transfer)  # Complete receipt proves all remote writes have ended.
+        elif hasattr(self.transport, "cancel"):
+            self.transport.cancel(transfer_id)
 
     def cancel_safe(self, transfer_id):
         """Coordinator confirms remote writers stopped; resources may now be retired."""
@@ -325,7 +407,8 @@ class PDStageConnector:
             if transfer.outgoing:
                 raise RuntimeError("source cancellation must drain local and remote accesses")
             transfer.cancel_confirmed = True
-            self._remove(transfer)
+            if not self.transport.busy(transfer_id):
+                self._remove(transfer)
 
     def commit(self, transfer_id, count):
         transfer = self.transfers.get(transfer_id)
@@ -349,6 +432,10 @@ class PDStageConnector:
     def progress(self):
         self.cache.poll_prefixes()
         _, notifications = self.transport.poll()
+        if getattr(self.transport, "serialize_transfers", False) and self.wire_owner is not None:
+            owner = self.transfers.get(self.wire_owner)
+            if owner is None or (not owner.chunks and not self.transport.busy(self.wire_owner)):
+                self.wire_owner = None
         for peer, tid, sequence in notifications:
             transfer = self.transfers.get(tid)
             if transfer is None or transfer.cancelled:
@@ -399,7 +486,9 @@ class PDStageConnector:
                 # in-flight budget is filled with further passes below.
                 self._submit_chunk(transfer)
             elif transfer.cancelled:
-                if transfer.ready or transfer.cancel_confirmed:
+                if transfer.ready or (
+                    transfer.cancel_confirmed and not self.transport.busy(transfer.tid)
+                ):
                     self._remove(transfer)
             elif transfer.ready:
                 if transfer.request.request_id not in self.engine.scheduler.requests:
@@ -445,11 +534,19 @@ class PDStageConnector:
         """Submit the transfer's next ready chunk; True when one went out."""
         if not transfer.chunks:
             return False
+        if getattr(self.transport, "serialize_transfers", False):
+            if self.wire_owner is None:
+                self.wire_owner = transfer.tid
+            elif self.wire_owner != transfer.tid:
+                return False
         event, seq, local, remote, size = transfer.chunks[0]
         if event.query() and self.transport.submit(
             transfer.tid, seq, transfer.peer, local, remote, size
         ):
             transfer.chunks.popleft()
             transfer.submitted_since_compute = True
+            transfer.wire_started = True
+            if hasattr(self.transport, "start_receive"):
+                self.notify("transfer_started", tid=transfer.tid, sequence=seq)
             return True
         return False
