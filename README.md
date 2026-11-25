@@ -139,6 +139,11 @@ including Dory sliding attention, uses `flash-attn-4==4.0.0b39` and calibrates
 a fixed scale at startup. See the
 [hardware and calibration requirements](docs/runtime.md#experimental-fa4-static-scale-adapter).
 
+An [experimental deferred Ouro runner](docs/recipes/ouro_deferred.md) groups deep
+loops across response positions with true per-loop KV. It provides a standalone
+mixed-readout experiment and an eager same-readout reference; real-weight BF16
+quality, memory and speed qualification are still required.
+
 ## Model Support
 
 | Checkpoint | Implementation | Platforms | Documented validation scope |

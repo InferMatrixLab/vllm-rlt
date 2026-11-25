@@ -6,12 +6,13 @@ from torch.nn import functional as F
 
 
 @torch.inference_mode()
-def dense_reference(model, token_ids, loops):
+def dense_reference(model, token_ids, loops, *, return_kv=False):
     """Functional causal oracle: no model modules, paged cache, or recurrent API.
 
     Mirrors the equations of the pinned official model, including split-half
     RoPE, GQA, all four sandwich norms, and norm at each loop boundary.
     Returns every depth so intermediate hidden states and gate logits are checked.
+    With return_kv=True, also return the true pre-GQA K/V planes per loop/layer.
     """
     config = model.config
     weights = model.state_dict()
@@ -41,8 +42,9 @@ def dense_reference(model, token_ids, loops):
         rotated = torch.cat([-value[..., split:], value[..., :split]], dim=-1)
         return value * cos + rotated * sin
 
-    outputs = []
+    outputs, kv_planes = [], []
     for _ in range(loops):
+        layer_kv = []
         for layer in range(config.num_hidden_layers):
             prefix = f"model.layers.{layer}"
             attention_input = norm(hidden, prefix + ".input_layernorm")
@@ -59,6 +61,8 @@ def dense_reference(model, token_ids, loops):
             v = linear(attention_input, prefix + ".self_attn.v_proj").reshape(
                 length, config.num_key_value_heads, config.head_dim
             )
+            if return_kv:
+                layer_kv.append((k.clone(), v.clone()))
             groups = config.num_attention_heads // config.num_key_value_heads
             k = k.repeat_interleave(groups, dim=1)
             v = v.repeat_interleave(groups, dim=1)
@@ -80,7 +84,9 @@ def dense_reference(model, token_ids, loops):
             linear(hidden, "model.early_exit_gate") + weights["model.early_exit_gate.bias"]
         ).squeeze(-1)
         outputs.append((hidden.clone(), gate, linear(hidden, "lm_head")))
-    return outputs
+        if return_kv:
+            kv_planes.append(layer_kv)
+    return (outputs, kv_planes) if return_kv else outputs
 
 
 @torch.inference_mode()

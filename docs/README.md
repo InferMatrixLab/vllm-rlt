@@ -30,6 +30,7 @@ setup on `v0.2.0`. The Ascend guide below uses `main`.
 | [Ouro on Ascend](recipes/ouro_ascend.md) | Huawei Ascend NPU setup on `main`, serving commands, and validation scope |
 | [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
 | [Ouro-Thinking recipe](recipes/ouro_thinking.md) | Shared 1.4B/2.6B setup, JSON/SSE client, budgets and validation limits |
+| [Experimental deferred Ouro](recipes/ouro_deferred.md) | Fixed-interval deep batching, true per-loop KV, same-readout reference and unfinished qualification |
 | [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |
 
 Earlier measurements and known limitations are retained in the
