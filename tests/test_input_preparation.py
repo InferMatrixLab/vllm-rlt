@@ -461,7 +461,7 @@ def test_prelude_workspace_owned_once_across_gpu_prepare_and_forward(
         attention_backend="triton" if device == "cuda" else "torch",
     )
     runner = e.model_runner
-    acquired, recorded, forwarded = [], [], []
+    acquired, recorded, forwarded, completion_events = [], [], [], []
     for workspace in runner.requestspaces["boundary"]:
         acquire, record_done = workspace.acquire, workspace.record_done
 
@@ -469,9 +469,10 @@ def test_prelude_workspace_owned_once_across_gpu_prepare_and_forward(
             acquired.append(workspace)
             return acquire()
 
-        def track_done(workspace=workspace, record_done=record_done):
+        def track_done(event=None, *, workspace=workspace, record_done=record_done):
             recorded.append(workspace)
-            return record_done()
+            completion_events.append(event)
+            return record_done(event)
 
         monkeypatch.setattr(workspace, "acquire", track_acquire)
         monkeypatch.setattr(workspace, "record_done", track_done)
@@ -508,6 +509,10 @@ def test_prelude_workspace_owned_once_across_gpu_prepare_and_forward(
             assert forwarded[0].cpu().tolist() == [7]
         assert len(acquired) == 1
         assert recorded == acquired
+        if device == "cuda" and not fail_preparation:
+            assert completion_events == [runner.submissions.events[-1]]
+        else:
+            assert completion_events == [None]
         monkeypatch.setattr(runner, "prepare_on_gpu", original_prepare)
         runner.submit(batch=batch).collect()
         assert len(acquired) == 2

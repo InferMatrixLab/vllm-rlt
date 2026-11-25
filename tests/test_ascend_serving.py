@@ -63,7 +63,7 @@ def test_checkpoint_http_completions_stream_and_disconnect(
         "--num-blocks",
         "64",
         "--max-num-seqs",
-        "2",
+        "3" if combined_execution else "2",
         "--max-num-batched-tokens",
         "32",
         "--port",
@@ -110,23 +110,26 @@ def test_checkpoint_http_completions_stream_and_disconnect(
                     await asyncio.sleep(0.25)
 
                 def body(prompt, **extra):
-                    return dict(
-                        model="ouro-ascend",
-                        prompt=prompt,
-                        max_tokens=4,
-                        temperature=0,
-                        min_loops=2 if combined_execution else 4,
-                        max_loops=4,
-                        exit_threshold=0.2 if combined_execution else 1,
-                        ignore_eos=True,
-                        **extra,
+                    return (
+                        dict(
+                            model="ouro-ascend",
+                            prompt=prompt,
+                            max_tokens=4,
+                            temperature=0,
+                            min_loops=2 if combined_execution else 4,
+                            max_loops=4,
+                            exit_threshold=0.2 if combined_execution else 1,
+                            ignore_eos=True,
+                        )
+                        | extra
                     )
 
-                async def complete(prompt):
-                    async with client.post(url + "/v1/completions", json=body(prompt)) as response:
+                async def complete(prompt, **extra):
+                    payload = body(prompt, **extra)
+                    async with client.post(url + "/v1/completions", json=payload) as response:
                         result = await response.json()
                         assert response.status == 200, result
-                        assert result["usage"]["completion_tokens"] == 4
+                        assert result["usage"]["completion_tokens"] == payload["max_tokens"]
                         return result
 
                 prompts = ["The capital of France is", "One plus one equals"]
@@ -163,7 +166,47 @@ def test_checkpoint_http_completions_stream_and_disconnect(
                     await response.content.readline()
                 after_disconnect = await complete(prompts[1])
                 assert after_disconnect["choices"][0]["text"] == normal[1]["choices"][0]["text"]
-                return dict(normal=normal, stream=events, after_disconnect=after_disconnect)
+                result = dict(normal=normal, stream=events, after_disconnect=after_disconnect)
+                if combined_execution:
+                    ready = [asyncio.Event() for _ in range(3)]
+                    finish_order = []
+
+                    async def resident(started):
+                        payload = body(
+                            prompts[0],
+                            priority=10,
+                            max_tokens=16,
+                            stream=True,
+                            stream_options={"include_usage": True},
+                        )
+                        usage = None
+                        async with client.post(url + "/v1/completions", json=payload) as response:
+                            assert response.status == 200
+                            async for line in response.content:
+                                if not line.startswith(b"data: "):
+                                    continue
+                                data = line[6:].strip()
+                                if data == b"[DONE]":
+                                    break
+                                event = json.loads(data)
+                                if event.get("choices"):
+                                    started.set()
+                                if event.get("usage"):
+                                    usage = event["usage"]
+                        assert usage is not None and usage["completion_tokens"] == 16
+                        finish_order.append("resident")
+
+                    async def priority():
+                        await asyncio.wait_for(
+                            asyncio.gather(*(started.wait() for started in ready)), timeout=30
+                        )
+                        await complete("One plus one equals", priority=-10, max_tokens=1)
+                        finish_order.append("priority")
+
+                    await asyncio.gather(*(resident(started) for started in ready), priority())
+                    assert finish_order == ["priority", "resident", "resident", "resident"]
+                    result["priority_finish_order"] = finish_order
+                return result
 
         try:
             result = asyncio.run(exercise())

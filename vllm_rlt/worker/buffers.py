@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from vllm_rlt.device import stream_module
 from vllm_rlt.worker.metadata import KVLayout, KVMetadata
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import UvaBackedTensor, copy_tensor, use_uva_on
@@ -66,8 +67,10 @@ class Workspace:
     def __init__(self, rows, width, hidden_size, device, dtype, *, use_uva=True):
         self.hidden = torch.empty((rows, hidden_size), device=device, dtype=dtype)
         self.device = device
+        self.device_ops = stream_module(device)
         self.use_uva = use_uva
-        self.submissions = SubmissionQueue()
+        # Host snapshots rotate, but the hidden and device buffers have one owner.
+        self.submissions = SubmissionQueue(max_pending=1)
         specs = {
             "tokens": ((rows,), torch.int64),
             "positions": ((rows,), torch.int64),
@@ -86,12 +89,12 @@ class Workspace:
         # Protect pinned snapshots until the previous workspace consumer retires.
         self.submissions.begin()
 
-    def record_done(self):
+    def record_done(self, event=None):
         """Record the last GPU consumer without waiting or freeing storage."""
-        if self.device.type == "cuda":
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(self.device))
-            self.submissions.complete(event)
+        if event is None and self.device_ops is not None:
+            event = self.device_ops.Event()
+            event.record(self.device_ops.current_stream(self.device))
+        self.submissions.complete(event)
 
     def store_metadata(self, layout: KVLayout, size):
         """Fill fixed host buffers from a storage-independent layout."""

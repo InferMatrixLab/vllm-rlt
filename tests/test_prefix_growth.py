@@ -327,6 +327,10 @@ def test_npu_preemption_restores_adaptive_decode(asynchronous, offload):
                 break
         else:
             pytest.fail("did not reach the recurrent preemption point")
+        if asynchronous:
+            signal = engine._pending_exit_signals["low"]
+            slot = signal.ticket.slot
+            assert slot is not None and slot.leased
         engine.add_request("high", [13] * 15, SamplingParams(max_tokens=3, ignore_eos=True))
         for _ in range(40):
             engine.step()
@@ -337,12 +341,61 @@ def test_npu_preemption_restores_adaptive_decode(asynchronous, offload):
         snapshot = engine.preemption.snapshots["low"]
         assert (snapshot["kv"] is not None) == offload
         assert snapshot["phase"] is RequestPhase.RECURRENT
+        if asynchronous:
+            assert engine._pending_exit_signals["low"] is signal
+            assert not slot.leased and signal.ticket.slot is None
         completed = finish(engine)
         assert list(completed) == ["high", "low"]
         assert completed["low"].token_ids == expected.token_ids
         assert completed["low"].exit_depths == expected.exit_depths
         assert engine.preemption.preemptions == engine.preemption.resumptions == 1
         assert not engine.preemption.snapshots
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.npu
+@torch.inference_mode()
+def test_npu_preempted_gates_release_slots_for_more_than_one_pool():
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    model.model.early_exit_gate.weight.zero_()
+    model.model.early_exit_gate.bias.fill_(10)
+    engine = StageEngine(
+        model,
+        attention_backend="ascend_eager",
+        cache_config=CacheConfig(128, 16),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, policy="priority", enable_preemption=True),
+        exit_config=ExitConfig("ouro_delayed"),
+        execution_config=ExecutionConfig(async_scheduling=True, use_uva=False),
+    )
+    try:
+        slots = [
+            slot
+            for slot in engine.model_runner.readback_slots
+            if slot.storage.dtype == torch.float32
+        ]
+        for priority in range(len(slots) + 2, 0, -1):
+            request_id = str(priority)
+            params = SamplingParams(
+                max_tokens=4, priority=priority, min_loops=2, exit_threshold=0.9, ignore_eos=True
+            )
+            engine.add_request(request_id, [3, 7, 11], params)
+            for _ in range(40):
+                engine.step()
+                if request_id in engine._pending_exit_signals:
+                    break
+            else:
+                pytest.fail("request did not reach the recurrent preemption point")
+        assert engine.preemption.preemptions > len(slots)
+        assert sum(slot.leased for slot in slots) == 1
+        completed = finish(engine)
+        assert len(completed) == len(slots) + 2
+        assert all(out.exit_depths == [4, 3, 3, 3] for out in completed.values())
+        assert engine.preemption.resumptions == engine.preemption.preemptions
+        assert not any(slot.leased for slot in slots)
         assert engine.cache_manager.num_used_blocks == 0
     finally:
         engine.close()

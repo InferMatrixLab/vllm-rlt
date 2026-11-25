@@ -64,6 +64,28 @@ def drain(engine):
 
 
 @pytest.mark.npu
+def test_npu_workspace_retires_its_consumer_before_reuse():
+    from vllm_rlt.worker.buffers import Workspace
+
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    workspace = Workspace(4, 4, 8, device, torch.bfloat16, use_uva=False)
+    consumer = torch.npu.Stream(device=device)
+    consumer.wait_stream(torch.npu.current_stream(device))
+    workspace.acquire()
+    with torch.npu.stream(consumer):
+        workspace.hidden.fill_(7)
+        observed = workspace.hidden.clone()
+        workspace.record_done()
+    (event,) = workspace.submissions.events
+    workspace.acquire()
+    assert event.query()
+    assert not workspace.submissions.events
+    workspace.hidden.fill_(9)
+    assert observed.cpu().tolist() == [[7.0] * 8] * 4
+
+
+@pytest.mark.npu
 @pytest.mark.parametrize("multi_stream", [False, True])
 @pytest.mark.parametrize(
     "static_buffers,pad",
@@ -77,6 +99,14 @@ def test_async_npu_matches_sync_without_device_barriers(
     resolve_device("npu")
     torch.npu.set_device(0)
     model = make_npu_model(torch.device("npu:0"))
+    recurrent = model.recurrent_prepared
+    row_shapes = set()
+
+    def observe_rows(hidden, batch, cache, **kwargs):
+        row_shapes.add((len(batch.rows), len(hidden)))
+        return recurrent(hidden, batch, cache, **kwargs)
+
+    monkeypatch.setattr(model, "recurrent_prepared", observe_rows)
     prompts = [[3, 5, 7] * 7, [2, 11, 17], [13, 19] * 9]
     params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
     reference = None
@@ -89,6 +119,7 @@ def test_async_npu_matches_sync_without_device_barriers(
             pad=asynchronous and pad,
         )
         try:
+            row_shapes.clear()
             assert bool(engine.model_runner.requestspaces) == (asynchronous and static_buffers)
             for repeat in range(2):
                 for i, prompt in enumerate(prompts):
@@ -105,18 +136,34 @@ def test_async_npu_matches_sync_without_device_barriers(
                     reference = actual
                 else:
                     assert actual == reference
+            if asynchronous:
+                assert (3, 4 if pad else 3) in row_shapes
         finally:
             engine.close()
 
 
 @pytest.mark.npu
 @pytest.mark.parametrize(
-    "exit_mode, async_schedule, multi_stream",
-    [("ouro", False, False), ("ouro_delayed", True, False), ("ouro_delayed", True, True)],
-    ids=["ouro-sync", "delayed-async-single", "delayed-async-multi"],
+    "exit_mode, async_schedule, multi_stream, pad",
+    [
+        ("ouro", False, False, False),
+        ("ouro", False, True, False),
+        ("ouro_delayed", True, False, False),
+        ("ouro_delayed", True, True, False),
+        ("ouro_delayed", True, True, True),
+    ],
+    ids=[
+        "ouro-sync",
+        "ouro-sync-multi",
+        "delayed-async-single",
+        "delayed-async-multi",
+        "delayed-async-padded",
+    ],
 )
 @torch.inference_mode()
-def test_npu_adaptive_exit_then_deeper_decode(monkeypatch, exit_mode, async_schedule, multi_stream):
+def test_npu_adaptive_exit_then_deeper_decode(
+    monkeypatch, exit_mode, async_schedule, multi_stream, pad
+):
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
     model = make_npu_model(device)
@@ -137,7 +184,14 @@ def test_npu_adaptive_exit_then_deeper_decode(monkeypatch, exit_mode, async_sche
     early = 2 if exit_mode == "ouro" else 3
 
     def run(asynchronous, use_multi_stream):
-        engine = make_engine(model, asynchronous, use_multi_stream, exit_mode=exit_mode)
+        engine = make_engine(
+            model,
+            asynchronous,
+            use_multi_stream,
+            exit_mode=exit_mode,
+            static_buffers=asynchronous and pad,
+            pad=asynchronous and pad,
+        )
         try:
             with pytest.raises(ValueError, match="exceed the model's supported depth"):
                 engine.add_request("invalid", [3], SamplingParams(max_loops=5))
@@ -159,8 +213,8 @@ def test_npu_adaptive_exit_then_deeper_decode(monkeypatch, exit_mode, async_sche
     assert expected["adaptive"][1] == [4, early, 4, early, 4]
     assert expected["fixed"][1] == [4] * 5
     assert expected["capped"][1] == [4, 1, 1, 1, 1]
-    if async_schedule:
-        assert run(True, multi_stream) == expected
+    if async_schedule or multi_stream:
+        assert run(async_schedule, multi_stream) == expected
 
 
 @pytest.mark.npu

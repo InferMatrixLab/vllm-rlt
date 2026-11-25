@@ -1219,6 +1219,7 @@ class ModelRunner:
         prepared = None
         routing_finish_attempted = False
         slot = None
+        compute_done = None
         try:
             if self.submissions.begin() and split_prefill:
                 self.split_prefill_submission_waits += 1
@@ -1262,12 +1263,12 @@ class ModelRunner:
                 ):
                     result = None
                 device_values = result
-                event = compute_done = None
+                event = None
                 if self.device_ops is not None:
                     compute_stream = self.device_ops.current_stream(self.device)
-                    compute_done = self.device_ops.Event()
-                    compute_done.record(compute_stream)
-                    event = compute_done
+                    event = self.device_ops.Event()
+                    event.record(compute_stream)
+                    compute_done = event
                     if result is not None:
                         slot = self._readback_slot(result)
                         readback_stream = self.readback_stream or compute_stream
@@ -1317,8 +1318,11 @@ class ModelRunner:
             raise
         finally:
             if prepared is not None and prepared.workspace is not None:
-                with self.device_ops.stream(stream) if stream is not None else nullcontext():
-                    prepared.workspace.record_done()
+                if compute_done is None and stream is not None:
+                    with self.device_ops.stream(stream):
+                        prepared.workspace.record_done()
+                else:
+                    prepared.workspace.record_done(compute_done)
 
     def finalize_many(self, requests):
         if not requests:

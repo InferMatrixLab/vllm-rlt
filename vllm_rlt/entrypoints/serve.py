@@ -23,6 +23,12 @@ from vllm_rlt.models import (
 )
 
 
+def _attention_backend(args):
+    if args.attention_backend is not None:
+        return args.attention_backend
+    return "auto" if args.device == "npu" else "triton"
+
+
 def load_engine(args):
     from tokenizers.decoders import ByteLevel
 
@@ -62,7 +68,7 @@ def load_engine(args):
             max_admission_bypasses=getattr(args, "max_admission_bypasses", 8),
             min_coda_batch_size=getattr(args, "min_coda_batch_size", 1),
         ),
-        attention_backend=args.attention_backend,
+        attention_backend=_attention_backend(args),
     )
     if profiling is not None:
         engine.start_profile(profiling, scheduled=True)
@@ -116,13 +122,12 @@ def main():
 
     add_runtime_args(parser)
     args = parser.parse_args()
-    if args.attention_backend is None:
-        args.attention_backend = "auto" if args.device == "npu" else "triton"
+    backend = _attention_backend(args)
     limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
-    if args.device == "cpu" and args.attention_backend not in ("auto", "torch"):
+    if args.device == "cpu" and backend not in ("auto", "torch"):
         parser.error("CPU execution requires --attention-backend torch or auto")
     try:
-        validate_backend_name(args.attention_backend, device_type=args.device)
+        validate_backend_name(backend, device_type=args.device)
     except ValueError as exc:
         parser.error(str(exc))
     torch.set_num_threads(args.cpu_threads)

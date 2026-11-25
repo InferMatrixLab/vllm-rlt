@@ -33,6 +33,10 @@ class PreemptionManager:
         previous = self.snapshots.get(victim.request_id)
         if previous is None:
             e.model_runner.synchronize()
+            signal = e._pending_exit_signals.get(victim.request_id)
+            if signal is not None:
+                # Keep the score for resumption while releasing the pinned slot.
+                signal.ticket.collect()
             e._rewind_split_prefill(victim)
             phase, hidden, token = victim.phase, victim.hidden_state, victim.input_token_tensor
         else:

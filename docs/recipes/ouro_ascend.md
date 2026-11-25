@@ -116,7 +116,13 @@ describes how the two policies interpret the gate score.
   lifetimes. Decode PRELUDE and each recurrent loop are separate submissions,
   so the scheduler can select a new batch at each boundary.
 - **Buffers.** `--static-buffers` opts into reusable eager workspaces.
-  Add `--pad-to-power-of-two` to bucket the submitted row counts.
+  Add `--pad-to-power-of-two` to bucket the submitted row counts. The workspace
+  pool sizes its four page tables by the batch-token budget and the model's
+  maximum context. With 8,192 batch tokens, a 65,536-token context, and
+  16-token pages, the tables alone reserve 512 MiB on the NPU and 1.5 GiB
+  on the host, including 1 GiB of pinned staging. Each recurrent submission
+  copies the full table width for its submitted rows. Budget this storage
+  separately from `--num-blocks`.
 - **Reuse and batching.** Ascend uses the shared packed-prefill metadata by
   default with `ascend_eager`. Use `--no-packed-prefill` to select the per-query
   layout. Greedy sampling and compatible prefill are batched. Full prefill
@@ -127,8 +133,8 @@ describes how the two policies interpret the gate score.
   assignment using its own block table.
   The Ascend backend gathers the visible KV rows for Torch SDPA.
 
-The example uses private, fully reserved `last_exited` KV. Graphs and
-prefill/decode disaggregation require separate platform support.
+The example uses private, fully reserved `last_exited` KV. Prefix caching,
+graphs, and prefill/decode disaggregation require separate platform support.
 Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs.
 
 ### Incremental KV and chunked prefill
