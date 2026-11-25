@@ -48,6 +48,16 @@ _TRACE = bool(os.environ.get("RLT_TRACE"))
 class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
     ASYNC = False
 
+    def __new__(cls, *args, **kwargs):
+        # vLLM enables async scheduling by default but, for a custom scheduler
+        # class, leaves picking the async variant to the user. A sync scheduler
+        # under an async engine silently loses draft tokens (the engine then
+        # skips its draft handoff), so follow the engine's mode here.
+        config = kwargs.get("vllm_config", args[0] if args else None)
+        if cls is LoopScheduler and config is not None and config.scheduler_config.async_scheduling:
+            cls = LoopAsyncScheduler
+        return super().__new__(cls)
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.layout = self._resolve_layout()
@@ -80,6 +90,11 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
         if self.layout.full_only:
             return super().schedule(throttle_prefills)
         if self._needs_token_level():
+            if _TRACE:
+                logger.warning(
+                    "rlt pre-open spec=%s",
+                    {r.request_id: len(r.spec_token_ids) for r in self.running},
+                )
             out = self._open_spans_via_vllm(throttle_prefills)
             self._spec_to_schedule = out.num_spec_tokens_to_schedule
             if _TRACE:
@@ -100,6 +115,19 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
             ready, key, self.max_rows, self.max_num_scheduled_tokens, self.allow_mixed_depth
         )
         return self._build_step(key, rows)
+
+    def update_draft_token_ids(self, draft_token_ids) -> None:
+        # Drafts are proposed after a span's final op only (the runner returns
+        # none after other ops); a request mid-loop keeps what it has.
+        if _TRACE:
+            logger.warning(
+                "rlt drafts in: %s",
+                {
+                    r: (len(t), self.requests[r].is_prefill_chunk if r in self.requests else None)
+                    for r, t in zip(draft_token_ids.req_ids, draft_token_ids.draft_token_ids)
+                },
+            )
+        super().update_draft_token_ids(draft_token_ids)
 
     def finish_requests(self, request_ids, finished_status):
         finished = super().finish_requests(request_ids, finished_status)

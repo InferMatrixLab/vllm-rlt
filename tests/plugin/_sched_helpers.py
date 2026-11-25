@@ -76,9 +76,10 @@ def run_step(sched, out, token: int = 7, exit_depths: dict | None = None):
         for rid in ids:
             # Only a span that reaches the end of the prompt (or a decode token)
             # samples; an earlier prompt chunk returns nothing.
-            start = out.span_starts.get(rid, 0)
+            start = out.span_starts.get(rid)  # set for prompt chunks only
             ends_prompt = (
-                start + out.num_scheduled_tokens[rid] >= sched.requests[rid].num_prompt_tokens
+                start is None
+                or start + out.num_scheduled_tokens[rid] >= sched.requests[rid].num_prompt_tokens
             )
             sampled.append([token] if ends_prompt else [])
     return sched.update_from_output(

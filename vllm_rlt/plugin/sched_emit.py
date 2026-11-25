@@ -102,7 +102,14 @@ class EmitMixin:
         # The runner proposes this many drafts after a final op (vLLM's own
         # dynamic-K field, set when it opened the spans).
         out.num_spec_tokens_to_schedule = getattr(self, "_spec_to_schedule", 0)
-        out.span_starts = {q.request_id: s.start for q, s in zip(reqs, spans)}
+        # Prompt chunks only. Their start is exact, and under WCPB not in the
+        # order of the worker's counter. A decode or verify span's start is the
+        # scheduler's optimistic count under async scheduling (it assumes every
+        # draft is accepted); the worker's device counter already holds the
+        # rejection-corrected value and must not be overwritten.
+        out.span_starts = {
+            q.request_id: s.start for q, s in zip(reqs, spans) if s.start < q.num_prompt_tokens
+        }
         out.candidates = dict(getattr(self, "_candidates", {}))
         out.step_key = group_key(rows[0], self.allow_mixed_depth) if rows else None
         out.exit_params = {

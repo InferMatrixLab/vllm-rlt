@@ -175,6 +175,30 @@ def test_async_final_op_is_never_advanced_early():
     assert request.in_flight  # the span ends only when its token comes back
 
 
+def test_async_late_return_of_an_advanced_step_does_not_reopen_the_next_op():
+    """The engine returns step k after step k+1 was emitted. Step k's row was
+    advanced at emit time, so its return must not clear the in-flight mark that
+    step k+1 set; otherwise the final op is emitted twice (seen on a GPU: every
+    CODA ran twice and the second sampled a stale token)."""
+    sched = make_scheduler(INKLING, asynchronous=True)
+    request = make_request("a", prompt_len=3, max_tokens=1)
+    sched.add_request(request)
+    emitted = []
+    for _ in range(10):
+        out = sched.schedule()
+        if out.loop_step is None or not out.total_num_scheduled_tokens:
+            continue
+        emitted.append(out)
+        if out.loop_step.op == Op.CODA:
+            break
+    last_core, coda = emitted[-2], emitted[-1]
+    assert last_core.loop_step.advanced == (True,)
+    run_step(sched, last_core)  # returns after CODA was emitted
+    again = sched.schedule()
+    assert again.loop_step is None or not again.total_num_scheduled_tokens
+    assert request.in_flight
+
+
 def test_full_only_model_is_plain_vllm():
     sched = make_scheduler(LoopLayout(num_passes=3, full_only=True))
     request = make_request("a", prompt_len=3, max_tokens=2)

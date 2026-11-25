@@ -23,9 +23,11 @@ class LoopSchedulerOutput(SchedulerOutput):
     worker has no request objects, so the scheduler sends what the runner needs
     to evaluate the exit gate. ``candidates`` is what this rank could run next,
     which the workers use to agree on one op across data-parallel ranks.
-    ``span_starts`` is each row's ``num_computed_tokens`` before its span: with
-    WCPB several chunks of one prompt are in flight, so the worker must not
-    infer a chunk's position from its own counter.
+    ``span_starts`` is a prompt chunk's ``num_computed_tokens`` before its span:
+    with WCPB several chunks of one prompt are in flight, so the worker must not
+    infer a chunk's position from its own counter. Decode spans are left out:
+    the worker's counter is right for them, and under async scheduling the
+    scheduler's is not (it assumes every draft was accepted).
     """
 
     loop_step: LoopStep | None = None

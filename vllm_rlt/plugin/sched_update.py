@@ -51,8 +51,14 @@ class UpdateMixin:
             if span is None:  # preempted while the step was in flight
                 skipped.add(rid)
                 continue
+            if advanced and rid not in skipped:
+                # Async: the span moved on when this step was emitted and a later
+                # step for it may be in flight now; that step owns ``in_flight``.
+                continue
             span.in_flight = False
             if rid in skipped:
+                if advanced:
+                    span.op, span.depth = step.op, step.depths[step.req_ids.index(rid)]
                 continue  # not run this step: stays on the same op
             if final:
                 # vLLM's update_from_output (below) consumes the sampled token.

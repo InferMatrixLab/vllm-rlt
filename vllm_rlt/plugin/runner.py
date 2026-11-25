@@ -95,6 +95,20 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
             out.skipped = self._skipped
         return out
 
+    def take_draft_token_ids(self):
+        # The engine asks after every step; only a final op proposes drafts.
+        # After any other op the handler still holds the previous round's
+        # drafts, which must not be handed out again.
+        step = self._step
+        if step is not None and step.op != Op.FULL and (step.is_dummy or not step.is_final):
+            return None
+        out = super().take_draft_token_ids()
+        if _TRACE and out is not None:
+            logger.warning(
+                "rlt take drafts %s", dict(zip(out.req_ids, map(len, out.draft_token_ids)))
+            )
+        return out
+
     def load_model(self, *args, **kwargs):
         result = super().load_model(*args, **kwargs)
         if self._speculator_pending:
