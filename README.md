@@ -143,8 +143,8 @@ a fixed scale at startup. See the
 
 | Checkpoint | Implementation | Platforms | Documented validation scope |
 | --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | [CUDA](docs/launching.md)<br>[Ascend](docs/recipes/ouro_ascend.md) | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. |
-| Ouro-2.6B | Shared Ouro | [CUDA](docs/launching.md) | Shares the Ouro implementation. [Separate quality and performance qualification](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) remains open. |
+| Ouro-1.4B | Native Ouro | [CUDA](docs/launching.md)<br>[Ascend](docs/recipes/ouro_ascend.md) | Ascend BF16 greedy eager serving with paged KV and synchronous or asynchronous decode. |
+| Ouro-2.6B | Shared Ouro | [CUDA](docs/launching.md)<br>[Ascend](docs/recipes/ouro_ascend.md) | Ascend BF16 real-checkpoint generation with fixed and adaptive decode. Quality evidence covers the GSM8K-87 screen. |
 | [Ouro-1.4B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
 | [Ouro-2.6B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
 | Nanbeige4.2-3B | Native Nanbeige | [CUDA](docs/launching.md) | Fixed two-loop inference. [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |

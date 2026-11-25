@@ -2,9 +2,12 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from tests.test_ascend import make_npu_model
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.device import resolve_device
 from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import RequestPhase
 
@@ -64,6 +67,52 @@ def test_prefix_refcounts_and_eviction():
     assert not c.lookup_prefix([1, 2, 3, 4, 5])
     c.free("all")
     assert c.num_free_blocks == 12
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "asynchronous,multi_stream,wavefront",
+    [(False, False, False), (True, False, True), (True, True, True)],
+    ids=["sync", "async-wavefront-single", "async-wavefront-multi"],
+)
+@torch.inference_mode()
+def test_npu_incremental_growth_matches_reserved_generation(asynchronous, multi_stream, wavefront):
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    prompts = {"a": [3, 7, 11] * 5, "b": [13, 17, 19] * 6}
+    params = SamplingParams(max_tokens=4, min_loops=2, exit_threshold=0.2, ignore_eos=True)
+    results = []
+    for incremental in (False, True):
+        engine = StageEngine(
+            model,
+            attention_backend="ascend_eager",
+            cache_config=CacheConfig(96, 16, incremental_allocation=incremental),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=48,
+                prefill_chunk_size=16,
+                wavefront_chunked_prefill=wavefront,
+            ),
+            exit_config=ExitConfig("ouro_delayed"),
+            execution_config=ExecutionConfig(
+                async_scheduling=asynchronous, multi_stream=multi_stream, use_uva=False
+            ),
+        )
+        try:
+            for request_id, prompt in prompts.items():
+                engine.add_request(request_id, prompt, params)
+            engine.step()
+            cache = engine.cache_manager
+            assert cache.allocated_blocks("a") == (4 if incremental else 8)
+            outputs = finish(engine)
+            assert outputs.keys() == prompts.keys()
+            assert all(len(out.token_ids) == params.max_tokens for out in outputs.values())
+            results.append({key: (out.token_ids, out.exit_depths) for key, out in outputs.items()})
+            assert cache.num_used_blocks == 0
+        finally:
+            engine.close()
+    assert results[0] == results[1]
 
 
 def test_incremental_growth_matches_reserved_generation():
@@ -233,6 +282,123 @@ def test_priority_preempts_at_safe_boundary():
     result = finish(e)
     assert list(result) == ["high", "low"]
     assert e.preemption.preemptions == 1
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async-multi"])
+@pytest.mark.parametrize("offload", [False, True], ids=["resident", "offload"])
+@torch.inference_mode()
+def test_npu_preemption_restores_adaptive_decode(asynchronous, offload):
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    prompt = [3, 7, 11] * 5
+    params = SamplingParams(max_tokens=6, priority=10, exit_threshold=0.2, ignore_eos=True)
+    configs = dict(
+        attention_backend="ascend_eager",
+        cache_config=CacheConfig(8 if offload else 32, 16),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, policy="priority", enable_preemption=True),
+        exit_config=ExitConfig("ouro_delayed"),
+        execution_config=ExecutionConfig(
+            async_scheduling=asynchronous,
+            multi_stream=asynchronous,
+            static_buffers=asynchronous,
+            use_uva=False,
+        ),
+    )
+    reference = StageEngine(model, **configs)
+    try:
+        reference.add_request("low", prompt, params)
+        expected = finish(reference)["low"]
+    finally:
+        reference.close()
+
+    engine = StageEngine(model, **configs)
+    try:
+        engine.add_request("low", prompt, params)
+        request = engine.scheduler.requests["low"]
+        for _ in range(40):
+            engine.step()
+            if (
+                request.phase is RequestPhase.RECURRENT
+                and request.loops_done == 1
+                and not request.num_output_placeholders
+            ):
+                break
+        else:
+            pytest.fail("did not reach the recurrent preemption point")
+        if asynchronous:
+            signal = engine._pending_exit_signals["low"]
+            slot = signal.ticket.slot
+            assert slot is not None and slot.leased
+        engine.add_request("high", [13] * 15, SamplingParams(max_tokens=3, ignore_eos=True))
+        for _ in range(40):
+            engine.step()
+            if "low" in engine.preemption.snapshots:
+                break
+        else:
+            pytest.fail("priority request did not suspend the resident")
+        snapshot = engine.preemption.snapshots["low"]
+        assert (snapshot["kv"] is not None) == offload
+        assert snapshot["phase"] is RequestPhase.RECURRENT
+        if asynchronous:
+            assert engine._pending_exit_signals["low"] is signal
+            assert not slot.leased and signal.ticket.slot is None
+        completed = finish(engine)
+        assert list(completed) == ["high", "low"]
+        assert completed["low"].token_ids == expected.token_ids
+        assert completed["low"].exit_depths == expected.exit_depths
+        assert engine.preemption.preemptions == engine.preemption.resumptions == 1
+        assert not engine.preemption.snapshots
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
+
+
+@pytest.mark.npu
+@torch.inference_mode()
+def test_npu_preempted_gates_release_slots_for_more_than_one_pool():
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    model.model.early_exit_gate.weight.zero_()
+    model.model.early_exit_gate.bias.fill_(10)
+    engine = StageEngine(
+        model,
+        attention_backend="ascend_eager",
+        cache_config=CacheConfig(128, 16),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, policy="priority", enable_preemption=True),
+        exit_config=ExitConfig("ouro_delayed"),
+        execution_config=ExecutionConfig(async_scheduling=True, use_uva=False),
+    )
+    try:
+        slots = [
+            slot
+            for slot in engine.model_runner.readback_slots
+            if slot.storage.dtype == torch.float32
+        ]
+        for priority in range(len(slots) + 2, 0, -1):
+            request_id = str(priority)
+            params = SamplingParams(
+                max_tokens=4, priority=priority, min_loops=2, exit_threshold=0.9, ignore_eos=True
+            )
+            engine.add_request(request_id, [3, 7, 11], params)
+            for _ in range(40):
+                engine.step()
+                if request_id in engine._pending_exit_signals:
+                    break
+            else:
+                pytest.fail("request did not reach the recurrent preemption point")
+        assert engine.preemption.preemptions > len(slots)
+        assert sum(slot.leased for slot in slots) == 1
+        completed = finish(engine)
+        assert len(completed) == len(slots) + 2
+        assert all(out.exit_depths == [4, 3, 3, 3] for out in completed.values())
+        assert engine.preemption.resumptions == engine.preemption.preemptions
+        assert not any(slot.leased for slot in slots)
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
 
 
 @pytest.mark.gpu

@@ -9,6 +9,8 @@ Sampling RNG remains in the runner registry throughout either path.
 
 import torch
 
+from vllm_rlt.device import stream_module
+
 
 class PreemptionManager:
     def __init__(self, engine):
@@ -31,6 +33,10 @@ class PreemptionManager:
         previous = self.snapshots.get(victim.request_id)
         if previous is None:
             e.model_runner.synchronize()
+            signal = e._pending_exit_signals.get(victim.request_id)
+            if signal is not None:
+                # Keep the score for resumption while releasing the pinned slot.
+                signal.ticket.collect()
             e._rewind_split_prefill(victim)
             phase, hidden, token = victim.phase, victim.hidden_state, victim.input_token_tensor
         else:
@@ -52,10 +58,11 @@ class PreemptionManager:
             hidden=None if hidden is None else hidden.to(device).clone(),
             token=None if token is None else token.to(device).clone(),
         )
-        if not offload_kv and cache.device.type == "cuda":
+        device_ops = stream_module(cache.device)
+        if not offload_kv and device_ops is not None:
             # Clones can borrow runner-owned rows. Finish reading them before
             # another stream reuses the released runner slot.
-            torch.cuda.current_stream(cache.device).synchronize()
+            device_ops.current_stream(cache.device).synchronize()
         if previous is None:
             if runner is not None:
                 runner.release(victim)
@@ -87,8 +94,9 @@ class PreemptionManager:
             self.engine.speculative_runner.restore_pipeline(request, state.get("pipeline"))
         # Resident copies completed before suspension released their runner slot.
         # Restored CPU buffers must be visible to every stream before resumption.
-        if kv is not None and cache.device.type == "cuda":
-            torch.cuda.current_stream(cache.device).synchronize()
+        device_ops = stream_module(cache.device)
+        if kv is not None and device_ops is not None:
+            device_ops.current_stream(cache.device).synchronize()
         del self.snapshots[request.request_id]
         self.resumptions += 1
         return state["phase"]

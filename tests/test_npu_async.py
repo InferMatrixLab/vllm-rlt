@@ -25,7 +25,9 @@ def test_fixed_depth_decode_keeps_each_loop_schedulable():
     assert request.phase == RequestPhase.CODA
 
 
-def make_engine(model, asynchronous, multi_stream):
+def make_engine(
+    model, asynchronous, multi_stream, *, exit_mode=None, static_buffers=False, pad=False
+):
     return StageEngine(
         model,
         attention_backend="ascend_eager",
@@ -36,12 +38,12 @@ def make_engine(model, asynchronous, multi_stream):
         execution_config=ExecutionConfig(
             async_scheduling=asynchronous,
             multi_stream=multi_stream,
-            static_buffers=False,
-            pad_to_power_of_two=False,
+            static_buffers=static_buffers,
+            pad_to_power_of_two=pad,
             use_uva=False,
             cuda_graphs=False,
         ),
-        exit_config=ExitConfig("ouro_delayed" if asynchronous else "ouro"),
+        exit_config=ExitConfig(exit_mode or ("ouro_delayed" if asynchronous else "ouro")),
     )
 
 
@@ -62,18 +64,63 @@ def drain(engine):
 
 
 @pytest.mark.npu
+def test_npu_workspace_retires_its_consumer_before_reuse():
+    from vllm_rlt.worker.buffers import Workspace
+
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    workspace = Workspace(4, 4, 8, device, torch.bfloat16, use_uva=False)
+    consumer = torch.npu.Stream(device=device)
+    consumer.wait_stream(torch.npu.current_stream(device))
+    workspace.acquire()
+    with torch.npu.stream(consumer):
+        workspace.hidden.fill_(7)
+        observed = workspace.hidden.clone()
+        workspace.record_done()
+    (event,) = workspace.submissions.events
+    workspace.acquire()
+    assert event.query()
+    assert not workspace.submissions.events
+    workspace.hidden.fill_(9)
+    assert observed.cpu().tolist() == [[7.0] * 8] * 4
+
+
+@pytest.mark.npu
 @pytest.mark.parametrize("multi_stream", [False, True])
+@pytest.mark.parametrize(
+    "static_buffers,pad",
+    [(False, False), (True, False), (True, True)],
+    ids=["dynamic", "static", "static-padded"],
+)
 @torch.inference_mode()
-def test_async_npu_matches_sync_without_device_barriers(monkeypatch, multi_stream):
+def test_async_npu_matches_sync_without_device_barriers(
+    monkeypatch, multi_stream, static_buffers, pad
+):
     resolve_device("npu")
     torch.npu.set_device(0)
     model = make_npu_model(torch.device("npu:0"))
+    recurrent = model.recurrent_prepared
+    row_shapes = set()
+
+    def observe_rows(hidden, batch, cache, **kwargs):
+        row_shapes.add((len(batch.rows), len(hidden)))
+        return recurrent(hidden, batch, cache, **kwargs)
+
+    monkeypatch.setattr(model, "recurrent_prepared", observe_rows)
     prompts = [[3, 5, 7] * 7, [2, 11, 17], [13, 19] * 9]
     params = SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True)
     reference = None
     for asynchronous in (False, True):
-        engine = make_engine(model, asynchronous, multi_stream)
+        engine = make_engine(
+            model,
+            asynchronous,
+            multi_stream,
+            static_buffers=asynchronous and static_buffers,
+            pad=asynchronous and pad,
+        )
         try:
+            row_shapes.clear()
+            assert bool(engine.model_runner.requestspaces) == (asynchronous and static_buffers)
             for repeat in range(2):
                 for i, prompt in enumerate(prompts):
                     engine.add_request(str(i), prompt, params)
@@ -89,8 +136,111 @@ def test_async_npu_matches_sync_without_device_barriers(monkeypatch, multi_strea
                     reference = actual
                 else:
                     assert actual == reference
+            if asynchronous:
+                assert (3, 4 if pad else 3) in row_shapes
         finally:
             engine.close()
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "exit_mode, async_schedule, multi_stream, pad",
+    [
+        ("ouro", False, False, False),
+        ("ouro", False, True, False),
+        ("ouro_delayed", True, False, False),
+        ("ouro_delayed", True, True, False),
+        ("ouro_delayed", True, True, True),
+    ],
+    ids=[
+        "ouro-sync",
+        "ouro-sync-multi",
+        "delayed-async-single",
+        "delayed-async-multi",
+        "delayed-async-padded",
+    ],
+)
+@torch.inference_mode()
+def test_npu_adaptive_exit_then_deeper_decode(
+    monkeypatch, exit_mode, async_schedule, multi_stream, pad
+):
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    recurrent = model.recurrent_prepared
+
+    def alternate_gate(hidden, batch, cache, **kwargs):
+        hidden, gate = recurrent(hidden, batch, cache, **kwargs)
+        if gate is not None:
+            # Decode starts at position 15. Walk into the next page at full
+            # depth, which needs the KV copied from the earlier exit.
+            gate = batch.position_ids.remainder(2).to(gate.dtype) * 20 - 10
+        return hidden, gate
+
+    monkeypatch.setattr(model, "recurrent_prepared", alternate_gate)
+    adaptive = SamplingParams(max_tokens=5, min_loops=2, exit_threshold=0.9, ignore_eos=True)
+    fixed = SamplingParams(max_tokens=5, ignore_eos=True)
+    capped = SamplingParams(max_tokens=5, min_loops=1, max_loops=1, ignore_eos=True)
+    early = 2 if exit_mode == "ouro" else 3
+
+    def run(asynchronous, use_multi_stream):
+        engine = make_engine(
+            model,
+            asynchronous,
+            use_multi_stream,
+            exit_mode=exit_mode,
+            static_buffers=asynchronous and pad,
+            pad=asynchronous and pad,
+        )
+        try:
+            with pytest.raises(ValueError, match="exceed the model's supported depth"):
+                engine.add_request("invalid", [3], SamplingParams(max_loops=5))
+            with pytest.raises(ValueError, match="require greedy sampling"):
+                engine.add_request("invalid", [3], SamplingParams(temperature=0.5))
+            engine.add_request("adaptive", [3, 7, 11] * 5, adaptive)
+            for _ in range(30):
+                if any(out.token_ids for out in engine.step()):
+                    break
+            else:
+                pytest.fail("adaptive request did not produce its first token")
+            engine.add_request("fixed", [13, 17, 19], fixed)
+            engine.add_request("capped", [3, 5, 7], capped)
+            return drain(engine)
+        finally:
+            engine.close()
+
+    expected = run(False, False)
+    assert expected["adaptive"][1] == [4, early, 4, early, 4]
+    assert expected["fixed"][1] == [4] * 5
+    assert expected["capped"][1] == [4, 1, 1, 1, 1]
+    if async_schedule or multi_stream:
+        assert run(async_schedule, multi_stream) == expected
+
+
+@pytest.mark.npu
+@torch.inference_mode()
+def test_npu_adaptive_abort_discards_pending_gate_before_request_id_reuse():
+    device = resolve_device("npu:0")
+    torch.npu.set_device(device)
+    model = make_npu_model(device)
+    model.model.early_exit_gate.weight.zero_()
+    model.model.early_exit_gate.bias.fill_(10)
+    params = SamplingParams(max_tokens=4, min_loops=2, exit_threshold=0.9, ignore_eos=True)
+    engine = make_engine(model, True, True)
+    try:
+        engine.add_request("a", [3, 7, 11], params)
+        for _ in range(30):
+            engine.step()
+            if "a" in engine._pending_exit_signals:
+                break
+        else:
+            pytest.fail("adaptive request did not retain a gate result")
+        engine.abort_request("a")
+        assert "a" not in engine._pending_exit_signals
+        engine.add_request("a", [13, 17, 19], params)
+        assert drain(engine)["a"][1] == [4, 3, 3, 3]
+    finally:
+        engine.close()
 
 
 @pytest.mark.npu
@@ -121,10 +271,11 @@ def test_npu_delayed_delivery_consumes_device_token_before_host_result():
             assert request.generated_token_ids == []
             engine.step()
             assert engine.last_schedule.phase == RequestPhase.PRELUDE
-            engine.step()
-            assert engine.last_schedule.phase == RequestPhase.RECURRENT
-            assert request.loops_done == 4
-            assert request.generated_token_ids == []
+            for depth in range(1, 5):
+                engine.step()
+                assert engine.last_schedule.phase == RequestPhase.RECURRENT
+                assert request.loops_done == depth
+                assert request.generated_token_ids == []
             assert ticket.device_values.device.type == "npu"
         finally:
             ticket.event = real_event

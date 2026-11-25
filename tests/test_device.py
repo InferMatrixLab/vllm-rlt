@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
-from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig, SpeculativeConfig
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.device import resolve_device, stream_module
 from vllm_rlt.engine.stage_engine import StageEngine
@@ -38,7 +38,6 @@ def npu_model_stub(**overrides):
     [
         dict(execution_config=ExecutionConfig(cuda_graphs=True)),
         dict(cache_config=CacheConfig(num_blocks=32, enable_prefix_caching=True)),
-        dict(scheduler_config=SchedulerConfig(enable_preemption=True)),
         dict(exit_config=ExitConfig(mode="random_lookahead")),
     ],
 )
@@ -67,9 +66,9 @@ def test_npu_does_not_use_cpu_default_memory_budget():
     assert blocks == 17 and info["source"] == "blocks"
 
 
-@pytest.mark.parametrize("backend", ["auto", "triton", "flash_attn_4"])
-def test_npu_requires_explicit_torch_before_allocation(backend):
-    with pytest.raises(ValueError, match="explicit attention_backend='torch'"):
+@pytest.mark.parametrize("backend", ["triton", "flash_attn_4"])
+def test_npu_rejects_incompatible_attention_before_allocation(backend):
+    with pytest.raises(ValueError, match="NPU attention requires"):
         StageEngine(npu_model_stub(), attention_backend=backend)
 
 
@@ -81,3 +80,12 @@ def test_builtin_profiler_does_not_mislabel_npu_as_cpu_only(tmp_path):
 def test_npu_async_requires_explicit_delayed_exit_policy():
     with pytest.raises(ValueError, match="async scheduling requires ouro_delayed"):
         StageEngine(npu_model_stub(), execution_config=ExecutionConfig(async_scheduling=True))
+
+
+def test_npu_rejects_async_self_speculation_before_allocation():
+    with pytest.raises(ValueError, match="async speculative decoding requires CUDA"):
+        StageEngine(
+            npu_model_stub(),
+            speculative_config=SpeculativeConfig(2),
+            execution_config=ExecutionConfig(async_scheduling=True),
+        )

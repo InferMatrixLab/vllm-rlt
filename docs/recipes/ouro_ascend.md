@@ -1,9 +1,10 @@
 # Ouro on Ascend
 
-Run Ouro-1.4B on one Ascend NPU with BF16, greedy decoding and four recurrent
-loops. The Python runtime uses Torch's `scaled_dot_product_attention` through
-the `ascend_eager` backend, matching HF's SDPA entry point. Torch-NPU selects
-the device kernel according to the input shape, mask and hardware.
+Run Ouro-1.4B or Ouro-2.6B on one Ascend NPU with BF16 and greedy decoding.
+Decode uses four recurrent loops by default. The Python runtime uses Torch's
+`scaled_dot_product_attention` through the `ascend_eager` backend, matching HF's
+SDPA entry point. Torch-NPU selects the device kernel according to the input
+shape, mask and hardware.
 The example enables the optional asynchronous engine plan.
 
 ## Prepare the environment and model
@@ -64,11 +65,15 @@ sequence lengths, resident request count and available device memory. For
 whole-cohort prefill, the chunk size must fit each prompt and the batched token
 budget must fit the sum of prompt lengths in the cohort.
 
+The serving CLI defaults to `--attention-backend auto` on NPU. It prefers
+`ascend_eager` for compatible BF16 execution. Use `--attention-backend torch`
+for an explicit Torch reference run.
+
 ```bash
 TASK_QUEUE_ENABLE=2 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 python -m vllm_rlt.entrypoints.serve \
   --model "$MODEL" --tokenizer "$MODEL" --served-model-name ouro \
-  --device npu --dtype bfloat16 --attention-backend ascend_eager \
+  --device npu --dtype bfloat16 \
   --mode refill --exit-mode ouro_delayed \
   --async-scheduling --single-stream --no-uva \
   --block-size 16 --num-blocks 2064 --max-num-seqs 32 \
@@ -88,12 +93,36 @@ curl --fail http://127.0.0.1:8123/v1/completions \
   -d '{"model":"ouro","prompt":"The capital of France is","max_tokens":8,"temperature":0,"min_loops":4,"max_loops":4,"exit_threshold":1}'
 ```
 
+### Adaptive decode depth
+
+Ouro on Ascend uses the shared CUDA and ROCm exit policies. Use `--exit-mode ouro`
+with synchronous scheduling for the original gate. Use `--exit-mode ouro_delayed`
+for the one-round delayed policy, which also supports `--async-scheduling`.
+The first output uses all four prefill loops. For subsequent tokens, specify
+`min_loops`, `max_loops` and an `exit_threshold` below `1` to
+enable the adaptive gate. Decode depth can also be capped with `max_loops` from
+`1` to `4`, subject to `min_loops <= max_loops`. Omit `max_loops` to use the
+model depth. Keep `temperature=0` on Ascend.
+
+For example, send `"min_loops": 2, "max_loops": 4, "exit_threshold": 0.5` in
+the completion request. Threshold `1` disables gate-driven exits and retains
+the requested decode cap. The [shared runtime guide](../runtime.md#reusing-the-trained-ouro-gate-ouro_delayed)
+describes how the two policies interpret the gate score.
+
 <a id="6-fixed-depth-asynchronous-engine-plan"></a>
-## Fixed-depth asynchronous engine plan
+## Asynchronous engine plan
 
 - **Scheduling.** Stream events track completion and protect buffer and request
   lifetimes. Decode PRELUDE and each recurrent loop are separate submissions,
   so the scheduler can select a new batch at each boundary.
+- **Buffers.** `--static-buffers` opts into reusable eager workspaces.
+  Add `--pad-to-power-of-two` to bucket the submitted row counts. The workspace
+  pool sizes its four page tables by the batch-token budget and the model's
+  maximum context. With 8,192 batch tokens, a 65,536-token context, and
+  16-token pages, the tables alone reserve 512 MiB on the NPU and 1.5 GiB
+  on the host, including 1 GiB of pinned staging. Each recurrent submission
+  copies the full table width for its submitted rows. Budget this storage
+  separately from `--num-blocks`.
 - **Reuse and batching.** Ascend uses the shared packed-prefill metadata by
   default with `ascend_eager`. Use `--no-packed-prefill` to select the per-query
   layout. Greedy sampling and compatible prefill are batched. Full prefill
@@ -104,17 +133,67 @@ curl --fail http://127.0.0.1:8123/v1/completions \
   assignment using its own block table.
   The Ascend backend gathers the visible KV rows for Torch SDPA.
 
-The example uses private, fully reserved `last_exited` KV. Keep graphs,
-static buffers, padding, prefix caching, incremental KV allocation, preemption,
-speculation and prefill/decode disaggregation disabled in this configuration.
-Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs
-and adaptive exit.
+The example uses private, fully reserved `last_exited` KV. Prefix caching,
+graphs, and prefill/decode disaggregation require separate platform support.
+Greedy parity remains unqualified for arbitrary chunked or mixed-length inputs.
+
+### Incremental KV and chunked prefill
+
+Use `--incremental-kv` to allocate pages as requests grow with the shared
+`last_exited` cache. The option works with synchronous or asynchronous eager
+execution. Use `--wavefront-chunked-prefill` to group ready prompt chunks by
+depth.
+
+For chunked-prefill parity checks, compare against HF SDPA using the same token
+IDs, chunk boundaries, and batch shapes. On Ascend 910B3, changing the number of
+rows in a BF16 `Linear` can change the projection even when the input rows and
+weights are identical. Compare full prefill with chunked prefill separately to
+measure sensitivity to chunk shape. The real-checkpoint regression checks exact
+logits and greedy tokens with packed and per-query metadata under identical
+127- and 128-token chunk boundaries.
+
+### Priority preemption
+
+Use `--scheduling-policy priority --enable-preemption`. Lower priority
+numbers are admitted first. A suspended request retains its KV pages when
+there is room. Under capacity pressure, the engine copies those pages to the
+host and restores them before resuming the request. Both synchronous and
+asynchronous eager execution use the same suspension and restoration path.
+
+### Synchronous self-speculation
+
+Run with `--exit-mode ouro --speculative-tokens 3 --draft-loops 2 --target-loops 4`
+and select `--speculative-mode block` or `--speculative-mode pipeline`.
+Use synchronous scheduling and fixed four-loop greedy requests. The engine
+verifies candidate tokens at the target depth.
+
+With BF16 checkpoints on 910B3, block verification can use a different
+`Linear` row count from serial decode. A one-ULP change can flip the
+greedy token when the top logits are nearly tied.
 
 <a id="8-profile-guided-high-batch-scheduling"></a>
 ## Performance and correctness
 
 A higher prefill quota lets more requests reach decode together and can delay
 decode for existing requests. The scheduler default is 1.
+
+### Ouro-2.6B accuracy screen
+
+On Ascend 910B3 with CANN 9.0 and Torch-NPU 2.10, a BF16 greedy run used the
+[GSM8K-87 question IDs](../../benchmarks/fixtures/gsm8k-87.json), three
+demonstrations, and the strict answer scorer. Each run used cohorts of up to
+eight requests and a 1,024-token output limit. Adaptive runs used
+`min_loops=2` and `max_loops=4`.
+
+| Mode | Threshold | Correct | Mean decode loops |
+| --- | ---: | ---: | ---: |
+| Fixed four loops | 1.0 | 61/87 | 4.00 |
+| Synchronous `ouro` | 0.2 | 59/87 | 2.09 |
+| Asynchronous multi-stream `ouro_delayed` | 0.2 | 67/87 | 3.10 |
+
+The paired result against fixed depth was four losses and two gains for
+`ouro`, and zero losses and six gains for `ouro_delayed`. These scores cover
+the fixed regression cohort.
 
 ### Full unified W1-W7 validation
 

@@ -102,17 +102,14 @@ class StageEngine:
                 raise ValueError("NPU Ouro requires BF16 KV cache")
             if (
                 self.execution_config.cuda_graphs
-                or (self.execution_config.async_scheduling and self.execution_config.static_buffers)
-                or speculative_config is not None
                 or self.stage_config.role != "prefill_decode"
-                or scheduler_config.enable_preemption
                 or cache_config.enable_prefix_caching
                 or cache_config.layout != "last_exited"
                 or self.exit_config.mode not in ("ouro", "ouro_delayed")
             ):
                 raise ValueError(
                     "NPU Ouro requires local execution, ouro/ouro_delayed exit mode and "
-                    "last_exited KV without speculation, graphs, preemption or prefix caching"
+                    "last_exited KV without graphs or prefix caching"
                 )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
@@ -562,10 +559,8 @@ class StageEngine:
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
         fixed_loop_count = getattr(self.model, "fixed_loop_count", False)
         target_loops, max_loops = self._resolve_loop_bounds(params)
-        if next(self.model.parameters()).device.type == "npu" and (
-            max_loops != 4 or params.exit_threshold != 1.0 or params.temperature != 0
-        ):
-            raise ValueError("NPU Ouro requests require four loops, exit_threshold=1 and greedy")
+        if next(self.model.parameters()).device.type == "npu" and params.temperature != 0:
+            raise ValueError("NPU Ouro requests require greedy sampling")
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
