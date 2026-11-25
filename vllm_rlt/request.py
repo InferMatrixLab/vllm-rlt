@@ -67,6 +67,23 @@ class Request:
     compute_released: bool = False
     finish_reason: FinishReason | None = None
     exit_trace: tuple[int, ...] = field(default=(), repr=False)
+    _target_loops: int | None = field(default=None, repr=False)
+    # Fixed at wavefront admission so in-flight ring offsets keep their meaning.
+    prefill_chunk_size: int | None = None
+
+    def __post_init__(self):
+        if self._target_loops is not None and (
+            type(self._target_loops) is not int or self._target_loops < 1
+        ):
+            raise ValueError("target_loops must be a positive integer")
+
+    @property
+    def target_loops(self) -> int | None:
+        return self._target_loops
+
+    def loop_limit(self, default: int) -> int:
+        """Return the request's fixed target or its legacy loop upper bound."""
+        return self.target_loops or self.sampling_params.max_loops or default
 
     @staticmethod
     def prefill_boundaries(

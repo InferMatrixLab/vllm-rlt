@@ -118,6 +118,7 @@ class AdmissionPlan:
     reserved_growth_blocks: int
     admission_headroom_blocks: int
     cached_claim_blocks: int
+    prefill_chunk_size: int | None = None
 
     @property
     def total_budget_blocks(self) -> int:
@@ -140,6 +141,8 @@ class Scheduler:
         total_ut_steps: int | None = None,
         eos_token_id=(),
         exit_mode: str = "ouro",
+        mixed_speculative: bool = False,
+        prioritize_prefill_continuations: bool = False,
     ):
         self.config = config
         self.cache_manager = cache_manager
@@ -167,10 +170,16 @@ class Scheduler:
         # recurrent batches. Other prompt chunks execute all depths atomically.
         self.wavefront_chunked_prefill = config.wavefront_chunked_prefill
         self.staged_prefill = requires_staged_prefill(config, produces_tokens=produces_tokens)
+        self.prioritize_prefill_continuations = (
+            prioritize_prefill_continuations
+            and config.mode == "mixed"
+            and not self.wavefront_chunked_prefill
+        )
         self.policy = create_scheduling_policy(
             config,
             speculative_config,
             produces_tokens=produces_tokens,
+            mixed_speculative=mixed_speculative,
         )
 
     def add_request(self, request: Request):
@@ -181,7 +190,19 @@ class Scheduler:
 
     def enqueue(self, request: Request, phase: RequestPhase):
         request.phase = phase
-        self.queues[phase].append(request.request_id)
+        queue = self.queues[phase]
+        if (
+            self.prioritize_prefill_continuations
+            and request.num_prefilled_tokens > 0
+            and phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+        ):
+            # Continue prompts with a completed chunk first. Preserve queue
+            # order within each group.
+            for index, request_id in enumerate(queue):
+                if self.requests[request_id].num_prefilled_tokens == 0:
+                    queue.insert(index, request.request_id)
+                    return
+        queue.append(request.request_id)
 
     def suspend_for_transfer(self, request):
         """Stop scheduling without freeing resources that a transfer still borrows."""
@@ -388,8 +409,14 @@ class Scheduler:
         capacity = len(request.prompt_token_ids) + request.sampling_params.max_tokens - 1
         prefix = cache.lookup_prefix(request.prompt_token_ids)
         cached_tokens = len(prefix) * cache.block_size
+        chunk_size = None
+        if self.config.adaptive_wavefront_prefill:
+            chunk_size = request.prefill_chunk_size or self._choose_wavefront_chunk(
+                len(request.prompt_token_ids) - cached_tokens
+            )
         initial_tokens = min(
-            len(request.prompt_token_ids), cached_tokens + self.config.prefill_chunk_size
+            len(request.prompt_token_ids),
+            cached_tokens + (chunk_size or self.config.prefill_chunk_size),
         )
         if not cache.incremental_allocation:
             initial_tokens = capacity
@@ -417,6 +444,7 @@ class Scheduler:
             reserved_growth_blocks=reserved,
             admission_headroom_blocks=admission_headroom_blocks,
             cached_claim_blocks=cached_claim,
+            prefill_chunk_size=chunk_size,
         )
 
     def reserve_transfer(self, request: Request) -> AdmissionPlan | None:
@@ -450,6 +478,7 @@ class Scheduler:
         """Allocate pages and enter PREFILL only when the whole budget fits."""
         if not self._allocate(request, plan):
             return False
+        request.prefill_chunk_size = plan.prefill_chunk_size
         request.num_prefilled_tokens = plan.cached_tokens
         # A reused prompt prefix is already prefilled at every depth, so the
         # staged window starts closed at that frontier and opens for the rest.
@@ -466,10 +495,33 @@ class Scheduler:
         return True
 
     def _enter_prefill(self, request):
+        if self.config.adaptive_wavefront_prefill and request.prefill_chunk_size is None:
+            # An outgoing transfer may already own its entire prompt allocation.
+            remaining = len(request.prompt_token_ids) - request.prefill_window_origin
+            request.prefill_chunk_size = self._choose_wavefront_chunk(
+                remaining, resident_rows=remaining
+            )
         if self.staged_prefill:
             self.enqueue(request, RequestPhase.PREFILLING_PRELUDE)
         else:
             self.enqueue(request, RequestPhase.PREFILL)
+
+    def _choose_wavefront_chunk(self, remaining: int, *, resident_rows: int = 0) -> int:
+        """Set a bounded ring stride from the prompt suffix and available pages."""
+        cache = self.cache_manager
+        upper = min(self.config.prefill_chunk_size, self.config.max_num_batched_tokens)
+        prompt_owners = 1 + sum(
+            len(self.queues[phase])
+            for phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
+        )
+        batch_share = self.config.max_num_batched_tokens // min(self.total_ut_steps, prompt_owners)
+        pages = cache.num_free_blocks // (cache.storage_depths * prompt_owners)
+        kv_rows = resident_rows + pages * cache.block_size
+        limit = min(batch_share, kv_rows)
+        if limit < upper:
+            # Keep chunk boundaries page-aligned when a smaller stride is needed.
+            upper = min(upper, max(1, limit // cache.block_size) * cache.block_size)
+        return max(1, min(upper, remaining))
 
     def _admit(self):
         """Admit waiting requests: order -> slot -> restore/allocate -> defer/enter.
@@ -617,7 +669,7 @@ class Scheduler:
         self, request, phase, token_budget, *, start, depth=None
     ) -> ScheduledRequest | None:
         """Snapshot one chunk within the bounded per-request wavefront ring."""
-        chunk_size = self.config.prefill_chunk_size
+        chunk_size = request.prefill_chunk_size or self.config.prefill_chunk_size
         origin = request.prefill_window_origin
         if start < origin:
             raise RuntimeError("wavefront work precedes its cached-prefix origin")
@@ -638,8 +690,9 @@ class Scheduler:
             if depth is None:
                 raise ValueError("wavefront recurrent work requires an explicit depth")
             left, right = request.prefill_depth_ranges[depth]
-            if left != start:
-                raise RuntimeError("wavefront recurrent task is not at its depth frontier")
+            # Additional spans may follow an earlier span in the same batch.
+            if start < left:
+                raise RuntimeError("wavefront recurrent task precedes its depth frontier")
             end = min(chunk_end, right, request.num_preluded_tokens)
 
         count = min(token_budget, end - start)
@@ -683,10 +736,10 @@ class Scheduler:
         and retires one ring slot after each contiguous final-depth chunk.
         """
         if self.wavefront_chunked_prefill:
+            chunk_size = request.prefill_chunk_size or self.config.prefill_chunk_size
             window_end = min(
                 len(request.prompt_token_ids),
-                request.prefill_reclaimable_tokens
-                + self.config.prefill_chunk_size * len(request.prefill_depth_ranges),
+                request.prefill_reclaimable_tokens + chunk_size * len(request.prefill_depth_ranges),
             )
             return request.num_preluded_tokens < window_end
         return request.num_preluded_tokens == request.num_prefilled_tokens
@@ -701,29 +754,79 @@ class Scheduler:
     def _take(self, phase: RequestPhase) -> SchedulerOutput | None:
         return self.take_phases((phase,))
 
-    def take_phases(self, phases, *, eligible=None):
+    def _wavefront_limits(self, phase, available, eligible):
+        """Bound prefill rows and leave pages for the next queued decode visit."""
+        cache = self.cache_manager
+        protect_growth = phase == RequestPhase.PREFILLING_PRELUDE and cache.incremental_allocation
+        shrink_budget = self.policy.decode_due and available > self.config.prefill_chunk_size
+        if not (protect_growth or shrink_budget):
+            return available, None
+        decode_count = 0
+        decode_blocks = 0
+        for decode_phase in (
+            RequestPhase.PRELUDE,
+            RequestPhase.RECURRENT,
+            RequestPhase.CODA,
+            RequestPhase.SPECULATIVE,
+        ):
+            for request_id in self.queues[decode_phase]:
+                request = self.requests[request_id]
+                if eligible is not None and not eligible(request):
+                    continue
+                decode_count += 1
+                if protect_growth:
+                    rows = (
+                        self.speculative_config.num_speculative_tokens + 1
+                        if decode_phase == RequestPhase.SPECULATIVE
+                        else 1
+                    )
+                    end = min(
+                        request.position + rows,
+                        len(request.prompt_token_ids) + request.sampling_params.max_tokens - 1,
+                    )
+                    decode_blocks += max(
+                        0, cache.required_blocks(end) - cache.allocated_blocks(request_id)
+                    )
+        if decode_count and shrink_budget:
+            hard = self.config.max_num_batched_tokens
+            chunk = self.config.prefill_chunk_size
+            target = hard - hard * decode_count // self.config.max_num_seqs
+            available = min(available, max(chunk, ((target + chunk - 1) // chunk) * chunk))
+        growth = max(0, cache.num_free_blocks - decode_blocks) if decode_blocks else None
+        return available, growth
+
+    def take_phases(self, phases, *, eligible=None, reserve_for_later=0):
         """Select compatible requests across queues under one budget/reservation set."""
         eligible = eligible if eligible is not None else self.execution_ready
         token_budget = self.config.max_num_batched_tokens
         scheduled_requests = []
         selected: set[str] = set()
-        for phase in phases:
+        for index, phase in enumerate(phases):
             queue = self.queues[phase]
+            reserved = reserve_for_later if index == 0 else 0
+            available = token_budget - reserved
             if self.wavefront_chunked_prefill and phase in (
                 RequestPhase.PREFILLING_PRELUDE,
                 RequestPhase.PREFILLING_RECURRENT,
             ):
-                token_budget = self._take_wavefront_phase(
+                budget, growth = (
+                    self._wavefront_limits(phase, available, eligible)
+                    if self.config.adaptive_wavefront_prefill and available
+                    else (available, None)
+                )
+                remaining = self._take_wavefront_phase(
                     phase,
                     queue,
-                    token_budget,
+                    budget,
                     scheduled_requests,
                     selected,
                     eligible,
+                    growth_blocks=growth,
                 )
+                token_budget -= budget - remaining
                 continue
             remaining = len(queue)
-            while queue and token_budget and len(selected) < self.config.max_num_seqs and remaining:
+            while queue and available and len(selected) < self.config.max_num_seqs and remaining:
                 remaining -= 1
                 request = self.requests[queue.popleft()]
                 if eligible is not None and not eligible(request):
@@ -740,7 +843,7 @@ class Scheduler:
                 ):
                     queue.append(request.request_id)
                     continue
-                scheduled_request = self._make_scheduled_request(request, phase, token_budget)
+                scheduled_request = self._make_scheduled_request(request, phase, available)
                 if (
                     phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
                     and scheduled_request.token_count <= 0
@@ -762,6 +865,7 @@ class Scheduler:
                 selected.add(request.request_id)
                 scheduled_requests.append(replace(scheduled_request, phase=phase))
                 token_budget -= scheduled_request.token_count
+                available -= scheduled_request.token_count
         if not scheduled_requests:
             return None
         # Fairness follows the requests actually selected, including a mixed attempt
@@ -769,7 +873,9 @@ class Scheduler:
         selected_phases = {scheduled_request.phase for scheduled_request in scheduled_requests}
         prompt_phases = selected_phases.intersection(self.policy.PREFILL_PHASES)
         recorded = (
-            RequestPhase.RECURRENT
+            RequestPhase.SPECULATIVE
+            if RequestPhase.SPECULATIVE in selected_phases
+            else RequestPhase.RECURRENT
             if RequestPhase.RECURRENT in selected_phases
             else next(iter(prompt_phases))
             if prompt_phases
@@ -799,6 +905,8 @@ class Scheduler:
         phases = {item.phase for item in scheduled_requests}
         if phases == {RequestPhase.PREFILL}:
             return self.total_ut_steps
+        if phases == {RequestPhase.SPECULATIVE, RequestPhase.PREFILLING_RECURRENT}:
+            return 1
         if RequestPhase.SPECULATIVE in phases or RequestPhase.CODA in phases:
             return 0
         if RequestPhase.PRELUDE in phases:
@@ -809,7 +917,12 @@ class Scheduler:
             # In mixed mode, stage just the embeddings when recurrent decode work
             # is ready so the next depth can join that batch. Without a reason to
             # yield, PRELUDE can execute the full prompt depth in this submission.
-            if self.config.mode == "mixed" and self.has_ready(RequestPhase.RECURRENT):
+            if self.config.mode == "mixed" and (
+                self.has_ready(RequestPhase.RECURRENT)
+                or (
+                    self.speculative_config is not None and self.has_ready(RequestPhase.SPECULATIVE)
+                )
+            ):
                 return 0
             return self.total_ut_steps
         if RequestPhase.PREFILLING_RECURRENT in phases:
@@ -857,7 +970,7 @@ class Scheduler:
         )
 
     def _take_wavefront_phase(
-        self, phase, queue, token_budget, scheduled_requests, selected, eligible
+        self, phase, queue, token_budget, scheduled_requests, selected, eligible, *, growth_blocks
     ):
         """Round-robin each request's chunks/depths into the shared token budget."""
         remaining = len(queue)
@@ -889,12 +1002,23 @@ class Scheduler:
 
         def accept_task(request: Request, scheduled_request: ScheduledRequest) -> bool:
             """Reserve capacity and commit one wavefront task to this batch."""
-            nonlocal token_budget
+            nonlocal token_budget, growth_blocks
             request_id = request.request_id
             frontier = scheduled_request.token_start + scheduled_request.token_count
+            extra = (
+                max(
+                    0,
+                    self.cache_manager.required_blocks(frontier)
+                    - self.cache_manager.allocated_blocks(request_id),
+                )
+                if growth_blocks is not None
+                else 0
+            )
             if not self._ensure_execution_capacity(request, frontier, selected=selected):
                 blocked.add(request_id)
                 return False
+            if growth_blocks is not None:
+                growth_blocks -= extra
             selected.add(request_id)
             added.add(request_id)
             token_budget -= scheduled_request.token_count
@@ -921,10 +1045,16 @@ class Scheduler:
                     end = min(end, request.num_preluded_tokens)
                 if start >= end:
                     continue
+                available = token_budget
+                if growth_blocks is not None:
+                    cache = self.cache_manager
+                    blocks = cache.allocated_blocks(request_id) + growth_blocks
+                    frontier = blocks // cache.storage_depths * cache.block_size
+                    available = min(available, frontier - start)
                 scheduled_request = self._make_wavefront_task(
                     request,
                     phase,
-                    token_budget,
+                    available,
                     depth=(None if phase == RequestPhase.PREFILLING_PRELUDE else depth),
                     start=start,
                 )
@@ -934,6 +1064,26 @@ class Scheduler:
                     assert prelude_cursors is not None
                     prelude_cursors[request_id] += scheduled_request.token_count
                 tasks.append((owner_index, scheduled_request))
+        if (
+            token_budget
+            and self.config.adaptive_wavefront_prefill
+            and phase == RequestPhase.PREFILLING_RECURRENT
+        ):
+            # Every ready depth has had its first turn. Fill the remaining rows
+            # with staged chunks at those same depths, without advancing their
+            # frontiers or borrowing work that this submission has yet to produce.
+            for owner_index, first in tuple(tasks):
+                request, depth = first.request, first.depth
+                start = first.token_start + first.token_count
+                ready_end = min(request.prefill_depth_ranges[depth][1], request.num_preluded_tokens)
+                while token_budget and start < ready_end:
+                    task = self._make_wavefront_task(
+                        request, phase, token_budget, start=start, depth=depth
+                    )
+                    if task is None or not accept_task(request, task):
+                        break
+                    tasks.append((owner_index, task))
+                    start += task.token_count
         tasks.sort(key=lambda item: (item[0], item[1].token_start))
         scheduled_requests.extend(
             replace(scheduled_request, phase=phase) for _, scheduled_request in tasks
@@ -1112,6 +1262,7 @@ class Scheduler:
             )
         else:
             chunk_complete = False
+            chunk_size = request.prefill_chunk_size or self.config.prefill_chunk_size
             representative = scheduled_requests[0]
             for item in scheduled_requests:
                 depth = item.depth
@@ -1128,7 +1279,7 @@ class Scheduler:
 
                 chunk_end = min(
                     len(request.prompt_token_ids),
-                    item.chunk_start + self.config.prefill_chunk_size,
+                    item.chunk_start + chunk_size,
                 )
                 if end == chunk_end:
                     if item.chunk_start != request.prefill_reclaimable_tokens:
@@ -1232,7 +1383,9 @@ class Scheduler:
     def _should_exit(self, request: Request) -> bool:
         """Evaluate the policy after recording the completed loop's actual hazard."""
         params = request.sampling_params
-        maximum = params.max_loops or self.total_ut_steps
+        maximum = request.loop_limit(self.total_ut_steps)
+        if request.target_loops is not None:
+            return request.loops_done >= maximum
         return request.loops_done >= maximum or (
             params.exit_threshold < 1.0
             and request.loops_done >= params.min_loops
@@ -1260,7 +1413,9 @@ class Scheduler:
     def needs_exit_signal(self, request: Request) -> bool:
         """Whether the next submitted loop needs its predecessor's readback."""
         params = request.sampling_params
-        maximum = params.max_loops or self.total_ut_steps
+        maximum = request.loop_limit(self.total_ut_steps)
+        if request.target_loops is not None:
+            return False
         # No score can end a request whose minimum depth is its maximum.
         return (
             self.exit_mode != "trace"
@@ -1322,13 +1477,15 @@ class Scheduler:
                 request.loops_done += 1
                 if self.exit_mode == "trace":
                     should_exit = self._trace_exit(request)
+                elif request.target_loops is not None:
+                    should_exit = self._should_exit(request)
                 else:
                     score = result.gate_scores[row]
                     if self.exit_mode == "ouro":
                         request.remaining_probability *= 1.0 - score
                         should_exit = self._should_exit(request)
                     else:
-                        maximum = request.sampling_params.max_loops or self.total_ut_steps
+                        maximum = request.loop_limit(self.total_ut_steps)
                         should_exit = (
                             request.loops_done >= maximum
                             or request.pending_exit_depth == request.loops_done
@@ -1397,7 +1554,8 @@ class Scheduler:
                         request.loops_done = 0
                     if request.request_id not in self.queues[RequestPhase.SPECULATIVE]:
                         self.enqueue(request, RequestPhase.SPECULATIVE)
-                update.outputs.append(request)
+                if emitted:
+                    update.outputs.append(request)
         return update
 
     def update_after_submission(
@@ -1455,12 +1613,10 @@ class Scheduler:
                     and self.needs_exit_signal(request)
                 )
                 request.loops_done += 1
-                should_exit = (
-                    self._trace_exit(request)
-                    if self.exit_mode == "trace"
-                    else request.loops_done
-                    >= (request.sampling_params.max_loops or self.total_ut_steps)
-                )
+                if self.exit_mode == "trace":
+                    should_exit = self._trace_exit(request)
+                else:
+                    should_exit = request.loops_done >= request.loop_limit(self.total_ut_steps)
                 signal = signals.get(row) if signals else None
                 if consume_signal:
                     if (
@@ -1475,7 +1631,8 @@ class Scheduler:
                     request.pending_exit_depth = request.loops_done
                     update.exited.append(request)
                 elif (
-                    self.exit_mode in ("ouro_delayed", "random_lookahead")
+                    request.target_loops is None
+                    and self.exit_mode in ("ouro_delayed", "random_lookahead")
                     and request.sampling_params.exit_threshold < 1
                 ):
                     update.retain_signal.append(row)

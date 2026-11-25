@@ -14,7 +14,15 @@ import pytest
 import torch
 
 from tests.helpers import make_prefill_engine, tiny_ouro_config, tiny_ouro_model
-from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import (
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    SamplingParams,
+    SchedulerConfig,
+    SpeculativeConfig,
+)
+from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.core.scheduling_policy import (
     MixedPolicy,
     NoRefillPolicy,
@@ -857,6 +865,46 @@ def test_wavefront_prefill_batches_ready_depths_and_reuses_retired_ring_slots():
     e.close()
 
 
+def test_adaptive_wavefront_fills_spare_rows_with_staged_chunks_at_the_same_depth():
+    config = SchedulerConfig(
+        mode="mixed",
+        max_num_seqs=1,
+        max_num_batched_tokens=7,
+        prefill_chunk_size=2,
+        wavefront_chunked_prefill=True,
+        adaptive_wavefront_prefill=True,
+    )
+    reference = make_prefill_engine(atomic=True)
+    engine = make_prefill_engine(scheduler_config=config)
+    prompt = list(range(1, 12))
+    try:
+        expected = run_request(reference, prompt)
+        params = SamplingParams(max_tokens=3, max_loops=2, ignore_eos=True)
+        engine.add_request("run", prompt, params)
+        assert not engine.step()
+        request = engine.scheduler.requests["run"]
+        assert request.phase is RequestPhase.PREFILLING_PRELUDE
+        assert not engine.step()
+
+        core = engine.scheduler.schedule()
+        assert core.phase is RequestPhase.PREFILLING_RECURRENT
+        assert [(item.token_start, item.token_count, item.depth) for item in core.requests] == [
+            (0, 2, 0),
+            (2, 2, 0),
+            (4, 2, 0),
+            (6, 1, 0),
+        ]
+        # Release the selection and exercise the runner's normal submit/update path.
+        engine.scheduler.enqueue(request, core.phase)
+        actual = drain_request(engine)
+        assert actual.token_ids == expected.token_ids
+        assert actual.exit_depths == expected.exit_depths
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
+        reference.close()
+
+
 def test_wavefront_prefill_matches_atomic_tokens_and_keeps_full_depth_first_output():
     wavefront = SchedulerConfig(
         max_num_seqs=2,
@@ -881,6 +929,117 @@ def test_wavefront_prefill_matches_atomic_tokens_and_keeps_full_depth_first_outp
     assert actual.scheduler.config.wavefront_chunked_prefill
     reference.close()
     actual.close()
+
+
+@pytest.mark.parametrize(("kv_blocks", "long_chunk"), [(28, 6), (64, 12)])
+def test_adaptive_wavefront_sizes_follow_live_kv_and_preserve_ring_progress(kv_blocks, long_chunk):
+    config = SchedulerConfig(
+        mode="mixed",
+        max_num_seqs=2,
+        max_num_batched_tokens=24,
+        prefill_chunk_size=16,
+        wavefront_chunked_prefill=True,
+        adaptive_wavefront_prefill=True,
+    )
+    engine = make_prefill_engine(
+        scheduler_config=config, cache_config=CacheConfig(kv_blocks, 2, incremental_allocation=True)
+    )
+    reference = make_prefill_engine(atomic=True)
+    try:
+        prompts = {"short": [2, 3], "long": list(range(1, 13))}
+        params = SamplingParams(max_tokens=1)
+        expected = {}
+        for request_id, prompt in prompts.items():
+            reference.add_request(request_id, prompt, params)
+            expected[request_id] = drain_request(reference).token_ids
+            engine.add_request(request_id, prompt, params)
+        finished = set()
+        for _ in range(60):
+            for output in engine.step():
+                if output.finished:
+                    assert output.token_ids == expected[output.request_id]
+                    finished.add(output.request_id)
+            if len(finished) == 2:
+                break
+            short = engine.scheduler.requests.get("short")
+            long = engine.scheduler.requests.get("long")
+            if short is not None:
+                assert short.prefill_chunk_size == 2
+            if long is not None:
+                assert long.prefill_chunk_size == long_chunk
+        assert finished == {"short", "long"}
+        assert engine.cache_manager.num_used_blocks == 0
+    finally:
+        engine.close()
+        reference.close()
+
+
+def test_adaptive_wavefront_reduces_budget_and_accounts_for_decode_page_growth():
+    config = SchedulerConfig(
+        mode="mixed",
+        max_num_seqs=4,
+        max_num_batched_tokens=12,
+        prefill_chunk_size=4,
+        wavefront_chunked_prefill=True,
+        adaptive_wavefront_prefill=True,
+    )
+    engine = make_prefill_engine(
+        scheduler_config=config, cache_config=CacheConfig(32, 2, incremental_allocation=True)
+    )
+    try:
+        scheduler = engine.scheduler
+        cache = engine.cache_manager
+        for index in range(3):
+            request = Request(str(index), [2, 3], SamplingParams(max_tokens=2))
+            request.generated_token_ids.append(4)
+            assert cache.allocate(request.request_id, 3, initial_tokens=2)
+            scheduler.requests[request.request_id] = request
+            scheduler.enqueue(request, RequestPhase.RECURRENT)
+        phase = RequestPhase.PREFILLING_PRELUDE
+        assert scheduler._wavefront_limits(phase, 12, None) == (12, 8)
+        scheduler.policy.record_batch(phase)
+        assert scheduler._wavefront_limits(phase, 12, None) == (4, 8)
+    finally:
+        engine.close()
+
+
+def test_adaptive_wavefront_runs_decode_when_prefill_must_leave_its_next_kv_page_free():
+    config = SchedulerConfig(
+        mode="mixed",
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        prefill_chunk_size=4,
+        wavefront_chunked_prefill=True,
+        adaptive_wavefront_prefill=True,
+    )
+    engine = make_prefill_engine(
+        scheduler_config=config, cache_config=CacheConfig(12, 2, incremental_allocation=True)
+    )
+    try:
+        scheduler = engine.scheduler
+        cache = engine.cache_manager
+        decode = Request("d", [2, 3], SamplingParams(max_tokens=2), generated_token_ids=[4])
+        prompt = Request(
+            "p",
+            [5, 6, 7, 8],
+            SamplingParams(max_tokens=1),
+            num_preluded_tokens=2,
+            prefill_depth_ranges=Request.prefill_boundaries(4, TOTAL_DEPTHS),
+        )
+        for request, capacity, phase in (
+            (decode, 3, RequestPhase.RECURRENT),
+            (prompt, 4, RequestPhase.PREFILLING_PRELUDE),
+        ):
+            assert cache.allocate(request.request_id, capacity, initial_tokens=2)
+            scheduler.requests[request.request_id] = request
+            scheduler.enqueue(request, phase)
+
+        batch = scheduler.schedule()
+        assert batch.phase is RequestPhase.RECURRENT
+        assert batch.requests[0].request is decode
+        assert list(scheduler.queues[RequestPhase.PREFILLING_PRELUDE]) == ["p"]
+    finally:
+        engine.close()
 
 
 @pytest.mark.parametrize("budget", [1, 5, 17])
@@ -1823,6 +1982,53 @@ def test_scheduling_policies_declare_their_prefill_stages():
         RequestPhase.PREFILLING_PRELUDE,
         RequestPhase.PREFILLING_RECURRENT,
     )
+
+
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_mixed_speculative_schedule_reserves_prompt_rows_under_the_shared_budget(wavefront):
+    engine = make_prefill_engine()
+    try:
+        scheduler = Scheduler(
+            SchedulerConfig(
+                mode="mixed",
+                max_num_seqs=3,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=4,
+                wavefront_chunked_prefill=wavefront,
+            ),
+            engine.cache_manager,
+            SpeculativeConfig(2, 1, 3, "pipeline"),
+            total_ut_steps=3,
+            mixed_speculative=True,
+        )
+        for request_id in ("decode-a", "decode-b"):
+            request = Request(request_id, [1], SamplingParams(max_tokens=8))
+            scheduler.requests[request_id] = request
+            assert engine.cache_manager.allocate(request_id, 8)
+            scheduler.enqueue(request, RequestPhase.SPECULATIVE)
+        prompt = Request(
+            "prompt",
+            [1, 2, 3, 4],
+            SamplingParams(max_tokens=8),
+            num_preluded_tokens=4,
+            prefill_depth_ranges=Request.prefill_boundaries(4, 3),
+        )
+        scheduler.requests[prompt.request_id] = prompt
+        assert engine.cache_manager.allocate(prompt.request_id, 4)
+        scheduler.enqueue(prompt, RequestPhase.PREFILLING_RECURRENT)
+        scheduler.policy.prefill_batches_since_recurrent = 1
+
+        batch = scheduler.schedule()
+
+        assert batch.is_mixed and batch.loop_count == 1 and batch.num_tokens == 4
+        assert [(batch.phase_for(span), span.token_count) for span in batch.requests] == [
+            (RequestPhase.SPECULATIVE, 3),
+            (RequestPhase.PREFILLING_RECURRENT, 1),
+        ]
+        assert scheduler.policy.prefill_batches_since_recurrent == 0
+        assert list(scheduler.queues[RequestPhase.SPECULATIVE]) == ["decode-b"]
+    finally:
+        engine.close()
 
 
 @pytest.mark.parametrize(

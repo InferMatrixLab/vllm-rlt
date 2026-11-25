@@ -51,6 +51,8 @@ class ProfileConfig:
             object.__setattr__(self, "activities", values)
 
     def resolve_activities(self, device):
+        if str(device).startswith("npu"):
+            raise ValueError("NPU device profiling requires torch_npu.profiler")
         names = self.activities or (("cpu", "cuda") if str(device).startswith("cuda") else ("cpu",))
         values = [getattr(torch.profiler.ProfilerActivity, name.upper()) for name in names]
         if not set(values) <= torch.profiler.supported_activities():

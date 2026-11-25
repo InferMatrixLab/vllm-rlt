@@ -63,7 +63,9 @@ if __name__ == "__main__":
 
 The default exit mode remains `ouro`, with the original cumulative hazard policy. For random lookahead, sigmoid is a direct score for exiting after one more loop, not a hazard/CDF. `SamplingParams.exit_threshold` compares this score directly. Threshold 1 disables adaptive exit; `max_loops` always caps execution. Adaptive lookahead cannot exit before round 2, although an explicitly configured hard maximum of 1 is honored. All prompt tokens still run the model's full depth.
 
-Ordinary asynchronous execution requires `ouro_delayed`, `random_lookahead` or `trace`; speculative execution has the separate constraints below. It automatically enables reusable static inputs to avoid blocking device metadata transfers. CPU supports the same scheduling state machine for tests, with immediately completed operations; it does not simulate GPU parallel execution. `multi_stream` is an independent CUDA execution feature: `False` uses one stream for core, boundary and copies; `True` separates those streams, with or without async scheduling.
+Fixed-loop models accept the request-level `SamplingParams.target_loops` field (offline CLI: `--request-target-loops`). An omitted target defaults to `total_ut_steps`; an explicit target must be between one and the model depth. If `max_loops` is provided, it must match the fixed target. For compatibility with the default, `min_loops=2` is accepted, as is `min_loops` equal to the target; the fixed target determines the exit depth. Targets below the model depth are rejected until per-request prompt prefill is enabled; they are never silently run at full prompt depth. Dynamic-exit models do not accept this field and retain their existing loop-bound and exit-threshold behavior.
+
+For dynamic-exit models, ordinary asynchronous execution requires `ouro_delayed`, `random_lookahead` or `trace`; fixed-loop models do not need an exit signal. Speculative execution has the separate constraints below. Asynchronous execution automatically enables reusable static inputs to avoid blocking device metadata transfers. CPU supports the same scheduling state machine for tests, with immediately completed operations; it does not simulate GPU parallel execution. `multi_stream` is an independent CUDA execution feature: `False` uses one stream for core, boundary and copies; `True` separates those streams, with or without async scheduling.
 
 CLI flags are shared by offline and serving entrypoints:
 
@@ -229,11 +231,9 @@ for the selection order, shared budget and per-request progress.
 ### Wavefront chunked prefill
 
 `SchedulerConfig(wavefront_chunked_prefill=True)` opts into WCPB and requires
-LAST_EXITED KV. It can run with
-refill or mixed scheduling. When combined with speculation, use refill mode;
-asynchronous block speculation rejects preemption. Synchronous block and
-pipeline modes have different support constraints; do not infer that every
-combination is validated.
+LAST_EXITED KV. It can run with refill or mixed scheduling. Speculation in
+mixed mode is available for the single-stage native Inkling async token
+pipeline. Asynchronous block speculation uses refill and rejects preemption.
 
 The scheduler stages up to `total_ut_steps` chunks per request, then batches one
 ready chunk for each prompt depth. For four depths and chunk size two, recurrent
@@ -473,7 +473,7 @@ recommended default; validate calibration and task quality for deployment.
 
 ## Replay and validation commands
 
-Trace mode expects `depths_by_request`, with one depth per output: full prefill depth first, then each decode input's exit depth. Admission validates coverage and loop bounds. Request IDs must match the trace. The public engine replay fixes depth decisions; token generation still follows the configured sampler.
+Trace mode expects `depths_by_request`, with one depth per output: full prefill depth first, then each decode input's exit depth. Trace decisions take precedence over a valid request-level `target_loops` value; the trace controls per-output depths. Trace depths remain bounded by model depth and any supplied `max_loops`. Admission validates coverage and loop bounds. Request IDs must match the trace. The public engine replay fixes depth decisions; token generation still follows the configured sampler.
 
 ```python
 ExitConfig(mode="trace", depths_by_request={"A": [4, 2, 4]})

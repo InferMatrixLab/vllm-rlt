@@ -19,6 +19,20 @@ def _query_count(batch):
     return len(batch.position_ids) if isinstance(batch, DeviceKVMetadata) else len(batch.rows)
 
 
+def _empty_device_batch(cache):
+    """Capture with zero live rows and keep all KV writes masked."""
+    device = cache.device
+    positions = torch.empty(0, device=device, dtype=torch.long)
+    return DeviceKVMetadata(
+        allocations=(),
+        position_ids=positions,
+        write_blocks=positions,
+        write_offsets=positions,
+        context_lengths=torch.empty(0, device=device, dtype=torch.int32),
+        block_tables=torch.empty((0, 1), device=device, dtype=torch.int32),
+    )
+
+
 def graph_capture_sizes(execution, preferred=()):
     """Prefer full-batch shapes, then spend remaining entries on smaller rows.
 
@@ -51,7 +65,11 @@ def _bucket_size(sizes, count):
 
 
 def _cache_full(owner, key):
-    full = key not in owner.entries and len(owner.entries) >= owner.execution.cuda_graph_max_graphs
+    if key in owner.entries:
+        return False
+    if not getattr(owner, "allow_capture", True):
+        return True
+    full = len(owner.entries) >= owner.execution.cuda_graph_max_graphs
     if full and not owner.warned_cache_full:
         logger.warning(
             "%s cache is full (%d shapes); unseen shapes will run eager. "
@@ -79,7 +97,8 @@ def _capture(hidden, stream, pool, run, *, startup=False):
                 run()
         stream.synchronize()
         # Preserve main's cleanup of old engine cycles before entering capture.
-        gc.collect()
+        if not startup or gc.isenabled():
+            gc.collect()
         graph = torch.cuda.CUDAGraph()
         # Collecting an unreachable old CUDAGraph here calls cudaGraphExecDestroy,
         # which is forbidden during capture and invalidates the new graph.
@@ -104,10 +123,18 @@ class _DeviceCache:
 
     def __init__(self, cache):
         self.cache = cache
+        self.block_size = cache.key_cache.shape[2]
+        self.key_cache = cache.key_cache
+        self.value_cache = cache.value_cache
+        self.auxiliary_cache = getattr(cache, "auxiliary_cache", None)
+
+    def record_external_kv(self, layer, batch):
+        # The graph owners advance host coverage after replay.
+        pass
 
     def _write_prepared(self, layer, batch, k, v):
         cache = self.cache
-        if cache.key_scale is not None:
+        if getattr(cache, "key_scale", None) is not None:
             # FP8 pools: one fused quantizing writer that honors the same row masks.
             cache._store_layer(
                 layer,
@@ -169,11 +196,27 @@ class _DeviceCache:
 
 
 def _graph_entry(
-    hidden, batch, cache, max_position_embeddings, *, count=None, packed=None, bucketed=False
+    hidden,
+    batch,
+    cache,
+    max_position_embeddings,
+    *,
+    count=None,
+    packed=None,
+    bucketed=False,
+    table_count=None,
+    masked=False,
+    block_tables=None,
 ):
     count = _query_count(batch) if count is None else count
     packed = batch.cu_seqlens_q is not None if packed is None else packed
-    tables = count if bucketed else len(batch.context_lengths)
+    tables = (
+        table_count
+        if table_count is not None
+        else count
+        if bucketed
+        else len(batch.context_lengths)
+    )
     width = math.ceil(max_position_embeddings / cache.block_size)
     return SimpleNamespace(
         hidden=hidden.new_empty((count, *hidden.shape[1:])),
@@ -184,7 +227,11 @@ def _graph_entry(
             position_ids=torch.empty(count, device=cache.device, dtype=torch.long),
             write_blocks=torch.empty(count, device=cache.device, dtype=torch.long),
             write_offsets=torch.empty(count, device=cache.device, dtype=torch.long),
-            block_tables=torch.zeros((tables, width), device=cache.device, dtype=torch.int32),
+            block_tables=(
+                torch.zeros((tables, width), device=cache.device, dtype=torch.int32)
+                if block_tables is None
+                else block_tables
+            ),
             context_lengths=torch.empty(tables, device=cache.device, dtype=torch.int32),
             cu_seqlens_q=(
                 torch.empty(tables + 1, device=cache.device, dtype=torch.int32) if packed else None
@@ -192,14 +239,14 @@ def _graph_entry(
             max_seqlen_q=batch.max_seqlen_q if packed else 1,
             write_mask=(
                 torch.empty(count, device=cache.device, dtype=torch.bool)
-                if bucketed or getattr(batch, "write_mask", None) is not None
+                if bucketed or masked or getattr(batch, "write_mask", None) is not None
                 else None
             ),
         ),
     )
 
 
-def _copy_graph_inputs(entry, hidden, batch, *, count=None):
+def _copy_graph_inputs(entry, hidden, batch, *, count=None, copy_tables=True):
     count = _query_count(batch) if count is None else count
     metadata = entry.metadata
     if metadata.active_rows is not None:
@@ -210,7 +257,7 @@ def _copy_graph_inputs(entry, hidden, batch, *, count=None):
         metadata.write_offsets[count:].zero_()
         # Padding has zero context, so attention never reads its (stale) table
         # rows, and active rows read only pages they cover; no table reset.
-        metadata.context_lengths[count:].zero_()
+        metadata.context_lengths[len(batch.context_lengths) :].zero_()
     entry.hidden[:count].copy_(hidden[:count])
     metadata.position_ids[:count].copy_(batch.position_ids[:count])
     metadata.write_blocks[:count].copy_(batch.write_blocks[:count])
@@ -224,8 +271,12 @@ def _copy_graph_inputs(entry, hidden, batch, *, count=None):
     tables = len(batch.context_lengths)
     metadata.context_lengths[:tables].copy_(batch.context_lengths)
     if metadata.cu_seqlens_q is not None:
-        metadata.cu_seqlens_q.copy_(batch.cu_seqlens_q)
-    metadata.block_tables[:tables, : batch.block_tables.shape[1]].copy_(batch.block_tables)
+        metadata.cu_seqlens_q[: tables + 1].copy_(batch.cu_seqlens_q)
+        if len(metadata.cu_seqlens_q) > tables + 1:
+            # searchsorted over a fixed capacity still maps the actual query rows.
+            metadata.cu_seqlens_q[tables + 1 :].fill_(count)
+    if copy_tables:
+        metadata.block_tables[:tables, : batch.block_tables.shape[1]].copy_(batch.block_tables)
 
 
 @dataclass
@@ -259,29 +310,34 @@ class RecurrentGraphs:
                 context_lengths=batch.context_lengths[:count],
                 block_tables=batch.block_tables[:count],
             )
+        if not count or count > cuda_graph_rows(self.execution):
+            self.fallbacks += 1
+            return PreparedGraph(batch)
+        frontier = {}
+        ranges = getattr(batch, "packed_ranges", None)
+        host_rows = () if ranges is not None or isinstance(batch, DeviceKVMetadata) else batch.rows
+        for allocation, depth, pos in host_rows:
+            row_key = (id(allocation), depth)
+            previous = frontier.get(row_key)
+            if previous is not None and pos != previous + 1:
+                self.fallbacks += 1
+                return PreparedGraph(batch)
+            frontier[row_key] = pos
+        variant_of = getattr(self.model, "recurrent_graph_variant", None)
+        variant = variant_of(batch) if variant_of is not None else None
+        # A plan can freeze launch dimensions and tensor slices selected from host layout.
+        plan_for = getattr(self.model, "packed_recurrent_graph_plan", None)
+        plan = plan_for(batch) if packed and plan_for is not None else None
         key = (
             count,
             len(batch.context_lengths),
             batch.max_seqlen_q if packed else 1,
             packed,
             getattr(batch, "write_mask", None) is not None,
+            variant,
+            plan,
         )
-        frontier = {}
-        contiguous = True
-        host_rows = () if isinstance(batch, DeviceKVMetadata) else batch.rows
-        for allocation, depth, pos in host_rows:
-            row_key = (id(allocation), depth)
-            previous = frontier.get(row_key)
-            if previous is not None and pos != previous + 1:
-                contiguous = False
-                break
-            frontier[row_key] = pos
-        if (
-            not count
-            or count > cuda_graph_rows(self.execution)
-            or not contiguous
-            or _cache_full(self, key)
-        ):
+        if _cache_full(self, key):
             self.fallbacks += 1
             return PreparedGraph(batch)
         entry = self.entries.get(key)
@@ -289,12 +345,14 @@ class RecurrentGraphs:
             entry = _graph_entry(
                 hidden, batch, self.cache, self.model.config.max_position_embeddings
             )
+            entry.metadata.graph_variant = variant
+            entry.metadata.packed_attention_plan = plan
             entry.graph = None
             self.entries[key] = entry
         return PreparedGraph(batch, entry)
 
     @torch.inference_mode()
-    def prepare_inputs(self, call, hidden):
+    def prepare_inputs(self, call, hidden, *, startup=False):
         batch, entry = call.metadata, call.entry
         if entry is not None:
             cache = self.cache
@@ -304,7 +362,11 @@ class RecurrentGraphs:
             seen = set()
             # Device-owned progress is ordered by the runner's stream. The CPU
             # written frontier intentionally lags in-flight speculative rounds.
-            host_rows = () if isinstance(batch, DeviceKVMetadata) else batch.rows
+            ranges = getattr(batch, "packed_ranges", None)
+            if ranges is not None:
+                host_rows = ((seq.allocation, seq.depth, seq.start) for seq in ranges)
+            else:
+                host_rows = () if isinstance(batch, DeviceKVMetadata) else batch.rows
             for allocation, depth, pos in host_rows:
                 key = (id(allocation), depth)
                 if key not in seen:
@@ -324,7 +386,7 @@ class RecurrentGraphs:
                     lambda: self.model.recurrent_prepared(
                         entry.hidden, entry.metadata, proxy, compute_gate=self.compute_gate
                     ),
-                    startup=self.startup,
+                    startup=startup or self.startup,
                 )
                 self.captures += 1
         call.inputs_ready = True
@@ -345,10 +407,14 @@ class RecurrentGraphs:
         )
         self.last_event = torch.cuda.Event()
         self.last_event.record(torch.cuda.current_stream(self.cache.device))
-        host_rows = () if isinstance(batch, DeviceKVMetadata) else batch.rows
-        for allocation, depth, pos in host_rows:
+        if getattr(batch, "packed_ranges", None) is not None:
             for layer in self.cache.recurrent_layers:
-                allocation.written[self.cache._plane(depth)][layer].add(pos)
+                self.cache._mark_prepared_write(layer, batch, None)
+        else:
+            host_rows = () if isinstance(batch, DeviceKVMetadata) else batch.rows
+            for allocation, depth, pos in host_rows:
+                for layer in self.cache.recurrent_layers:
+                    allocation.written[self.cache._plane(depth)][layer].add(pos)
         self.replays += 1
         return output
 
@@ -369,14 +435,7 @@ class DeviceRecurrentGraphs(RecurrentGraphs):
         """Capture the finite bucket set before any serving requests exist."""
         parameter = next(self.model.parameters())
         hidden = parameter.new_empty((0, self.model.config.hidden_size))
-        batch = SimpleNamespace(
-            position_ids=torch.empty(0, device=self.cache.device, dtype=torch.long),
-            write_blocks=torch.empty(0, device=self.cache.device, dtype=torch.long),
-            write_offsets=torch.empty(0, device=self.cache.device, dtype=torch.long),
-            context_lengths=torch.empty(0, device=self.cache.device, dtype=torch.int32),
-            block_tables=torch.empty((0, 1), device=self.cache.device, dtype=torch.int32),
-            cu_seqlens_q=None,
-        )
+        batch = _empty_device_batch(self.cache)
         proxy = _DeviceCache(self.cache)
         for size in self.capture_sizes:
             entry = _graph_entry(
@@ -430,8 +489,6 @@ class CodaGraphs:
         self.cache = cache
         # The boundary layers whose KV one replay reads and writes.
         self.kv_layers = getattr(model, "coda_kv_layers", ()) if cache is not None else ()
-        if bucketed and cache is not None:
-            raise ValueError("bucketed coda graphs require a row-independent Ouro head")
         self.capture_sizes = (capture_sizes or graph_capture_sizes(execution)) if bucketed else None
         self.entries = {}
         self.pool = torch.cuda.graph_pool_handle()
@@ -445,6 +502,25 @@ class CodaGraphs:
     def prepare(self):
         if self.capture_sizes is None:
             return
+        if self.cache is not None:
+            batch = _empty_device_batch(self.cache)
+            hidden = self._empty_input()
+            for size in self.capture_sizes:
+                entry = _graph_entry(
+                    hidden,
+                    batch,
+                    self.cache,
+                    self.model.config.max_position_embeddings,
+                    count=size,
+                    bucketed=True,
+                )
+                _copy_graph_inputs(entry, hidden, batch, count=0)
+                entry.graph, entry.output = _capture(
+                    entry.hidden, self.stream, self.pool, lambda: self._run(entry), startup=True
+                )
+                self.entries[size] = entry
+                self.captures += 1
+            return
         parameter = next(self.model.parameters())
         for size in self.capture_sizes:
             hidden = parameter.new_zeros((size, self.model.config.hidden_size))
@@ -457,12 +533,18 @@ class CodaGraphs:
             call.inputs_ready = False
         self.replays = 0
 
+    def _empty_input(self):
+        parameter = next(self.model.parameters())
+        dtype = getattr(self.model, "state_dtype", parameter.dtype)
+        return torch.empty((0, self.model.config.hidden_size), device=parameter.device, dtype=dtype)
+
     def select(self, hidden, batch=None):
         count = len(hidden)
+        device_owned = isinstance(batch, DeviceKVMetadata)
         if self.cache is not None and (
             batch is None
-            or not batch.writable
-            or len(batch.rows) != count
+            or (not device_owned and not batch.writable)
+            or _query_count(batch) != count
             or batch.cu_seqlens_q is not None
         ):
             raise ValueError("coda graphs require matching decode rows and KV metadata")
@@ -474,7 +556,14 @@ class CodaGraphs:
         entry = self.entries.get(capacity)
         if entry is None:
             entry = (
-                _graph_entry(hidden, batch, self.cache, self.model.config.max_position_embeddings)
+                _graph_entry(
+                    hidden,
+                    batch,
+                    self.cache,
+                    self.model.config.max_position_embeddings,
+                    count=capacity,
+                    bucketed=self.capture_sizes is not None,
+                )
                 if self.cache is not None
                 else SimpleNamespace(hidden=hidden.new_empty((capacity, *hidden.shape[1:])))
             )
@@ -487,9 +576,10 @@ class CodaGraphs:
         batch, entry = call.metadata, call.entry
         if self.cache is not None:
             self.cache._require_live_batch(batch)
-            for allocation, depth, position in batch.rows:
-                for layer in self.kv_layers:
-                    self.cache._require_prefix(allocation, layer, depth, position)
+            if not isinstance(batch, DeviceKVMetadata):
+                for allocation, depth, position in batch.rows:
+                    for layer in self.kv_layers:
+                        self.cache._require_prefix(allocation, layer, depth, position)
         if entry is not None:
             stream = torch.cuda.current_stream(hidden.device)
             if self.last_event is not None:
@@ -532,12 +622,85 @@ class CodaGraphs:
         output = entry.output[: len(hidden)].clone()
         self.last_event = torch.cuda.Event()
         self.last_event.record(torch.cuda.current_stream(hidden.device))
-        if self.cache is not None:
+        if self.cache is not None and not isinstance(batch, DeviceKVMetadata):
             for allocation, depth, position in batch.rows:
                 for layer in self.kv_layers:
                     allocation.written[self.cache._plane(depth)][layer].add(position)
         self.replays += 1
         return output
+
+
+class CodaPairGraphs:
+    """Replay the ordered pair on the speculative runner's single compute stream.
+
+    Returned tokens borrow graph storage. The runner enqueues all consumers on
+    that same stream before another replay can overwrite them.
+    """
+
+    def __init__(self, model, cache, capture_sizes):
+        self.model, self.cache = model, cache
+        self.capture_sizes = capture_sizes
+        self.stream = torch.cuda.Stream(device=cache.device)
+        self.pool = torch.cuda.graph_pool_handle()
+        self.entries = {}
+        self.replays = self.fallbacks = 0
+
+    @torch.inference_mode()
+    def prepare(self):
+        model, cache = self.model, self.cache
+        parameter = next(model.parameters())
+        hidden = torch.empty(
+            (0, model.config.hidden_size),
+            dtype=getattr(model, "state_dtype", parameter.dtype),
+            device=cache.device,
+        )
+        empty = _empty_device_batch(cache)
+        proxy = _DeviceCache(cache)
+        for size in self.capture_sizes:
+            target = _graph_entry(
+                hidden,
+                empty,
+                cache,
+                model.config.max_position_embeddings,
+                count=size,
+                bucketed=True,
+            )
+            draft = _graph_entry(
+                hidden,
+                empty,
+                cache,
+                model.config.max_position_embeddings,
+                count=size,
+                bucketed=True,
+                block_tables=target.metadata.block_tables,
+            )
+            for entry in (target, draft):
+                _copy_graph_inputs(entry, hidden, empty, count=0)
+
+            def run():
+                return model.coda_pair(
+                    target.hidden, target.metadata, draft.hidden, draft.metadata, proxy
+                )
+
+            graph, tokens = _capture(target.hidden, self.stream, self.pool, run, startup=True)
+            self.entries[size] = (target, draft, graph, tokens)
+
+    def forward(self, target_hidden, target_kv, draft_hidden, draft_kv):
+        self.cache._require_live_batch(target_kv)
+        self.cache._require_live_batch(draft_kv)
+        count = len(target_hidden)
+        capacity = _bucket_size(self.capture_sizes, count)
+        if capacity not in self.entries or target_kv.block_tables is not draft_kv.block_tables:
+            self.fallbacks += 1
+            return self.model.coda_pair(
+                target_hidden, target_kv, draft_hidden, draft_kv, self.cache
+            )
+        target, draft, graph, tokens = self.entries[capacity]
+        _copy_graph_inputs(target, target_hidden, target_kv)
+        _copy_graph_inputs(draft, draft_hidden, draft_kv, copy_tables=False)
+        graph.replay()
+        self.replays += 1
+        return tokens[:, :count]
 
 
 class PreludeGraphs(CodaGraphs):
@@ -546,9 +709,12 @@ class PreludeGraphs(CodaGraphs):
     Prompt prefill stays eager; its row count follows the prompt, not the batch.
     """
 
-    def __init__(self, model, execution, cache):
-        super().__init__(model, execution, cache)
+    def __init__(self, model, execution, cache, *, bucketed=False, capture_sizes=None):
+        super().__init__(model, execution, cache, bucketed=bucketed, capture_sizes=capture_sizes)
         self.kv_layers = model.prelude_kv_layers
+
+    def _empty_input(self):
+        return torch.empty(0, device=self.cache.device, dtype=torch.long)
 
     def _run(self, entry):
         return self.model.prelude_prepared(entry.hidden, entry.metadata, _DeviceCache(self.cache))

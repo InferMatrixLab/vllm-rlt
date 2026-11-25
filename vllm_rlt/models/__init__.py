@@ -11,6 +11,7 @@ import torch
 from .config import ModelConfig, prepare_model
 from .dory import DoryConfig, DoryForCausalLM
 from .huginn import HuginnConfig, HuginnForCausalLM
+from .inkling2mini import Inkling2Config, Inkling2ForCausalLM
 from .nanbeige import NanbeigeConfig, NanbeigeForCausalLM
 from .ouro import OuroConfig, OuroForCausalLM
 
@@ -19,6 +20,7 @@ MODEL_MAPPING = {
     "nanbeige": NanbeigeForCausalLM,
     "huginn_raven": HuginnForCausalLM,
     "dory": DoryForCausalLM,
+    "inkling2_loop": Inkling2ForCausalLM,
 }
 
 
@@ -226,6 +228,8 @@ __all__ = [
     "HuginnForCausalLM",
     "DoryConfig",
     "DoryForCausalLM",
+    "Inkling2Config",
+    "Inkling2ForCausalLM",
     "AutoModelForCausalLM",
     "resolve_local_model_path",
     "resolve_model_source",

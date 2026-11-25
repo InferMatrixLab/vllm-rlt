@@ -37,12 +37,21 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", self.frequencies(), persistent=False)
 
     def frequencies(self, device: torch.device | str | None = None) -> torch.Tensor:
-        return 1.0 / (
+        target = device
+        if device is not None and torch.device(device).type == "npu":
+            device = "cpu"  # HF creates NPU rotary constants on the host.
+        frequencies = 1.0 / (
             self.rope_theta
             ** (
                 torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
                 / self.head_dim
             )
+        )
+
+        return (
+            frequencies.to(target)
+            if device == "cpu" and target is not None and torch.device(target).type == "npu"
+            else frequencies
         )
 
     def _apply(self, fn, recurse=True):

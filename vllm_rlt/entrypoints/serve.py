@@ -7,6 +7,7 @@ from functools import partial
 
 import torch
 
+from vllm_rlt.attention import validate_backend_name
 from vllm_rlt.config import SchedulerConfig
 from vllm_rlt.engine.llm_engine import StageClient
 from vllm_rlt.entrypoints.runtime_args import (
@@ -37,13 +38,17 @@ def load_engine(args):
             else (args.revision if args.tokenizer else revision)
         ),
     )
-    if config["model_type"].lower() == "ouro":
+    model_type = config["model_type"].lower()
+    if model_type == "ouro":
         decoder = getattr(getattr(tokenizer, "backend_tokenizer", None), "decoder", None)
         if not isinstance(decoder, ByteLevel):
             raise ValueError("serving requires the Ouro byte-level tokenizer")
+    max_loops = getattr(args, "max_loops", None)
+    if max_loops is not None and model_type != "inkling2_loop":
+        raise ValueError("serve --max-loops sets the startup depth of an Inkling checkpoint")
     engine = StageClient(
         source,
-        model_config=ModelConfig.from_dict(config),
+        model_config=ModelConfig.from_dict(config).with_max_loops(max_loops),
         revision=revision,
         device=args.device,
         dtype=args.dtype,
@@ -56,6 +61,7 @@ def load_engine(args):
             mode=args.mode,
             prefill_chunk_size=getattr(args, "prefill_chunk_size", 128),
             wavefront_chunked_prefill=getattr(args, "wavefront_chunked_prefill", False),
+            adaptive_wavefront_prefill=getattr(args, "adaptive_wavefront_prefill", False),
             max_prefill_batches_before_decode=getattr(args, "max_prefill_batches_before_decode", 1),
             admission_scan_limit=getattr(args, "admission_scan_limit", 64),
             max_admission_bypasses=getattr(args, "max_admission_bypasses", 8),
@@ -79,15 +85,17 @@ def main():
         "--model", help="Local checkpoint path or HuggingFace repository ID", required=True
     )
     parser.add_argument("--revision")
+    parser.add_argument("--max-loops", type=int, help="Startup depth for Inkling VarLoop")
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokenizer-revision")
     parser.add_argument("--served-model-name")
-    parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--device", choices=["cpu", "cuda", "npu"], default="cuda")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument(
         "--attention-backend",
         type=str.lower,
         choices=[
+            "ascend_eager",
             "auto",
             "torch",
             "triton",
@@ -117,6 +125,10 @@ def main():
     limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
     if args.device == "cpu" and args.attention_backend not in ("auto", "torch"):
         parser.error("CPU execution requires --attention-backend torch or auto")
+    try:
+        validate_backend_name(args.attention_backend, device_type=args.device)
+    except ValueError as exc:
+        parser.error(str(exc))
     torch.set_num_threads(args.cpu_threads)
     logging.basicConfig(level=logging.INFO)
     app = create_app(

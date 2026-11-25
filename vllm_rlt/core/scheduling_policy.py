@@ -75,7 +75,9 @@ class RefillPolicy(SchedulingPolicy):
         scheduler._admit()
         for phase in self.PREFILL_PHASES:
             if scheduler.has_ready(phase):
-                return scheduler._take(phase)
+                batch = scheduler._take(phase)
+                if batch is not None or not self.config.adaptive_wavefront_prefill:
+                    return batch
         # Admission can restore a snapshot directly to a boundary phase.
         if scheduler.has_ready(RequestPhase.PRELUDE):
             return scheduler._take(RequestPhase.PRELUDE)
@@ -147,10 +149,49 @@ class SpeculativePolicy(SchedulingPolicy):
             return scheduler._take(RequestPhase.CODA)
         for phase in self.PREFILL_PHASES:
             if scheduler.has_ready(phase):
-                return scheduler._take(phase)
+                batch = scheduler._take(phase)
+                if batch is not None or not self.config.adaptive_wavefront_prefill:
+                    return batch
         if scheduler.has_ready(RequestPhase.SPECULATIVE):
             return scheduler._take(RequestPhase.SPECULATIVE)
         return None
+
+
+class MixedSpeculativePolicy(SpeculativePolicy):
+    """Share a core visit while keeping bootstrap and round results independent."""
+
+    def schedule(self, scheduler, *, prefer_recurrent=False):
+        if scheduler.has_ready(RequestPhase.CODA):
+            return scheduler._take(RequestPhase.CODA)
+        scheduler._admit()
+        if scheduler.has_ready(RequestPhase.CODA):
+            return scheduler._take(RequestPhase.CODA)
+        decode_ready = scheduler.has_ready(RequestPhase.SPECULATIVE)
+        if decode_ready and scheduler.has_ready(RequestPhase.PREFILLING_RECURRENT):
+            # Leave room for prompt rows even when all decode windows could
+            # fill the batch. For a one-row budget, decode_due caps the prompt streak.
+            budget = self.config.max_num_batched_tokens
+            reserved = (
+                int(not self.decode_due)
+                if budget == 1
+                else min(self.config.prefill_chunk_size, max(1, budget // 4))
+            )
+            batch = scheduler.take_phases(
+                (RequestPhase.SPECULATIVE, RequestPhase.PREFILLING_RECURRENT),
+                reserve_for_later=reserved,
+            )
+            if batch is not None:
+                return batch
+        if decode_ready and self.decode_due:
+            batch = scheduler._take(RequestPhase.SPECULATIVE)
+            if batch is not None:
+                return batch
+        for phase in self.PREFILL_PHASES:
+            if scheduler.has_ready(phase):
+                batch = scheduler._take(phase)
+                if batch is not None:
+                    return batch
+        return scheduler._take(RequestPhase.SPECULATIVE) if decode_ready else None
 
 
 class SplitPrefillPolicy(RefillPolicy):
@@ -186,6 +227,7 @@ def create_scheduling_policy(
     speculative_config: SpeculativeConfig | None,
     *,
     produces_tokens: bool = True,
+    mixed_speculative: bool = False,
 ) -> SchedulingPolicy:
     """Pick one policy; reject combinations no policy implements yet.
 
@@ -204,7 +246,9 @@ def create_scheduling_policy(
     # The remaining compatibility checks apply to generation scheduling.
     if scheduler_config.mode == "mixed":
         if speculative_config is not None:
-            raise ValueError("mixed scheduling does not support speculative work")
+            if not mixed_speculative or speculative_config.mode != "pipeline":
+                raise ValueError("mixed scheduling requires a compatible speculative pipeline")
+            return MixedSpeculativePolicy(scheduler_config)
     elif staged_prefill and speculative_config is None and scheduler_config.mode != "refill":
         raise ValueError("staged prefill currently implements refill or mixed scheduling")
 

@@ -650,7 +650,15 @@ def test_cuda_dynamic_async_respects_buffers_and_matches_sync(layout, multi_stre
     expected = LLM(base, **common).generate(prompts, params)
     execution = ExecutionConfig(async_scheduling=True, multi_stream=multi_stream)
     actual = LLM(base, execution_config=execution, **common)
-    assert actual.engine.execution_config == execution
+    # Automatic fields resolve at engine construction; other switches must survive.
+    assert (
+        replace(
+            actual.engine.execution_config,
+            cuda_graph_max_batch_size=execution.cuda_graph_max_batch_size,
+            packed_prefill=execution.packed_prefill,
+        )
+        == execution
+    )
     assert actual.engine.model_runner.requestspaces == {}
     assert actual.engine.model_runner.states is actual.engine.model_runner.async_state.hidden
     result = actual.generate(prompts, params)

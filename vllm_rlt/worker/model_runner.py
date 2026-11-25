@@ -1,14 +1,15 @@
 """Request-phase execution, random lookahead signals and event-owned CUDA submissions."""
 
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import torch
 
-from vllm_rlt.config import ExecutionConfig, ExitConfig, SchedulerConfig
+from vllm_rlt.config import ExecutionConfig, ExitConfig, SchedulerConfig, cuda_graph_rows
 from vllm_rlt.core.scheduler import SchedulerOutput
+from vllm_rlt.device import stream_module
 from vllm_rlt.request import ExecutionBatch, Operation, Request
 from vllm_rlt.worker.buffers import (
     PackedMetadataBuffer,
@@ -19,6 +20,7 @@ from vllm_rlt.worker.buffers import (
 from vllm_rlt.worker.cuda_graph import CodaGraphs, PreludeGraphs, RecurrentGraphs
 from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
 from vllm_rlt.worker.output import ModelRunnerOutput
+from vllm_rlt.worker.packed_graph import PackedGraphs
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
 from vllm_rlt.worker.tensors import StagedInputTensor, TensorTransfer, UvaBuffer, pinned_tensor
@@ -164,16 +166,21 @@ class ModelRunner:
         self.model = model.eval()
         self.cache_manager = cache_manager
         self.metadata = cache_manager.metadata_builder
-        self.runtime = ModelRuntime(self.model, cache_manager)
         parameter = next(model.parameters())
+        self.state_dtype = getattr(model, "state_dtype", parameter.dtype)
         self.device = parameter.device
+        self.device_ops = stream_module(self.device)
         self.sampler = Sampler()
         # Sampling RNG state lives with the engine, which shares this registry
         # between the CODA runner and the speculative runner.
         self.rng = rng if rng is not None else RngRegistry()
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
-        use_async_state = self.execution_config.async_scheduling and self.device.type == "cuda"
+        use_async_state = (
+            self.execution_config.async_scheduling
+            and self.device.type == "cuda"
+            and getattr(model, "supports_device_kv_metadata", True)
+        )
         scheduler = scheduler_config or SchedulerConfig()
         self.graphs = (
             RecurrentGraphs(
@@ -195,6 +202,21 @@ class ModelRunner:
             if self.coda_graphs is not None and hasattr(model, "prelude_kv_layers")
             else None
         )
+        self.mixed_graphs = (
+            RecurrentGraphs(model, cache_manager, self.execution_config, self.graphs.compute_gate)
+            if self.graphs is not None
+            and scheduler.mode == "mixed"
+            and getattr(model, "supports_packed_recurrent_graphs", False)
+            else None
+        )
+        self.packed_graphs = (
+            PackedGraphs(model, cache_manager, self.execution_config, scheduler)
+            if self.graphs is not None
+            and self.execution_config.packed_prefill is not False
+            and getattr(model, "supports_packed_prefill_graphs", False)
+            else None
+        )
+        self.runtime = ModelRuntime(self.model, cache_manager, packed_graphs=self.packed_graphs)
         self.input_buffers: dict[torch.dtype, StagedInputTensor] = {
             dtype: StagedInputTensor(dtype, self.device, use_uva=self.execution_config.use_uva)
             for dtype in (torch.int64, torch.int32)
@@ -218,20 +240,20 @@ class ModelRunner:
             self.lookahead_head = head.to(device=self.device, dtype=parameter.dtype).eval()
             self.lookahead_head.requires_grad_(False)
         self.core_stream = self.boundary_stream = self.copy_stream = self.readback_stream = None
-        if self.device.type == "cuda":
-            self.core_stream = torch.cuda.Stream(device=self.device)
+        if self.device_ops is not None:
+            self.core_stream = self.device_ops.Stream(device=self.device)
             self.boundary_stream = (
-                torch.cuda.Stream(device=self.device)
+                self.device_ops.Stream(device=self.device)
                 if self.execution_config.multi_stream
                 else self.core_stream
             )
             self.copy_stream = (
-                torch.cuda.Stream(device=self.device)
+                self.device_ops.Stream(device=self.device)
                 if self.execution_config.multi_stream
                 else self.core_stream
             )
             self.readback_stream = (
-                torch.cuda.Stream(device=self.device)
+                self.device_ops.Stream(device=self.device)
                 if self.execution_config.multi_stream
                 else self.core_stream
             )
@@ -241,9 +263,9 @@ class ModelRunner:
                 self.copy_stream,
                 self.readback_stream,
             ):
-                stream.wait_stream(torch.cuda.current_stream(self.device))
+                stream.wait_stream(self.device_ops.current_stream(self.device))
         self.readback_slots = []
-        if self.device.type == "cuda":
+        if self.device_ops is not None:
             # cudaHostAlloc during submission can serialize streams. Allocate all
             # readback storage before work starts, retaining leases until consumed.
             for dtype in (torch.float32, torch.int64):
@@ -272,7 +294,7 @@ class ModelRunner:
             torch.empty(
                 (scheduler.max_num_seqs, stage_rows, model.config.hidden_size),
                 device=self.device,
-                dtype=parameter.dtype,
+                dtype=self.state_dtype,
             )
             if self.staged_prefill
             else None
@@ -284,7 +306,7 @@ class ModelRunner:
             torch.empty(
                 (prefill_rows, model.config.hidden_size),
                 device=self.device,
-                dtype=parameter.dtype,
+                dtype=self.state_dtype,
             )
             if self.staged_prefill
             else None
@@ -297,7 +319,7 @@ class ModelRunner:
                     else scheduler.max_num_seqs,
                     max(scheduler.max_num_batched_tokens, scheduler.prefill_chunk_size),
                     self.device,
-                    parameter.dtype,
+                    self.state_dtype,
                     use_uva=self.execution_config.use_uva,
                 )
                 for _ in range(MAX_CONCURRENT_SUBMISSIONS)
@@ -330,7 +352,7 @@ class ModelRunner:
                         width,
                         model.config.hidden_size,
                         self.device,
-                        parameter.dtype,
+                        self.state_dtype,
                         use_uva=self.execution_config.use_uva,
                     )
                     for _ in range(2)
@@ -339,12 +361,12 @@ class ModelRunner:
                 self.states = torch.empty(
                     (scheduler.max_num_seqs, model.config.hidden_size),
                     device=self.device,
-                    dtype=parameter.dtype,
+                    dtype=self.state_dtype,
                 )
             # Buffers allocated after stream creation must be visible there too.
             for stream in (self.core_stream, self.boundary_stream):
                 if stream is not None:
-                    stream.wait_stream(torch.cuda.current_stream(self.device))
+                    stream.wait_stream(self.device_ops.current_stream(self.device))
 
         self.async_state = None
         if use_async_state:
@@ -364,7 +386,7 @@ class ModelRunner:
             self.state_slots = self.async_state.slots
             self.free_state_slots = self.async_state.free
             for stream in (self.core_stream, self.boundary_stream, self.copy_stream):
-                stream.wait_stream(torch.cuda.current_stream(self.device))
+                stream.wait_stream(self.device_ops.current_stream(self.device))
 
     def _size(self, count):
         size = count
@@ -612,6 +634,11 @@ class ModelRunner:
         for request in requests:
             request.hidden_state = self.states[self.state_slots[request.request_id]]
 
+    def bind_sampled_tokens(self, batch, values, rows):
+        """Bind the scheduler-selected sample rows as the next prelude inputs."""
+        for row in rows:
+            batch.requests[row].request.input_token_tensor = values[row]
+
     def _gather(self, requests, workspace, size):
         if workspace is None:
             return torch.stack([r.hidden_state for r in requests])
@@ -621,13 +648,16 @@ class ModelRunner:
             hidden[row].copy_(request.hidden_state)
         return hidden
 
-    def _prepare_prefill_coda(self, ids, positions, requests, kv=None, *, packed=None):
+    def _prepare_prefill_coda(
+        self, ids, positions, requests, kv=None, *, packed=None, eligible=None
+    ):
         if not getattr(self.model, "requires_boundary_kv", False):
             return None, None
         rows = [
             row
             for row, (position, request) in enumerate(zip(positions, requests))
-            if position < len(request.prompt_token_ids) - 1
+            if (eligible is None or row in eligible)
+            and position < len(request.prompt_token_ids) - 1
         ]
         if not rows:
             return None, None
@@ -646,6 +676,32 @@ class ModelRunner:
         return ForwardBatch(
             Operation.CODA, prelude_coda_kv_metadata=kv_metadata, compute_logits=False
         ), index
+
+    def _prepare_packed_prefill_coda(self, spans, *, loops=None):
+        if not getattr(self.model, "requires_boundary_kv", False):
+            return None, None
+        selected, rows = [], []
+        offset = 0
+        for span in spans:
+            if loops is None or (
+                span.chunk_start is not None
+                and span.depth + loops == self.model.config.total_ut_steps
+            ):
+                # The last prompt row is consumed by the logits-producing CODA.
+                count = min(
+                    span.token_count, len(span.request.prompt_token_ids) - 1 - span.token_start
+                )
+                if count > 0:
+                    selected.append(replace(span, token_count=count, depth=0))
+                    rows.extend(range(offset, offset + count))
+            offset += span.token_count
+        if not rows:
+            return None, None
+        layout = self.metadata.build_packed(selected, (0,))
+        kv = stage_metadata(layout, self._append_input)[0]
+        index = self.input_buffers[torch.int64].append(rows)
+        forward = ForwardBatch(Operation.CODA, prelude_coda_kv_metadata=kv, compute_logits=False)
+        return forward, index
 
     def _prepare_shared_loop_inputs(self, batch):
         cache = self.cache_manager
@@ -720,7 +776,9 @@ class ModelRunner:
     def _uses_packed_loop_inputs(self, batch):
         capabilities = self.cache_manager.attention_capabilities
         return (
-            batch.operation == Operation.PRELUDE
+            # PackedMetadataBuffer expands write addresses with a CUDA kernel.
+            self.device.type == "cuda"
+            and batch.operation == Operation.PRELUDE
             and batch.loop_count
             and self.cache_manager.layout != "shared"
             and capabilities.packed_prefill
@@ -733,35 +791,37 @@ class ModelRunner:
         cache = self.cache_manager
         if cache.layout == "shared":
             return self._prepare_shared_loop_inputs(batch)
-        ids, positions, tokens, requests, outputs, depths = [], [], [], [], [], []
-        for span in batch.spans:
-            count, request = span.token_count, span.request
-            ids.extend([request.request_id] * count)
-            depths.extend([span.depth] * count)
-            positions.extend(range(span.token_start, span.token_start + count))
-            tokens.extend(span.input_tokens)
-            requests.extend([request] * count)
-            outputs.append((len(tokens) - 1, request))
         packed = cache.attention_capabilities.packed_prefill and (
             not cache.attention_capabilities.packed_sliding_window
             or all(len(span.request.prompt_token_ids) > 64 for span in batch.spans)
         )
-        size = len(tokens) if packed else self._size(len(tokens))
-        depth_sets = [[depth + offset for depth in depths] for offset in range(batch.loop_count)]
-        if packed_metadata is not None:
-            layouts = self.metadata.build(ids, depth_sets, positions, packed=True)
-            packed_metadata.store(layouts, tokens)
-            tensor, metadata = None, ()
+        tokens, requests, outputs = [], [], []
+        for span in batch.spans:
+            tokens.extend(span.input_tokens)
+            requests.extend([span.request] * span.token_count)
+            outputs.append((len(tokens) - 1, span.request))
+        loop_offsets = range(batch.loop_count)
+        if packed:
+            layouts = self.metadata.build_packed(batch.spans, loop_offsets)
+            if packed_metadata is not None:
+                packed_metadata.store(layouts, tokens)
+                tensor, metadata = None, ()
+            else:
+                tensor = self.input_buffers[torch.int64].append(tokens)
+                metadata = stage_metadata(layouts, self._append_input)
+            coda, coda_rows = self._prepare_packed_prefill_coda(batch.spans)
         else:
+            ids, depths, positions = batch.addresses()
+            size = self._size(len(tokens))
             tensor = self.input_buffers[torch.int64].append(tokens + [0] * (size - len(tokens)))
+            depth_sets = [[depth + offset for depth in depths] for offset in loop_offsets]
             metadata = self._stage_metadata(
                 ids,
                 depth_sets,
                 positions,
-                packed=packed,
                 padded_rows=size,
             )
-        coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests, packed=packed)
+            coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests, packed=False)
         forwards = [
             PreparedForward(
                 ForwardBatch(Operation.PRELUDE, tokens=tensor, metadata=metadata),
@@ -824,7 +884,7 @@ class ModelRunner:
                         storage = torch.empty(
                             (capacity, self.model.config.hidden_size),
                             device=self.device,
-                            dtype=next(self.model.parameters()).dtype,
+                            dtype=self.state_dtype,
                         )
                         self.loop_hidden[slot] = storage
                     hidden_buffer = storage[:size]
@@ -847,27 +907,55 @@ class ModelRunner:
         if batch.operation == Operation.PRELUDE and batch.loop_count:
             return prepared
         metadata, boundary_metadata = (), None
+        followups = ()
+        boundary_kv = getattr(self.model, "requires_boundary_kv", False)
+        packed = batch.has_chunks and self.cache_manager.attention_capabilities.packed_prefill
         if batch.operation == Operation.RECURRENT:
             start = 1 if prepared.kv is not None else 0
-            if start < batch.loop_count:
+            if not packed and (start < batch.loop_count or (boundary_kv and batch.has_chunks)):
                 ids, depths, positions = batch.addresses()
-                metadata = self._stage_metadata(
-                    ids,
-                    [
-                        [depth + offset for depth in depths]
-                        for offset in range(start, batch.loop_count)
-                    ],
-                    positions,
-                    packed=batch.has_chunks
-                    and self.cache_manager.attention_capabilities.packed_prefill,
-                )
-        elif getattr(self.model, "requires_boundary_kv", False):
-            ids, depths, positions = batch.addresses()
-            boundary_metadata = self._stage_metadata(ids, (depths,), positions)[0]
+            if start < batch.loop_count:
+                offsets = range(start, batch.loop_count)
+                if packed:
+                    layouts = self.metadata.build_packed(batch.spans, offsets)
+                    metadata = stage_metadata(layouts, self._append_input)
+                else:
+                    metadata = self._stage_metadata(
+                        ids, [[depth + offset for depth in depths] for offset in offsets], positions
+                    )
+            if packed:
+                coda, rows = self._prepare_packed_prefill_coda(batch.spans, loops=batch.loop_count)
+                if coda is not None:
+                    followups = (PreparedForward(coda, outputs=(), hidden_rows=rows),)
+            elif boundary_kv and batch.has_chunks:
+                complete, requests = set(), []
+                row = 0
+                for span in batch.spans:
+                    end = row + span.token_count
+                    if (
+                        span.chunk_start is not None
+                        and span.depth + batch.loop_count == self.model.config.total_ut_steps
+                    ):
+                        complete.update(range(row, end))
+                    requests.extend([span.request] * span.token_count)
+                    row = end
+                if complete:
+                    coda, rows = self._prepare_prefill_coda(
+                        ids, positions, requests, packed=packed, eligible=complete
+                    )
+                    if coda is not None:
+                        followups = (PreparedForward(coda, outputs=(), hidden_rows=rows),)
+        elif boundary_kv:
+            if packed:
+                layouts = self.metadata.build_packed(batch.spans, (0,))
+                boundary_metadata = stage_metadata(layouts, self._append_input)[0]
+            else:
+                ids, depths, positions = batch.addresses()
+                boundary_metadata = self._stage_metadata(ids, (depths,), positions)[0]
         forward = ForwardBatch(
             batch.operation, metadata=metadata, prelude_coda_kv_metadata=boundary_metadata
         )
-        return replace(prepared, forwards=(PreparedForward(forward),))
+        return replace(prepared, forwards=(PreparedForward(forward), *followups))
 
     def _prepare_cpu_inputs(self, batch: ExecutionBatch):
         """Snapshot request inputs and acquire the storage used by this submission."""
@@ -975,10 +1063,10 @@ class ModelRunner:
                 ),
             )
         if prepared.routing is not None:
-            with torch.cuda.stream(self.copy_stream):
+            with self.device_ops.stream(self.copy_stream):
                 kv = prepared.routing.transfer(prepared.kv)
             if self.device.type == "cuda":
-                torch.cuda.current_stream(self.device).wait_event(prepared.routing.ready_event)
+                self.device_ops.current_stream(self.device).wait_event(prepared.routing.ready_event)
             prepared = replace(prepared, kv=kv)
         elif prepared.kv is not None and prepared.workspace is not None:
             prepared = replace(prepared, kv=prepared.workspace.upload_metadata(prepared.kv))
@@ -1007,28 +1095,45 @@ class ModelRunner:
         requests = [span.request for span in batch.spans]
         size = batch.num_rows if batch.has_chunks else self._size(batch.num_rows)
         inputs = prepared.forwards[0].forward
+        followups = prepared.forwards[1:]
         metadata = inputs.metadata
         kv_metadata = inputs.prelude_coda_kv_metadata
         if metadata or kv_metadata is not None or prepared.gate_indices is not None:
             uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
+
+            def input_view(indices):
+                return uploaded[indices.dtype].as_strided(
+                    indices.shape, indices.stride(), indices.storage_offset()
+                )
+
             if prepared.gate_indices is not None:
-                indices = prepared.gate_indices
                 prepared = replace(
                     prepared,
-                    gate_indices=uploaded[indices.dtype].as_strided(
-                        indices.shape, indices.stride(), indices.storage_offset()
-                    ),
+                    gate_indices=input_view(prepared.gate_indices),
                 )
             metadata = tuple(self.metadata.bind(kv, uploaded) for kv in metadata)
             if kv_metadata is not None:
                 kv_metadata = self.metadata.bind(kv_metadata, uploaded)
+            followups = tuple(
+                replace(
+                    entry,
+                    forward=replace(
+                        entry.forward,
+                        prelude_coda_kv_metadata=self.metadata.bind(
+                            entry.forward.prelude_coda_kv_metadata, uploaded
+                        ),
+                    ),
+                    hidden_rows=input_view(entry.hidden_rows),
+                )
+                for entry in followups
+            )
         if batch.operation == Operation.PRELUDE:
             forward = ForwardBatch(
                 Operation.PRELUDE,
                 tokens=prepared.token_ids,
                 prelude_coda_kv_metadata=kv_metadata,
                 generators=self._prepare_generators(requests) if kv_metadata else None,
-                graphs=self.prelude_graphs if kv_metadata else None,
+                graphs=self.prelude_graphs if kv_metadata and not batch.has_chunks else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
         hidden = self._load_hidden(batch, prepared, workspace, size)
@@ -1040,10 +1145,24 @@ class ModelRunner:
                 graphs=self.coda_graphs if kv_metadata else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
-        graphs = self.graphs if batch.emit_gate else None
+        boundary_kv = getattr(self.model, "requires_boundary_kv", False)
+        supports_packed_graphs = getattr(self.model, "supports_packed_recurrent_graphs", False)
+        graph_eligible = supports_packed_graphs or not (boundary_kv and batch.has_chunks)
+        graphs = self.graphs if batch.emit_gate and graph_eligible else None
         kv = prepared.kv
         if kv is not None:
             metadata = (kv,) + metadata
+        if graphs is not None and batch.has_chunks:
+            graphs = self.mixed_graphs or graphs
+            if (
+                self.packed_graphs is not None
+                and (
+                    self.packed_graphs.bucketed
+                    or batch.num_rows > cuda_graph_rows(self.execution_config)
+                )
+                and metadata[0].cu_seqlens_q is not None
+            ):
+                graphs = None
         forward = ForwardBatch(
             Operation.RECURRENT,
             hidden=hidden[: batch.num_rows]
@@ -1054,7 +1173,9 @@ class ModelRunner:
             compute_gate=batch.emit_gate and self.exit_config.mode in ("ouro", "ouro_delayed"),
         )
         return replace(
-            prepared, kv=metadata[0], forwards=(PreparedForward(self.runtime.prepare(forward)),)
+            prepared,
+            kv=metadata[0],
+            forwards=(PreparedForward(self.runtime.prepare(forward)), *followups),
         )
 
     def _load_hidden(self, batch, prepared, workspace, size):
@@ -1140,14 +1261,21 @@ class ModelRunner:
                         )
                         values = selected.float().sigmoid()
             elif forward.compute_logits:
-                values = torch.stack(
-                    [
-                        self.sampler.sample(row, params, generator)
-                        for row, params, generator in zip(
-                            result.logits, prepared.sampling_params, prepared.sampling_generators
-                        )
-                    ]
-                )
+                if self.device.type == "npu":
+                    values = self.sampler.sample_batch(
+                        result.logits, prepared.sampling_params, prepared.sampling_generators
+                    )
+                else:
+                    values = torch.stack(
+                        [
+                            self.sampler.sample(row, params, generator)
+                            for row, params, generator in zip(
+                                result.logits,
+                                prepared.sampling_params,
+                                prepared.sampling_generators,
+                            )
+                        ]
+                    )
                 if prepared.routing is not None:
                     prepared.routing.scatter(values, tokens=True)
         return values
@@ -1169,9 +1297,9 @@ class ModelRunner:
         raise RuntimeError("readback buffers exhausted; retire completed submissions")
 
     def _synchronize_submission(self, stream, prepared):
-        if self.device.type != "cuda":
+        if self.device_ops is None:
             return
-        (stream or torch.cuda.current_stream(self.device)).synchronize()
+        (stream or self.device_ops.current_stream(self.device)).synchronize()
         if self.readback_stream is not None and self.readback_stream is not stream:
             self.readback_stream.synchronize()
         if prepared is not None and prepared.routing is not None:
@@ -1188,6 +1316,32 @@ class ModelRunner:
                 dependencies.add(event)
             if span.request.hidden_state is not None:
                 span.request.hidden_state.record_stream(stream)
+
+    @contextmanager
+    def prepare_mixed_recurrent(self, batch):
+        """Lease the regular prompt inputs until the joined Core finishes reading them."""
+        stream = self.core_stream
+        if self.submissions.begin():
+            self.split_prefill_submission_waits += 1
+        prepared = self.prepare_on_cpu(batch)
+        source_stream = torch.cuda.current_stream(self.device)
+        with torch.cuda.stream(stream):
+            if source_stream != stream:
+                stream.wait_stream(source_stream)
+            self._wait_for_requests(batch, stream)
+            yield self.prepare_on_gpu(prepared)
+            event = torch.cuda.Event()
+            event.record(stream)
+            for span in batch.spans:
+                self.events[span.request.request_id] = event
+            self.submissions.complete(event)
+        self.split_prefill_submissions += 1
+
+    def finish_mixed_recurrent(self, prepared, hidden):
+        """Save the prompt slice and enqueue the ordinary KV-only Coda follows."""
+        self._store_hidden(prepared.batch, hidden, prepared)
+        for entry in prepared.forwards[1:]:
+            self.runtime.forward(replace(entry.forward, hidden=hidden[entry.hidden_rows]))
 
     @torch.inference_mode()
     def submit(self, scheduled_batch: SchedulerOutput | None = None, *, batch: ExecutionBatch):
@@ -1209,14 +1363,14 @@ class ModelRunner:
                 self.split_prefill_submission_waits += 1
             prepared = self.prepare_on_cpu(batch)
             source_stream = (
-                torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+                self.device_ops.current_stream(self.device) if self.device_ops is not None else None
             )
             if prepared.routing is not None and prepared.routing.imports:
                 self.copy_stream.wait_stream(source_stream)
                 # Imported hidden/token tensors may have been produced by core,
                 # not by the caller's stream. The copy itself must wait for them.
                 self._wait_for_requests(batch, self.copy_stream)
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            with self.device_ops.stream(stream) if stream is not None else nullcontext():
                 if stream is not None:
                     if self.async_state is None and source_stream != stream:
                         stream.wait_stream(source_stream)
@@ -1237,34 +1391,32 @@ class ModelRunner:
                     and batch.operation == Operation.RECURRENT
                     and not any(
                         span.emit_gate
+                        and span.request.target_loops is None
                         and self.exit_config.mode in ("ouro_delayed", "random_lookahead")
                         and span.request.sampling_params.exit_threshold < 1
                         and span.depth + batch.loop_count
-                        < (
-                            span.request.sampling_params.max_loops
-                            or self.model.config.total_ut_steps
-                        )
+                        < span.request.loop_limit(self.model.config.total_ut_steps)
                         for span in batch.spans
                     )
                 ):
                     result = None
                 device_values = result
                 event = compute_done = None
-                if self.device.type == "cuda":
-                    compute_stream = torch.cuda.current_stream(self.device)
-                    compute_done = torch.cuda.Event()
+                if self.device_ops is not None:
+                    compute_stream = self.device_ops.current_stream(self.device)
+                    compute_done = self.device_ops.Event()
                     compute_done.record(compute_stream)
                     event = compute_done
                     if result is not None:
                         slot = self._readback_slot(result)
                         readback_stream = self.readback_stream or compute_stream
-                        with torch.cuda.stream(readback_stream):
+                        with self.device_ops.stream(readback_stream):
                             if readback_stream != compute_stream:
                                 readback_stream.wait_event(compute_done)
                             result.record_stream(readback_stream)
                             host = slot.storage[: result.numel()].view(result.shape)
                             host.copy_(result, non_blocking=True)
-                            event = torch.cuda.Event()
+                            event = self.device_ops.Event()
                             event.record(readback_stream)
                         slot.event = event
                         result = host
@@ -1295,7 +1447,7 @@ class ModelRunner:
                     and prepared.routing is not None
                     and not routing_finish_attempted
                 ):
-                    with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                    with self.device_ops.stream(stream) if stream is not None else nullcontext():
                         routing_finish_attempted = True
                         prepared.routing.record_done()
             finally:
@@ -1304,7 +1456,7 @@ class ModelRunner:
             raise
         finally:
             if prepared is not None and prepared.workspace is not None:
-                with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                with self.device_ops.stream(stream) if stream is not None else nullcontext():
                     prepared.workspace.record_done()
 
     def finalize_many(self, requests):
@@ -1384,7 +1536,7 @@ class ModelRunner:
     def finalize(self, request):
         # The final core event must precede copies and coda on the boundary stream.
         stream = self.boundary_stream
-        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+        with self.device_ops.stream(stream) if stream is not None else nullcontext():
             event = self.events.get(request.request_id)
             if stream is not None and event is not None:
                 stream.wait_event(event)
@@ -1392,7 +1544,7 @@ class ModelRunner:
                 request.request_id, request.position, request.loops_done - 1
             )
             if stream is not None:
-                event = torch.cuda.Event()
+                event = self.device_ops.Event()
                 event.record(stream)
                 self.events[request.request_id] = event
 
@@ -1428,6 +1580,9 @@ class ModelRunner:
         self.rng.drop(request_id)
 
     def synchronize(self):
+        if self.device.type == "npu":
+            torch.npu.synchronize(self.device)
+            return
         for stream in (
             self.core_stream,
             self.boundary_stream,
