@@ -34,6 +34,9 @@ vllm-rlt = "vllm_rlt.entrypoints.cli:main"
 vllm-rlt-serve = "vllm_rlt.entrypoints.serve:main"
 vllm-rlt-pd-serve = "vllm_rlt.entrypoints.pd_serve:main"
 
+[project.entry-points."vllm.general_plugins"]
+vllm_rlt = "vllm_rlt.plugin:register"
+
 [tool.setuptools.packages.find]
 include = ["vllm_rlt*"]
 
