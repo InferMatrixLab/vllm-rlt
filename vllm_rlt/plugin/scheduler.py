@@ -27,6 +27,9 @@ through untouched, so with loop features off the baseline is vLLM itself.
 
 from __future__ import annotations
 
+import os
+
+from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -37,6 +40,9 @@ from vllm_rlt.plugin.plan import take_rows
 from vllm_rlt.plugin.sched_emit import EmitMixin
 from vllm_rlt.plugin.sched_open import OpenMixin
 from vllm_rlt.plugin.sched_update import UpdateMixin
+
+logger = init_logger(__name__)
+_TRACE = bool(os.environ.get("RLT_TRACE"))
 
 
 class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
@@ -76,6 +82,14 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
         if self._needs_token_level():
             out = self._open_spans_via_vllm(throttle_prefills)
             self._spec_to_schedule = out.num_spec_tokens_to_schedule
+            if _TRACE:
+                logger.warning(
+                    "rlt open: spec_to_schedule=%s scheduled=%s drafts=%s waiting_spec=%s",
+                    out.num_spec_tokens_to_schedule,
+                    out.num_scheduled_tokens,
+                    {k: len(v) for k, v in out.scheduled_spec_decode_tokens.items()},
+                    {r.request_id: len(r.spec_token_ids) for r in self.running},
+                )
             self._carry.absorb(out)
             self._adopt_spans(out)
         ready = self._ready()

@@ -294,3 +294,26 @@ def test_self_spec_method_registers_and_resolves():
     cls = get_custom_speculator_config_class("rlt_self")
     assert cls is not None and cls.speculator_class.endswith("LoopSpeculator")
     assert "speculator_options" in cls.supported_options
+
+
+def test_kv_fill_copies_one_slot_across_passes_in_the_logical_layout():
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_rlt.plugin.kvfill import fill_skipped_passes
+
+    blocks, heads, tokens, content = 4, 2, 8, 6
+    caches = [torch.randn(blocks, heads, tokens, content) for _ in range(3)]
+    attention = [[SimpleNamespace(kv_cache=c, layer_name=f"p{i}")] for i, c in enumerate(caches)]
+    slots = torch.tensor([9, 18, -1])  # block 1 offset 1, block 2 offset 2, a pad row
+    want = caches[0][[1, 2], :, [1, 2], :].clone()
+    before = [c.clone() for c in caches]
+    assert fill_skipped_passes(attention, lambda name: slots, exit_depth=0) == 2
+    for p in (1, 2):
+        assert torch.equal(caches[p][[1, 2], :, [1, 2], :], want)
+        untouched = torch.ones_like(caches[p], dtype=torch.bool)
+        untouched[[1, 2], :, [1, 2], :] = False
+        assert torch.equal(caches[p][untouched], before[p][untouched])
+    assert torch.equal(caches[0], before[0])
+    assert fill_skipped_passes(attention, lambda name: slots, exit_depth=2) == 0

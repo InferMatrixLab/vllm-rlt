@@ -24,8 +24,11 @@ in ``docs/vllm-plugin.md``.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
 
 from vllm_rlt.plugin.context import LoopContext, state_cat, state_slice
@@ -34,6 +37,9 @@ from vllm_rlt.plugin.output import LoopModelRunnerOutput
 from vllm_rlt.plugin.parallel import NoAlign
 from vllm_rlt.plugin.program import LoopStep, Op
 from vllm_rlt.plugin.runner_exit import ExitMixin
+
+logger = init_logger(__name__)
+_TRACE = bool(os.environ.get("RLT_TRACE"))
 
 
 class LoopModelRunner(ExitMixin, GPUModelRunner):
@@ -146,6 +152,14 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
         model.loop_ctx = ctx
         graphs = self.cudagraph_manager
         use_graph = self._use_graph(ctx, step)
+        if _TRACE:
+            logger.warning(
+                "rlt step op=%s depths=%s tokens=%s graph=%s",
+                step.op.name,
+                step.depths,
+                step.num_tokens,
+                use_graph,
+            )
         captured = getattr(graphs, "_graphs_captured", None)
         if use_graph:
             self.loop_graphs.activate(ctx)
@@ -153,14 +167,20 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
         elif captured is not None:
             graphs._graphs_captured = False  # eager: no graph was captured for this
         try:
-            return super().execute_model(scheduler_output, *args, **kwargs)
+            result = super().execute_model(scheduler_output, *args, **kwargs)
+            if use_graph and ctx.out is None:
+                # The model did not run in Python: a graph replayed, and the state
+                # the op produced is in the graph's static output buffer. Read it
+                # while that op's manager is still the active one.
+                ctx.out = self.loop_graphs.output(ctx, step.total_tokens)
+            return result
         finally:
             if use_graph:
                 self.loop_graphs.deactivate()
             elif captured is not None:
                 graphs._graphs_captured = captured
             model.loop_ctx = None
-            self._after_step(scheduler_output, step, order, ctx, sids, use_graph)
+            self._after_step(scheduler_output, step, order, ctx, sids)
 
     def _use_graph(self, ctx, step) -> bool:
         """Replay the op's graph for a uniform one-token-per-row decode step (the
@@ -221,11 +241,7 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
         }
         return LoopContext(step.op, -1, state, row_depth, rows)
 
-    def _after_step(self, scheduler_output, step, order, ctx, sids, replayed) -> None:
-        if replayed and ctx.out is None:
-            # The model never ran in Python: a graph replayed, and the state the
-            # op produced is in the graph's static output buffer.
-            ctx.out = self.loop_graphs.output(ctx, step.total_tokens)
+    def _after_step(self, scheduler_output, step, order, ctx, sids) -> None:
         if step.op == Op.CODA:
             for rid in step.req_ids:
                 self.loop_state.pop((rid, sids[rid]), None)

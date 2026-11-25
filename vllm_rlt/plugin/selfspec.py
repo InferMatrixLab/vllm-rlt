@@ -30,11 +30,16 @@ output distribution is the target's. Not run on a GPU.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
 from vllm.v1.worker.gpu.spec_decode.speculator_config import SpeculatorConfig
+
+logger = init_logger(__name__)
+_TRACE = bool(os.environ.get("RLT_TRACE"))
 
 METHOD = "rlt_self"
 SPECULATOR = "vllm_rlt.plugin.selfspec.LoopSpeculator"
@@ -134,6 +139,10 @@ class LoopSpeculator(BaseSpeculator):
         k = self.num_speculative_steps if num_speculative_tokens is None else num_speculative_tokens
         out = self.draft_tokens[:n]
         out.zero_()
+        if _TRACE:
+            logger.warning(
+                "rlt propose n=%s k=%s dummy=%s bound=%s", n, k, dummy_run, self.runner is not None
+            )
         if dummy_run or k == 0 or self.runner is None:
             return out
         runner = self.runner
