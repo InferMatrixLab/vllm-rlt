@@ -95,13 +95,20 @@ process latency require separate measurement for each model and workload.
 `StageEngine.prepare_runtime()` is idempotent. Its worker-local `startup_report`
 records the covered token lengths and batch sizes, graph keys and replay/fallback
 counts, and remaining coverage gaps. The `initialized`, `captured`, `replayed`
-and `cleaned` phase snapshots record elapsed time, driver-free memory and PyTorch
-allocated/reserved memory, including peaks since the preceding snapshot. The
-allocator cache is retained consistently at these boundaries. Times are cumulative
-seconds from the start of preparation; memory values are bytes. The first peak
-includes earlier engine initialization; subsequent peaks cover the interval since
-the preceding snapshot. Driver-free values are boundary samples, not a continuous
-device high-water mark. The report is published only after successful cleanup.
+and `cleaned` phase snapshots record elapsed time, driver-free memory and current
+PyTorch allocated/reserved memory. Ordinary preparation leaves the process's CUDA
+allocator peak counters intact. An isolated sizing worker can defer automatic preparation
+and opt in on its first call with `prepare_runtime(measure_cuda_peaks=True)`. This adds
+allocated/reserved peak fields to each phase, resetting the PyTorch counters
+for the entire process on that CUDA device before the first sample and after
+each sample. The first peak starts at the current initialized allocation, and
+subsequent peaks cover their own intervals. Use this mode only when no other
+engine or application measurement shares those allocator counters. Consumers
+of a report without these peak fields must retain the estimated allowance.
+
+The allocator cache is retained at the sample boundaries. Times are cumulative
+seconds from the start of preparation and memory values are bytes. Driver-free
+values are boundary samples. The report is published only after successful cleanup.
 
 Single-request history covers the configured prefill limit and crosses a sliding
 window when committed KV permits. Decode batch buckets also cross a KV page.
@@ -118,7 +125,9 @@ estimated transient allowance and is listed as a coverage gap. Pipeline speculat
 supports greedy requests only.
 Async multi-stream preparation additionally submits an independent prompt core
 and coda before collection, followed by a decode core/coda pair, within the
-request/token/KV limits. Its
+request/token/KV limits. Only the final overlapping prompt chunk shares the token
+budget with coda. Independent submissions do not cover a mixed prompt/decode batch;
+mixed scheduling records that gap and retains an estimated allowance. The
 `concurrent_prepared` and `concurrent` snapshots separate initial shape preparation
 from repeated concurrent execution. `concurrent_batches` lists coda row counts;
 each is submitted alongside one independent core request. Actual overlap depends
@@ -144,7 +153,8 @@ the idempotent preparation call. PD/NIXL must retain ordinary storage until the
 mapping and registration requirements are supported.
 
 Small explicit pools can reduce warmup coverage. Unseen exact graph shapes retain
-bounded lazy capture. Longer contexts and mixed speculative/prompt
+bounded lazy capture. Startup prioritizes larger planned decode shapes when the
+Graph budget is limited. Longer contexts and mixed speculative/prompt
 overlap retain estimated transient allowances. Pipeline preparation reaches
 target verification before releasing its scratch state. The report is a lifecycle
 boundary for subsequent memory-planning integration, not a guarantee that every

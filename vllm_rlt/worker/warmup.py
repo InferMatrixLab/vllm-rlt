@@ -120,13 +120,18 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
                 requests.append(request)
                 if not cache.allocate(request.request_id, length + extra):
                     raise RuntimeError("insufficient KV blocks for startup preparation")
-            chunk_size = min(
-                prefill_limit, scheduler.max_num_batched_tokens - (count - 1 if concurrent else 0)
+            overlap_rows = count - 1
+            overlap_start = length - min(
+                length, prefill_limit, scheduler.max_num_batched_tokens - overlap_rows
             )
-            for start in range(0, length, chunk_size):
-                end = min(length, start + chunk_size)
-                spans = [
-                    StateSpan(
+            for index, request in enumerate(requests):
+                overlap = concurrent and index == overlap_rows
+                history_end = overlap_start if overlap else length
+                start = 0
+                while start < length:
+                    pending = overlap and start == history_end
+                    end = length if pending else min(history_end, start + prefill_limit)
+                    span = StateSpan(
                         request,
                         start,
                         end - start,
@@ -135,11 +140,7 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
                         retain_chunk=runner.staged_prefill,
                         input_tokens=tuple(request.prompt_token_ids[start:end]),
                     )
-                    for request in requests
-                ]
-                # One request at a time respects the prefill token budget.
-                for index, span in enumerate(spans):
-                    pending = concurrent and end == length and index == count - 1
+                    start = end
                     if runner.staged_prefill:
                         execute(Operation.PRELUDE, (span,))
                         operation = Operation.RECURRENT
@@ -275,13 +276,14 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
             for owner in owners:
                 owner.startup = True
             if speculation is not None and hasattr(speculation.graphs, "capture_sizes"):
-                if not speculation.graphs.entries:
-                    speculation.graphs.prepare()
-                    speculation.coda_graphs.prepare()
+                for owner in (speculation.graphs, speculation.coda_graphs):
+                    if owner is not None and not owner.entries:
+                        owner.prepare()
+            # Exact graphs retain the first shapes they see under a tight budget.
+            for count in reversed(sizes):
+                run_case(count, batch_history, True)
             for length in prefill:
                 run_case(1, length, False)
-            for count in sizes:
-                run_case(count, batch_history, True)
             if history != batch_history:
                 run_case(1, history, True)
             run_case(sizes[-1], batch_history, False, stochastic=True)
@@ -354,6 +356,8 @@ def prepare_runner(runner, scheduler, speculation=None, *, phase=None):
         "contexts and batch/history combinations beyond the reported workloads "
         "retain the estimated transient reserve"
     )
+    if scheduler.mode == "mixed":
+        gaps.append("mixed prompt/decode batches retain the estimated transient reserve")
     if speculation is not None and speculation.config.mode == "block":
         gaps.append("random block speculation retains the estimated transient reserve")
     if runner.execution_config.async_scheduling and speculation is not None:

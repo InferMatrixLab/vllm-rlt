@@ -470,11 +470,13 @@ class StageEngine:
         if not _defer_runtime_preparation:
             self.prepare_runtime()
 
-    def prepare_runtime(self):
+    def prepare_runtime(self, *, measure_cuda_peaks=False):
         """Prepare serving execution before readiness; KV sizing remains estimate-based.
 
         Workers defer this boundary until connector-owned buffers are initialized.
-        The report is a handoff for measured sizing, not a new capacity estimate.
+        CUDA phase peaks require exclusive measurement in this process. Opt in
+        before the first preparation if resetting the device's allocator peak
+        counters is safe. The default preserves application peak accounting.
         """
         if self.startup_report is not None:
             return self.startup_report
@@ -490,21 +492,24 @@ class StageEngine:
             def phase(name):
                 drain(runner, self.speculative_runner)
                 free, total = torch.cuda.mem_get_info(runner.device)
-                report["phases"].append(
-                    dict(
-                        name=name,
-                        elapsed_seconds=time.perf_counter() - started,
-                        driver_free_bytes=free,
-                        device_total_bytes=total,
-                        allocated_bytes=torch.cuda.memory_allocated(runner.device),
-                        reserved_bytes=torch.cuda.memory_reserved(runner.device),
+                sample = dict(
+                    name=name,
+                    elapsed_seconds=time.perf_counter() - started,
+                    driver_free_bytes=free,
+                    device_total_bytes=total,
+                    allocated_bytes=torch.cuda.memory_allocated(runner.device),
+                    reserved_bytes=torch.cuda.memory_reserved(runner.device),
+                )
+                if measure_cuda_peaks:
+                    sample.update(
                         peak_allocated_bytes=torch.cuda.max_memory_allocated(runner.device),
                         peak_reserved_bytes=torch.cuda.max_memory_reserved(runner.device),
                     )
-                )
-                torch.cuda.reset_peak_memory_stats(runner.device)
+                    torch.cuda.reset_peak_memory_stats(runner.device)
+                report["phases"].append(sample)
 
-            torch.cuda.reset_peak_memory_stats(runner.device)
+            if measure_cuda_peaks:
+                torch.cuda.reset_peak_memory_stats(runner.device)
             phase("initialized")
             try:
                 report.update(

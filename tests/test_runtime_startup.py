@@ -505,6 +505,9 @@ def test_startup_keeps_direct_gpu_preparation_usable():
             mode="mixed", max_num_seqs=1, max_num_batched_tokens=4, prefill_chunk_size=2
         ),
     )
+    assert any(
+        "mixed prompt/decode batches" in gap for gap in engine.startup_report["coverage_gaps"]
+    )
     runner = engine.model_runner
     request = Request("direct", [1, 2], SamplingParams())
     assert engine.cache_manager.allocate("direct", 2)
@@ -743,7 +746,70 @@ def test_cuda_startup_replay_and_generation_match_unprepared(
 
 
 @pytest.mark.gpu
-def test_cuda_startup_excludes_peaks_from_before_preparation():
+def test_concurrent_startup_bounds_prefill_submissions(monkeypatch):
+    from vllm_rlt.request import Operation
+
+    limit = 16
+    engine = StageEngine(
+        OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16),
+        attention_backend="triton",
+        cache_config=CacheConfig(256, 16),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=limit, max_num_batched_tokens=limit, prefill_chunk_size=limit
+        ),
+        execution_config=ExecutionConfig(async_scheduling=True),
+        exit_config=ExitConfig("ouro_delayed"),
+        _defer_runtime_preparation=True,
+    )
+    submissions = []
+    submit = engine.model_runner.submit
+
+    def observe(*args, batch):
+        if batch.operation == Operation.PRELUDE and batch.loop_count:
+            submissions.append(sum(span.token_count for span in batch.spans))
+        return submit(*args, batch=batch)
+
+    monkeypatch.setattr(engine.model_runner, "submit", observe)
+    try:
+        report = engine.prepare_runtime()
+        assert limit - 1 in report["concurrent_batches"]
+        assert max(submissions) == limit
+        assert len(submissions) <= 16 * limit
+    finally:
+        engine.close()
+
+
+@pytest.mark.gpu
+def test_dory_startup_preserves_single_coda_graph_entry_for_full_batch():
+    from tests.test_dory import tiny_dory_config
+    from vllm_rlt.models import DoryForCausalLM
+
+    engine = StageEngine(
+        DoryForCausalLM(tiny_dory_config(head_dim=64, d_model=256)).to("cuda", torch.bfloat16),
+        attention_backend="triton",
+        cache_config=CacheConfig(128, 16),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8, max_num_batched_tokens=16, prefill_chunk_size=4
+        ),
+        execution_config=ExecutionConfig(cuda_graphs=True, cuda_graph_max_graphs=1),
+    )
+    try:
+        graphs = engine.model_runner.coda_graphs
+        assert engine.startup_report["graph_coverage"]["runner.coda_graphs"]["keys"] == (8,)
+        for index in range(8):
+            engine.add_request(str(index), [1, 2], SamplingParams(max_tokens=3, ignore_eos=True))
+        completed = []
+        while engine.has_unfinished_requests():
+            completed.extend(out for out in engine.step() if out.finished)
+        assert len(completed) == 8
+        assert graphs.replays >= 2
+    finally:
+        engine.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("measure_cuda_peaks", [False, True])
+def test_cuda_startup_excludes_peaks_from_before_preparation(measure_cuda_peaks):
     engine = StageEngine(
         OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16),
         attention_backend="triton",
@@ -760,10 +826,23 @@ def test_cuda_startup_excludes_peaks_from_before_preparation():
         torch.cuda.empty_cache()
         assert torch.cuda.max_memory_allocated(device) > torch.cuda.memory_allocated(device)
 
-        initialized = engine.prepare_runtime()["phases"][0]
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
+        report = (
+            engine.prepare_runtime(measure_cuda_peaks=True)
+            if measure_cuda_peaks
+            else engine.prepare_runtime()
+        )
+        initialized = report["phases"][0]
         assert initialized["name"] == "initialized"
-        assert initialized["peak_allocated_bytes"] == initialized["allocated_bytes"]
-        assert initialized["peak_reserved_bytes"] == initialized["reserved_bytes"]
+        if measure_cuda_peaks:
+            assert initialized["peak_allocated_bytes"] == initialized["allocated_bytes"]
+            assert initialized["peak_reserved_bytes"] == initialized["reserved_bytes"]
+        else:
+            assert "peak_allocated_bytes" not in initialized
+            assert "peak_reserved_bytes" not in initialized
+            assert torch.cuda.max_memory_allocated(device) >= peak_allocated
+            assert torch.cuda.max_memory_reserved(device) >= peak_reserved
     finally:
         engine.close()
 

@@ -96,9 +96,8 @@ def _capture(hidden, stream, pool, run, *, startup=False):
             for _ in range(2):
                 run()
         stream.synchronize()
-        # Preserve main's cleanup of old engine cycles before entering capture.
-        if not startup or gc.isenabled():
-            gc.collect()
+        # Retire older graphs before capture, even when automatic GC is disabled.
+        gc.collect()
         graph = torch.cuda.CUDAGraph()
         # Collecting an unreachable old CUDAGraph here calls cudaGraphExecDestroy,
         # which is forbidden during capture and invalidates the new graph.
