@@ -78,6 +78,88 @@ OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli --toy --dtype float32 \
 
 For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --attention-backend triton`. Use `--single-stream` for the single-stream pipeline. `--num-blocks` overrides automatic sizing, or specify `--kv-cache-memory-bytes`; these two overrides are mutually exclusive. CPU auto mode keeps a 256-block default. `StageEngine.memory_plan` records the worker-local sizing decision; it is not an attribute of the public `LLM.engine` client.
 
+## Startup execution
+
+CUDA workers prepare their actual runners after connector initialization and
+before sending `ready`. Preparation runs bounded prefill, decode and configured
+speculative work with valid scratch KV allocations. It captures the graph shapes
+encountered by those workloads and replays representative paths. Scratch requests
+never enter the scheduler or publish prefix-cache entries. Streams and submission
+queues are drained before request state and KV leases are released; the serving
+RNG and request counters are preserved. CPU workers do not execute this workload.
+
+Preparation increases startup time and retains serving workspaces earlier. It
+reduces setup work in the first request; steady-state throughput and total cold
+process latency require separate measurement for each model and workload.
+
+`StageEngine.prepare_runtime()` is idempotent. Its worker-local `startup_report`
+records the covered token lengths and batch sizes, graph keys and replay/fallback
+counts, and remaining coverage gaps. The `initialized`, `captured`, `replayed`
+and `cleaned` phase snapshots record elapsed time, driver-free memory and current
+PyTorch allocated/reserved memory. Ordinary preparation leaves the process's CUDA
+allocator peak counters intact. An isolated sizing worker can defer automatic preparation
+and opt in on its first call with `prepare_runtime(measure_cuda_peaks=True)`. This adds
+allocated/reserved peak fields to each phase, resetting the PyTorch counters
+for the entire process on that CUDA device before the first sample and after
+each sample. The first peak starts at the current initialized allocation, and
+subsequent peaks cover their own intervals. Use this mode only when no other
+engine or application measurement shares those allocator counters. Consumers
+of a report without these peak fields must retain the estimated allowance.
+
+The allocator cache is retained at the sample boundaries. Times are cumulative
+seconds from the start of preparation and memory values are bytes. Driver-free
+values are boundary samples. The report is published only after successful cleanup.
+
+Single-request history covers the configured prefill limit and crosses a sliding
+window when committed KV permits. Decode batch buckets also cross a KV page.
+`decode_workloads` pairs the `batch_size` and `history_tokens` of each completed
+recurrent decode traversal. History is the number of preceding tokens, excluding the
+decode input itself. Independent maximum batch and history fields do not imply
+that their combination was executed. Larger contexts and unreported batch/history
+combinations still need an estimated transient allowance, even when the KV pool
+could hold them.
+
+Greedy and full-vocabulary top-p sampling use scratch request generators. Block
+speculation is warmed with greedy requests; random block speculation retains its
+estimated transient allowance and is listed as a coverage gap. Pipeline speculation
+supports greedy requests only.
+Async multi-stream preparation additionally submits an independent prompt core
+and coda before collection, followed by a decode core/coda pair, within the
+request/token/KV limits. Only the final overlapping prompt chunk shares the token
+budget with coda. Independent submissions do not cover a mixed prompt/decode batch;
+mixed scheduling records that gap and retains an estimated allowance. The
+`concurrent_prepared` and `concurrent` snapshots separate initial shape preparation
+from repeated concurrent execution. `concurrent_batches` lists coda row counts;
+each is submitted alongside one independent core request. Actual overlap depends
+on device execution and host submission cost. These phases drain the serving streams.
+
+This preparation does not replace automatic KV sizing. The report describes the
+existing allocated KV pool, including FP8 scale storage when configured, and
+sizing still uses the current estimates and reserves. The graph and workspace
+allocations remain resident; the KV pool itself is not a transient workspace.
+The report is a snapshot of preparation. Repeated `prepare_runtime()` calls return
+that snapshot; they do not measure or validate later storage changes. With ordinary
+KV tensors, `kv_bytes` is the usable payload including FP8 scales. Future VMM
+integration must report physical mapping bytes separately, including alignment
+overhead; PyTorch allocator counters do not include those mappings.
+
+Future storage integration must keep the full reserved tensor shape, pointers,
+views and strides stable for captured graphs, while exposing only physically
+backed blocks to the allocator. Capturing a view limited to the bootstrap blocks
+can retain that smaller indexing bound after commitment. Never initialize the
+unmapped part of a reservation with whole-tensor operations. Validate replay on
+newly committed blocks before publishing readiness; this is a separate step from
+the idempotent preparation call. PD/NIXL must retain ordinary storage until the
+mapping and registration requirements are supported.
+
+Small explicit pools can reduce warmup coverage. Unseen exact graph shapes retain
+bounded lazy capture. Startup prioritizes larger planned decode shapes when the
+Graph budget is limited. Longer contexts and mixed speculative/prompt
+overlap retain estimated transient allowances. Pipeline preparation reaches
+target verification before releasing its scratch state. The report is a lifecycle
+boundary for subsequent memory-planning integration, not a guarantee that every
+serving shape or peak allocation has been measured.
+
 ## Packed prefill
 
 `ExecutionConfig.packed_prefill` controls packed prefill attention and metadata

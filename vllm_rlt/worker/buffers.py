@@ -296,6 +296,12 @@ class PackedMetadataBuffer:
             )
         self.storage.np[: len(values)] = values
 
+    def clear(self):
+        """Release host request bindings after the slot's consumers have drained."""
+        self.layouts = ()
+        self.owner = None
+        self.allocations = ()
+
     def upload(self):
         from vllm_rlt.kernels.metadata import expand_kv_addresses
 

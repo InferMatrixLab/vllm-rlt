@@ -698,11 +698,17 @@ def test_cuda_graph_reserve_reduces_budget_with_fixed_memory_inputs(monkeypatch,
 def test_cuda_memory_plan_reclaims_allocator_residue_on_recreation():
     import gc
 
+    # Earlier tests can leave unreachable engines whose streams retain buffers.
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     base = model().to(device="cuda", dtype=torch.bfloat16)
     options = dict(
         cache_config=CacheConfig(block_size=2, memory_reserve_bytes=0),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=3),
         attention_backend="triton",
+        # Isolate planning from per-stream library workspaces created by warmup.
+        _defer_runtime_preparation=True,
     )
     first = LLMEngine(base, **options)
     budget = first.memory_plan["kv_budget_bytes"]
@@ -717,5 +723,6 @@ def test_cuda_memory_plan_reclaims_allocator_residue_on_recreation():
     second = LLMEngine(base, **options)
     assert second.cache_manager.num_blocks == blocks
     assert abs(second.memory_plan["kv_budget_bytes"] - budget) < 16 * 1024 * 1024
+    second.prepare_runtime()
     second.add_request("recreated", [1, 2], SamplingParams(max_tokens=2, ignore_eos=True))
     assert len(drain(second)["recreated"].token_ids) == 2

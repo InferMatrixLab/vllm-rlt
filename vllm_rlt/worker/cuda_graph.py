@@ -96,9 +96,8 @@ def _capture(hidden, stream, pool, run, *, startup=False):
             for _ in range(2):
                 run()
         stream.synchronize()
-        # Preserve main's cleanup of old engine cycles before entering capture.
-        if not startup or gc.isenabled():
-            gc.collect()
+        # Retire older graphs before capture, even when automatic GC is disabled.
+        gc.collect()
         graph = torch.cuda.CUDAGraph()
         # Collecting an unreachable old CUDAGraph here calls cudaGraphExecDestroy,
         # which is forbidden during capture and invalidates the new graph.
@@ -298,6 +297,7 @@ class RecurrentGraphs:
         self.last_event = None
         self.captures = self.replays = self.fallbacks = 0
         self.warned_cache_full = False
+        self.startup = False
 
     def select(self, hidden, batch):
         count = _query_count(batch)
@@ -385,7 +385,7 @@ class RecurrentGraphs:
                     lambda: self.model.recurrent_prepared(
                         entry.hidden, entry.metadata, proxy, compute_gate=self.compute_gate
                     ),
-                    startup=startup,
+                    startup=startup or self.startup,
                 )
                 self.captures += 1
         call.inputs_ready = True
@@ -495,6 +495,7 @@ class CodaGraphs:
         self.last_event = None
         self.captures = self.replays = self.fallbacks = 0
         self.warned_cache_full = False
+        self.startup = False
 
     @torch.inference_mode()
     def prepare(self):
@@ -589,7 +590,11 @@ class CodaGraphs:
                 entry.hidden[len(hidden) :].zero_()
             if entry.graph is None:
                 entry.graph, entry.output = _capture(
-                    entry.hidden, self.stream, self.pool, lambda: self._run(entry), startup=startup
+                    entry.hidden,
+                    self.stream,
+                    self.pool,
+                    lambda: self._run(entry),
+                    startup=startup or self.startup,
                 )
                 self.captures += 1
         call.inputs_ready = True

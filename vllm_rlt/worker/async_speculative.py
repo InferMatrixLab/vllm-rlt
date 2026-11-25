@@ -403,10 +403,6 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             self.coda_pair_graphs = CodaPairGraphs(model, cache, sizes)
             self.prelude_graphs.prepare()
             self.coda_pair_graphs.prepare()
-        if self.graphs is not None:
-            self.graphs.prepare()
-        if self.coda_graphs is not None:
-            self.coda_graphs.prepare()
         self.compute_stream = compute_stream
         self.copy_stream = copy_stream
         self.input_stream = (
