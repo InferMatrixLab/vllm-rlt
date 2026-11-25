@@ -1,4 +1,4 @@
-# vllm-rlt as a vLLM plugin (unverified on GPU)
+# vllm-rlt as a vLLM plugin (first GPU runs on Ouro only)
 
 This branch adds `vllm_rlt/plugin/`: the loop-aware parts of vllm-rlt running
 inside vLLM's own engine process. Serving, tokenizer, executor, parallelism,
@@ -121,21 +121,38 @@ state helpers (`TokenState`, `Sink`); the scheduler against the real vLLM
 and entry point; the `rlt_self` registration; Ouro's model code on vLLM's CPU setup;
 and the Inkling op partition.
 
-**Not run on a GPU.** Nothing below has executed a kernel:
+**GPU runs so far** (one B300, Ouro-1.4B, three short prompts, greedy, vLLM
+`0.34.0rc1.dev1149`). What ran:
 
-* `runner.py`, `runner_exit.py`, `worker.py` (the code that talks to vLLM's runner
-  internals: `execute_model_state`, slot mappings, `_dummy_run`, the CUDA-graph
-  manager, `num_computed_tokens` staging);
-* `loopgraph.py`: capture order, the static buffers, and whether the attention
-  metadata vLLM builds for a replay matches the capture;
-* `selfspec.py`: the draft step builds its own attention metadata with
-  `build_attn_metadata`; whether that is accepted for a one-token decode on every
-  backend is untested. The draft's greedy tokens, rollback and KV rewrite are
-  untested;
-* `ouro*.py` numerics and `kvfill.py`;
-* `inkling.py`: it calls vLLM's private `_run_layer`. Its first check on a GPU
-  must be that running prelude, the core passes and coda as separate ops gives
-  the same final hidden state as vLLM's single forward.
+* the plugin loads Ouro (96 per-pass attention layers on FlashInfer) and
+  generates coherent text through the loop scheduler and runner (eager);
+* early exit (`rlt_exit_threshold=0.5`) runs without error and changes the output
+  relative to full depth, as expected. How many tokens actually left early, and
+  whether the KV fill ran, was not measured. The fill itself first failed on a
+  real run because FlashInfer hands the layer a `(blocks, heads, tokens, content)`
+  view, not `(2, blocks, ...)`; fixed and covered by a CPU test of the indexing;
+* `rlt_graphs`: five loop graphs (CORE 0..3, CODA) capture, and one-token decode
+  steps replay them. The first run stopped every request after two tokens: the
+  runner read the replayed state after the graph manager was switched back, so the
+  next op had no state. Fixed; the replayed run then matched the same
+  configuration run without loop graphs for 12 tokens;
+* the `rlt_self` method registers and the engine runs with it.
+
+What is **not** established:
+
+* **Correctness against a reference.** Nothing was compared with the existing rlt
+  engine or HF. With vLLM's own CUDA graphs on (`enforce_eager=False`) the greedy
+  output of one prompt diverges from the eager run at the fifth token (both are
+  fluent text). The cause is not known: bf16 differences between the two configs,
+  or a plugin bug in one path.
+* **Self-speculation drafted nothing.** `vllm:spec_decode_num_drafts` stayed 0, so
+  no draft, verify or rollback has executed. The output equals the non-speculative
+  output only because no draft was ever verified.
+* WCPB ran on prompts shorter than a chunk, so chunks of one prompt never
+  overlapped; the multi-chunk path is tested on CPU only.
+* Not run at all: Inkling (the `_run_layer` split must first be checked against
+  vLLM's single forward), data parallelism, async scheduling, mixed depths on a
+  GPU, `rlt_allow_mixed_depth`.
 
 ## Known gaps
 
