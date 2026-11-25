@@ -63,6 +63,7 @@ def load_engine(args):
             max_num_batched_tokens=args.prefill_max_num_batched_tokens,
             prefill_chunk_size=args.prefill_chunk_size,
             wavefront_chunked_prefill=getattr(args, "wavefront_chunked_prefill", False),
+            adaptive_wavefront_prefill=getattr(args, "adaptive_wavefront_prefill", False),
         ),
         decode_scheduler_config=SchedulerConfig(
             policy=getattr(args, "scheduling_policy", "fcfs"),

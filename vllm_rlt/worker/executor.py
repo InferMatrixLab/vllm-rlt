@@ -103,6 +103,12 @@ class Executor:
         batch = build_execution_batch(scheduled_batch, self.runner.model.config.total_ut_steps)
         return self.runner.submit(scheduled_batch, batch=batch)
 
+    @torch.inference_mode()
+    def submit_mixed_speculative(self, speculative, prompt):
+        batch = build_execution_batch(prompt, self.runner.model.config.total_ut_steps)
+        with self.runner.prepare_mixed_recurrent(batch) as prepared:
+            return self.speculation.submit(speculative, prompt=(self.runner, prepared))
+
 
 @dataclass(frozen=True)
 class ForwardBatch:
@@ -139,9 +145,13 @@ class ForwardResult:
 
 
 class ModelRuntime:
-    def __init__(self, model, cache):
+    def __init__(self, model, cache, *, packed_graphs=None):
         self.model = model
         self.cache = cache
+        self.packed_graphs = packed_graphs
+
+    def _has_packed_graphs(self, metadata):
+        return self.packed_graphs is not None and metadata.cu_seqlens_q is not None
 
     def prepare(self, batch: ForwardBatch) -> ForwardBatch:
         """Choose graph/fallback for every call before execution.
@@ -178,12 +188,13 @@ class ModelRuntime:
                 if batch.graphs is not None:
                     logits = batch.graphs.execute(batch.graph_calls[0], hidden)
                 elif batch.prelude_coda_kv_metadata is not None:
-                    logits = self.model.coda_prepared(
-                        hidden,
-                        batch.prelude_coda_kv_metadata,
-                        self.cache,
-                        compute_logits=batch.compute_logits,
-                    )
+                    kv = batch.prelude_coda_kv_metadata
+                    if not batch.compute_logits and self._has_packed_graphs(kv):
+                        logits = self.packed_graphs.forward(Operation.CODA, hidden, kv)
+                    else:
+                        logits = self.model.coda_prepared(
+                            hidden, kv, self.cache, compute_logits=batch.compute_logits
+                        )
                 else:
                     logits = self.model.coda(hidden) if batch.compute_logits else None
                 return ForwardResult(hidden=hidden, logits=logits)
@@ -193,12 +204,16 @@ class ModelRuntime:
                 if batch.graphs is not None:
                     return ForwardResult(batch.graphs.execute(batch.graph_calls[0], batch.tokens))
                 if batch.prelude_coda_kv_metadata is not None:
-                    hidden = self.model.prelude_prepared(
-                        batch.tokens[: len(batch.prelude_coda_kv_metadata.position_ids)],
-                        batch.prelude_coda_kv_metadata,
-                        self.cache,
-                        generators=batch.generators,
-                    )
+                    kv = batch.prelude_coda_kv_metadata
+                    tokens = batch.tokens[: len(kv.position_ids)]
+                    if self._has_packed_graphs(kv):
+                        hidden = self.packed_graphs.forward(
+                            Operation.PRELUDE, tokens, kv, generators=batch.generators
+                        )
+                    else:
+                        hidden = self.model.prelude_prepared(
+                            tokens, kv, self.cache, generators=batch.generators
+                        )
                     if batch.hidden_buffer is not None:
                         batch.hidden_buffer.zero_()
                         batch.hidden_buffer[: len(hidden)].copy_(hidden)
@@ -215,6 +230,10 @@ class ModelRuntime:
                     if not call.inputs_ready:
                         batch.graphs.prepare_inputs(call, hidden)
                     hidden, gate = batch.graphs.execute(call, hidden)
+                elif self._has_packed_graphs(kv):
+                    hidden, gate = self.packed_graphs.forward(
+                        Operation.RECURRENT, hidden, kv, compute_gate=batch.compute_gate
+                    )
                 else:
                     hidden, gate = self.model.recurrent_prepared(
                         hidden, kv, self.cache, compute_gate=batch.compute_gate

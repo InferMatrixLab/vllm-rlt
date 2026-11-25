@@ -198,6 +198,7 @@ class SpeculativeRunner:
     ):
         self.model, self.cache, self.config = model, cache, config
         self.boundary_kv = getattr(model, "requires_boundary_kv", False)
+        self.ordered_pipeline_coda = getattr(model, "requires_ordered_pipeline_coda", False)
         # Windowed attention needs one query row per token.
         self.row_queries = getattr(model, "requires_sliding_window", False)
         self.metadata = cache.metadata_builder
@@ -215,6 +216,7 @@ class SpeculativeRunner:
         # each request's RNG slot.
         self.rng = rng if rng is not None else RngRegistry()
         self.stats = SpeculativeStats()
+        self.prelude_graphs = None
         self.graphs = (
             RecurrentGraphs(model, cache, execution, False) if execution.cuda_graphs else None
         )
@@ -316,9 +318,13 @@ class SpeculativeRunner:
         )
 
     def _prelude(self, tokens, boundary=None):
-        return self.runtime.forward(
-            ForwardBatch(Operation.PRELUDE, tokens=tokens, prelude_coda_kv_metadata=boundary)
-        ).hidden
+        forward = ForwardBatch(
+            Operation.PRELUDE,
+            tokens=tokens,
+            prelude_coda_kv_metadata=boundary,
+            graphs=self.prelude_graphs,
+        )
+        return self.runtime.forward(self.runtime.prepare(forward)).hidden
 
     def _recurrent(self, hidden, metadata):
         forward = ForwardBatch(
@@ -436,13 +442,23 @@ class SpeculativeRunner:
         endpoints = [
             i for i, t in enumerate(tokens) if t.depth + draft in (draft, self.config.target_loops)
         ]
+        coda_batches = [endpoints] if endpoints else []
+        if self.ordered_pipeline_coda:
+            # Commit the target history before evaluating the later draft.
+            # Each short-conv call gets at most one position per request.
+            target = [i for i in endpoints if tokens[i].depth + draft == self.config.target_loops]
+            proposal = [i for i in endpoints if tokens[i].depth == 0]
+            coda_batches = [rows for rows in (target, proposal) if rows]
+            endpoints = [i for rows in coda_batches for i in rows]
         if self.boundary_kv:
             # Boundary history lives at depth 0. A request's rows stay ordered by
             # position and every row stores before any row attends, so a draft
             # row reads the target KV its predecessor stores in the same call.
             # PRELUDE runs for new rows only; CODA reads the endpoint rows.
             views[Operation.PRELUDE] = self._view(source, new, (draft,), layouts)
-            views[Operation.CODA] = self._view(source, endpoints, (draft,), layouts)
+            views[Operation.CODA] = tuple(
+                self._view(source, rows, (draft,), layouts)[0] for rows in coda_batches
+            )
         uploaded = {dtype: buffer.upload() for dtype, buffer in self.input_buffers.items()}
         layouts = tuple(self.metadata.bind(metadata, uploaded) for _, metadata in layouts.values())
         if new:
@@ -460,12 +476,15 @@ class SpeculativeRunner:
             token.hidden = row
             token.depth += self.config.draft_loops
         # Synchronous execution reads decisions in collect(), before the next step.
-        choices = (
-            self._coda(hidden[endpoints], self._boundary(layouts, views, Operation.CODA)).argmax(-1)
-            if endpoints
-            else hidden.new_empty(0, dtype=torch.long)
-        )
-        decisions = choices
+        coda_layouts = views.get(Operation.CODA, ())
+        choices = [
+            self._coda(hidden[rows], layouts[coda_layouts[i]] if coda_layouts else None).argmax(-1)
+            for i, rows in enumerate(coda_batches)
+        ]
+        if len(choices) > 1:
+            decisions = torch.cat(choices)
+        else:
+            decisions = choices[0] if choices else hidden.new_empty(0, dtype=torch.long)
         event = None
         if self.device_ops is not None:
             event = self.device_ops.Event()

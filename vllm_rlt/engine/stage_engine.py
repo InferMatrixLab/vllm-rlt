@@ -14,7 +14,7 @@ from vllm_rlt.config import (
 )
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import calibrate_fp8_scale, plan_cache
-from vllm_rlt.core.scheduler import Scheduler
+from vllm_rlt.core.scheduler import Scheduler, SchedulerOutput
 from vllm_rlt.core.scheduling_policy import requires_staged_prefill
 from vllm_rlt.engine.connector import StageConnector
 from vllm_rlt.engine.packed_prefill import packed_prefill_eligible
@@ -65,6 +65,7 @@ class StageEngine:
         scheduler_config = scheduler_config or SchedulerConfig()
         parameter = next(model.parameters())
         config = model.config
+        auxiliary_width = getattr(config, "auxiliary_cache_width", 0)
         if getattr(model, "requires_boundary_kv", False):
             required_layout = getattr(model, "kv_cache_layout", "last_exited")
             if cache_config.layout != required_layout:
@@ -75,6 +76,23 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
+        if self.execution_config.cuda_graph_warmup and not getattr(model, "interleaved_kv", False):
+            raise ValueError("CUDA Graph warmup requires native Inkling kernels")
+        if auxiliary_width:
+            if attention_backend not in ("auto", "torch", "triton"):
+                raise ValueError("Inkling 2 Mini requires the Triton KV backend")
+            # Inkling uses Triton for KV layout and vLLM for model attention.
+            attention_backend = "triton"
+            if (
+                cache_config.kv_cache_dtype != "auto"
+                or scheduler_config.enable_preemption
+                or self.stage_config.role != "prefill_decode"
+            ):
+                raise ValueError(
+                    "Inkling 2 Mini requires a single stage with BF16 KV, without preemption"
+                )
+            if self.exit_config.mode != "ouro":
+                raise ValueError("Inkling 2 Mini runs the configured number of passes")
         if parameter.device.type == "npu":
             if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
                 raise ValueError("NPU currently supports Ouro with four loops")
@@ -107,8 +125,35 @@ class StageEngine:
             speculative=speculative_config is not None,
             preemption=scheduler_config.enable_preemption,
         )
+        ordered_pipeline = (
+            speculative_config is not None
+            and speculative_config.mode == "pipeline"
+            and getattr(model, "requires_ordered_pipeline_coda", False)
+        )
+        device_boundary_pipeline = ordered_pipeline and getattr(model, "interleaved_kv", False)
+        mixed_speculative = scheduler_config.mode == "mixed" and speculative_config is not None
+        if mixed_speculative:
+            if not (
+                device_boundary_pipeline
+                and getattr(model, "fixed_loop_count", False)
+                and self.execution_config.async_scheduling
+                and speculative_config.draft_loops == 1
+                and self.stage_config.role == "prefill_decode"
+            ):
+                raise ValueError(
+                    "mixed speculative decoding requires the async native Inkling pipeline"
+                )
+            if self.execution_config.packed_prefill is False:
+                raise ValueError("mixed speculative decoding requires packed prefill")
+            self.execution_config = replace(self.execution_config, packed_prefill=True)
+            prefer_packed = True
         if getattr(model, "requires_boundary_kv", False):
-            if staged_prefill:
+            prefill_capability = (
+                "supports_wavefront_prefill"
+                if scheduler_config.wavefront_chunked_prefill
+                else "supports_mixed_prefill"
+            )
+            if staged_prefill and not getattr(model, prefill_capability, False):
                 raise ValueError(
                     "boundary-KV models do not support staged prefill required by this scheduler"
                 )
@@ -117,11 +162,14 @@ class StageEngine:
             ):
                 raise ValueError("boundary-KV models require synchronous scheduling")
             if speculative_config is not None:
-                if not getattr(model, "supports_self_speculation", False):
+                if not ordered_pipeline and not getattr(model, "supports_self_speculation", False):
                     raise ValueError("boundary-KV speculative decoding is not yet supported")
-                # Qualified: synchronous eager rounds. Async rounds, Graph replay and
-                # resumable preemption of draft/target boundary state are separate work.
-                if (
+                if ordered_pipeline:
+                    if self.execution_config.async_scheduling and not device_boundary_pipeline:
+                        raise ValueError("async boundary pipeline requires interleaved KV")
+                    if scheduler_config.enable_preemption:
+                        raise ValueError("Inkling pipeline requires preemption to be disabled")
+                elif (
                     self.execution_config.async_scheduling
                     or self.execution_config.cuda_graphs
                     or scheduler_config.enable_preemption
@@ -138,6 +186,14 @@ class StageEngine:
         )
         self.async_speculative = bool(speculative_config and self.execution_config.async_scheduling)
         if speculative_config is not None:
+            if speculative_config.pipeline_graph != "off" and not (
+                device_boundary_pipeline
+                and self.async_speculative
+                and self.execution_config.cuda_graphs
+            ):
+                raise ValueError(
+                    "pipeline_graph requires native Inkling, async scheduling and CUDA Graphs"
+                )
             if cache_config.layout != "last_exited":
                 raise ValueError("speculative decoding requires last_exited KV")
             if speculative_config.target_loops != config.total_ut_steps:
@@ -146,7 +202,7 @@ class StageEngine:
                 raise ValueError("speculative decoding requires fixed-depth ouro exit mode")
             if self.async_speculative and parameter.device.type != "cuda":
                 raise ValueError("async speculative decoding requires CUDA")
-            if scheduler_config.mode != "refill" or (
+            if (scheduler_config.mode != "refill" and not mixed_speculative) or (
                 self.async_speculative
                 and not self.pipeline_speculative
                 and scheduler_config.enable_preemption
@@ -264,6 +320,7 @@ class StageEngine:
             speculative=speculative_config,
             staged_prefill=staged_prefill,
             fp8_scale=fp8_scale,
+            attention=attention,
         )
         self.cache_manager = KVCacheManager(
             num_layers=kv_layers,
@@ -283,6 +340,8 @@ class StageEngine:
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
             kv_cache_dtype=cache_config.kv_cache_dtype,
             fp8_scale=fp8_scale,
+            auxiliary_width=auxiliary_width,
+            interleaved_kv=getattr(model, "interleaved_kv", False),
         )
         self.scheduler = Scheduler(
             scheduler_config,
@@ -292,6 +351,13 @@ class StageEngine:
             total_ut_steps=config.total_ut_steps,
             eos_token_id=config.eos_token_id,
             exit_mode=self.exit_config.mode,
+            mixed_speculative=mixed_speculative,
+            prioritize_prefill_continuations=(
+                getattr(model, "interleaved_kv", False)
+                and getattr(model, "fixed_loop_count", False)
+                and connector is None
+                and not scheduler_config.enable_preemption
+            ),
         )
         self.connector = connector
         # One RNG registry per engine, shared by both runners: the CODA and
@@ -312,12 +378,29 @@ class StageEngine:
             staged_prefill=self.scheduler.staged_prefill,
             rng=self.rng,
         )
+        if device_boundary_pipeline and self.async_speculative:
+            # Speculative steps execute the boundary layers as well as Core.
+            # Their Inkling MoE scratch is shared with new-request prefill.
+            # Keep model work ordered and retain separate readback streams.
+            self.model_runner.boundary_stream = self.model_runner.core_stream
+        if mixed_speculative and self.model_runner.packed_graphs is not None:
+            self.model_runner.packed_graphs.enable_speculative_core()
+        self.graph_warmup = None
+        if self.execution_config.cuda_graph_warmup:
+            from vllm_rlt.worker.inkling_graph_warmup import warmup_inkling_graphs
+
+            self.graph_warmup = warmup_inkling_graphs(self.model_runner, scheduler_config)
+        spec_execution = self.execution_config
+        if ordered_pipeline and not self.async_speculative:
+            # Boundary calls share the normal model's graph owners, including
+            # their keys, input buffers, and replay completion events.
+            spec_execution = replace(spec_execution, cuda_graphs=False, cuda_graph_warmup=False)
         self.speculative_runner = (
             SpeculativeRunner(
                 model,
                 self.cache_manager,
                 speculative_config,
-                self.execution_config,
+                spec_execution,
                 rng=self.rng,
                 runtime=self.model_runner.runtime,
                 compute_stream=self.model_runner.core_stream,
@@ -325,6 +408,28 @@ class StageEngine:
             if speculative_config is not None and not self.async_speculative
             else None
         )
+        if ordered_pipeline and self.speculative_runner is not None:
+            self.speculative_runner.prelude_graphs = self.model_runner.prelude_graphs
+            self.speculative_runner.graphs = self.model_runner.graphs
+            self.speculative_runner.coda_graphs = self.model_runner.coda_graphs
+            if device_boundary_pipeline and self.execution_config.cuda_graphs:
+                assert speculative_config is not None
+                from vllm_rlt.worker.cuda_graph import (
+                    DeviceRecurrentGraphs,
+                    speculative_capture_sizes,
+                )
+
+                graphs = DeviceRecurrentGraphs(
+                    model,
+                    self.cache_manager,
+                    self.execution_config,
+                    False,
+                    capture_sizes=speculative_capture_sizes(
+                        self.execution_config, scheduler_config, speculative_config
+                    ),
+                )
+                graphs.prepare()
+                self.speculative_runner.graphs = graphs
         if self.async_speculative:
             from vllm_rlt.worker.async_speculative import AsyncSpeculativeRunner
 
@@ -529,6 +634,21 @@ class StageEngine:
         """Drain owned GPU work before serving teardown drops tensor owners."""
         self.profiling.close()
         self.model_runner.synchronize()
+        if self.execution_config.cuda_graphs and getattr(
+            self.model.config, "auxiliary_cache_width", 0
+        ):
+            names = ("prelude_graphs", "graphs", "mixed_graphs", "packed_graphs", "coda_graphs")
+            for name in names:
+                graph = getattr(self.model_runner, name)
+                if graph is None:
+                    continue
+                logger.info(
+                    "Inkling %s CUDA Graph captures=%d replays=%d fallbacks=%d",
+                    name,
+                    graph.captures,
+                    graph.replays,
+                    graph.fallbacks,
+                )
         if self.async_speculative:
             cast("AsyncSpeculativeRunner", self.speculative_runner).synchronize()
         for rid in list(self.scheduler.requests):
@@ -893,7 +1013,26 @@ class StageEngine:
         batch = self._schedule()
         self.last_schedule = batch
         if batch is not None:
-            if batch.phase == RequestPhase.SPECULATIVE:
+            if batch.is_mixed:
+                speculative = SchedulerOutput(
+                    RequestPhase.SPECULATIVE,
+                    [item for item in batch.requests if item.phase == RequestPhase.SPECULATIVE],
+                    loop_count=0,
+                )
+                prompt = SchedulerOutput(
+                    RequestPhase.PREFILLING_RECURRENT,
+                    [
+                        item
+                        for item in batch.requests
+                        if item.phase == RequestPhase.PREFILLING_RECURRENT
+                    ],
+                    loop_count=batch.loop_count,
+                )
+                ticket = self.executor.submit_mixed_speculative(speculative, prompt)
+                self._pending_speculative.append(ticket)
+                outputs.extend(self._update(prompt, None))
+                self._apply_update(self.scheduler.update_after_submission(speculative))
+            elif batch.is_speculative:
                 ticket = self.executor.submit(batch)
                 self._pending_speculative.append(ticket)
                 self._apply_update(self.scheduler.update_after_submission(batch))
