@@ -31,9 +31,11 @@ def register() -> None:
 
     from vllm_rlt.plugin.ouro_config import register_ouro_config
     from vllm_rlt.plugin.patch import apply_request_patch
+    from vllm_rlt.plugin.selfspec import register_self_spec
 
     apply_request_patch()
     register_ouro_config()
+    register_self_spec()
     ModelRegistry.register_model("OuroForCausalLM", "vllm_rlt.plugin.ouro:OuroLoopForCausalLM")
     # Inkling is vLLM's own model; this subclass can also run one op at a time
     # and, with no loop context, is identical to vLLM's, so a run that does not

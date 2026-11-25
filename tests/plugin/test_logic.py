@@ -167,3 +167,130 @@ def test_layouts_by_architecture():
     assert loop_layout(forced).num_passes == 2
     with pytest.raises(ValueError, match="no loop layout"):
         loop_layout(_config_for("LlamaForCausalLM"))
+
+
+# -- VarLoop vs Fixed, spans, ordering ------------------------------------------
+
+
+def _inkling_cfg(*, varloop, share=False, passes=3, split=True):
+    from types import SimpleNamespace
+
+    text = SimpleNamespace(
+        loop_config={"num_passes": passes, "is_varloop": varloop},
+        num_loop_passes=passes,
+        loop_share_cache=share,
+    )
+    hf = SimpleNamespace(architectures=["Inkling2LoopForConditionalGeneration"], text_config=text)
+    extra = {"rlt_split_ops": True} if split else {}
+    return SimpleNamespace(model_config=SimpleNamespace(hf_config=hf), additional_config=extra)
+
+
+def test_fixed_inkling_always_runs_every_pass():
+    from vllm_rlt.plugin.models import loop_layout
+
+    layout = loop_layout(_inkling_cfg(varloop=False))
+    assert not layout.varloop and layout.num_passes == 3
+    assert layout.limit(ExitParams.from_extra_args({"rlt_target_loops": 1})) == 3
+
+
+def test_varloop_inkling_exits_by_pass_count_only_with_a_shared_cache():
+    from vllm_rlt.plugin.models import loop_layout
+
+    shared = loop_layout(_inkling_cfg(varloop=True, share=True))
+    separate = loop_layout(_inkling_cfg(varloop=True, share=False))
+    want = ExitParams.from_extra_args({"rlt_target_loops": 2})
+    assert shared.varloop and shared.limit(want) == 2
+    assert separate.limit(want) == 3  # a skipped pass would leave a hole in its own cache
+    assert shared.limit(ExitParams()) == 3 and not shared.has_gate
+
+
+def test_loop_features_turn_the_split_on():
+    from vllm_rlt.plugin.models import loop_layout
+
+    assert loop_layout(_inkling_cfg(varloop=False, split=False)).full_only
+    cfg = _inkling_cfg(varloop=True, split=False)
+    for feature in ("rlt_wcpb", "rlt_graphs"):
+        cfg.additional_config = {feature: True}
+        assert not loop_layout(cfg).full_only
+
+
+def test_program_rank_orders_ops():
+    layout = LoopLayout(num_passes=3)
+    ranks = [layout.rank(Op.PRELUDE, 0)] + [layout.rank(Op.CORE, d) for d in range(3)]
+    ranks.append(layout.rank(Op.CODA, 2))
+    assert ranks == sorted(set(ranks)) and ranks == [0, 1, 2, 3, 4]
+
+
+def test_a_chunk_waits_for_the_chunk_before_it():
+    from vllm_rlt.plugin.plan import unblocked
+    from vllm_rlt.plugin.request import Span
+
+    layout = LoopLayout(num_passes=3)
+    first = Span(0, 4, 0, Op.CORE, 0)
+    second = Span(1, 4, 4, Op.CORE, 0)
+    rank = lambda s: layout.rank(s.op, s.depth)  # noqa: E731
+    assert unblocked([first, second], rank) == [first]  # same position: second waits
+    first.depth = 1
+    assert unblocked([first, second], rank) == [first, second]  # first moved on
+    first.in_flight = True
+    assert unblocked([first, second], rank) == [second]
+
+
+def test_a_step_takes_one_span_per_request():
+    rows = [
+        Ready("a", Op.CORE, 0, 4, sid=0),
+        Ready("a", Op.CORE, 0, 4, sid=1),
+        Ready("b", Op.CORE, 0, 4, sid=0),
+    ]
+    picked = take_rows(rows, (int(Op.CORE), 0), max_rows=8, token_budget=100)
+    assert [(r.req_id, r.sid) for r in picked] == [("a", 0), ("b", 0)]
+
+
+def test_self_spec_alone_keeps_the_native_full_path():
+    from vllm_rlt.plugin.models import loop_layout
+
+    cfg = _inkling_cfg(varloop=True, split=False)
+    cfg.additional_config = {"rlt_self_spec": True}
+    assert loop_layout(cfg).full_only
+
+
+def test_state_helpers_keep_the_token_axis():
+    import torch
+
+    from vllm_rlt.plugin.context import (
+        Sink,
+        TokenState,
+        state_copy_,
+        state_like,
+        state_view,
+    )
+
+    state = TokenState(
+        {"stack": torch.arange(2 * 3 * 4.0).reshape(2, 3, 4), "partial": torch.ones(3, 4)},
+        {"stack": 1, "partial": 0},
+        {"num_blocks": 1},
+    )
+    static = state_like(state, 8)
+    assert static["stack"].shape == (2, 8, 4) and static["partial"].shape == (8, 4)
+    state_copy_(static, state, 3)
+    assert torch.equal(state_view(static, 3)["stack"], state["stack"])
+    assert static.meta == {"num_blocks": 1}
+    sink = Sink(8)
+    sink.write(state, 3)
+    assert torch.equal(sink.state["partial"][:3], state["partial"])
+    plain = Sink(5)
+    plain.write(torch.ones(2, 4), 2)
+    assert plain.state.shape == (5, 4) and plain.state[:2].sum() == 8
+
+
+def test_self_spec_method_registers_and_resolves():
+    from vllm.v1.worker.gpu.spec_decode.speculator_config import (
+        get_custom_speculator_config_class,
+    )
+
+    import vllm_rlt.plugin as plugin
+
+    plugin.register()
+    cls = get_custom_speculator_config_class("rlt_self")
+    assert cls is not None and cls.speculator_class.endswith("LoopSpeculator")
+    assert "speculator_options" in cls.supported_options

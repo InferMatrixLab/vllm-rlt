@@ -14,6 +14,12 @@ How vLLM stays consistent:
   ``num_computed_tokens`` when it opens the span, which is when the span's KV
   slots were allocated.
 * ``update_from_output`` reaches vLLM only when a span's last op has returned.
+* Self-speculation is vLLM's own speculative decoding (see ``selfspec.py``): a
+  verify round is a span of K+1 tokens, so vLLM's draft-token placeholders,
+  rollback and async accounting apply unchanged.
+* WCPB (``rlt_wcpb``): a prompt with chunks left stays visible to vLLM, so the
+  next chunk opens while earlier chunks are still mid-loop; the loop level then
+  runs chunk c at depth d once chunk c-1 is past depth d.
 
 Models that vLLM already runs natively (``layout.full_only``) are passed
 through untouched, so with loop features off the baseline is vLLM itself.
@@ -41,12 +47,25 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
         self.layout = self._resolve_layout()
         extra = self.vllm_config.additional_config
         extra = extra if isinstance(extra, dict) else {}
-        # v0: a CORE step mixes rows of one depth only. Rows carry their depth
-        # and the planner can mix; the runner and model reject mixed depths.
-        self.allow_mixed_depth = bool(extra.get("rlt_allow_mixed_depth", False))
+        # A CORE step mixes rows of one depth only unless this is on. Rows carry
+        # their depth; the runner and the model must support mixed depths
+        # (Ouro does; Inkling's AttnRes state does not).
         self.wait_limit = int(extra.get("rlt_wait_limit", 8))
         self.max_rows = self.scheduler_config.max_num_seqs
+        self.wcpb = bool(extra.get("rlt_wcpb", False)) and not self.layout.full_only
+        # WCPB's gain is chunks at different depths sharing one CORE step, so it
+        # turns mixed depth on wherever the model can run it (Ouro; not Inkling,
+        # whose AttnRes bank differs per pass).
+        self.allow_mixed_depth = self.layout.mixed_depth and (
+            bool(extra.get("rlt_allow_mixed_depth", False)) or self.wcpb
+        )
+        if self.wcpb and self.layout.share_cache:
+            raise ValueError("WCPB needs a KV cache per pass; it cannot share one (LAST_EXITED)")
+        # Prelude, each core pass and coda: at most this many chunks of one prompt
+        # can be in flight, one per program position.
+        self.wcpb_depth = int(extra.get("rlt_wcpb_depth", self.layout.num_passes + 2))
         self._carry = Carry()
+        self._spec_to_schedule = self.num_spec_tokens
 
     def _resolve_layout(self):
         return loop_layout(self.vllm_config)
@@ -56,6 +75,7 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
             return super().schedule(throttle_prefills)
         if self._needs_token_level():
             out = self._open_spans_via_vllm(throttle_prefills)
+            self._spec_to_schedule = out.num_spec_tokens_to_schedule
             self._carry.absorb(out)
             self._adopt_spans(out)
         ready = self._ready()

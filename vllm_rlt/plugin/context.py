@@ -20,6 +20,24 @@ import torch
 from vllm_rlt.plugin.program import Op
 
 
+class Sink:
+    """Static buffers that receive the state after an op.
+
+    A CUDA graph replay runs no Python, so the model cannot hand the next op a
+    freshly allocated state: it copies what it produced into this buffer, inside
+    the graph, and the runner reads the first ``tokens`` of it afterwards. The
+    buffer is allocated at the first copy, sized for ``max_tokens``."""
+
+    def __init__(self, max_tokens: int) -> None:
+        self.max_tokens = max_tokens
+        self.state: Any = None
+
+    def write(self, out: Any, tokens: int) -> None:
+        if self.state is None:
+            self.state = state_like(out, self.max_tokens)
+        state_copy_(self.state, out, tokens)
+
+
 @dataclass
 class LoopContext:
     op: Op
@@ -28,10 +46,23 @@ class LoopContext:
     row_depth: torch.Tensor | None = None  # [tokens] int32, mixed only
     group_rows: dict[int, torch.Tensor] = field(default_factory=dict)
     out: Any = None  # state after the op, set by the model
+    passes: int | None = None  # core passes the tokens of this step will run
+    sink: Sink | None = None  # static copy of ``out`` (CUDA graphs)
+    draft: bool = False  # run prelude, ``passes`` cores and coda in one forward
 
     @property
     def mixed(self) -> bool:
         return self.depth < 0
+
+    def state_for(self, tokens: int):
+        """The state this op reads, for a batch of ``tokens`` (padded) tokens."""
+        return self.state
+
+    def emit(self, tokens: int, out: Any) -> None:
+        """The model reports the state after the op."""
+        self.out = out
+        if self.sink is not None and not isinstance(out, type(None)):
+            self.sink.write(out, tokens)
 
 
 @dataclass
@@ -97,11 +128,51 @@ def pad_rows(t: torch.Tensor, rows: int, value: float = 0.0) -> torch.Tensor:
 
 
 def pad_state(state: Any, rows: int) -> Any:
-    """Pad every token axis of a state to ``rows`` tokens."""
+    """Make every token axis of a state exactly ``rows`` long: pad a short one,
+    view the first ``rows`` of a long one (a graph's static buffers are sized for
+    the largest batch)."""
     if isinstance(state, TokenState):
-        padded = {k: pad_dim(v, state.dims[k], rows) for k, v in state.tensors.items()}
-        return TokenState(padded, state.dims, dict(state.meta))
-    return pad_rows(state, rows)
+        fixed = {}
+        for k, v in state.tensors.items():
+            dim = state.dims[k]
+            v = pad_dim(v, dim, rows)
+            fixed[k] = v.narrow(dim, 0, rows) if v.shape[dim] > rows else v
+        return TokenState(fixed, state.dims, dict(state.meta))
+    padded = pad_rows(state, rows)
+    return padded[:rows]
+
+
+def state_like(state: Any, rows: int) -> Any:
+    """Zeroed buffers shaped like ``state`` with ``rows`` tokens (graph inputs)."""
+    if isinstance(state, TokenState):
+        made = {}
+        for k, v in state.tensors.items():
+            shape = list(v.shape)
+            shape[state.dims[k]] = rows
+            made[k] = v.new_zeros(shape)
+        return TokenState(made, dict(state.dims), dict(state.meta))
+    return state.new_zeros((rows, *state.shape[1:]))
+
+
+def state_view(state: Any, rows: int) -> Any:
+    """The first ``rows`` tokens of a static buffer, as views (no copy)."""
+    if isinstance(state, TokenState):
+        views = {k: v.narrow(state.dims[k], 0, rows) for k, v in state.tensors.items()}
+        return TokenState(views, state.dims, dict(state.meta))
+    return state[:rows]
+
+
+def state_copy_(dst: Any, src: Any, rows: int) -> None:
+    """Copy ``src`` (``rows`` tokens, or fewer) into the first tokens of the
+    static buffers ``dst`` in place, so a captured graph reads it at replay."""
+    if isinstance(dst, TokenState):
+        for k, buf in dst.tensors.items():
+            dim = dst.dims[k]
+            s = src.tensors[k]
+            buf.narrow(dim, 0, s.shape[dim]).copy_(s)
+        dst.meta.update(src.meta)
+        return
+    dst[: src.shape[0]].copy_(src)
 
 
 @contextmanager

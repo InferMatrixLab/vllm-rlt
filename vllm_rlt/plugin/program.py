@@ -31,10 +31,41 @@ class LoopLayout:
     native forward (the Inkling v0 baseline path).
     """
 
-    num_passes: int
+    num_passes: int  # passes one token runs by default (the configured count)
     has_prelude: bool = True
     full_only: bool = False
     has_gate: bool = False  # the model has an exit gate (Ouro); Inkling does not
+    varloop: bool = False  # Inkling VarLoop: the pass count may be chosen
+    share_cache: bool = False  # one KV cache for all passes (VarLoop option)
+    mixed_depth: bool = False  # one CORE step may hold rows at different depths
+
+    def limit(self, params) -> int:
+        """Core passes one request runs.
+
+        Ouro: up to its gate / ``max_loops`` / ``target_loops``. Inkling has no
+        gate. Its pass count is the one the checkpoint was served with
+        (``num_loop_passes``: Fixed always its own, VarLoop any 1..N chosen at
+        serve time) and every request runs them all. A VarLoop checkpoint
+        served with ``loop_share_cache`` can also stop earlier per request
+        (``rlt_target_loops``): all passes read and write one KV cache, so the
+        last executed pass already stands in for the skipped ones and no fill
+        is needed. Without a shared cache a skipped pass would leave a hole in
+        its own cache, so the request keeps all passes.
+        """
+        if self.has_gate:
+            return params.limit(self.num_passes)
+        if self.varloop and self.share_cache and params.target_loops:
+            return max(1, min(params.target_loops, self.num_passes))
+        return self.num_passes
+
+    def rank(self, op: Op, depth: int) -> int:
+        """Position of (op, depth) in the program; orders the chunks of one
+        prompt (a chunk may run an op only after the chunk before it has)."""
+        if op == Op.PRELUDE:
+            return 0
+        if op == Op.CORE:
+            return depth + 1
+        return self.num_passes + 1
 
     def first(self) -> tuple[Op, int]:
         if self.full_only:
@@ -75,6 +106,7 @@ class LoopStep:
     advanced: tuple[bool, ...]
     is_dummy: bool = False
     dummy_rows: int = 0
+    spans: tuple[int, ...] = ()  # span id per row (a request can have several)
 
     @property
     def is_final(self) -> bool:

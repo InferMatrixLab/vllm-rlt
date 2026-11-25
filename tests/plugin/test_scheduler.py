@@ -193,3 +193,68 @@ def test_full_only_model_is_plain_vllm():
         )
         produced += 1
     assert request.num_output_tokens == 2 and not request.in_loop
+
+
+# -- WCPB: several chunks of one prompt in flight -------------------------------
+
+
+def _wcpb_scheduler(**kwargs):
+    sched = make_scheduler(INKLING, **kwargs)
+    sched.wcpb, sched.wcpb_depth = True, INKLING.num_passes + 2
+    return sched
+
+
+def test_wcpb_keeps_more_than_one_chunk_of_a_prompt_in_flight():
+    sched = _wcpb_scheduler(
+        max_num_seqs=2, max_num_batched_tokens=4, long_prefill_token_threshold=4
+    )
+    request = make_request("a", prompt_len=12, max_tokens=1)
+    sched.add_request(request)
+    most = 0
+    for _ in range(60):
+        if not sched.has_requests():
+            break
+        out = sched.schedule()
+        most = max(most, len(request.spans))
+        if out.total_num_scheduled_tokens:
+            # at most one span of a request per step: the batch is keyed by request
+            assert len(out.num_scheduled_tokens) == len(set(out.num_scheduled_tokens))
+            run_step(sched, out)
+    assert most >= 2 and request.num_output_tokens == 1 and not request.spans
+
+
+def test_wcpb_chunks_report_their_own_start():
+    sched = _wcpb_scheduler(
+        max_num_seqs=2, max_num_batched_tokens=4, long_prefill_token_threshold=4
+    )
+    sched.add_request(make_request("a", prompt_len=12, max_tokens=1))
+    starts = set()
+    for _ in range(60):
+        if not sched.has_requests():
+            break
+        out = sched.schedule()
+        if out.total_num_scheduled_tokens:
+            starts.add(out.span_starts["a"])
+            run_step(sched, out)
+    assert {0, 4, 8} <= starts
+
+
+def test_wcpb_rejects_a_shared_cache():
+    import pytest as _pytest
+
+    shared = LoopLayout(num_passes=3, share_cache=True)
+    sched_cls = type(make_scheduler(INKLING))
+    base = make_scheduler(INKLING)
+    base.vllm_config.additional_config = {"rlt_wcpb": True}
+
+    class Shared(sched_cls):
+        def _resolve_layout(self):
+            return shared
+
+    with _pytest.raises(ValueError, match="KV cache per pass"):
+        Shared(
+            vllm_config=base.vllm_config,
+            kv_cache_config=base.kv_cache_config,
+            structured_output_manager=base.structured_output_manager,
+            block_size=base.block_size,
+        )

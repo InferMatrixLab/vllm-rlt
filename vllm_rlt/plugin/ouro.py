@@ -72,17 +72,19 @@ class OuroLoopForCausalLM(nn.Module):
         if ctx is None:  # a plain vLLM call (profiling, warmup): one pass at depth 0
             ctx = LoopContext(Op.CORE, 0)
         rows = positions.shape[0]
+        state = ctx.state_for(rows)
         if ctx.op == Op.CODA:
             # An idle DP rank has no carried state: use embeddings so the same
             # tensors flow through the LM head.
-            hidden = self.embed_input_ids(input_ids) if ctx.state is None else ctx.state
-            ctx.out = hidden = pad_rows(hidden, rows)
+            hidden = self.embed_input_ids(input_ids) if state is None else state
+            hidden = pad_rows(hidden, rows)
+            ctx.emit(rows, hidden)
             return hidden
-        if ctx.state is None or (not ctx.mixed and ctx.depth == 0):
+        if state is None or (not ctx.mixed and ctx.depth == 0):
             hidden = self.embed_input_ids(input_ids)
         else:
-            hidden = pad_rows(ctx.state, rows)
-        if ctx.mixed and ctx.state is not None:
+            hidden = pad_rows(state, rows)
+        if ctx.mixed and state is not None:
             # Depth-0 rows have no carried hidden state; embed them.
             embedded = self.embed_input_ids(input_ids)
             first = pad_rows(ctx.row_depth, rows, -1) == 0
@@ -90,11 +92,23 @@ class OuroLoopForCausalLM(nn.Module):
         for layer in self.model.layers:
             hidden = layer(positions, hidden, ctx)
         hidden = self.model.norm(hidden)
-        ctx.out = hidden
+        ctx.emit(rows, hidden)
         return hidden
 
     def loop_gate(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.model.early_exit_gate(hidden).squeeze(-1)
+
+    def draft_hidden(self, input_ids, positions, passes: int) -> torch.Tensor:
+        """Core passes 0..passes-1 on one batch and the final norm: one
+        self-speculative draft step. Each pass writes its own KV."""
+        hidden = self.embed_input_ids(input_ids)
+        rows = positions.shape[0]
+        for depth in range(passes):
+            ctx = LoopContext(Op.CORE, depth, None)
+            for layer in self.model.layers:
+                hidden = layer(positions, hidden, ctx)
+            ctx.emit(rows, hidden)
+        return self.model.norm(hidden)
 
     def loop_attention(self) -> list[list[nn.Module]]:
         """Attention instances indexed [pass][layer], for the LAST_EXITED fill."""
