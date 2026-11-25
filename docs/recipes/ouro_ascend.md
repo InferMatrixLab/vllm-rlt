@@ -167,6 +167,10 @@ and select `--speculative-mode block` or `--speculative-mode pipeline`.
 Use synchronous scheduling and fixed four-loop greedy requests. The engine
 verifies candidate tokens at the target depth.
 
+With BF16 checkpoints on 910B3, block verification can use a different
+`Linear` row count from serial decode. A one-ULP change can flip the
+greedy token when the top logits are nearly tied.
+
 <a id="8-profile-guided-high-batch-scheduling"></a>
 ## Performance and correctness
 
