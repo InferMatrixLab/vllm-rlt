@@ -1,15 +1,18 @@
 """Ouro as a loop model for the plugin (vLLM removed its own Ouro in 0.26).
 
-One CORE op runs all 24 layers at one pass index, then the shared final norm
-and the exit gate. There is no PRELUDE (the embedding is the first thing CORE
-depth 0 does) and CODA is just the LM head, which vLLM's runner applies when it
-samples. The runner supplies the loop context before each step.
+One CORE op runs all 24 layers at one pass index (or, when rows sit at different
+depths, each row at its own), then the shared final norm and the exit gate.
+There is no PRELUDE op (the embedding is the first thing CORE depth 0 does) and
+CODA is just the LM head, which vLLM's runner applies when it samples. The
+runner supplies the loop context before each step.
+
+The step's batch can be padded by vLLM (graph or DP size), so a carried state may
+have fewer rows than ``input_ids``; ``forward`` pads it to match.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -22,16 +25,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from vllm_rlt.plugin.context import LoopContext, pad_rows
 from vllm_rlt.plugin.ouro_layers import OuroLayer
 from vllm_rlt.plugin.program import Op
-
-
-@dataclass
-class LoopContext:
-    op: Op
-    depth: int
-    hidden: torch.Tensor | None = None  # input for CORE depth > 0 and CODA
-    out: torch.Tensor | None = None  # filled by forward for the runner
 
 
 class OuroModel(nn.Module):
@@ -73,14 +69,26 @@ class OuroLoopForCausalLM(nn.Module):
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
         ctx = self.loop_ctx
-        if ctx is None:  # a plain vLLM call (profiling, warmup): run pass 0 only
+        if ctx is None:  # a plain vLLM call (profiling, warmup): one pass at depth 0
             ctx = LoopContext(Op.CORE, 0)
+        rows = positions.shape[0]
         if ctx.op == Op.CODA:
-            ctx.out = ctx.hidden
-            return ctx.hidden
-        hidden = self.embed_input_ids(input_ids) if ctx.depth == 0 else ctx.hidden
+            # An idle DP rank has no carried state: use embeddings so the same
+            # tensors flow through the LM head.
+            hidden = self.embed_input_ids(input_ids) if ctx.state is None else ctx.state
+            ctx.out = hidden = pad_rows(hidden, rows)
+            return hidden
+        if ctx.state is None or (not ctx.mixed and ctx.depth == 0):
+            hidden = self.embed_input_ids(input_ids)
+        else:
+            hidden = pad_rows(ctx.state, rows)
+        if ctx.mixed and ctx.state is not None:
+            # Depth-0 rows have no carried hidden state; embed them.
+            embedded = self.embed_input_ids(input_ids)
+            first = pad_rows(ctx.row_depth, rows, -1) == 0
+            hidden = torch.where(first.unsqueeze(-1), embedded, hidden)
         for layer in self.model.layers:
-            hidden = layer(positions, hidden, ctx.depth)
+            hidden = layer(positions, hidden, ctx)
         hidden = self.model.norm(hidden)
         ctx.out = hidden
         return hidden

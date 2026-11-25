@@ -54,16 +54,41 @@ Per-request loop parameters go in `vllm_xargs`:
 
 ## Status
 
-Tested on CPU against the real vLLM scheduler (`tests/plugin`, 32 tests, set
-`VLLM_SRC` to a vLLM checkout). **Not run on a GPU**: `runner.py`, `worker.py`,
-`ouro*.py` and `kvfill.py` are untested. Known gaps:
+Tested on CPU (`tests/plugin`, 46 tests, `VLLM_SRC` pointing at a vLLM checkout
+of the pinned commit): the loop program, planner, exit policy and DP alignment
+tables; the scheduler against the real vLLM `Scheduler` (sync and async); the
+`Request` patch and entry point; Ouro's model code built on vLLM's CPU setup
+(layer names, parameter names and loading against the checkpoint layout, per-pass
+KV layers, depth-masked slot mapping); and the Inkling op partition (every op
+visits exactly vLLM's layers, once, in order).
 
-* CORE steps mix rows of one depth only; mixed depth raises in the runner.
-* Inkling runs as one FULL op. Splitting it into per-op steps needs the
-  AttnRes state (`stack`, `prelude_partial`, `bank`) to be kept between ops.
-* `LoopWorker.execute_dummy_batch` runs a dummy loop step only after
-  `set_dummy_step`; nothing in the DP engine calls it yet.
-* `DPAlign` needs a gather over the DP group; it is not wired.
-* The runner turns CUDA graphs off for loop steps; per-op graphs are not done.
-* Async scheduling advances gate-free rows when a step is emitted; the interplay
-  with vLLM's output placeholders is only tested at the scheduler level.
+**Not run on a GPU.** Nothing below has executed a kernel:
+
+* `runner.py`, `worker.py` (the code that talks to vLLM's runner internals:
+  `execute_model_state`, slot mappings, `_dummy_run`, the CUDA-graph manager);
+* `ouro*.py` numerics and `kvfill.py`;
+* `inkling.py`: it calls vLLM's private `_run_layer`. Its first check on a GPU
+  must be that running prelude, the core passes and coda as separate ops gives
+  the same final hidden state as vLLM's single forward.
+
+What was added since v0: DP op alignment in the workers (an all-reduce of each
+rank's candidate table over vLLM's DP CPU group, and an idle rank joins it before
+running a dummy of the agreed op); depth-mixed CORE steps for Ouro (projections
+run once, attention once per depth with a slot mapping that only writes that
+depth's rows); Ouro's HF config registered so vLLM can load the checkpoint; and
+Inkling split into ops (`rlt_split_ops`), with the AttnRes state carried between
+ops.
+
+## Known gaps
+
+* Per-op CUDA graphs: the runner switches graphs off for a loop step. This is the
+  largest open performance item.
+* Inkling mixed depths: the AttnRes state differs per depth (block counts), so an
+  Inkling CORE step holds one depth; `state_cat` refuses to merge otherwise.
+* The exit decision is made on the device but read back by the scheduler, one
+  step late under async scheduling; gated rows therefore advance synchronously.
+* `LAST_EXITED` fill assumes a `(2, blocks, block_size, ...)` KV layout and
+  raises on any other; the real layout of the attention backend in use has not
+  been checked.
+* No data-parallel run: `DPOpAlign` and the idle-rank path are unexercised.
+* No accuracy check of early exit against Ouro's reference.

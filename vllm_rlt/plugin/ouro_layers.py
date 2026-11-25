@@ -4,6 +4,11 @@ Weights are shared across passes; each (layer, pass) pair owns an ``Attention``
 instance. vLLM gives every ``Attention`` its own KV tensor but one block table
 per KV group, so per-pass KV needs no new cache code (this is how vLLM's own
 Inkling loop model does it).
+
+When a step mixes depths, the QKV and MLP projections run once for all rows (the
+weight reads that dominate decode), and attention runs once per depth present,
+each call writing KV only for its own rows (``masked_slots``) and contributing
+only its own rows to the output.
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.llama import LlamaMLP
+
+from vllm_rlt.plugin.context import LoopContext, masked_slots
 
 
 class OuroAttention(nn.Module):
@@ -66,11 +73,22 @@ class OuroAttention(nn.Module):
             for p in range(num_passes)
         )
 
-    def forward(self, positions: torch.Tensor, hidden: torch.Tensor, depth: int):
+    def forward(self, positions: torch.Tensor, hidden: torch.Tensor, ctx: LoopContext):
         qkv, _ = self.qkv_proj(hidden)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        out, _ = self.o_proj(self.attn[depth](q, k, v))
+        if not ctx.mixed:
+            attended = self.attn[ctx.depth](q, k, v)
+        else:
+            attended = None
+            for depth, rows in ctx.group_rows.items():
+                attn = self.attn[depth]
+                with masked_slots(attn.layer_name, ctx.row_depth, depth):
+                    part = attn(q, k, v)
+                if attended is None:
+                    attended = torch.zeros_like(part)
+                attended[rows] = part[rows]
+        out, _ = self.o_proj(attended)
         return out
 
 
@@ -89,13 +107,14 @@ class OuroLayer(nn.Module):
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.mlp",
         )
-        norm = lambda: RMSNorm(cfg.hidden_size, eps=eps)  # noqa: E731
-        self.input_layernorm, self.input_layernorm_2 = norm(), norm()
-        self.post_attention_layernorm, self.post_attention_layernorm_2 = norm(), norm()
+        self.input_layernorm = RMSNorm(cfg.hidden_size, eps=eps)
+        self.input_layernorm_2 = RMSNorm(cfg.hidden_size, eps=eps)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=eps)
+        self.post_attention_layernorm_2 = RMSNorm(cfg.hidden_size, eps=eps)
 
-    def forward(self, positions: torch.Tensor, hidden: torch.Tensor, depth: int):
+    def forward(self, positions: torch.Tensor, hidden: torch.Tensor, ctx: LoopContext):
         hidden = hidden + self.input_layernorm_2(
-            self.self_attn(positions, self.input_layernorm(hidden), depth)
+            self.self_attn(positions, self.input_layernorm(hidden), ctx)
         )
         return hidden + self.post_attention_layernorm_2(
             self.mlp(self.post_attention_layernorm(hidden))

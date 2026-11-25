@@ -70,10 +70,11 @@ def should_exit(params: ExitParams, passes_done: int, remaining: float, num_pass
     return 1.0 - remaining >= params.threshold
 
 
-def exit_mask(gate_logits, remaining, passes_done: int, thresholds, min_loops, limits):
+def exit_mask(gate_logits, remaining, passes_done, thresholds, min_loops, limits):
     """Vectorized version for the runner. All arguments are 1-D tensors on the
-    same device (``passes_done`` is the scalar depth + 1). ``remaining`` is
-    updated in place and the boolean exit mask is returned."""
+    same device; ``passes_done`` is each row's pass count including the one that
+    just ran (rows may be at different depths). ``remaining`` is updated in
+    place and the boolean exit mask is returned."""
     import torch
 
     remaining.mul_(1.0 - torch.sigmoid(gate_logits.float()))

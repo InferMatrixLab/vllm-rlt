@@ -27,9 +27,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm_rlt.plugin.carry import Carry
 from vllm_rlt.plugin.models import loop_layout
 from vllm_rlt.plugin.output import LoopSchedulerOutput
-from vllm_rlt.plugin.parallel import NoAlign
 from vllm_rlt.plugin.plan import take_rows
-from vllm_rlt.plugin.program import LoopStep, Op
 from vllm_rlt.plugin.sched_emit import EmitMixin
 from vllm_rlt.plugin.sched_open import OpenMixin
 from vllm_rlt.plugin.sched_update import UpdateMixin
@@ -48,7 +46,6 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
         self.allow_mixed_depth = bool(extra.get("rlt_allow_mixed_depth", False))
         self.wait_limit = int(extra.get("rlt_wait_limit", 8))
         self.max_rows = self.scheduler_config.max_num_seqs
-        self.aligner = NoAlign()
         self._carry = Carry()
 
     def _resolve_layout(self):
@@ -68,14 +65,7 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
         rows = take_rows(
             ready, key, self.max_rows, self.max_num_scheduled_tokens, self.allow_mixed_depth
         )
-        if not rows:  # another DP rank chose this op, this rank has none of it
-            return self._dummy_output(key)
         return self._build_step(key, rows)
-
-    def _dummy_output(self, key) -> LoopSchedulerOutput:
-        out = self._empty_output()
-        out.loop_step = LoopStep.dummy(Op(key[0]), max(key[1], 0))
-        return out
 
     def finish_requests(self, request_ids, finished_status):
         finished = super().finish_requests(request_ids, finished_status)

@@ -28,8 +28,13 @@ def walk(layout: LoopLayout, last_depth: int, exit_at: int | None = None):
 
 
 def test_inkling_program_is_prelude_core_coda():
-    expected = [(Op.PRELUDE, 0), (Op.CORE, 0), (Op.CORE, 1), (Op.CORE, 2), (Op.CODA, 2)]
-    assert walk(INKLING, 2) == expected
+    assert walk(INKLING, 2) == [
+        (Op.PRELUDE, 0),
+        (Op.CORE, 0),
+        (Op.CORE, 1),
+        (Op.CORE, 2),
+        (Op.CODA, 2),
+    ]
 
 
 def test_ouro_has_no_prelude():
@@ -52,8 +57,9 @@ def test_exit_params_parse_and_validate():
     p = ExitParams.from_extra_args({"rlt_exit_threshold": 0.9, "rlt_min_loops": 2})
     assert p.uses_gate and p.min_loops == 2 and p.limit(4) == 4
     assert not ExitParams.from_extra_args(None).uses_gate
-    fixed = {"rlt_target_loops": 2, "rlt_exit_threshold": 0.5}
-    assert ExitParams.from_extra_args(fixed).limit(4) == 2
+    assert (
+        ExitParams.from_extra_args({"rlt_target_loops": 2, "rlt_exit_threshold": 0.5}).limit(4) == 2
+    )
     for bad in ({"rlt_exit_threshold": 1.5}, {"rlt_min_loops": 0}):
         with pytest.raises(ValueError):
             ExitParams.from_extra_args(bad)
@@ -133,3 +139,31 @@ def test_dp_tie_goes_to_earlier_op_then_shallower_depth():
 def test_dummy_step_has_no_rows():
     step = LoopStep.dummy(Op.CORE, depth=1, rows=4)
     assert step.is_dummy and step.req_ids == () and step.dummy_rows == 4 and not step.is_final
+
+
+def _config_for(arch: str, extra: dict | None = None, **hf):
+    from types import SimpleNamespace
+
+    hf_config = SimpleNamespace(architectures=[arch], **hf)
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config), additional_config=extra or {}
+    )
+
+
+def test_layouts_by_architecture():
+    from vllm_rlt.plugin.models import loop_layout
+
+    text = type("T", (), {})()
+    text.loop_config, text.num_loop_passes = {"num_passes": 3}, 3
+    inkling = _config_for("Inkling2LoopForConditionalGeneration", text_config=text)
+    assert loop_layout(inkling).full_only and loop_layout(inkling).num_passes == 3
+    split = _config_for(
+        "Inkling2LoopForConditionalGeneration", {"rlt_split_ops": True}, text_config=text
+    )
+    assert not loop_layout(split).full_only and loop_layout(split).has_prelude
+    ouro = loop_layout(_config_for("OuroForCausalLM", total_ut_steps=4))
+    assert not ouro.has_prelude and ouro.has_gate and ouro.num_passes == 4
+    forced = _config_for("Anything", {"rlt_loop": {"num_passes": 2, "has_prelude": False}})
+    assert loop_layout(forced).num_passes == 2
+    with pytest.raises(ValueError, match="no loop layout"):
+        loop_layout(_config_for("LlamaForCausalLM"))

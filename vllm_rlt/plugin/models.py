@@ -18,11 +18,13 @@ def _additional(vllm_config) -> dict:
     return extra if isinstance(extra, dict) else {}
 
 
-def _inkling(hf) -> LoopLayout:
+def _inkling(hf, split: bool = False) -> LoopLayout:
+    """``full_only`` runs vLLM's own forward as one op (the baseline path, equal
+    to vLLM); ``split`` runs prelude, each core pass and coda as separate ops."""
     text = getattr(hf, "text_config", hf)
     loop = getattr(text, "loop_config", None) or {}
     passes = getattr(text, "num_loop_passes", None) or loop.get("num_passes") or 1
-    return LoopLayout(num_passes=int(passes), has_prelude=True, full_only=True)
+    return LoopLayout(num_passes=int(passes), has_prelude=True, full_only=not split)
 
 
 def _ouro(hf) -> LoopLayout:
@@ -41,12 +43,15 @@ _BY_ARCH = {
 
 
 def loop_layout(vllm_config) -> LoopLayout:
-    override = _additional(vllm_config).get("rlt_loop")
+    extra = _additional(vllm_config)
+    override = extra.get("rlt_loop")
     if override is not None:
         return LoopLayout(**override)
     hf = vllm_config.model_config.hf_config
     for arch in getattr(hf, "architectures", None) or ():
         if arch in _BY_ARCH:
+            if _BY_ARCH[arch] is _inkling:
+                return _inkling(hf, split=bool(extra.get("rlt_split_ops", False)))
             return _BY_ARCH[arch](hf)
     raise ValueError(
         "vllm-rlt: no loop layout for this model; add it to plugin/models.py or "

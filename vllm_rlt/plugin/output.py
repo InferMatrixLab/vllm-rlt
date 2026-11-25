@@ -21,16 +21,22 @@ class LoopSchedulerOutput(SchedulerOutput):
 
     ``exit_params`` maps each gated row to (threshold, min_loops, limit): the
     worker has no request objects, so the scheduler sends what the runner needs
-    to evaluate the exit gate.
+    to evaluate the exit gate. ``candidates`` is what this rank could run next,
+    which the workers use to agree on one op across data-parallel ranks.
     """
 
     loop_step: LoopStep | None = None
     exit_params: dict[str, tuple[float, int, int]] = field(default_factory=dict)
+    candidates: dict[tuple[int, int], int] = field(default_factory=dict)
+    step_key: tuple[int, int] | None = None  # the (op, depth) group this step is
 
 
 @dataclass
 class LoopModelRunnerOutput(ModelRunnerOutput):
     """Runner output for one loop step. ``exit_depths`` maps a request to the
-    core depth at which its exit gate fired (only rows with ``can_exit``)."""
+    core depth at which its exit gate fired (only rows with ``can_exit``).
+    ``skipped`` lists rows the worker did not run because the data-parallel
+    ranks agreed on a different op; the scheduler leaves them where they were."""
 
     exit_depths: dict[str, int] = field(default_factory=dict)
+    skipped: list[str] = field(default_factory=list)
