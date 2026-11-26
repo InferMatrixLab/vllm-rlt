@@ -145,9 +145,7 @@ class _DeviceCache:
                 mask=batch.write_mask,
                 active=batch.active_rows,
             )
-        elif batch.active_rows is not None or (
-            batch.write_mask is None and cache.backend == "triton"
-        ):
+        elif batch.active_rows is not None:
             from vllm_rlt.kernels.graph_kv import write_graph_kv
 
             write_graph_kv(cache.key_cache[:, layer], cache.value_cache[:, layer], batch, k, v)
@@ -156,8 +154,13 @@ class _DeviceCache:
 
             masked_kv_store(cache.key_cache[:, layer], cache.value_cache[:, layer], k, v, batch)
         else:
-            cache.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
-            cache.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+            from vllm_rlt.kernels.graph_kv import can_use_graph_kv_write, write_graph_kv
+
+            if can_use_graph_kv_write(cache):
+                write_graph_kv(cache.key_cache[:, layer], cache.value_cache[:, layer], batch, k, v)
+            else:
+                cache.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
+                cache.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
 
     def _attend_prepared(self, layer, batch, q, *, window=None):
         cache = self.cache
