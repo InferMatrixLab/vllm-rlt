@@ -1,7 +1,7 @@
-"""Loop programs: what one EngineCore step executes for a loop model.
+"""Loop ops and steps: what one EngineCore step executes for a loop model.
 
-A token goes through PRELUDE, CORE at depth 0..N-1, then CODA. Mapping A
-(one EngineCore step = one loop step) emits a program of length one.
+A token goes through PRELUDE, CORE at depth 0..N-1, then CODA. One EngineCore
+step is one loop step (mapping A): a single op over a set of rows.
 
 Every step holds a single op kind. CODA is the only op that samples, so a step
 is either all-final (CODA) or all-non-final, and the runner never has to

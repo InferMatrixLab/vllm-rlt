@@ -79,7 +79,7 @@ pass count, never a predicted exit like Ouro's.
 
 * One EngineCore step is one loop step (mapping A). Every step holds one op
   kind: PRELUDE, CORE at one depth, or CODA. Every model, Inkling included,
-  runs as this program; no path hands a token to a model's single forward.
+  runs op by op; no path hands a token to a model's single forward.
 * Scheduler as it is in the code today (the subclass design; a reimplemented
   scheduler is preferred, see "Decided, not yet in code"): vLLM's `schedule()`
   does admission, KV allocation, preemption and token accounting. It opens a token span; the loop scheduler walks the span through
