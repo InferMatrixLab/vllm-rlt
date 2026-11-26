@@ -80,8 +80,9 @@ pass count, never a predicted exit like Ouro's.
 * One EngineCore step is one loop step (mapping A). Every step holds one op
   kind: PRELUDE, CORE at one depth, or CODA. Every model, Inkling included,
   runs as this program; no path hands a token to a model's single forward.
-* vLLM's `schedule()` still does admission, KV allocation, preemption and token
-  accounting. It opens a token span; the loop scheduler walks the span through
+* Scheduler as it is in the code today (the subclass design; a reimplemented
+  scheduler is preferred, see "Decided, not yet in code"): vLLM's `schedule()`
+  does admission, KV allocation, preemption and token accounting. It opens a token span; the loop scheduler walks the span through
   its ops while the request is hidden from vLLM's running list.
 * `update_from_output` reaches vLLM only when a span's last op returns.
 * **Early exit (Ouro)** follows the reference: `remaining *= 1 - sigmoid(gate)`,
@@ -203,30 +204,40 @@ early exit on a task (only its mechanics are checked); Inkling with
   after the next pass's restart (bank cut, stack back to `prelude_blocks`), so every
   depth enters CORE with the same block count and states merge along the token axis;
   depth-0 rows get a zero bank. Mixed-depth steps run eagerly at first.
-* **Two scheduler designs, both built and compared.**
-  1. *Inherit* (current code): `LoopScheduler(Scheduler)` /
-     `LoopAsyncScheduler(LoopScheduler, AsyncScheduler)`. vLLM's `schedule()` opens
-     token spans; requests mid-loop are hidden from `running`; a span's last op hands
-     vLLM a restricted `SchedulerOutput`. Structured output, KV connector, encoder
-     budget, DP prefill throttling, preemption and async placeholders come for free;
-     it depends on `Scheduler` internals.
-  2. *Replace*: a scheduler that implements `SchedulerInterface` directly, without
-     subclassing `Scheduler`. Queues, admission, budget, preemption, chunked prefill,
-     spec-token accounting, output placeholders and op selection are decided in one
-     place; `KVCacheManager`, `StructuredOutputManager`, the encoder cache manager,
-     the KV connector and vLLM's output types are used by composition. EngineCore
+* **Scheduler: reimplement it (preferred), keep the subclass as a control.**
+  Both plug in through `scheduler_cls` and are compared before one is kept.
+  1. *Reimplement* (preferred, not written yet): a scheduler that implements
+     `SchedulerInterface` directly, without subclassing `Scheduler`. Scheduling has
+     one level: each `schedule()` picks one op's rows from the ready loop steps, and
+     admission, KV allocation, preemption and op choice are decided in the same
+     place. Queues, token budget, chunked prefill, preemption, spec-token accounting
+     and rollback, output placeholders and the loop state are rlt's;
+     `KVCacheManager`, `StructuredOutputManager`, the encoder cache manager, the KV
+     connector and vLLM's output types are used by composition. Sync and async are
+     two modes of one class, chosen by `async_scheduling`. vLLM features it does not
+     cover (KV connector async loads, encoder budget, DP prefill throttling, LoRA
+     limits, priority scheduling) raise at startup in the first version. EngineCore
      only calls the interface (`schedule`, `update_from_output`,
      `update_draft_token_ids[_in_output]`, `get_grammar_bitmask`, `add_request`,
      `finish_requests`, `has_[unfinished_]requests`, `make_stats`, the reset and
      connector getters, `get_request_counts`, `get_kv_cache_usage`, `pause_state`,
      `shutdown`), and `get_scheduler_cls` does not check the base class.
+     Why preferred: the subclass works around `Scheduler`'s one-span-per-request
+     model by hiding mid-loop requests from `running`, handing vLLM a restricted
+     `SchedulerOutput` at a span's last op, and keeping a span table beside vLLM's;
+     the two scheduler bugs the GPU runs found were at that seam. It also runs the
+     full `Scheduler.schedule()` on every step that opens a span.
+  2. *Subclass* (current code, control): `LoopScheduler(Scheduler)` /
+     `LoopAsyncScheduler(LoopScheduler, AsyncScheduler)`, two-level scheduling as
+     described under "How it works". Structured output, KV connector, encoder
+     budget, DP prefill throttling, preemption and async placeholders come with the
+     base class; it depends on `Scheduler` internals.
 
-  Both share `LoopRequest`, `LoopSchedulerOutput`, the loop program and the runner,
-  and both plug in through `scheduler_cls`. They are compared on throughput with
-  loop features off (≥95% of vLLM), per-step CPU time of `schedule()` and
-  `update_from_output` under nsys, the same correctness cases (the applicable vLLM
-  scheduler CPU tests plus the plugin's sync/async/WCPB/self-spec/exit cases), and
-  how many vLLM internals each depends on.
+  Both share `LoopRequest`, `LoopSchedulerOutput`, the loop program, the runner and
+  the tests. They are compared on throughput with loop features off (≥95% of vLLM),
+  per-step CPU time of `schedule()` and `update_from_output` under nsys, the same
+  correctness cases (the applicable vLLM scheduler CPU tests plus the plugin's
+  sync/async/WCPB/self-spec/exit cases), and how many vLLM internals each depends on.
 
 ## Known gaps
 
