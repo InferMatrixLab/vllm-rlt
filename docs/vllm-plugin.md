@@ -1,4 +1,4 @@
-# vllm-rlt as a vLLM plugin (first GPU runs on Ouro only)
+# vllm-rlt as a vLLM plugin
 
 This branch adds `vllm_rlt/plugin/`: the loop-aware parts of vllm-rlt running
 inside vLLM's own engine process. Serving, tokenizer, executor, parallelism,
@@ -15,11 +15,12 @@ pip install -e . --no-deps          # registers the vllm.general_plugins entry p
 vllm serve <model> \
   --scheduler-cls vllm_rlt.plugin.scheduler.LoopScheduler \
   --worker-cls vllm_rlt.plugin.worker.LoopWorker
-# with async scheduling use LoopAsyncScheduler instead
 ```
 
 Without those two options a vLLM run is unaffected, apart from `Request`
-being the `LoopRequest` subclass (see below).
+being the `LoopRequest` subclass (see below). `LoopScheduler` builds itself as
+`LoopAsyncScheduler` when vLLM's async scheduling is on (its default), so the
+same `--scheduler-cls` works in both modes.
 
 Loop features are switched on in `--additional-config` (JSON):
 
@@ -113,60 +114,94 @@ pass count, never a predicted exit like Ouro's.
 
 ## Status
 
-Tested on CPU (`tests/plugin`, 58 tests, `VLLM_SRC` pointing at a vLLM checkout of
-the pinned commit): the loop program, planner (including chunk ordering and one
-span per request), exit policy, DP alignment tables; the Fixed/VarLoop layouts;
-state helpers (`TokenState`, `Sink`); the scheduler against the real vLLM
-`Scheduler` (sync, async, WCPB with several chunks in flight); the `Request` patch
-and entry point; the `rlt_self` registration; Ouro's model code on vLLM's CPU setup;
-and the Inkling op partition.
+Tested on CPU (`tests/plugin`, 61 tests, `VLLM_SRC` pointing at a vLLM checkout of
+the pinned commit): the loop program, planner (chunk ordering, one span per
+request), exit policy, DP alignment tables; the Fixed/VarLoop layouts; state
+helpers (`TokenState`, `Sink`, mixed-depth merge); the scheduler against the real
+vLLM `Scheduler` (sync, async, WCPB with several chunks in flight, late return of
+an async step); the `Request` patch and entry point; the `rlt_self` registration;
+Ouro's model code on vLLM's CPU setup; and the Inkling op partition.
 
-**GPU runs so far** (one B300, Ouro-1.4B, three short prompts, greedy, vLLM
-`0.34.0rc1.dev1149`). What ran:
+### GPU runs (one B300, vLLM `0.34.0rc1.dev1149`, greedy, three prompts)
 
-* the plugin loads Ouro (96 per-pass attention layers on FlashInfer) and
-  generates coherent text through the loop scheduler and runner (eager);
-* early exit (`rlt_exit_threshold=0.5`) runs without error and changes the output
-  relative to full depth, as expected. How many tokens actually left early, and
-  whether the KV fill ran, was not measured. The fill itself first failed on a
-  real run because FlashInfer hands the layer a `(blocks, heads, tokens, content)`
-  view, not `(2, blocks, ...)`; fixed and covered by a CPU test of the indexing;
-* `rlt_graphs`: five loop graphs (CORE 0..3, CODA) capture, and one-token decode
-  steps replay them. The first run stopped every request after two tokens: the
-  runner read the replayed state after the graph manager was switched back, so the
-  next op had no state. Fixed; the replayed run then matched the same
-  configuration run without loop graphs for 12 tokens;
-* the `rlt_self` method registers and the engine runs with it.
+Scripts are in `tools/plugin/`: `smoke_ouro.py`, `smoke_inkling.py`, `hf_ref.py`, and the
+benchmark `run_job.sh`, `queue.sh`, `bench.py`, `jobs_plugin.txt`.
 
-What is **not** established:
+**Ouro-1.4B** (12 tokens per prompt unless noted):
 
-* **Correctness against a reference.** Nothing was compared with the existing rlt
-  engine or HF. With vLLM's own CUDA graphs on (`enforce_eager=False`) the greedy
-  output of one prompt diverges from the eager run at the fifth token (both are
-  fluent text). The cause is not known: bf16 differences between the two configs,
-  or a plugin bug in one path.
-* **Self-speculation drafted nothing.** `vllm:spec_decode_num_drafts` stayed 0, so
-  no draft, verify or rollback has executed. The output equals the non-speculative
-  output only because no draft was ever verified.
-* WCPB ran on prompts shorter than a chunk, so chunks of one prompt never
-  overlapped; the multi-chunk path is tested on CPU only.
-* Not run at all: Inkling (the `_run_layer` split must first be checked against
-  vLLM's single forward), data parallelism, async scheduling, mixed depths on a
-  GPU, `rlt_allow_mixed_depth`.
+| run | result |
+| --- | --- |
+| HF transformers reference, bf16 and fp32 | identical ids in both dtypes |
+| plugin, fp32, sync and async | identical to HF on all three prompts |
+| plugin, bf16, sync | identical to HF on prompts 2 and 3; prompt 1 differs from token 8 (`216, 33` vs HF `216, 34`) |
+| plugin, bf16, async | prompt 1 differs from token 5; prompts 2 and 3 identical to HF |
+| vLLM's own `OuroForCausalLM`, bf16 (no plugin) | prompt 1 differs from token 5, prompt 2 from token 4, prompt 3 from token 1 |
+
+fp32 matching HF exactly on every token, sync and async, is the evidence that the
+loop scheduler, per-pass KV and runner compute the model correctly. The bf16
+differences are most likely rounding: they disappear in fp32, and the sync and
+async bf16 runs differ from each other in the same way. vLLM's native Ouro is
+further from HF in bf16 than the plugin is.
+
+| feature | result |
+| --- | --- |
+| self-speculation `rlt_self`, K=3, 2 draft passes, 32 tokens | 39 rounds, 59 of 117 draft tokens accepted (50%); the first 12 ids equal HF on all three prompts; sync and async give identical ids |
+| early exit, threshold 0.5 | 287 gated tokens, 93 exited, 72 of them before the last pass and so filled; for all 72, layer 0 of the last pass holds the same KV as the exit pass (checked on the device) |
+| WCPB, 200-token prompts in 64-token chunks | all 4 chunks of a prompt in flight at once, at different ops; 8 ids per prompt identical to the run without WCPB, sync and async |
+| `rlt_allow_mixed_depth`, async | 8 ids per prompt equal HF except prompt 1's 8th (the same bf16 difference as the sync run); on long prompts identical to the run without it |
+| `rlt_graphs` | five loop graphs (CORE 0..3, CODA) capture and replay; 12 ids equal the same configuration without loop graphs |
+
+**Inkling-2 mini** (`/dev/shm/zjy-inkling2-mini`, 16 tokens):
+
+| run | result |
+| --- | --- |
+| VarLoop, plugin passthrough (`full_only`) | identical to plain vLLM |
+| VarLoop, `rlt_split_ops`, sync and async | identical to plain vLLM |
+| Fixed, `rlt_split_ops` | identical to plain vLLM (Fixed) |
+| VarLoop, `rlt_graphs` | identical to plain vLLM |
+| VarLoop, WCPB, 200-token prompts in 64-token chunks | identical to plain vLLM on the same prompts |
+| VarLoop, `rlt_self` K=3, 1 draft pass | 14 rounds, 38 of 42 drafts accepted; prompts 1 and 2 identical to plain vLLM, prompt 3 differs from token 5 (cause not checked) |
+
+**Throughput**, output tok/s (Inkling VarLoop, 3 passes, one B300; `tools/plugin`:
+`run_job.sh` + `queue.sh`, median of 3 waves, same server flags as vLLM's row;
+W1C1/W3C16: fixed prompts, 128 tokens, ignore_eos; W7C32: 512 tokens):
+
+| engine | W1C1 | W3C16 | W7C32 |
+| --- | --- | --- | --- |
+| vLLM | 262.7 | 1045.6 | 3699.3 |
+| plugin, loop features off (passthrough) | 260.3 (99.1%) | 1044.8 (99.9%) | 3691.0 (99.8%) |
+| plugin, `rlt_split_ops`, eager | 17.8 (7%) | 211.9 (20%) | 474.7 (13%) |
+| plugin, `rlt_graphs` (split + loop graphs) | 168.9 (64%) | 640.4 (61%) | not run |
+| existing rlt engine (reference) | 256.0 | 510.1 | 2191.2 |
+
+The ≥95% target for loop features off is met. Running the loop as separate ops
+costs a lot on Inkling: each op is a full EngineCore step (schedule, input
+preparation, sampler bookkeeping) for a fraction of the model, and without
+`rlt_graphs` every op runs eagerly (vLLM's own graphs are switched off for loop
+ops, because they were captured for the whole model). Loop graphs recover part of it. Closing the rest (fewer
+host steps per token, e.g. the decode pipeline, and graphs for mixed steps) is
+what decides whether loop features can pay for themselves here.
+
+Bugs these runs found and fixed: drafts never reached vLLM (a sync scheduler
+class under vLLM's default async engine); every CODA ran twice under async
+scheduling (a late return cleared the next op's in-flight mark); a mixed-depth
+step dropped rows without carried state and shifted the others; the KV fill
+assumed a `(2, blocks, ...)` layout; loop graph output was read after the graph
+manager was switched back.
+
+Not run: data parallelism (`DPOpAlign`, idle-rank dummies); the accuracy of
+early exit on a task (only its mechanics are checked); Inkling with
+`loop_share_cache`.
 
 ## Known gaps
 
 * Inkling mixed depths: the AttnRes state differs per depth (block counts), so an
   Inkling CORE step holds one depth; `state_cat` refuses to merge otherwise. WCPB
-  on Inkling therefore overlaps chunks of different requests, not of different depths
+  on Inkling overlaps chunks of different requests, not chunks at different depths
   in one step, until that state is made depth-independent.
 * The exit decision is made on the device but read back by the scheduler, one
   step late under async scheduling; gated rows therefore advance synchronously.
-* `LAST_EXITED` fill assumes a `(2, blocks, block_size, ...)` KV layout and
-  raises on any other.
 * The draft step is eager and one token at a time; a CUDA graph for it and a
   batched draft/verify CODA are not done.
-* The decode pipeline (tokens of one request at different depths in one step) is not
-  implemented. A span is one program walk.
-* No data-parallel run: `DPOpAlign` and the idle-rank path are unexercised.
-* No accuracy check of early exit against Ouro's reference.
+* The decode pipeline (tokens of one request at different depths in one step) is
+  not implemented. A span is one program walk.
