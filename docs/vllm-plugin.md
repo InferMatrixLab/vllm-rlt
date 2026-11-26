@@ -22,11 +22,11 @@ being the `LoopRequest` subclass (see below). `LoopScheduler` builds itself as
 `LoopAsyncScheduler` when vLLM's async scheduling is on (its default), so the
 same `--scheduler-cls` works in both modes.
 
-Loop features are switched on in `--additional-config` (JSON):
+Options in `--additional-config` (JSON). The loop program always runs; these
+only choose what the loop scheduler does on top of it:
 
 | key | effect |
 | --- | --- |
-| `rlt_split_ops` | Inkling: run prelude, each core pass and coda as separate ops (needed by the three below except self-spec) |
 | `rlt_wcpb` | wavefront chunked prefill: chunks of one prompt run at different depths in the same step |
 | `rlt_graphs` | per-op CUDA graphs for one-token decode steps |
 | `rlt_draft_passes` | passes the self-speculative draft runs (default N/2) |
@@ -78,14 +78,12 @@ pass count, never a predicted exit like Ouro's.
 ## How it works
 
 * One EngineCore step is one loop step (mapping A). Every step holds one op
-  kind: PRELUDE, CORE at one depth, CODA, or FULL.
+  kind: PRELUDE, CORE at one depth, or CODA. Every model, Inkling included,
+  runs as this program; no path hands a token to a model's single forward.
 * vLLM's `schedule()` still does admission, KV allocation, preemption and token
   accounting. It opens a token span; the loop scheduler walks the span through
   its ops while the request is hidden from vLLM's running list.
 * `update_from_output` reaches vLLM only when a span's last op returns.
-* A model vLLM already runs natively (Inkling) uses `LoopLayout.full_only` unless
-  `rlt_split_ops`, `rlt_wcpb` or `rlt_graphs` is on: the scheduler passes straight
-  through to vLLM, so with loop features off the baseline is vLLM itself.
 * **Early exit (Ouro)** follows the reference: `remaining *= 1 - sigmoid(gate)`,
   exit when `1 - remaining >= threshold`, bounded by min/max loops. The runner
   decides on the device; a skipped pass gets the exit pass's KV copied slot by slot.
@@ -155,9 +153,8 @@ further from HF in bf16 than the plugin is.
 
 | run | result |
 | --- | --- |
-| VarLoop, plugin passthrough (`full_only`) | identical to plain vLLM |
-| VarLoop, `rlt_split_ops`, sync and async | identical to plain vLLM |
-| Fixed, `rlt_split_ops` | identical to plain vLLM (Fixed) |
+| VarLoop, loop path, sync and async | identical to plain vLLM |
+| Fixed, loop path | identical to plain vLLM (Fixed) |
 | VarLoop, `rlt_graphs` | identical to plain vLLM |
 | VarLoop, WCPB, 200-token prompts in 64-token chunks | identical to plain vLLM on the same prompts |
 | VarLoop, `rlt_self` K=3, 1 draft pass | 14 rounds, 38 of 42 drafts accepted; prompts 1 and 2 identical to plain vLLM, prompt 3 differs from token 5 (cause not checked) |
@@ -169,18 +166,17 @@ W1C1/W3C16: fixed prompts, 128 tokens, ignore_eos; W7C32: 512 tokens):
 | engine | W1C1 | W3C16 | W7C32 |
 | --- | --- | --- | --- |
 | vLLM | 262.7 | 1045.6 | 3699.3 |
-| plugin, loop features off (passthrough) | 260.3 (99.1%) | 1044.8 (99.9%) | 3691.0 (99.8%) |
-| plugin, `rlt_split_ops`, eager | 17.8 (7%) | 211.9 (20%) | 474.7 (13%) |
-| plugin, `rlt_graphs` (split + loop graphs) | 168.9 (64%) | 640.4 (61%) | not run |
+| plugin (rlt loop path), eager | 17.8 (7%) | 211.9 (20%) | 474.7 (13%) |
+| plugin (rlt loop path), `rlt_graphs` | 168.9 (64%) | 640.4 (61%) | not run |
 | existing rlt engine (reference) | 256.0 | 510.1 | 2191.2 |
 
-The ≥95% target for loop features off is met. Running the loop as separate ops
-costs a lot on Inkling: each op is a full EngineCore step (schedule, input
-preparation, sampler bookkeeping) for a fraction of the model, and without
-`rlt_graphs` every op runs eagerly (vLLM's own graphs are switched off for loop
-ops, because they were captured for the whole model). Loop graphs recover part of it. Closing the rest (fewer
-host steps per token, e.g. the decode pipeline, and graphs for mixed steps) is
-what decides whether loop features can pay for themselves here.
+These rows are the baseline: the rlt loop path with no loop gain exercised. The
+≥95% target is **not met**; the best row is 61–64% of vLLM. The existing rlt
+engine, running the same loop program, reaches 97% at W1C1, so the gap is in the
+plugin. Each op is a full EngineCore step (schedule, input preparation, sampler
+bookkeeping) for a fraction of the model, and without `rlt_graphs` every op runs
+eagerly (vLLM's graphs were captured for the whole model and are not replayed for
+loop ops).
 
 Bugs these runs found and fixed: drafts never reached vLLM (a sync scheduler
 class under vLLM's default async engine); every CODA ran twice under async

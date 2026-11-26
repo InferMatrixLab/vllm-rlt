@@ -199,29 +199,6 @@ def test_async_late_return_of_an_advanced_step_does_not_reopen_the_next_op():
     assert request.in_flight
 
 
-def test_full_only_model_is_plain_vllm():
-    sched = make_scheduler(LoopLayout(num_passes=3, full_only=True))
-    request = make_request("a", prompt_len=3, max_tokens=2)
-    sched.add_request(request)
-    produced = 0
-    while sched.has_requests() and produced < 20:
-        out = sched.schedule()
-        assert getattr(out, "loop_step", None) is None
-        if not out.total_num_scheduled_tokens:
-            continue
-        ids = list(out.num_scheduled_tokens)
-        from vllm.v1.outputs import ModelRunnerOutput
-
-        sched.update_from_output(
-            out, ModelRunnerOutput(req_ids=ids, sampled_token_ids=[[5] for _ in ids])
-        )
-        produced += 1
-    assert request.num_output_tokens == 2 and not request.in_loop
-
-
-# -- WCPB: several chunks of one prompt in flight -------------------------------
-
-
 def _wcpb_scheduler(**kwargs):
     sched = make_scheduler(INKLING, **kwargs)
     sched.wcpb, sched.wcpb_depth = True, INKLING.num_passes + 2

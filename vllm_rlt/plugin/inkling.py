@@ -183,8 +183,8 @@ class SplitInkling2LoopModel(Inkling2LoopModel):
 
 class Inkling2LoopOpsForCausalLM(Inkling2LoopForConditionalGeneration):
     """vLLM's Inkling loop model with the loop split into ops (the plugin's
-    ``Inkling2LoopForConditionalGeneration``). With no loop context it behaves
-    exactly like vLLM's, so profiling, warmup and the FULL path are unchanged."""
+    ``Inkling2LoopForConditionalGeneration``). With no loop context (vLLM's own
+    profiling and warmup runs) it runs vLLM's forward."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -194,7 +194,7 @@ class Inkling2LoopOpsForCausalLM(Inkling2LoopForConditionalGeneration):
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kw):
         ctx = self.loop_ctx
-        if ctx is None or ctx.op == Op.FULL:
+        if ctx is None:
             return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kw)
         if ctx.mixed:
             raise NotImplementedError(

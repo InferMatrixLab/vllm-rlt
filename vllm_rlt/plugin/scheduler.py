@@ -20,9 +20,6 @@ How vLLM stays consistent:
 * WCPB (``rlt_wcpb``): a prompt with chunks left stays visible to vLLM, so the
   next chunk opens while earlier chunks are still mid-loop; the loop level then
   runs chunk c at depth d once chunk c-1 is past depth d.
-
-Models that vLLM already runs natively (``layout.full_only``) are passed
-through untouched, so with loop features off the baseline is vLLM itself.
 """
 
 from __future__ import annotations
@@ -68,7 +65,7 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
         # (Ouro does; Inkling's AttnRes state does not).
         self.wait_limit = int(extra.get("rlt_wait_limit", 8))
         self.max_rows = self.scheduler_config.max_num_seqs
-        self.wcpb = bool(extra.get("rlt_wcpb", False)) and not self.layout.full_only
+        self.wcpb = bool(extra.get("rlt_wcpb", False))
         # WCPB's gain is chunks at different depths sharing one CORE step, so it
         # turns mixed depth on wherever the model can run it (Ouro; not Inkling,
         # whose AttnRes bank differs per pass).
@@ -87,8 +84,6 @@ class LoopScheduler(UpdateMixin, EmitMixin, OpenMixin, Scheduler):
         return loop_layout(self.vllm_config)
 
     def schedule(self, throttle_prefills: bool = False) -> LoopSchedulerOutput:
-        if self.layout.full_only:
-            return super().schedule(throttle_prefills)
         if self._needs_token_level():
             if _TRACE:
                 logger.warning(

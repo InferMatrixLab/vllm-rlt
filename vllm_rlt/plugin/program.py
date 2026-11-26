@@ -1,11 +1,10 @@
 """Loop programs: what one EngineCore step executes for a loop model.
 
 A token goes through PRELUDE, CORE at depth 0..N-1, then CODA. Mapping A
-(one EngineCore step = one loop step) emits a program of length one. A model
-that vLLM already runs natively keeps its baseline path as one ``FULL`` op.
+(one EngineCore step = one loop step) emits a program of length one.
 
 Every step holds a single op kind. CODA is the only op that samples, so a step
-is either all-final (CODA, FULL) or all-non-final, and the runner never has to
+is either all-final (CODA) or all-non-final, and the runner never has to
 sample a subset of a batch.
 """
 
@@ -19,7 +18,6 @@ class Op(IntEnum):
     PRELUDE = 0
     CORE = 1
     CODA = 2
-    FULL = 3
 
 
 @dataclass(frozen=True)
@@ -27,13 +25,11 @@ class LoopLayout:
     """Which ops a token needs for one model.
 
     ``has_prelude=False``: the first CORE pass embeds the tokens itself
-    (Ouro). ``full_only``: run the whole token as one FULL op, i.e. vLLM's
-    native forward (the Inkling v0 baseline path).
+    (Ouro).
     """
 
     num_passes: int  # passes one token runs by default (the configured count)
     has_prelude: bool = True
-    full_only: bool = False
     has_gate: bool = False  # the model has an exit gate (Ouro); Inkling does not
     varloop: bool = False  # Inkling VarLoop: the pass count may be chosen
     share_cache: bool = False  # one KV cache for all passes (VarLoop option)
@@ -68,8 +64,6 @@ class LoopLayout:
         return self.num_passes + 1
 
     def first(self) -> tuple[Op, int]:
-        if self.full_only:
-            return (Op.FULL, 0)
         return (Op.PRELUDE, 0) if self.has_prelude else (Op.CORE, 0)
 
     def next_op(self, op: Op, depth: int, last_depth: int, exited: bool = False):
@@ -78,7 +72,7 @@ class LoopLayout:
         ``last_depth`` is the request's final core depth (its loop limit);
         ``exited`` means the exit gate fired at this core pass.
         """
-        if op in (Op.FULL, Op.CODA):
+        if op == Op.CODA:
             return None
         if op == Op.PRELUDE:
             return (Op.CORE, 0)
@@ -110,7 +104,7 @@ class LoopStep:
 
     @property
     def is_final(self) -> bool:
-        return self.op in (Op.CODA, Op.FULL)
+        return self.op == Op.CODA
 
     @property
     def total_tokens(self) -> int:

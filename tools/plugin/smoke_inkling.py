@@ -1,4 +1,5 @@
-"""Inkling smoke: plain vLLM vs plugin (passthrough / split ops / WCPB / graphs)."""
+"""Inkling smoke: plain vLLM vs the plugin (rlt loop path; optional WCPB / loop graphs)."""
+
 import argparse
 import json
 import os
@@ -10,7 +11,7 @@ ROOT = "/dev/shm/zjy-inkling2-mini"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kind", default="varloop", choices=["varloop", "fixed"])
-    ap.add_argument("--mode", default="plain", choices=["plain", "pass", "split", "wcpb", "graphs"])
+    ap.add_argument("--mode", default="plain", choices=["plain", "loop", "wcpb", "graphs"])
     ap.add_argument("--tokens", type=int, default=16)
     ap.add_argument("--passes", type=int, default=3)
     ap.add_argument("--spec", type=int, default=0)
@@ -47,7 +48,6 @@ def main():
         kwargs["scheduler_cls"] = "vllm_rlt.plugin.scheduler.LoopScheduler"
         kwargs["worker_cls"] = "vllm_rlt.plugin.worker.LoopWorker"
         kwargs["additional_config"] = {
-            "rlt_split_ops": args.mode in ("split", "wcpb", "graphs"),
             "rlt_wcpb": args.mode == "wcpb",
             "rlt_graphs": args.mode == "graphs",
         }

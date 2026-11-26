@@ -37,9 +37,8 @@ def register() -> None:
     register_ouro_config()
     register_self_spec()
     ModelRegistry.register_model("OuroForCausalLM", "vllm_rlt.plugin.ouro:OuroLoopForCausalLM")
-    # Inkling is vLLM's own model; this subclass can also run one op at a time
-    # and, with no loop context, is identical to vLLM's, so a run that does not
-    # ask for split ops is unchanged.
+    # Inkling: vLLM's own model, subclassed to run one loop op at a time. Its
+    # single forward is only used by vLLM's profiling and warmup runs.
     ModelRegistry.register_model(
         "Inkling2LoopForConditionalGeneration",
         "vllm_rlt.plugin.inkling:Inkling2LoopOpsForCausalLM",

@@ -70,7 +70,7 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
             return super().execute_model(scheduler_output, *args, **kwargs)
         step = getattr(scheduler_output, "loop_step", None)
         self._step, self._skipped = step, []
-        if step is None or step.op == Op.FULL:
+        if step is None:
             return super().execute_model(scheduler_output, *args, **kwargs)
         step = self._align(scheduler_output, step)
         self._step = step
@@ -80,7 +80,7 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
 
     def sample_tokens(self, grammar_output):
         step = self._step
-        if step is None or step.op == Op.FULL:
+        if step is None:
             return super().sample_tokens(grammar_output)
         if step.is_dummy:
             self.execute_model_state = None
@@ -100,7 +100,7 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
         # After any other op the handler still holds the previous round's
         # drafts, which must not be handed out again.
         step = self._step
-        if step is not None and step.op != Op.FULL and (step.is_dummy or not step.is_final):
+        if step is not None and (step.is_dummy or not step.is_final):
             return None
         out = super().take_draft_token_ids()
         if _TRACE and out is not None:
@@ -117,7 +117,7 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
 
     def capture_model(self, *args, **kwargs) -> int:
         used = super().capture_model(*args, **kwargs)
-        if self.loop_graphs_requested and not self.loop_layout.full_only:
+        if self.loop_graphs_requested:
             from vllm_rlt.plugin.loopgraph import LoopGraphs
 
             self.loop_graphs = LoopGraphs(self)

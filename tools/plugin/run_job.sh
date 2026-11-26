@@ -9,7 +9,6 @@ mkdir -p $W/results; export CUDA_VISIBLE_DEVICES=$GPU
 PLUG=""
 case $ENGINE in
   plugin) PLUG="--scheduler-cls vllm_rlt.plugin.scheduler.LoopScheduler --worker-cls vllm_rlt.plugin.worker.LoopWorker" ;;
-  plugin-split) PLUG="--scheduler-cls vllm_rlt.plugin.scheduler.LoopScheduler --worker-cls vllm_rlt.plugin.worker.LoopWorker --additional-config {\"rlt_split_ops\":true}" ;;
   plugin-graphs) PLUG="--scheduler-cls vllm_rlt.plugin.scheduler.LoopScheduler --worker-cls vllm_rlt.plugin.worker.LoopWorker --additional-config {\"rlt_graphs\":true}" ;;
 esac
 if [ "$ENGINE" = vllm ] || [ -n "$PLUG" ]; then

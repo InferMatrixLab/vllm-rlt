@@ -1,9 +1,6 @@
 # ENGINE NAME KEY CONC PROMPTS RLT_CHUNK
 plugin        plugin-W3C16        W3 16 fixed.json 1024
-plugin-split  plugin-split-W3C16  W3 16 fixed.json 1024
 plugin        plugin-W7C32        W7 32 w7.json 1024
-plugin-split  plugin-split-W7C32  W7 32 w7.json 1024
 plugin        plugin-W1C1         W1 1 fixed.json 1024
-plugin-split  plugin-split-W1C1   W1 1 fixed.json 1024
 plugin-graphs plugin-graphs-W1C1  W1 1 fixed.json 1024
 plugin-graphs plugin-graphs-W3C16 W3 16 fixed.json 1024

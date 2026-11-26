@@ -48,7 +48,7 @@ class EmitMixin:
         # Async rows with no gate can be advanced right now, because their next
         # op does not depend on anything this step returns. The final op never
         # is: the span only ends when its sampled token comes back.
-        final = op in (Op.CODA, Op.FULL)
+        final = op == Op.CODA
         advance = [self.ASYNC and not g and not final for g in gated]
         step = LoopStep(
             op=op,

@@ -47,12 +47,6 @@ def test_early_exit_skips_remaining_cores_and_keeps_exit_depth():
     assert seq == [(Op.CORE, 0), (Op.CORE, 1), (Op.CODA, 1)]
 
 
-def test_full_only_is_one_op():
-    full = LoopLayout(num_passes=3, full_only=True)
-    assert full.first() == (Op.FULL, 0)
-    assert full.next_op(Op.FULL, 0, 2) is None
-
-
 def test_exit_params_parse_and_validate():
     p = ExitParams.from_extra_args({"rlt_exit_threshold": 0.9, "rlt_min_loops": 2})
     assert p.uses_gate and p.min_loops == 2 and p.limit(4) == 4
@@ -156,11 +150,7 @@ def test_layouts_by_architecture():
     text = type("T", (), {})()
     text.loop_config, text.num_loop_passes = {"num_passes": 3}, 3
     inkling = _config_for("Inkling2LoopForConditionalGeneration", text_config=text)
-    assert loop_layout(inkling).full_only and loop_layout(inkling).num_passes == 3
-    split = _config_for(
-        "Inkling2LoopForConditionalGeneration", {"rlt_split_ops": True}, text_config=text
-    )
-    assert not loop_layout(split).full_only and loop_layout(split).has_prelude
+    assert loop_layout(inkling).num_passes == 3 and loop_layout(inkling).has_prelude
     ouro = loop_layout(_config_for("OuroForCausalLM", total_ut_steps=4))
     assert not ouro.has_prelude and ouro.has_gate and ouro.num_passes == 4
     forced = _config_for("Anything", {"rlt_loop": {"num_passes": 2, "has_prelude": False}})
@@ -172,7 +162,7 @@ def test_layouts_by_architecture():
 # -- VarLoop vs Fixed, spans, ordering ------------------------------------------
 
 
-def _inkling_cfg(*, varloop, share=False, passes=3, split=True):
+def _inkling_cfg(*, varloop, share=False, passes=3):
     from types import SimpleNamespace
 
     text = SimpleNamespace(
@@ -181,8 +171,7 @@ def _inkling_cfg(*, varloop, share=False, passes=3, split=True):
         loop_share_cache=share,
     )
     hf = SimpleNamespace(architectures=["Inkling2LoopForConditionalGeneration"], text_config=text)
-    extra = {"rlt_split_ops": True} if split else {}
-    return SimpleNamespace(model_config=SimpleNamespace(hf_config=hf), additional_config=extra)
+    return SimpleNamespace(model_config=SimpleNamespace(hf_config=hf), additional_config={})
 
 
 def test_fixed_inkling_always_runs_every_pass():
@@ -202,16 +191,6 @@ def test_varloop_inkling_exits_by_pass_count_only_with_a_shared_cache():
     assert shared.varloop and shared.limit(want) == 2
     assert separate.limit(want) == 3  # a skipped pass would leave a hole in its own cache
     assert shared.limit(ExitParams()) == 3 and not shared.has_gate
-
-
-def test_loop_features_turn_the_split_on():
-    from vllm_rlt.plugin.models import loop_layout
-
-    assert loop_layout(_inkling_cfg(varloop=False, split=False)).full_only
-    cfg = _inkling_cfg(varloop=True, split=False)
-    for feature in ("rlt_wcpb", "rlt_graphs"):
-        cfg.additional_config = {feature: True}
-        assert not loop_layout(cfg).full_only
 
 
 def test_program_rank_orders_ops():
@@ -244,14 +223,6 @@ def test_a_step_takes_one_span_per_request():
     ]
     picked = take_rows(rows, (int(Op.CORE), 0), max_rows=8, token_budget=100)
     assert [(r.req_id, r.sid) for r in picked] == [("a", 0), ("b", 0)]
-
-
-def test_self_spec_alone_keeps_the_native_full_path():
-    from vllm_rlt.plugin.models import loop_layout
-
-    cfg = _inkling_cfg(varloop=True, split=False)
-    cfg.additional_config = {"rlt_self_spec": True}
-    assert loop_layout(cfg).full_only
 
 
 def test_state_helpers_keep_the_token_axis():
