@@ -31,7 +31,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
 
-from vllm_rlt.plugin.context import LoopContext, state_cat, state_slice
+from vllm_rlt.plugin.context import LoopContext, state_cat, state_like, state_slice
 from vllm_rlt.plugin.models import loop_layout
 from vllm_rlt.plugin.output import LoopModelRunnerOutput
 from vllm_rlt.plugin.parallel import NoAlign
@@ -168,11 +168,15 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
         use_graph = self._use_graph(ctx, step)
         if _TRACE:
             logger.warning(
-                "rlt step op=%s depths=%s tokens=%s graph=%s",
+                "rlt step op=%s depths=%s tokens=%s graph=%s rows=%s",
                 step.op.name,
                 step.depths,
                 step.num_tokens,
                 use_graph,
+                [
+                    (r[:3], sid, getattr(scheduler_output, "span_starts", {}).get(r))
+                    for r, sid in zip(step.req_ids, step.spans)
+                ],
             )
         captured = getattr(graphs, "_graphs_captured", None)
         if use_graph:
@@ -236,9 +240,17 @@ class LoopModelRunner(ExitMixin, GPUModelRunner):
             or (step.op == Op.CORE and self.loop_layout.has_prelude)
         )
         if needs_state:
-            keys = [(r, sids[r]) for r in order]
-            parts = [self.loop_state[k] for k in keys if k in self.loop_state]
-            state = state_cat(parts) if parts else None
+            have = [self.loop_state.get((r, sids[r])) for r in order]
+            known = next((p for p in have if p is not None), None)
+            if known is not None:
+                # A row with no carried state (depth 0 in a mixed step) keeps its
+                # place with zeros; the model embeds it. Skipping it would shift
+                # every later row onto another row's state.
+                parts = [
+                    p if p is not None else state_like(known, counts[r])
+                    for r, p in zip(order, have)
+                ]
+                state = state_cat(parts)
         if step.uniform_depth:
             return LoopContext(step.op, step.depths[0], state)
         row_depth = torch.cat(

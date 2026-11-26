@@ -191,7 +191,7 @@ def test_async_late_return_of_an_advanced_step_does_not_reopen_the_next_op():
         emitted.append(out)
         if out.loop_step.op == Op.CODA:
             break
-    last_core, coda = emitted[-2], emitted[-1]
+    last_core = emitted[-2]
     assert last_core.loop_step.advanced == (True,)
     run_step(sched, last_core)  # returns after CODA was emitted
     again = sched.schedule()

@@ -317,3 +317,38 @@ def test_kv_fill_copies_one_slot_across_passes_in_the_logical_layout():
         assert torch.equal(caches[p][untouched], before[p][untouched])
     assert torch.equal(caches[0], before[0])
     assert fill_skipped_passes(attention, lambda name: slots, exit_depth=2) == 0
+
+
+def test_mixed_step_keeps_rows_without_state_in_place():
+    """A depth-0 row of a mixed CORE step has no carried state. The merged state
+    must still hold one block per row in batch order (zeros for that row), or
+    every later row reads another row's hidden states. Seen on a GPU: with mixed
+    depths the third prompt's first token came out wrong."""
+    import types
+
+    import torch
+
+    pytest.importorskip("vllm.v1.worker.gpu.model_runner")
+    from vllm_rlt.plugin.runner import LoopModelRunner
+
+    a = torch.full((2, 3), 1.0)
+    c = torch.full((1, 3), 3.0)
+    fake = types.SimpleNamespace(
+        loop_state={("a", 0): a, ("c", 0): c},
+        loop_layout=LoopLayout(num_passes=4, has_prelude=False, has_gate=True),
+        device=torch.device("cpu"),
+    )
+    step = LoopStep(
+        op=Op.CORE,
+        depths=(2, 0, 1),
+        req_ids=("a", "b", "c"),
+        num_tokens=(2, 4, 1),
+        can_exit=(False,) * 3,
+        advanced=(False,) * 3,
+        spans=(0, 0, 0),
+    )
+    out = types.SimpleNamespace(num_scheduled_tokens={"a": 2, "b": 4, "c": 1})
+    ctx = LoopModelRunner._make_context(fake, out, step, ["a", "b", "c"], {"a": 0, "b": 0, "c": 0})
+    assert ctx.state.shape == (7, 3)
+    assert ctx.state[:2].eq(1).all() and ctx.state[2:6].eq(0).all() and ctx.state[6:].eq(3).all()
+    assert ctx.row_depth.tolist() == [2, 2, 0, 0, 0, 0, 1]

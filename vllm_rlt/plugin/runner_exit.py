@@ -12,10 +12,16 @@ pass count, which the scheduler's program already encodes.
 
 from __future__ import annotations
 
+import os
+
 import torch
+from vllm.logger import init_logger
 
 from vllm_rlt.plugin.exit import exit_mask
 from vllm_rlt.plugin.kvfill import fill_skipped_passes
+
+logger = init_logger(__name__)
+_TRACE = bool(os.environ.get("RLT_TRACE"))
 
 
 class ExitMixin:
@@ -40,6 +46,7 @@ class ExitMixin:
         thr, mn, lim = (torch.tensor([p[k] for p in params], device=dev) for k in range(3))
         done = exit_mask(gate, rem, passes, thr, mn, lim)
         state = self.execute_model_state
+        filled = 0
         for rid, left, d in zip(rids, rem.tolist(), done.tolist()):
             self.loop_remaining[rid] = left
             if not d:
@@ -55,4 +62,20 @@ class ExitMixin:
                 model.loop_attention(),
                 lambda name, lo=lo, hi=hi: state.slot_mappings_by_layer[name][lo:hi].long(),
                 depth_of[rid],
+            )
+            filled += 1
+            if _TRACE:
+                attn = model.loop_attention()
+                name = attn[depth_of[rid]][0].layer_name
+                slots = state.slot_mappings_by_layer[name][lo:hi].long()
+                src, dst = attn[depth_of[rid]][0].kv_cache, attn[-1][0].kv_cache
+                n = src.shape[2]
+                same = torch.equal(src[slots // n, :, slots % n], dst[slots // n, :, slots % n])
+                logger.warning("rlt fill %s depth=%d last-pass match=%s", rid, depth_of[rid], same)
+        if _TRACE:
+            logger.warning(
+                "rlt exit gated=%d exited=%d filled=%d",
+                len(rids),
+                sum(done.tolist()),
+                filled,
             )
