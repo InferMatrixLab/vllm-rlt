@@ -30,7 +30,7 @@ only choose what the loop scheduler does on top of it:
 | `rlt_wcpb` | wavefront chunked prefill: chunks of one prompt run at different depths in the same step |
 | `rlt_graphs` | per-op CUDA graphs for one-token decode steps |
 | `rlt_draft_passes` | passes the self-speculative draft runs (default N/2) |
-| `rlt_allow_mixed_depth` | let one CORE step hold rows at different depths (Ouro only) |
+| `rlt_allow_mixed_depth` | **to be removed** (see "Decided, not yet in code"): mixed depth becomes the default for Ouro and Inkling |
 | `rlt_wait_limit`, `rlt_wcpb_depth` | starvation bound; chunks of a prompt in flight |
 
 Self-speculation uses vLLM's speculative config with the plugin's method:
@@ -189,12 +189,50 @@ Not run: data parallelism (`DPOpAlign`, idle-rank dummies); the accuracy of
 early exit on a task (only its mechanics are checked); Inkling with
 `loop_share_cache`.
 
+## Decided, not yet in code
+
+* **Mixed depth from the first step, no switch.** A CORE step holds rows at
+  different depths for Ouro and Inkling alike; `rlt_allow_mixed_depth` goes away.
+  Weight work that does not depend on the pass (projections, MLP/MoE, the message
+  controllers) runs once for the whole batch; work that does runs once per depth
+  present. For Inkling that is attention KV (mask the slots in
+  `attn_metadata[layer].slot_mapping`, which is what its kernels write through),
+  the short-conv state `conv_states[pass]` (mask the conv metadata's slots), the
+  message blend (only rows at depth > 0 have a bank), and the last core layer's
+  next query (rows on their last pass mix for the CODA). The carried state is saved
+  after the next pass's restart (bank cut, stack back to `prelude_blocks`), so every
+  depth enters CORE with the same block count and states merge along the token axis;
+  depth-0 rows get a zero bank. Mixed-depth steps run eagerly at first.
+* **Two scheduler designs, both built and compared.**
+  1. *Inherit* (current code): `LoopScheduler(Scheduler)` /
+     `LoopAsyncScheduler(LoopScheduler, AsyncScheduler)`. vLLM's `schedule()` opens
+     token spans; requests mid-loop are hidden from `running`; a span's last op hands
+     vLLM a restricted `SchedulerOutput`. Structured output, KV connector, encoder
+     budget, DP prefill throttling, preemption and async placeholders come for free;
+     it depends on `Scheduler` internals.
+  2. *Replace*: a scheduler that implements `SchedulerInterface` directly, without
+     subclassing `Scheduler`. Queues, admission, budget, preemption, chunked prefill,
+     spec-token accounting, output placeholders and op selection are decided in one
+     place; `KVCacheManager`, `StructuredOutputManager`, the encoder cache manager,
+     the KV connector and vLLM's output types are used by composition. EngineCore
+     only calls the interface (`schedule`, `update_from_output`,
+     `update_draft_token_ids[_in_output]`, `get_grammar_bitmask`, `add_request`,
+     `finish_requests`, `has_[unfinished_]requests`, `make_stats`, the reset and
+     connector getters, `get_request_counts`, `get_kv_cache_usage`, `pause_state`,
+     `shutdown`), and `get_scheduler_cls` does not check the base class.
+
+  Both share `LoopRequest`, `LoopSchedulerOutput`, the loop program and the runner,
+  and both plug in through `scheduler_cls`. They are compared on throughput with
+  loop features off (≥95% of vLLM), per-step CPU time of `schedule()` and
+  `update_from_output` under nsys, the same correctness cases (the applicable vLLM
+  scheduler CPU tests plus the plugin's sync/async/WCPB/self-spec/exit cases), and
+  how many vLLM internals each depends on.
+
 ## Known gaps
 
-* Inkling mixed depths: the AttnRes state differs per depth (block counts), so an
-  Inkling CORE step holds one depth; `state_cat` refuses to merge otherwise. WCPB
-  on Inkling overlaps chunks of different requests, not chunks at different depths
-  in one step, until that state is made depth-independent.
+* Inkling mixed depths are not implemented yet (see above): today an Inkling CORE
+  step holds one depth and `state_cat` refuses to merge states with different block
+  counts, so WCPB on Inkling overlaps chunks of different requests only.
 * The exit decision is made on the device but read back by the scheduler, one
   step late under async scheduling; gated rows therefore advance synchronously.
 * The draft step is eager and one token at a time; a CUDA graph for it and a
