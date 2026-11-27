@@ -11,11 +11,11 @@ from itertools import product
 import pytest
 import torch
 
-from vllm_rlt.kernels.activation import silu_and_mul, silu_and_mul_reference
+from vllm_rlt.ops.silu_and_mul import silu_and_mul, silu_and_mul_reference
 
 
 def test_missing_native_extension_allows_optional_selection_but_not_explicit_load(monkeypatch):
-    from vllm_rlt.kernels import _extension
+    from vllm_rlt.ops import _extension
 
     def missing(name):
         raise ModuleNotFoundError(name=name)
@@ -31,7 +31,7 @@ def test_missing_native_extension_allows_optional_selection_but_not_explicit_loa
 
 
 def test_broken_native_extension_dependency_is_not_hidden(monkeypatch):
-    from vllm_rlt.kernels import _extension
+    from vllm_rlt.ops import _extension
 
     def broken(name):
         raise ModuleNotFoundError(name="missing_internal_dependency")
@@ -122,7 +122,7 @@ def test_kernel_initialization_and_cpu_fallback_do_not_initialize_cuda(missing_e
                     raise ModuleNotFoundError(name=name)
             return original_import(name, *args, **kwargs)
         importlib.import_module = import_module
-        from vllm_rlt.kernels import silu_and_mul
+        from vllm_rlt.ops.silu_and_mul import silu_and_mul
         for _ in range(3):
             gate, up = torch.randn(3, 7), torch.randn(3, 7)
             torch.testing.assert_close(silu_and_mul(gate, up), torch.nn.functional.silu(gate)*up)
@@ -135,7 +135,7 @@ def test_kernel_initialization_and_cpu_fallback_do_not_initialize_cuda(missing_e
 @pytest.fixture(autouse=True)
 def require_native_extension_for_gpu_tests(request):
     if request.node.get_closest_marker("gpu"):
-        from vllm_rlt.kernels._extension import load_extension
+        from vllm_rlt.ops._extension import load_extension
 
         load_extension()
 
@@ -355,7 +355,7 @@ def test_silu_and_mul_first_misaligned_call_during_graph_capture():
     # The device-property lookup used by dispatch must also work on first use.
     script = textwrap.dedent("""
         import torch
-        from vllm_rlt.kernels.activation import silu_and_mul, silu_and_mul_reference
+        from vllm_rlt.ops.silu_and_mul import silu_and_mul, silu_and_mul_reference
         n = 4097
         gate = torch.randn(n + 1, device='cuda', dtype=torch.bfloat16)[1:]
         up = torch.randn(n + 3, device='cuda', dtype=torch.bfloat16)[3:]

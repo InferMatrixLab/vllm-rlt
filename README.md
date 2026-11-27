@@ -1,253 +1,91 @@
-<h1 align="center">
-  <img src="docs/assets/vllm-rlt-logo.png" alt="vLLM-RLT" width="640">
-</h1>
+# vLLM-RLT
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2608.09444"><img src="https://img.shields.io/badge/arXiv-2608.09444-b31b1b?style=flat-square&amp;logo=arxiv&amp;logoColor=white" alt="Paper: arXiv 2608.09444"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-2563eb?style=flat-square" alt="License: Apache 2.0"></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3.10 or newer"></a>
-  <a href="#contributing"><img src="https://img.shields.io/badge/Contributions-welcome-0d9488?style=flat-square" alt="Contributions welcome"></a>
-</p>
+<img src="docs/assets/vllm-rlt-logo.png" alt="vLLM-RLT" width="360">
 
-<p align="center">
-  <strong>Loop-level continuous batching for recurrent language models.</strong>
-</p>
+vLLM-RLT is a vLLM plugin for loop-level continuous batching in recurrent
+language models. The plugin adds an operation-level scheduler and an MRv2
+worker, using vLLM for serving, execution, and KV block allocation.
 
-<p align="center">
-  <a href="docs/README.md"><b>Documentation</b></a> ·
-  <a href="#getting-started"><b>Getting Started</b></a> ·
-  <a href="#model-support"><b>Supported Models</b></a> ·
-  <a href="docs/developer-guide.md"><b>Developer Guide</b></a> ·
-  <a href="https://github.com/InferMatrixLab/vllm-rlt/releases"><b>Releases</b></a> ·
-  <a href="#join-the-community"><b>Community</b></a> ·
-  <a href="https://arxiv.org/abs/2608.09444"><b>CDB Paper</b></a>
-</p>
+The first adapters are Inkling-2-Mini VarLoop and Ouro-1.4B. Inkling supports
+request-level decode depth. Ouro uses its learned gate to exit on each decode
+token and backfills the skipped KV depths.
 
----
+## Install
 
-<a id="whats-new-in-v020"></a>
-
-## Latest News
-
-- **2026/11 — [v0.2.0](https://github.com/InferMatrixLab/vllm-rlt/releases/tag/v0.2.0)**:
-  core runtime refactoring around Stage and Loop, wavefront chunked prefill
-  (WCPB), and experimental token-level decode pipelining. See the
-  [changelog](CHANGELOG.md) for model additions, migration notes, and validation scope.
-
----
-
-## About
-
-**vllm-rlt** is a standalone inference and serving engine for **recurrent
-language models**. It schedules individual recurrent loops, allowing requests
-at different depths to share a batch instead of waiting for an entire cohort
-to finish. Its engine organization is inspired by vLLM, but it runs independently
-and does not require vLLM to be installed.
-
-<a id="highlights"></a>
-<a id="how-it-works"></a>
-
-### One runtime, pipelined work
-
-- **Stage/Loop architecture.** A stage owns deployment and resources; a loop
-  is a stage-local execution and scheduling unit. Scheduler selects work and
-  applies results; Executor submits execution. Prefill and decode share this
-  runtime structure.
-- **WCPB prefill.** Wavefront chunked prefill exposes loop boundaries so prompt
-  chunks can advance at different recurrent depths. Compatible non-speculative
-  prefill and decode work can share a batch.
-- **Decode pipeline.** Experimental token-level self-speculation advances
-  different tokens at different loop depths while retaining hidden states.
-  Asynchronous execution separates device progress from CPU output delivery.
-
-<p align="center">
-  <picture>
-    <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/rlt-loop-pipelines.png">
-    <img src="docs/assets/rlt-loop-pipelines.gif" alt="Conceptual Stage runtime: Scheduler and Executor coordinate WCPB prompt chunks and a separate experimental token-level decode pipeline" width="960">
-  </picture>
-</p>
-
-*Original conceptual animation, not a benchmark or a claim that every mode can
-be combined. [Static illustration](docs/assets/rlt-loop-pipelines.png) ·
-[Animation source](docs/assets/runtime/README.md) ·
-[Architecture](docs/unified_execution.md) ·
-[WCPB](docs/split-prefill-wavefront.md) ·
-[Decode pipeline](docs/async-speculative.md).*
-
-Prefill and decode provide complementary pipelined execution paths, connected
-through separate PD stages and KV transfer in supported configurations. PD is
-currently **same-host CUDA** with supported Triton/FA4 paths; it is not a claim
-of universal multi-node or model support. Speculative steps are not included
-in mixed prefill/decode batches.
-
-<a id="features"></a>
-
-### Designed for recurrent inference
-
-- **Depth-aware paged KV cache:** LAST_EXITED and SHARED layouts, with optional
-  prefix reuse, incremental allocation, priorities and preemption.
-- **Adaptive computation:** fixed-depth inference or Ouro's trained early-exit
-  gate, with per-request loop bounds. Changing exit policy can change quality.
-- **Configurable execution:** Torch reference execution, GPU attention backends,
-  CUDA Graphs, and optional asynchronous/speculative paths. An optional native
-  CUDA SiLU-and-Mul operator accelerates the Ouro activation path, with a Torch
-  fallback; it is not a general model-speedup claim.
-- **Offline and online use:** Python API, CLI, and a streaming
-  OpenAI-compatible **completions** endpoint. This is not a chat-completions API.
-
-> [!IMPORTANT]
-> **v0.2.0 is a research/evaluation milestone.** Default execution is synchronous;
-> advanced modes are opt-in and have model-specific constraints. Token-pipeline
-> speculation is experimental. Historical serving measurements have unresolved
-> cross-configuration output-equivalence differences, so they are diagnostic,
-> not equal-quality speedup or production-readiness claims.
-
-## Getting Started
-
-Requires **Python 3.10+** and **PyTorch 2.5+**. The commands below install
-`v0.2.0` for NVIDIA CUDA on Linux with compatible CUDA-enabled PyTorch.
-
-For Ascend NPU on `main`, follow the [PyTorch and Torch-NPU installation steps](docs/recipes/ouro_ascend.md#install-pytorch-and-torch-npu).
+Install CUDA-enabled vLLM at Git revision
+`3146a9df41403b8fc30234259444d205974982dd` in a Python 3.11–3.14
+environment. With that environment active, install the plugin:
 
 ```bash
-# Activate your Python environment first.
-git clone --branch v0.2.0 --depth 1 https://github.com/InferMatrixLab/vllm-rlt.git
-cd vllm-rlt
-uv pip install -e .
-vllm-rlt-serve --help
+python -m pip install --no-deps -e .
 ```
 
-This installs text, serving and Linux Triton dependencies. Standard isolated
-builds use the Torch activation fallback; optional native CUDA compilation
-requires a compatible toolchain. Model weights are downloaded separately.
-No PyPI publication is implied.
+## Serve Inkling-2-Mini VarLoop
 
-- [Installation, first request, Python API, and CLI](docs/launching.md)
-- [HTTP serving and streaming](docs/serving.md).
-  Use a trusted network or secure gateway. The server has no built-in authentication or TLS.
-- [Supported models](#model-support) and [Ouro-Thinking recipe](docs/recipes/ouro_thinking.md)
-- [Configuration and compatibility](docs/runtime.md)
-- [Native CUDA build](docs/launching.md#automatic-native-cuda-build)
-- [Migration from v0.1.0](CHANGELOG.md)
+The project CLI uses the vLLM serve parser and selects the RLT worker and
+scheduler. It also exposes RLT launch flags under `serve --help=all`.
 
-Packed prefill uses `ExecutionConfig.packed_prefill` and the
-`--packed-prefill` / `--no-packed-prefill` flags. Input transfer is controlled
-independently by `use_uva`; see the [selection rules](docs/runtime.md#packed-prefill).
+```bash
+vllm-rlt serve /path/to/inkling-varloop \
+  --served-model-name inkling --language-model-only
+```
 
-FP8 KV defaults to per-vector scales on Torch/Triton. Experimental native FA4 FP8,
-including Dory sliding attention, uses `flash-attn-4==4.0.0b39` and calibrates
-a fixed scale at startup. See the
-[hardware and calibration requirements](docs/runtime.md#experimental-fa4-static-scale-adapter).
+The equivalent upstream entry point is:
 
-## Model Support
+```bash
+VLLM_PLUGINS=rlt vllm serve /path/to/inkling-varloop \
+  --served-model-name inkling \
+  --language-model-only --enforce-eager --generation-config vllm \
+  --async-scheduling \
+  --scheduler-cls vllm_rlt.core.async_scheduler.LoopAsyncScheduler \
+  --worker-cls vllm_rlt.worker.loop_worker.LoopWorker
+```
 
-| Checkpoint | Implementation | Platforms | Documented validation scope |
-| --- | --- | --- | --- |
-| Ouro-1.4B | Native Ouro | [CUDA](docs/launching.md)<br>[Ascend](docs/recipes/ouro_ascend.md) | Ascend BF16 full prefill with eager Python execution, paged KV and optional fixed-depth async scheduling. Arbitrary chunked prefill remains unresolved. |
-| Ouro-2.6B | Shared Ouro | [CUDA](docs/launching.md) | Shares the Ouro implementation. [Separate quality and performance qualification](docs/recipes/ouro_thinking.md#6-evidence-and-limitations) remains open. |
-| [Ouro-1.4B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
-| [Ouro-2.6B-Thinking](docs/recipes/ouro_thinking.md) | Reuses Ouro | [CUDA](docs/launching.md) | Bounded BF16, fixed-four-loop synchronous basic integration |
-| Nanbeige4.2-3B | Native Nanbeige | [CUDA](docs/launching.md) | Fixed two-loop inference. [CUDA PD validation](https://github.com/InferMatrixLab/vllm-rlt/pull/77) |
-| Huginn-0125 | Native Huginn | [CUDA](docs/launching.md) | Synchronous fixed-depth, LAST_EXITED KV, CUDA Graph decode core and coda |
-| [NVIDIA-Nemotron-Labs-Dory1.0-4B](docs/dory.md) | Native Dory | [CUDA](docs/launching.md) | Synchronous fixed-loop execution, boundary KV, per-loop and last-loop KV modes, Triton/Torch sliding-window masking, BF16 real-checkpoint agreement at 1/2/4 loops on A100; long context, Graphs/async and reclamation not qualified |
-| Inkling 2 Mini / TML-d24-varloop-research | Shared Inkling 2 Mini | [CUDA SM10x](docs/launching.md#inkling-2-mini) | Uses vLLM Inkling operators, with optional async scheduling, packed prefill, and separate KV and convolution history per pass |
+```bash
+curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"inkling","prompt":"The capital of France is","max_tokens":16,
+       "temperature":0,"vllm_xargs":{"rlt_target_loops":1}}'
+```
 
-The broader model roadmap is in [RFC #69](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
+Inkling runs a full-depth prompt and first output token. The example sets each
+subsequent decode token to one loop. Omit `rlt_target_loops` to use the
+checkpoint's depth, which is three for Inkling-2-Mini VarLoop.
 
-Huginn uses native checkpoint loading and depth-aware KV for its recurrent
-core, with separate prelude and coda KV. It supports synchronous fixed-depth
-inference and CUDA Graphs for the recurrent core and decode coda.
+For synchronous execution, use `--no-async-scheduling` and
+`--scheduler-cls vllm_rlt.core.loop_scheduler.LoopScheduler`. The verified
+runtime configuration uses one data-parallel and one pipeline-parallel rank.
 
-Huginn does **not** currently support WCPB/mixed staged prefill, asynchronous
-execution, self-speculation, or PD. Feature availability is not equivalent to
-validation of every model/backend/workload combination.
+## Inkling execution options
 
-Dory runs the native normalized-GPT stack with attention-bearing input and
-output stages, so its boundary stages own their own KV. Synchronous
-fixed-loop execution is supported for both `per_loop` and `last_loop` KV
-modes. Sliding-window masking exists only in the Torch reference attention
-backend, and WCPB, CUDA Graphs, asynchronous execution, self-speculation,
-prefix reuse and PD are rejected. See the
-[Dory baseline notes](docs/dory.md) for the exact qualified scope.
+`vllm-rlt serve` defaults to eager. To enable vLLM CUDA graph modes for
+Inkling, pass an explicit compilation configuration:
+
+```bash
+vllm-rlt serve /path/to/inkling-varloop \
+  --language-model-only \
+  -cc '{"mode":0,"cudagraph_mode":"FULL_AND_PIECEWISE","use_breakable_cudagraph":true,"cudagraph_capture_sizes":[1,2,4,8,16,128]}'
+```
+
+The vLLM worker warmup captures the selected Inkling shapes before serving.
+`FULL` captures uniform decode operations. `PIECEWISE` captures the stable
+parts of the operation and runs dynamic attention eagerly. Mixed-depth CORE
+and unmatched shapes use eager execution.
+
+Use `--rlt-mixed-core` to share CORE projections and MLP/MoE, and
+`--rlt-packed-prefill` to run ragged prompt chunks in the same CORE forward.
+The latter works with `--rlt-wavefront-prefill --rlt-prefill-chunk-size 16`.
+`--rlt-self-speculation --rlt-decode-pipeline` allows Inkling to start one
+tentative token before verifying the prior proposal. These flags are opt-in.
+The [development log](docs/plugin-development.md) records output comparisons,
+including concurrent cases with token differences.
 
 ## Documentation
 
-Start with the [documentation index](docs/README.md), then explore:
+- [Development log and functional validation](docs/plugin-development.md)
+- [Ouro early-exit and GSM8K-87 evaluation](docs/accuracy.md)
+- [RLT SiLU-and-Mul build and selection](docs/kernels.md)
+- [Contributing](CONTRIBUTING.md)
+- [Release history](CHANGELOG.md)
 
-| Topic | Guide |
-| --- | --- |
-| Runtime and process boundaries | [Unified architecture](docs/unified_execution.md) |
-| Chunk/depth scheduling | [WCPB prefill](docs/split-prefill-wavefront.md) |
-| Asynchronous block execution and token pipelines | [Self-speculation](docs/async-speculative.md) |
-| Cache ownership and lifetime | [KV walkthrough](docs/kv_cache_walkthrough.md) |
-| Evaluation and measurement | [Accuracy](docs/accuracy.md), [profiling](docs/profiling.md) |
-
-<a id="performance-baselines"></a>
-
-**Performance evidence:** the [October 2026 serving report](docs/unified_execution.md#measured-serving-performance)
-records Ouro-1.4B BF16 on B300/FA4, workloads, one- versus two-GPU configurations,
-metric definitions and limitations. Compare matched hardware, workload and
-quality; do not interpret unequal resource budgets or differing output lengths
-as isolated runtime speedups.
-
-<a id="roadmap"></a>
-
-For the current architecture and ownership boundaries, see the
-[unified architecture guide](docs/unified_execution.md). Ongoing model and feature
-work is tracked in the [model roadmap](https://github.com/InferMatrixLab/vllm-rlt/issues/69).
-Roadmap proposals are not released capabilities.
-
-## Contributing
-
-We welcome systems, model, evaluation and documentation contributions.
-Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
-**[Developer Must-Read](docs/developer-guide.md)** before implementation.
-Include reproducible configurations, correctness evidence and the scope of
-any measurements. For larger changes, start with a design issue.
-
-## Citation
-
-
-For the CDB method that informs this project, please cite the original paper:
-[Depth-adaptive Inference of Looped Language Models via Continuous Depth
-Batching](https://arxiv.org/abs/2608.09444)
-([PDF](https://arxiv.org/pdf/2608.09444)).
-
-```bibtex
-@misc{schwethelm2026continuousdepthbatching,
-  title = {Depth-adaptive Inference of Looped Language Models via Continuous Depth Batching},
-  author = {Kristian Schwethelm and Daniel R\"{u}ckert and Georgios Kaissis},
-  year = {2026},
-  eprint = {2608.09444},
-  archivePrefix = {arXiv},
-  primaryClass = {cs.LG},
-  url = {https://arxiv.org/abs/2608.09444}
-}
-```
-
-The paper's measurements are separate from the vllm-rlt performance baselines
-linked above.
-
-## Join the Community
-
-Ask questions, report reproducible problems or discuss designs in
-[GitHub issues](https://github.com/InferMatrixLab/vllm-rlt/issues).
-You can also join the existing vllm-rlt developer group through WeChat:
-
-<p align="center">
-  <a href="docs/assets/wechat-group-qrcode.jpg">
-    <img src="docs/assets/wechat-group-qrcode.jpg" alt="vllm-rlt WeChat developer group QR code" width="240">
-  </a>
-</p>
-
-## Acknowledgments
-
-vllm-rlt builds on the published Ouro architecture and
-[Continuous Depth Batching](https://arxiv.org/abs/2608.09444). Its engine and
-Python API organization are inspired by [vLLM](https://github.com/vllm-project/vllm).
-See [NOTICE](NOTICE) for upstream model attribution.
-
-## License
-
-[Apache License 2.0](LICENSE). Model checkpoints retain their own licenses and
-usage conditions.
+The project WeChat group is listed in the [community QR code](docs/assets/wechat-group-qrcode.jpg).

@@ -497,7 +497,7 @@ def test_default_exit_is_the_fixed_recipe(loops):
     "backend,options",
     [
         ("native", dict(mode="ouro", threshold=0.5, min_loops=2)),
-        ("native", dict(mode="ouro_delayed", threshold=0.2, min_loops=2, async_scheduling=True)),
+        ("native", dict(threshold=0.2, min_loops=2, async_scheduling=True)),
         ("transformers", dict(mode="ouro", threshold=0.9, min_loops=1)),
     ],
 )
@@ -591,7 +591,7 @@ def test_run_refuses_the_stored_baseline_at_another_depth(tmp_path, monkeypatch)
         # Loop and scheduling options would be silently ignored at fixed depth.
         ("native", dict(min_loops=2), "below 1"),
         ("native", dict(mode="ouro_delayed"), "below 1"),
-        ("native", dict(threshold=0.5, min_loops=2, async_scheduling=True), "ouro_delayed"),
+        ("native", dict(mode="ouro_delayed", threshold=0.5, min_loops=2), "exit-mode ouro"),
         ("transformers", dict(threshold=0.5, min_loops=2), "min-loops 1"),
         ("transformers", dict(mode="ouro_delayed", threshold=0.5, min_loops=1), "min-loops 1"),
     ],

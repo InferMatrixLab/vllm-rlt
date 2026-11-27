@@ -1,175 +1,40 @@
-import argparse
-import json
-import logging
-import sys
-from dataclasses import asdict
+"""Serve the RLT models through vLLM's CLI and OpenAI frontend."""
 
-import torch
+import os
 
-from vllm_rlt import LLM, SamplingParams, SchedulerConfig
-from vllm_rlt.attention import validate_backend_name
-from vllm_rlt.entrypoints.runtime_args import (
-    add_runtime_args,
-    profile_config_from_args,
-    runtime_configs,
-)
-from vllm_rlt.models import OuroConfig
+from vllm_rlt.entrypoints.runtime_args import add_runtime_args, apply_runtime_args
 
 
-def _toy_ouro_config() -> OuroConfig:
-    return OuroConfig(
-        vocab_size=64,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=128,
-        total_ut_steps=4,
-        bos_token_id=0,
-        eos_token_id=0,
-    )
+def main() -> None:
+    allowlist = os.environ.get("VLLM_PLUGINS")
+    if allowlist is not None and "rlt" not in allowlist.split(","):
+        os.environ["VLLM_PLUGINS"] = ",".join(filter(None, (allowlist, "rlt")))
 
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.entrypoints.cli.serve import ServeSubcommand
+    from vllm.entrypoints.common.startup import cli_env_setup
+    from vllm.logger import configure_logging_from_args
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-def _toy_nanbeige_config():
-    from vllm_rlt.models import NanbeigeConfig
+    cli_env_setup()
+    parser = FlexibleArgumentParser(description="vLLM-RLT CLI")
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    command = ServeSubcommand()
+    serve_parser = command.subparser_init(subparsers)
+    serve_parser.usage = "vllm-rlt serve [model_tag] [options]"
+    serve_parser.set_defaults(async_scheduling=True, enforce_eager=None, generation_config="vllm")
+    add_runtime_args(serve_parser)
 
-    return NanbeigeConfig(
-        vocab_size=64,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-        max_position_embeddings=128,
-        num_loops=2,
-        total_ut_steps=2,
-        bos_token_id=0,
-        eos_token_id=1,
-        pad_token_id=0,
-    )
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Ouro inference with loop-level continuous batching"
-    )
-    parser.add_argument("--model", help="Local checkpoint path or HuggingFace repository ID")
-    parser.add_argument("--revision")
-    parser.add_argument("--prompt", action="append", help="Text prompt; repeat for a batch")
-    parser.add_argument(
-        "--toy", action="store_true", help="Use a tiny RANDOM model and token ID prompts"
-    )
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
-    parser.add_argument(
-        "--attention-backend",
-        type=str.lower,
-        choices=[
-            "ascend_eager",
-            "auto",
-            "torch",
-            "triton",
-            "flash_attn",
-            "flash_attn_2",
-            "flash_attn_3",
-            "flash_attn_4",
-        ],
-        default="torch",
-    )
-    parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
-    parser.add_argument("--max-tokens", type=int, default=16)
-    parser.add_argument(
-        "--max-loops",
-        type=int,
-        help="Request loop limit. For Inkling VarLoop, also sets the instance depth.",
-    )
-    parser.add_argument("--request-target-loops", type=int, default=None)
-    parser.add_argument("--min-loops", type=int, default=None)
-    parser.add_argument("--exit-threshold", type=float, default=1.0)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-k", type=int, default=-1)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-num-seqs", type=int, default=8)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=128)
-    parser.add_argument("--num-blocks", type=int, help="Override automatic KV sizing")
-    parser.add_argument("--block-size", type=int, default=16)
-
-    add_runtime_args(parser)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
-    if not args.toy and not args.model:
-        parser.error("--model is required unless --toy is used")
-    if args.toy and args.prompt:
-        parser.error("--toy uses built-in token ID prompts; omit --prompt")
-    if not args.toy and not args.prompt:
-        parser.error("provide --prompt or use --toy for a CPU smoke test")
+    if args.enforce_eager is None:
+        args.enforce_eager = args.compilation_config.cudagraph_mode in (None, CUDAGraphMode.NONE)
     try:
-        validate_backend_name(args.attention_backend, device_type=args.device.split(":", 1)[0])
+        apply_runtime_args(args)
     except ValueError as exc:
-        parser.error(str(exc))
-    profiling = profile_config_from_args(args)
-    if profiling is not None:
-        profiling.resolve_activities(args.device)
-    torch.manual_seed(args.seed)
-    if args.toy:
-        model = (
-            _toy_nanbeige_config()
-            if "nanbeige" in (args.model or "ouro").lower()
-            else _toy_ouro_config()
-        )
-    else:
-        model = args.model
-    llm = LLM(
-        model,
-        revision=args.revision,
-        max_loops=args.max_loops,
-        device=args.device,
-        dtype=getattr(torch, args.dtype),
-        **runtime_configs(args),
-        scheduler_config=SchedulerConfig(
-            policy=getattr(args, "scheduling_policy", "fcfs"),
-            enable_preemption=getattr(args, "enable_preemption", False),
-            max_num_seqs=args.max_num_seqs,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            mode=args.mode,
-            prefill_chunk_size=getattr(args, "prefill_chunk_size", 128),
-            wavefront_chunked_prefill=getattr(args, "wavefront_chunked_prefill", False),
-            adaptive_wavefront_prefill=getattr(args, "adaptive_wavefront_prefill", False),
-            max_prefill_batches_before_decode=getattr(args, "max_prefill_batches_before_decode", 1),
-            admission_scan_limit=getattr(args, "admission_scan_limit", 64),
-            max_admission_bypasses=getattr(args, "max_admission_bypasses", 8),
-            min_coda_batch_size=getattr(args, "min_coda_batch_size", 1),
-        ),
-        attention_backend=args.attention_backend,
-    )
-    model_depth = llm.engine.model_config.total_ut_steps
-    min_loops = args.min_loops if args.min_loops is not None else min(2, model_depth)
-    params = SamplingParams(
-        max_tokens=args.max_tokens,
-        max_loops=args.max_loops,
-        target_loops=args.request_target_loops,
-        min_loops=min_loops,
-        exit_threshold=args.exit_threshold,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        seed=args.seed,
-        ignore_eos=args.toy,
-    )
-    try:
-        if profiling is not None:
-            llm.start_profile(profiling, scheduled=True)
-        outputs = llm.generate([[1, 2, 3], [4, 5]] if args.toy else args.prompt, params)
-    finally:
-        llm.close()
-    if profiling is not None:
-        print(json.dumps(llm.profile_status()), file=sys.stderr)
-    for output in outputs:
-        print(json.dumps(asdict(output), ensure_ascii=False))
+        serve_parser.error(str(exc))
+    configure_logging_from_args(args)
+    command.validate(args)
+    command.cmd(args)
 
 
 if __name__ == "__main__":

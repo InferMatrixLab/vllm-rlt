@@ -6,7 +6,7 @@ from copy import deepcopy
 import pytest
 from jinja2 import TemplateError
 
-from vllm_rlt.entrypoints.chat_template import render_chat_prompt
+from benchmarks.chat_template import render_chat_prompt
 
 
 class RecordingTokenizer:

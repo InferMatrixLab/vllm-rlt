@@ -14,24 +14,36 @@ concurrency:
 
 jobs:
   cpu-tests:
-    name: lint and CPU unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
           cache: pip
-      - name: Install dependencies (CPU torch)
+      - name: Lint and format
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install -e .
-          python -m pip install pytest ruff==0.13.2
-      - name: Ruff lint
-        run: python -m ruff check .
-      - name: Ruff format
-        run: python -m ruff format --check .
+          python -m pip install ruff==0.13.2
+          python -m ruff check .
+          python -m ruff format --check .
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: 3146a9df41403b8fc30234259444d205974982dd
+          path: .ci-vllm
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0
+          python -m pip install -r .ci-vllm/requirements/common.txt pytest triton
+          python -m pip install --no-deps -e .
       - name: CPU regression tests
-        run: env OMP_NUM_THREADS=1 python -m pytest -q
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          OMP_NUM_THREADS: "1"
+          VLLM_PLUGINS: ""
+          VLLM_TARGET_DEVICE: cpu
+          PYTHONPATH: ${{ github.workspace }}/.ci-vllm
+        run: |
+          python -c "from vllm.v1.engine.core import EngineCore"
+          python -m pytest -q

@@ -1,22 +1,16 @@
 """Single-request BF16 generation with identical token inputs and stop criteria."""
 
 import importlib.util
+import json
+import re
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 import lm_eval
 import torch
 from transformers import AutoModelForCausalLM, DynamicCache, LogitsProcessor
 
 from benchmarks.gsm8k import is_fixed
-from vllm_rlt import (
-    CacheConfig,
-    ExecutionConfig,
-    ExitConfig,
-    SamplingParams,
-    SchedulerConfig,
-)
-from vllm_rlt.engine.stage_engine import StageEngine
-from vllm_rlt.models import AutoModelForCausalLM as NativeModel
 
 
 def _load_lm_eval_utils():
@@ -100,11 +94,78 @@ class ReleaseExitHooks:
         self.depths.append(int(step.item()) + 1)
 
 
+class PluginCompletions:
+    """Run the same token prompt on an RLT server and read committed Ouro depths."""
+
+    def __init__(self, endpoint, served_model, step_log):
+        self.endpoint = endpoint.rstrip("/")
+        self.served_model = served_model
+        self.step_log = Path(step_log)
+
+    def check_model(self, model, max_length):
+        with urlopen(self.endpoint + "/v1/models", timeout=30) as response:
+            data = json.load(response)["data"]
+        card = next((card for card in data if card["id"] == self.served_model), None)
+        if card is None or not card.get("root") or Path(card["root"]).resolve() != model.resolve():
+            raise ValueError("The RLT server must serve the protocol's local checkpoint")
+        if card.get("max_model_len", 0) < max_length:
+            raise ValueError("The RLT server context is shorter than the protocol requires")
+        if not self.step_log.is_file():
+            raise ValueError("The RLT server step log is missing")
+
+    def generate(self, prompt_ids, max_new_tokens, stops, exit_policy, eos_token):
+        payload = {
+            "model": self.served_model,
+            "prompt": prompt_ids,
+            "max_tokens": max_new_tokens,
+            "temperature": 0,
+            "return_token_ids": True,
+            "include_stop_str_in_output": True,
+            "stop": [stop for stop in stops if stop != eos_token],
+            "vllm_xargs": {
+                "rlt_min_loops": exit_policy["min_loops"],
+                "rlt_max_loops": exit_policy["max_loops"],
+                "rlt_exit_threshold": exit_policy["threshold"],
+            },
+        }
+        request = Request(
+            self.endpoint + "/v1/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with self.step_log.open() as trace:
+            trace.seek(0, 2)
+            with urlopen(request, timeout=300) as response:
+                result = json.load(response)
+            # vLLM appends the completion choice index and an internal request suffix.
+            pattern = re.compile(
+                rf"rlt commit request={re.escape(result['id'])}-0(?:-[^ ]+)? "
+                r"position=(\d+) depth=(\d+)"
+            )
+            events = [
+                (int(match.group(1)), int(match.group(2)))
+                for line in trace
+                if (match := pattern.search(line))
+            ]
+
+        ids = result["choices"][0]["token_ids"]
+        if [position for position, _ in events] != list(
+            range(len(prompt_ids), len(prompt_ids) + len(ids))
+        ):
+            raise RuntimeError("Committed RLT depths do not match the generated token positions")
+        depths = [depth for _, depth in events]
+        maximum = exit_policy["max_loops"]
+        if depths and depths[0] != maximum:
+            raise RuntimeError("Expected full-depth prefill")
+        if is_fixed(exit_policy) and any(depth != maximum for depth in depths):
+            raise RuntimeError("Expected fixed full-depth generation")
+        return ids, depths
+
+
 class Generator:
-    def __init__(self, backend, model_path, tokenizer, max_length, exit_policy):
+    def __init__(self, backend, model_path, tokenizer, exit_policy, *, plugin=None):
         self.backend, self.tokenizer, self.exit = backend, tokenizer, exit_policy
-        # Full depth, taken from the protocol (the checkpoint's total_ut_steps).
-        loops = exit_policy["max_loops"]
+        self.plugin = plugin
         if backend == "transformers":
             self.model = (
                 AutoModelForCausalLM.from_pretrained(
@@ -117,117 +178,63 @@ class Generator:
                 .eval()
                 .to("cuda")
             )
-            # Ouro indexes KV by depth * physical_layers + layer. Allocate all
-            # slots in the standard HF cache so the release need not replace it
-            # with its cache class, whose interface predates Transformers 4.55.
+            # The release indexes KV by depth * physical_layers + layer.
             self.cache_slots = (
                 self.model.config.num_hidden_layers * self.model.config.total_ut_steps
             )
-            check_depth(self.model.config, loops)
+            check_depth(self.model.config, exit_policy["max_loops"])
             self.exit_hooks = (
                 None
                 if is_fixed(exit_policy)
                 else ReleaseExitHooks(self.model, exit_policy["threshold"])
             )
-        else:
-            # Accuracy checks need a local logits hook. The deployment client
-            # owns a separate worker process and does not expose its model.
-            self.model = NativeModel.from_pretrained(
-                model_path, device="cuda", dtype=torch.bfloat16
-            ).eval()
-            check_depth(self.model.config, loops)
-            self.engine = StageEngine(
-                self.model,
-                attention_backend="triton",
-                # last_exited KV keeps one plane per loop.
-                cache_config=CacheConfig(num_blocks=loops * ((max_length + 15) // 16)),
-                scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=128),
-                exit_config=ExitConfig(exit_policy["mode"]),
-                execution_config=ExecutionConfig(async_scheduling=exit_policy["async_scheduling"]),
-            )
-            # Observe the existing sampling boundary without changing arithmetic.
-            self._finite_hook = self.model.lm_head.register_forward_hook(
-                lambda module, inputs, output: check_logits(output)
-            )
 
     @torch.inference_mode()
     def generate(self, prompt_ids, max_new_tokens, stops):
-        inputs = torch.tensor([prompt_ids], dtype=torch.long, device="cuda")
-        criteria = stop_sequences_criteria(self.tokenizer, stops, len(prompt_ids), 1)
         if self.backend == "transformers":
-            if self.exit_hooks is not None:
-                self.exit_hooks.depths = []
-            cache = DynamicCache()
-            cache.append_new_layers(self.cache_slots - 1)
-            ids = self.model.generate(
-                inputs,
-                attention_mask=torch.ones_like(inputs),
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                stopping_criteria=criteria,
-                logits_processor=[FiniteLogits()],
-                use_cache=True,
-                past_key_values=cache,
-                # The release selects the exited loop's hidden state after running
-                # every loop, so its KV stays full-depth even when exiting early.
-                **(
-                    {"exit_at_step": self.exit["max_loops"] - 1}
-                    if is_fixed(self.exit)
-                    else {"exit_threshold": self.exit["threshold"]}
-                ),
-                use_weighted_exit=False,
-                logits_to_keep=1,
-            )[0, len(prompt_ids) :].tolist()
-            if len(cache.layers) != self.cache_slots:
-                raise RuntimeError("Official cache does not cover every loop/layer")
-            depths = self.exit_hooks.depths if self.exit_hooks is not None else None
-            if depths is not None and len(depths) != len(ids):
-                raise RuntimeError("Recorded exit depths do not match the generated tokens")
+            ids, depths = self._generate_transformers(prompt_ids, max_new_tokens, stops)
         else:
-            engine = self.engine
-            engine.add_request(
-                "gsm8k",
-                prompt_ids,
-                SamplingParams(
-                    max_tokens=max_new_tokens,
-                    min_loops=self.exit["min_loops"],
-                    max_loops=self.exit["max_loops"],
-                    exit_threshold=self.exit["threshold"],
-                    temperature=0,
-                ),
+            ids, depths = self.plugin.generate(
+                prompt_ids, max_new_tokens, stops, self.exit, self.tokenizer.eos_token
             )
-            ids = []
-            depths = []
-            try:
-                while engine.has_unfinished_requests():
-                    for output in engine.step():
-                        ids = output.token_ids
-                        depths = output.exit_depths
-                        full = self.exit["max_loops"]
-                        if is_fixed(self.exit) and any(depth != full for depth in depths):
-                            raise RuntimeError("Expected fixed full-depth generation")
-                        sequence = torch.tensor([prompt_ids + ids], device="cuda")
-                        if not output.finished and criteria(sequence, None).all().item():
-                            engine.abort_request("gsm8k")
-            finally:
-                if engine.has_unfinished_requests():
-                    engine.abort_request("gsm8k")
         raw = self.tokenizer.decode(ids, skip_special_tokens=True)
         text = postprocess_generated_text(raw, stop=stops, think_end_token=None)
         eos = bool(ids and ids[-1] == self.tokenizer.eos_token_id)
         reason = "eos" if eos else "stop" if any(s in raw for s in stops) else "length"
         result = {"token_ids": ids, "raw_text": raw, "text": text, "finish_reason": reason}
         if depths is not None:
-            # The first output comes from full-depth prefill on both backends; later entries are
-            # decode depths. The release still computes every loop for every token.
             result["exit_depths"] = list(depths)
         return result
 
-    def close(self):
-        if self.backend != "transformers":
-            try:
-                self.engine.close()
-            finally:
-                self._finite_hook.remove()
+    def _generate_transformers(self, prompt_ids, max_new_tokens, stops):
+        inputs = torch.tensor([prompt_ids], dtype=torch.long, device="cuda")
+        criteria = stop_sequences_criteria(self.tokenizer, stops, len(prompt_ids), 1)
+        if self.exit_hooks is not None:
+            self.exit_hooks.depths = []
+        cache = DynamicCache()
+        cache.append_new_layers(self.cache_slots - 1)
+        ids = self.model.generate(
+            inputs,
+            attention_mask=torch.ones_like(inputs),
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            stopping_criteria=criteria,
+            logits_processor=[FiniteLogits()],
+            use_cache=True,
+            past_key_values=cache,
+            **(
+                {"exit_at_step": self.exit["max_loops"] - 1}
+                if is_fixed(self.exit)
+                else {"exit_threshold": self.exit["threshold"]}
+            ),
+            use_weighted_exit=False,
+            logits_to_keep=1,
+        )[0, len(prompt_ids) :].tolist()
+        if len(cache.layers) != self.cache_slots:
+            raise RuntimeError("Official cache does not cover every loop/layer")
+        depths = self.exit_hooks.depths if self.exit_hooks is not None else None
+        if depths is not None and len(depths) != len(ids):
+            raise RuntimeError("Recorded exit depths do not match the generated tokens")
+        return ids, depths

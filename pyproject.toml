@@ -5,34 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-rlt"
 version = "0.2.0"
-description = "Loop-level continuous batching for Ouro language models"
+description = "Loop-level continuous batching for recurrent language models in vLLM"
 readme = "README.md"
 license = {file = "LICENSE"}
-requires-python = ">=3.10"
-dependencies = [
-    "numpy>=1.24",
-    "torch>=2.5",
-    "safetensors>=0.4.3",
-    "huggingface-hub>=0.25",
-    "transformers>=4.54",
-    "aiohttp>=3.11,<4",
-    "triton>=3.1; platform_system == 'Linux'",
-]
+requires-python = ">=3.11,<3.15"
+dependencies = ["vllm"]
 
 [project.optional-dependencies]
-# Keep previous installation commands compatible; these dependencies are now included by default.
-text = []
-pd = ["nixl==1.4.1"]
-serve = []
-flash-attn = ["flash-attn>=2.8.3"]
-flash-attn4 = ["flash-attn-4==4.0.0b39"]
-triton = []
 dev = ["pytest>=8", "ruff>=0.9"]
 
 [project.scripts]
 vllm-rlt = "vllm_rlt.entrypoints.cli:main"
-vllm-rlt-serve = "vllm_rlt.entrypoints.serve:main"
-vllm-rlt-pd-serve = "vllm_rlt.entrypoints.pd_serve:main"
+
+[project.entry-points."vllm.general_plugins"]
+rlt = "vllm_rlt.plugin:register"
 
 [tool.setuptools.packages.find]
 include = ["vllm_rlt*"]
@@ -43,10 +29,7 @@ license-files = ["LICENSE", "NOTICE"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-markers = [
-    "gpu: requires an explicitly selected CUDA device and --run-gpu",
-    "npu: requires an assigned Ascend device and torch-npu/CANN",
-]
+markers = ["gpu: requires an explicitly selected CUDA device and --run-gpu"]
 
 [tool.ruff]
 line-length = 100

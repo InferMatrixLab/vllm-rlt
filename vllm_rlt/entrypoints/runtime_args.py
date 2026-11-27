@@ -1,218 +1,49 @@
-"""Shared offline/server flags for cache, scheduling and execution policies."""
+"""Map explicit RLT launch flags to the vLLM engine configuration."""
 
-import argparse
-import json
-from pathlib import Path
-from types import SimpleNamespace
+from argparse import ArgumentParser, BooleanOptionalAction, Namespace
 
-from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SpeculativeConfig
-from vllm_rlt.profiling import ProfileConfig
+from vllm_rlt.config import LoopRuntimeConfig
 
-
-def add_runtime_args(parser):
-    add_profile_args(parser)
-    parser.add_argument(
-        "--speculative-tokens",
-        type=int,
-        help="Enable fixed-loop self-speculation with K draft tokens",
-    )
-    parser.add_argument("--speculative-mode", choices=["block", "pipeline"], default="block")
-    parser.add_argument(
-        "--speculative-pipeline-graph",
-        choices=["off", "transition", "full"],
-        default="off",
-        help="Pre-capture native asynchronous pipeline state updates or dense decode rounds",
-    )
-    parser.add_argument("--draft-loops", type=int, default=2)
-    parser.add_argument("--target-loops", type=int, default=4)
-    parser.add_argument("--enable-prefix-caching", action="store_true")
-    parser.add_argument("--incremental-kv", action="store_true")
-    parser.add_argument("--kv-watermark", type=float, default=0.0)
-    parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
-    parser.add_argument("--enable-preemption", action="store_true")
-    packed_prefill_mode = parser.add_mutually_exclusive_group()
-    packed_prefill_mode.add_argument(
-        "--packed-prefill",
-        action="store_true",
-        default=None,
-        help="Require packed prefill on a compatible backend; fail if unsupported. "
-        "Defaults to automatic selection when execution and backend support it.",
-    )
-    packed_prefill_mode.add_argument(
-        "--no-packed-prefill",
-        action="store_false",
-        dest="packed_prefill",
-        help="Keep per-row prefill even when packed attention is available",
-    )
-    parser.add_argument(
-        "--no-uva",
-        dest="use_uva",
-        action="store_false",
-        help="Copy metadata to the GPU instead of reading mapped host memory",
-    )
-    parser.add_argument("--kv-layout", choices=["last_exited", "shared"], default="last_exited")
-    parser.add_argument(
-        "--kv-cache-dtype",
-        choices=["auto", "fp8_e4m3"],
-        default="auto",
-        help="FP8 KV: per-vector scales on Torch/Triton, startup calibration on FA4",
-    )
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--kv-cache-memory-bytes", type=int)
-    parser.add_argument("--memory-reserve-bytes", type=int, default=256 * 1024 * 1024)
-    parser.add_argument(
-        "--exit-mode",
-        choices=["ouro", "ouro_delayed", "random_lookahead", "trace"],
-        default="ouro",
-        help="ouro_delayed reuses the Ouro gate; random_lookahead uses an untrained head",
-    )
-    parser.add_argument("--exit-trace", help="JSON file with depths_by_request")
-    parser.add_argument("--lookahead-seed", type=int, default=0)
-    parser.add_argument("--async-scheduling", action="store_true")
-    parser.add_argument(
-        "--cuda-graphs",
-        action="store_true",
-        help="Capture decode/wavefront recurrent cores and speculative coda; sampling stays eager",
-    )
-    parser.add_argument(
-        "--cuda-graph-max-batch-size",
-        type=int,
-        default=None,
-        help="Graph row limit; unset covers async speculative verification rows, else 128",
-    )
-    parser.add_argument("--cuda-graph-max-graphs", type=int, default=16)
-    parser.add_argument(
-        "--cuda-graph-warmup",
-        action="store_true",
-        help="Prewarm native Inkling CUDA Graphs at startup and run unseen shapes eagerly",
-    )
-    parser.add_argument(
-        "--packed-graph-buckets",
-        action="store_true",
-        help="Use vLLM token buckets and a shared graph pool for native Inkling packed CUDA Graphs",
-    )
-    parser.add_argument(
-        "--cuda-graph-memory-reserve-bytes",
-        type=int,
-        default=1024**3,
-        help="Automatic KV planning headroom per CUDA Graph pool (plus retained spec logits)",
-    )
-    parser.add_argument(
-        "--single-stream",
-        action="store_true",
-        help="Disable multi-stream CUDA execution independently of async scheduling",
-    )
-    parser.add_argument("--static-buffers", action="store_true")
-    parser.add_argument("--pad-to-power-of-two", action="store_true")
-    parser.add_argument("--prefill-chunk-size", type=int, default=128)
-    parser.add_argument(
-        "--wavefront-chunked-prefill",
-        action="store_true",
-        help="Batch ready prompt chunks across recurrence depths",
-    )
-    parser.add_argument(
-        "--adaptive-wavefront-prefill",
-        action="store_true",
-        help="Adapt wavefront chunk and batch sizes within the configured upper limits",
-    )
-    parser.add_argument("--max-prefill-batches-before-decode", type=int, default=1)
-    parser.add_argument("--admission-scan-limit", type=int, default=64)
-    parser.add_argument("--max-admission-bypasses", type=int, default=8)
-    parser.add_argument("--min-coda-batch-size", type=int, default=1)
+_BOOL_OPTIONS = {
+    "trace-steps": "Log loop steps and Ouro's committed depths.",
+    "wavefront-prefill": "Schedule Inkling prompt chunks at different CORE depths.",
+    "packed-prefill": "Pack mixed Inkling prefill CORE rows into one ragged batch.",
+    "decode-pipeline": "Start the next Inkling token before draft validation.",
+    "mixed-core": "Share Inkling CORE projections and MoE across pass depths.",
+    "compact-mixed-core": "Test shared Inkling CORE with compact MRv2 attention groups.",
+    "self-speculation": "Enable Inkling's single-candidate greedy draft.",
+    "merge-decode-core": "Run terminal and continuing Inkling decode rows together at each depth.",
+    "merge-prefill-core": "Share each CORE with terminal rows and rows that continue past it.",
+    "decode-state-slots": "Keep Inkling decode state in GPU buffers indexed by MRv2 request slot.",
+    "batch-decode-coda": "Allow one ready terminal CORE before sampling a decode batch.",
+    "finish-decode-token": "Finish ready CORE work before starting the next decode token.",
+    "silu-and-mul": "Use the compiled RLT SiLU-and-Mul kernel in Ouro.",
+}
 
 
-def runtime_configs(args):
-    # load_engine is also called directly with older argparse namespaces.
-    parser = argparse.ArgumentParser(add_help=False)
-    add_runtime_args(parser)
-    args = SimpleNamespace(**(vars(parser.parse_args([])) | vars(args)))
-    if args.speculative_pipeline_graph != "off" and args.speculative_tokens is None:
-        raise ValueError("--speculative-pipeline-graph requires --speculative-tokens")
-    return dict(
-        speculative_config=SpeculativeConfig(
-            num_speculative_tokens=args.speculative_tokens,
-            draft_loops=args.draft_loops,
-            target_loops=args.target_loops,
-            mode=args.speculative_mode,
-            pipeline_graph=args.speculative_pipeline_graph,
-        )
-        if args.speculative_tokens is not None
-        else None,
-        cache_config=CacheConfig(
-            enable_prefix_caching=args.enable_prefix_caching,
-            incremental_allocation=args.incremental_kv,
-            watermark_ratio=args.kv_watermark,
-            num_blocks=args.num_blocks,
-            block_size=args.block_size,
-            layout=args.kv_layout,
-            kv_cache_dtype=args.kv_cache_dtype,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            kv_cache_memory_bytes=args.kv_cache_memory_bytes,
-            memory_reserve_bytes=args.memory_reserve_bytes,
-        ),
-        exit_config=ExitConfig(
-            mode=args.exit_mode,
-            seed=args.lookahead_seed,
-            depths_by_request=json.loads(Path(args.exit_trace).read_text())["depths_by_request"]
-            if args.exit_trace
-            else None,
-        ),
-        execution_config=ExecutionConfig(
-            packed_prefill=args.packed_prefill,
-            use_uva=args.use_uva,
-            cuda_graphs=args.cuda_graphs,
-            cuda_graph_warmup=args.cuda_graph_warmup,
-            cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,
-            cuda_graph_max_graphs=args.cuda_graph_max_graphs,
-            packed_graph_buckets=args.packed_graph_buckets,
-            cuda_graph_memory_reserve_bytes=args.cuda_graph_memory_reserve_bytes,
-            async_scheduling=args.async_scheduling,
-            multi_stream=not args.single_stream,
-            static_buffers=args.static_buffers,
-            pad_to_power_of_two=args.pad_to_power_of_two,
-        ),
-    )
-
-
-def add_profile_args(parser):
-    group = parser.add_argument_group("PyTorch profiling")
-    group.add_argument("--profile", action="store_true")
-    group.add_argument("--profile-dir")
+def add_runtime_args(parser: ArgumentParser) -> None:
+    group = parser.add_argument_group("RLT")
+    for option, help_text in _BOOL_OPTIONS.items():
+        group.add_argument(f"--rlt-{option}", action=BooleanOptionalAction, help=help_text)
     group.add_argument(
-        "--profile-activities",
-        default=ProfileConfig.activities,
-        help="comma-separated cpu,cuda",
+        "--rlt-prefill-chunk-size", type=int, help="Maximum prompt tokens in a wavefront chunk."
     )
-    for flag, field in (
-        ("record-shapes", "record_shapes"),
-        ("with-stack", "with_stack"),
-        ("memory", "profile_memory"),
-        ("with-flops", "with_flops"),
-    ):
-        group.add_argument(
-            "--profile-" + flag, action="store_true", default=getattr(ProfileConfig, field)
+
+
+def apply_runtime_args(args: Namespace) -> None:
+    options = dict(args.additional_config or {})
+    for flag in (*_BOOL_OPTIONS, "prefill-chunk-size"):
+        key = "rlt_" + flag.replace("-", "_")
+        value = getattr(args, key)
+        if value is not None:
+            options[key] = value
+    LoopRuntimeConfig.from_additional_config(options)
+    args.additional_config = options
+    if args.scheduler_cls is None:
+        args.scheduler_cls = (
+            "vllm_rlt.core.async_scheduler.LoopAsyncScheduler"
+            if args.async_scheduling
+            else "vllm_rlt.core.loop_scheduler.LoopScheduler"
         )
-    for name in ("wait", "warmup", "active", "repeat"):
-        group.add_argument("--profile-" + name, type=int, default=getattr(ProfileConfig, name))
-
-
-def profile_config_from_args(args) -> ProfileConfig | None:
-    """Build startup profiling settings, filling missing CLI fields from parser defaults."""
-    parser = argparse.ArgumentParser(add_help=False)
-    add_profile_args(parser)
-    args = SimpleNamespace(**(vars(parser.parse_args([])) | vars(args)))
-    if not args.profile:
-        return None
-
-    return ProfileConfig(
-        output_dir=args.profile_dir,
-        activities=tuple(args.profile_activities.split(",")) if args.profile_activities else None,
-        record_shapes=args.profile_record_shapes,
-        with_stack=args.profile_with_stack,
-        profile_memory=args.profile_memory,
-        with_flops=args.profile_with_flops,
-        wait=args.profile_wait,
-        warmup=args.profile_warmup,
-        active=args.profile_active,
-        repeat=args.profile_repeat,
-    )
+    if args.worker_cls == "auto":
+        args.worker_cls = "vllm_rlt.worker.loop_worker.LoopWorker"

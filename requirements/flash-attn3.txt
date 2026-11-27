@@ -1,2 +1,0 @@
-# Official Hopper implementation; PyPI's flash-attn-3 placeholder is not usable.
-flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git@94e22c906678e5483fa0e9e24d8e787bc2c0ed4c#subdirectory=hopper

@@ -29,13 +29,13 @@ validate optional configurations against your own workload.
 - `LLM` starts a spawned stage worker. Put construction inside a function and
   an `if __name__ == "__main__":` guard; use its context manager for cleanup.
   `LLM.engine` is a `StageClient`, not direct access to worker-local caches.
-  See [the current Python example](docs/launching.md#python-api).
+  See [the current Python example](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/docs/launching.md#python-api).
 - Python-only wheels retain the Torch activation implementation. To build
   the optional native extension from source, install compatible CUDA-enabled
   PyTorch, a CUDA toolkit with `nvcc`, and a C++ compiler, then install with
   `--no-build-isolation` and the allocated GPU visible. A driver alone is not
   a compiler. Native binaries are specific to their Torch/CUDA/target GPU
-  environment; see [kernel build instructions](docs/kernels.md).
+  environment; see [kernel build instructions](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/docs/kernels.md).
 - Model weights are downloaded separately. This GitHub release does not imply
   a PyPI publication or a bundled checkpoint.
 
@@ -58,9 +58,9 @@ validate optional configurations against your own workload.
   draft-length policy is not
   included merely because a proposal or pull request exists.
 
-See [runtime documentation](docs/runtime.md),
-[model support](README.md#model-support), and
-[benchmark qualification](docs/unified_execution.md#measured-serving-performance).
+See [runtime documentation](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/docs/runtime.md),
+[model support](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/README.md#model-support), and
+[benchmark qualification](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/docs/unified_execution.md#measured-serving-performance).
 
 ## 0.1.0 — 2026-10-10
 

@@ -1,59 +1,9 @@
-# Documentation — v0.2.0
+# Documentation
 
-This version is a research/evaluation milestone. Start with synchronous
-execution; optional GPU paths and historical measurements have narrower
-qualification scopes than the feature list. See the [changelog and migration
-notes](../CHANGELOG.md) before upgrading from v0.1.0.
+- [Plugin installation and Inkling serving](../README.md)
+- [Architecture milestones, functional validation and performance plan](plugin-development.md)
+- [Ouro early-exit and GSM8K-87 evaluation](accuracy.md)
+- [RLT SiLU-and-Mul build and selection](kernels.md)
+- [Development workflow](developer-guide.md)
 
-The [Getting Started section](../README.md#getting-started) lists the platform
-options. The [first-run user guide](launching.md) walks through the NVIDIA CUDA
-setup on `v0.2.0`. The Ascend guide below uses `main`.
-
-| Guide | Topics |
-| --- | --- |
-| [Developer Must-Read](developer-guide.md) | Requirement understanding, correctness, performance analysis, refactoring rules, and completion criteria |
-| [Native kernel development](kernels.md) | Optional CUDA extension, operator layout, and SiLU-and-Mul reference contract |
-| [First-run user guide](launching.md) | Environment setup, model download, server startup, first request, CLI, Python API, and troubleshooting |
-| [Unified architecture](unified_execution.md) | Stage process boundaries, component responsibilities, shared resources and loop-level execution |
-| [Model and KV semantics](design.md) | PRELUDE/RECURRENT/CODA, request progress and depth-specific history |
-| [Loop-level scheduling](scheduler.md) | Mixed batching, policy selection, admission budgets, progress and resource safety |
-| [KV layout examples](kv_layout_computation.md) | SHARED and LAST_EXITED semantics and worked attention examples |
-| [KV cache walkthrough](kv_cache_walkthrough.md) | Capacity, validity, shared metadata, transfer pins and snapshot/restore |
-| [Runtime execution and configuration](runtime.md) | Batch contracts, preparation, transfers, execution options and compatibility |
-| [Split prefill and WCPB](split-prefill-wavefront.md) | Chunk/depth scheduling, hidden-state ring, KV dependencies and validation limits |
-| [Self-speculation](async-speculative.md) | Cross-round asynchronous block execution, token pipelines, and acceptance/rejection timelines |
-| [Asynchronous scheduling](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
-| [FlashAttention](https://github.com/InferMatrixLab/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
-| [Cache and scheduling features](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
-| [Prefill/decode disaggregation](https://github.com/InferMatrixLab/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
-| [HTTP serving](serving.md) | Device setup, completions API, streaming, and service lifecycle |
-| [Ouro on Ascend](recipes/ouro_ascend.md) | Huawei Ascend NPU setup on `main`, serving commands, and validation scope |
-| [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
-| [Ouro-Thinking recipe](recipes/ouro_thinking.md) | Shared 1.4B/2.6B setup, JSON/SSE client, budgets and validation limits |
-| [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |
-
-Earlier measurements and known limitations are retained in the
-[historical validation record](runtime-history.md); they do not qualify the current revision.
-
-## Support and Runtime Notes
-
-Supported models are Ouro-1.4B, Nanbeige4.2-3B, Huginn-0125 and
-NVIDIA-Nemotron-Labs-Dory1.0-4B. See the
-[checkpoint support matrix](../README.md#model-support) and the
-[Thinking recipe](recipes/ouro_thinking.md) for model-specific coverage.
-Huginn currently uses synchronous execution, LAST_EXITED KV, and fixed
-recurrent depth; prefix caching, asynchronous execution, and speculative
-decoding are rejected, as are mixed/WCPB staged prefill and PD. Its CUDA Graphs capture the recurrent decode core
-and coda, including the LM head.
-The [Dory baseline notes](dory.md) list the narrower scope qualified for Dory:
-synchronous fixed-loop execution with boundary KV in both KV modes, sliding-window
-masking on the Torch and Triton backends, and BF16 agreement with the pinned
-checkpoint at 1/2/4 loops; Graphs, WCPB, async, speculation, prefix reuse and PD
-remain out of scope.
-CPU execution provides a Torch reference backend. FlashAttention hardware validation is currently documented
-for FA4 on B300; FA2/FA3 require validation on their target devices. Disaggregated
-serving currently targets multiple GPUs on a single host.
-
-`ouro_delayed` reuses the trained Ouro gate with a one-loop delay; it changes
-the exit policy. The `random_lookahead` mode uses an untrained head for runtime
-experiments. Neither is a distilled lookahead predictor.
+The standalone engine documentation is available at the [pre-plugin revision](https://github.com/InferMatrixLab/vllm-rlt/tree/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/docs).

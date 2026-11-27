@@ -1,0 +1,1 @@
+"""Compatibility adaptations for vLLM."""

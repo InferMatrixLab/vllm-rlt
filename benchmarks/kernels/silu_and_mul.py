@@ -18,8 +18,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from vllm_rlt.kernels._extension import load_extension
-from vllm_rlt.kernels.activation import silu_and_mul
+from vllm_rlt.ops._extension import load_extension
+from vllm_rlt.ops.silu_and_mul import silu_and_mul
 
 
 def errors(actual, expected):

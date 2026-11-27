@@ -12,7 +12,7 @@ import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from vllm_rlt.models import special_token_ids
+from benchmarks.chat_template import render_chat_prompt, special_token_ids
 
 DATA_REVISION = "740312add88f781978c0658806c59bc2815b9866"
 PACKAGES = ("torch", "transformers", "lm-eval", "datasets", "tokenizers", "triton")
@@ -190,8 +190,6 @@ def build_records(
     if not ids or ids != sorted(set(ids)) or any(i < 0 or i >= len(task.eval_docs) for i in ids):
         raise ValueError("Question IDs must be unique, sorted and present in the dataset")
     if prompt_mode == PROMPT_THINKING:
-        from vllm_rlt.entrypoints.chat_template import render_chat_prompt
-
         items = ids
     elif prompt_mode == PROMPT_RAW:
         task.build_all_requests(samples=ids, rank=0, world_size=1)
@@ -363,11 +361,10 @@ def exit_settings(
         return fixed_exit(loops)
     if min_loops is None or not 1 <= min_loops <= loops:
         raise ValueError(f"Adaptive exit requires an explicit --min-loops between 1 and {loops}")
-    if async_scheduling and mode != "ouro_delayed":
-        raise ValueError("--async-scheduling requires --exit-mode ouro_delayed")
-    if backend == "transformers" and (mode, min_loops) != ("ouro", 1):
-        # The release applies its threshold from the first loop and has no delayed mode.
+    if backend == "transformers" and (mode, min_loops, async_scheduling) != ("ouro", 1, False):
         raise ValueError("Transformers adaptive exit supports only --exit-mode ouro --min-loops 1")
+    if mode != "ouro":
+        raise ValueError("The plugin supports --exit-mode ouro")
     return {
         "mode": mode,
         "threshold": threshold,
@@ -577,7 +574,7 @@ def run(args):
     prompt_mode, scorer = validate_prompt_recipe(protocol)
     if protocol["source"]["packages"] != source()["packages"]:
         raise ValueError("Evaluation package versions changed after preparation")
-    from benchmarks.gsm8k_backends import Generator
+    from benchmarks.gsm8k_backends import Generator, PluginCompletions
 
     model = Path(protocol["model"])
     for name, expected in protocol["model_files"].items():
@@ -585,18 +582,23 @@ def run(args):
             raise ValueError(f"Model file changed: {name}")
     if checkpoint_loops(json.loads((model / "config.json").read_text())) != loops:
         raise ValueError("Checkpoint depth differs from the protocol")
-    if not os.environ.get("CUDA_VISIBLE_DEVICES") or torch.cuda.device_count() != 1:
-        raise RuntimeError("Run with one scheduler-assigned GPU")
+    plugin = None
+    if args.backend == "native":
+        if not (args.endpoint and args.served_model and args.step_log):
+            raise ValueError(
+                "The native backend requires --endpoint, --served-model and --step-log"
+            )
+        plugin = PluginCompletions(args.endpoint, args.served_model, args.step_log)
+        plugin.check_model(model, protocol["max_length"])
+    elif not os.environ.get("CUDA_VISIBLE_DEVICES") or torch.cuda.device_count() != 1:
+        raise RuntimeError("Run Transformers with one scheduler-assigned GPU")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
         "backend": args.backend,
         "protocol_sha256": file_digest(args.protocol),
         "source": source(),
-        "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
-        "gpu": str(torch.cuda.get_device_properties(0)),
         "cpu_affinity": sorted(os.sched_getaffinity(0)),
-        "torch_cuda": torch.version.cuda,
         "split": protocol["task_config"]["test_split"],
         "expected_examples": len(protocol["records"]),
         "max_regression_pp": protocol["max_regression_pp"],
@@ -604,38 +606,45 @@ def run(args):
         "loops": loops,
         "exit": exit_policy,
     }
+    if plugin is None:
+        metadata.update(
+            cuda_visible_devices=os.environ["CUDA_VISIBLE_DEVICES"],
+            gpu=str(torch.cuda.get_device_properties(0)),
+            torch_cuda=torch.version.cuda,
+        )
+    else:
+        metadata.update(
+            endpoint=args.endpoint, served_model=args.served_model, step_log=args.step_log
+        )
     write_json(output / "metadata.json", metadata)
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
     close_id = thinking_close_id(tokenizer) if scorer == SCORER_THINKING else None
     task = make_task(protocol["task_config"])
     start = time.monotonic()
-    generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"], exit_policy)
+    generator = Generator(args.backend, str(model), tokenizer, exit_policy, plugin=plugin)
     load_seconds = time.monotonic() - start
     rows = []
-    try:
-        with (output / "samples.jsonl").open("x", buffering=1) as stream:
-            for row in protocol["records"]:
-                stops = row["generation_kwargs"]["until"] + [tokenizer.eos_token]
-                start = time.monotonic()
-                result = generator.generate(row["prompt_ids"], protocol["max_new_tokens"], stops)
-                if scorer == SCORER_THINKING:
-                    result.update(score_thinking(row, result["token_ids"], tokenizer, close_id))
-                else:
-                    result.update(score(task, row, result["text"]))
-                result.update(
-                    id=row["id"],
-                    prompt_sha256=digest(row["prompt_ids"]),
-                    seconds=time.monotonic() - start,
-                )
-                stream.write(json.dumps(result) + "\n")
-                rows.append(result)
-                print(
-                    f"{args.backend} {len(rows)}/{len(protocol['records'])}: "
-                    f"correct={sum(r['correct'] for r in rows)}",
-                    flush=True,
-                )
-    finally:
-        generator.close()
+    with (output / "samples.jsonl").open("x", buffering=1) as stream:
+        for row in protocol["records"]:
+            stops = row["generation_kwargs"]["until"] + [tokenizer.eos_token]
+            start = time.monotonic()
+            result = generator.generate(row["prompt_ids"], protocol["max_new_tokens"], stops)
+            if scorer == SCORER_THINKING:
+                result.update(score_thinking(row, result["token_ids"], tokenizer, close_id))
+            else:
+                result.update(score(task, row, result["text"]))
+            result.update(
+                id=row["id"],
+                prompt_sha256=digest(row["prompt_ids"]),
+                seconds=time.monotonic() - start,
+            )
+            stream.write(json.dumps(result) + "\n")
+            rows.append(result)
+            print(
+                f"{args.backend} {len(rows)}/{len(protocol['records'])}: "
+                f"correct={sum(r['correct'] for r in rows)}",
+                flush=True,
+            )
     summary = {
         **metadata,
         "complete": True,
@@ -787,7 +796,10 @@ def main():
     p.add_argument("--backend", choices=["transformers", "native"], required=True)
     p.add_argument("--protocol", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--exit-mode", choices=["ouro", "ouro_delayed"], default="ouro")
+    p.add_argument("--endpoint", help="Base URL serving the RLT plugin for --backend native")
+    p.add_argument("--served-model", help="Model name advertised by the RLT server")
+    p.add_argument("--step-log", help="Path to the RLT server log with rlt_trace_steps enabled")
+    p.add_argument("--exit-mode", choices=["ouro"], default="ouro")
     p.add_argument(
         "--exit-threshold",
         type=float,
@@ -795,7 +807,11 @@ def main():
         help="Cumulative exit probability; 1 keeps the fixed full-depth recipe",
     )
     p.add_argument("--min-loops", type=int, help="Required when --exit-threshold is below 1")
-    p.add_argument("--async-scheduling", action="store_true", help="Native ouro_delayed only")
+    p.add_argument(
+        "--async-scheduling",
+        action="store_true",
+        help="Record an adaptive run on an async RLT server",
+    )
     p = commands.add_parser("compare")
     p.add_argument("--transformers", "--reference", dest="transformers", required=True)
     p.add_argument("--native", "--candidate", dest="native", required=True)
