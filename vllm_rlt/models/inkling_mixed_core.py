@@ -2,16 +2,21 @@
 
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from itertools import groupby
 from operator import attrgetter
 
 import torch
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.models.inkling2.nvidia.lora import add_linear_lora
 from vllm.models.inkling2.nvidia.ops.attn_res import attn_res
 from vllm.models.inkling2.nvidia.ops.linear import linear
+from vllm.utils.torch_utils import async_tensor_h2d
+
+from vllm_rlt.models.inkling_core_routes import pack_core_inputs
 
 
 @dataclass
@@ -252,13 +257,79 @@ class _CompactCoreGroup:
     state: object
 
 
-def _compact_core_layer(model, i, positions, tau, stack, blocks, groups):
+@dataclass
+class _CompactCoreExecution:
+    groups: list[_CompactCoreGroup]
+    positions: torch.Tensor
+    tau: torch.Tensor | None
+    stack: torch.Tensor
+    blocks: int
+    messages: list[torch.Tensor | None] | None = None
+    attention: torch.Tensor | None = None
+
+
+@dataclass
+class _PackedCoreExecution:
+    metadata: tuple
+    positions: torch.Tensor
+    tau: torch.Tensor | None
+    stack: torch.Tensor
+    blocks: int
+    later_rows: torch.Tensor | None
+    first_inputs: torch.Tensor | None
+    later_inputs: torch.Tensor | None
+    bank: torch.Tensor | None
+    row_routes: torch.Tensor
+    messages: torch.Tensor | None = None
+    attention: torch.Tensor | None = None
+    coda_inputs: torch.Tensor | None = None
+
+    def rows(self, tensor, indices):
+        if indices.shape[0] == self.positions.numel():
+            return tensor
+        return tensor.index_select(-2, indices)
+
+_compact_core_execution = ContextVar("compact_core_execution", default=None)
+
+
+def _prepare_packed_qkv(model, i, execution, qkv, inputs=None):
     layer = model.layers[i]
-    messages = []
-    attn_inputs = []
+    norm = layer.attn_norm
+    live = execution.positions.numel()
+    first = execution.first_inputs if inputs is None else inputs
+    mixed = None
+    if execution.later_rows is not None:
+        bank = execution.bank
+        execution.messages = attn_res(
+            bank[:1], bank[1], None,
+            model.message_queries[i - model.loop_core.start], None, 0.0, True,
+        )
+        later = execution.later_inputs if inputs is None else execution.rows(
+            inputs, execution.later_rows
+        )
+        weights = norm.weight.expand(3, -1) if layer.is_local else norm.weight
+        mixed = layer.blend(
+            slice(0, 3), later.expand(3, -1, -1), execution.messages[:3], weights, norm.eps
+        )
+    pack_core_inputs(
+        qkv, first, mixed, execution.row_routes, live, norm,
+        normalize_first=inputs is not None, first_is_full=inputs is not None,
+    )
+
+
+def _prepare_qkv(model, i, qkv):
+    execution = _compact_core_execution.get()
+    if execution is None:
+        qkv.zero_()
+        return
+    if isinstance(execution, _PackedCoreExecution):
+        _prepare_packed_qkv(model, i, execution, qkv)
+        return
+    layer = model.layers[i]
+    execution.messages = []
     norm = layer.attn_norm
     weights = norm.weight.expand(3, -1) if layer.is_local else norm.weight
-    for group in groups:
+    for group in execution.groups:
         inputs = group.state.inputs.expand(3, -1, -1)
         bank = group.state.bank
         message = None
@@ -273,20 +344,41 @@ def _compact_core_layer(model, i, positions, tau, stack, blocks, groups):
                 True,
             )
             inputs = layer.blend(slice(0, 3), inputs, message[:3], weights, norm.eps)
-        attn_inputs.append(inputs)
-        messages.append(message)
+        qkv[:, group.rows].copy_(inputs)
+        execution.messages.append(message)
+    qkv[:, execution.stack.shape[1] :].zero_()
 
-    xq, xk, xv = torch.cat(attn_inputs, dim=1).unbind()
-    attn = layer.attn
-    q, r, gate, sinks, k, v = attn._project(xq, xk, xv)
-    k_dynamic = attn.k_sconv.dynamic_taps(xk)
-    v_dynamic = attn.v_sconv.dynamic_taps(xv)
-    out = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
-    for group in groups:
+
+@eager_break_during_capture
+def _start_compact_layers(model, qkv):
+    _prepare_qkv(model, model.loop_core.start, qkv)
+
+
+@eager_break_during_capture
+def _attend(model, i, out, q, r, gate, sinks, k, v, k_dynamic, v_dynamic):
+    execution = _compact_core_execution.get()
+    if execution is None:
+        out.zero_()
+        return
+    layer = model.layers[i]
+    tau = execution.tau
+    if isinstance(execution, _PackedCoreExecution):
+        live = execution.positions.numel()
+        attn, metadata = execution.metadata[i - model.loop_core.start]
+        with _attention_metadata(metadata):
+            attn._attention(
+                execution.positions, q[:live], r[:live], gate[:live], sinks[:live],
+                k[:live], v[:live], None if k_dynamic is None else k_dynamic[:live],
+                None if v_dynamic is None else v_dynamic[:live],
+                None if layer.is_local else tau, out[:live],
+            )
+        out[live:].zero_()
+        return
+    for group in execution.groups:
         rows = group.rows
         with _attention_metadata(group.metadata):
-            attn._attention(
-                positions[rows],
+            layer.attn._attention(
+                execution.positions[rows],
                 q[rows],
                 r[rows],
                 gate[rows],
@@ -299,19 +391,51 @@ def _compact_core_layer(model, i, positions, tau, stack, blocks, groups):
                 out[rows],
                 group.depth,
             )
-    projected = linear(out, attn.wo_ud.weight)
+    out[execution.stack.shape[1] :].zero_()
 
+
+@eager_break_during_capture
+def _prepare_mlp(model, i, projected, mlp_inputs):
+    execution = _compact_core_execution.get()
+    if execution is None:
+        mlp_inputs.zero_()
+        return
+    layer = model.layers[i]
     first = i % model.block_size == 0
+    stack, blocks = execution.stack, execution.blocks
     partial = stack[blocks]
-    attn_out = torch.empty_like(partial)
-    mlp_inputs = []
-    for group, message in zip(groups, messages, strict=True):
+    execution.attention = torch.empty_like(partial)
+    if isinstance(execution, _PackedCoreExecution):
+        live = execution.positions.numel()
+        attn, metadata = execution.metadata[i - model.loop_core.start]
+        norm = layer.mlp_norm
+        with _attention_metadata(metadata):
+            mixed = layer.attn_sconv.conv_mix(
+                projected[:live], execution.positions, execution.attention,
+                stack[: blocks + first], None if first else partial,
+                model.attn_res.mlp_queries[i], None if execution.later_rows is not None else norm,
+                owner=attn.conv_states[0],
+            )
+        later_inputs = (
+            layer.blend(
+                slice(3, 4), execution.rows(mixed, execution.later_rows), execution.messages[3:],
+                norm.weight, norm.eps,
+            )
+            if execution.later_rows is not None else None
+        )
+        pack_core_inputs(
+            mlp_inputs.unsqueeze(0), mixed, later_inputs, execution.row_routes, live, norm,
+            normalize_first=later_inputs is not None, first_is_full=True,
+        )
+        return
+    assert execution.messages is not None
+    for group, message in zip(execution.groups, execution.messages, strict=True):
         rows = group.rows
         with _attention_metadata(group.metadata):
             mixed = layer.attn_sconv.conv_mix(
                 projected[rows],
-                positions[rows],
-                attn_out[rows],
+                execution.positions[rows],
+                execution.attention[rows],
                 stack[: blocks + first, rows],
                 None if first else partial[rows],
                 model.attn_res.mlp_queries[i],
@@ -321,11 +445,40 @@ def _compact_core_layer(model, i, positions, tau, stack, blocks, groups):
         if message is not None:
             norm = layer.mlp_norm
             mixed = layer.blend(slice(3, 4), mixed, message[3:], norm.weight, norm.eps)
-        mlp_inputs.append(mixed[0])
-    mlp_out = layer.mlp(torch.cat(mlp_inputs))
+        mlp_inputs[rows].copy_(mixed[0])
+    mlp_inputs[stack.shape[1] :].zero_()
 
+
+@eager_break_during_capture
+def _finish_compact_layer(model, i, mlp_out, qkv):
+    execution = _compact_core_execution.get()
+    if execution is None:
+        return
+    layer = model.layers[i]
+    first = i % model.block_size == 0
+    stack, blocks = execution.stack, execution.blocks
+    partial = stack[blocks]
     next_blocks = blocks + first
-    for group in groups:
+    assert execution.attention is not None
+    if isinstance(execution, _PackedCoreExecution):
+        following = i + 1
+        last_layer = following == model.loop_core.stop
+        attn, metadata = execution.metadata[i - model.loop_core.start]
+        with _attention_metadata(metadata):
+            inputs = layer.mlp_sconv.conv_mix(
+                mlp_out[: execution.positions.numel()], execution.positions, stack[next_blocks],
+                stack[:next_blocks], None, model.attn_res.attn_queries[i],
+                model.layers[following].attn_norm if last_layer else None,
+                addend=execution.attention, residual=None if first else partial,
+                owner=attn.conv_states[0],
+            )
+        execution.blocks = next_blocks
+        if last_layer:
+            execution.coda_inputs = inputs
+        else:
+            _prepare_packed_qkv(model, following, execution, qkv, inputs)
+        return
+    for group in execution.groups:
         rows = group.rows
         following = i + 1
         following_depth = group.depth
@@ -338,36 +491,130 @@ def _compact_core_layer(model, i, positions, tau, stack, blocks, groups):
         with _attention_metadata(group.metadata):
             group.state.inputs = layer.mlp_sconv.conv_mix(
                 mlp_out[rows],
-                positions[rows],
+                execution.positions[rows],
                 stack[next_blocks, rows],
                 stack[:next_blocks, rows],
                 None,
                 query,
                 next_norm,
-                addend=attn_out[rows],
+                addend=execution.attention[rows],
                 residual=None if first else partial[rows],
                 owner=layer.conv_states[group.depth],
             )
-    return next_blocks
+    execution.blocks = next_blocks
+    if i + 1 < model.loop_core.stop:
+        _prepare_qkv(model, i + 1, qkv)
+
+
+def run_compact_layers(model, qkv_inputs, mlp_inputs):
+    # The graph is keyed only by row width. Depth-specific KV and continuation
+    # routing read the current execution inside the breakable graph callbacks.
+    _start_compact_layers(model, qkv_inputs)
+    for i in model.loop_core:
+        layer = model.layers[i]
+        attn = layer.attn
+        xq, xk, xv = qkv_inputs.unbind()
+        q, r, gate, sinks, k, v = attn._project(xq, xk, xv)
+        k_dynamic = attn.k_sconv.dynamic_taps(xk)
+        v_dynamic = attn.v_sconv.dynamic_taps(xv)
+        out = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
+        _attend(model, i, out, q, r, gate, sinks, k, v, k_dynamic, v_dynamic)
+        projected = linear(out, attn.wo_ud.weight)
+        _prepare_mlp(model, i, projected, mlp_inputs)
+        _finish_compact_layer(model, i, layer.mlp(mlp_inputs), qkv_inputs)
+    return qkv_inputs
+
+
+def _run_compact_core(model, step, positions, execution):
+    token = _compact_core_execution.set(execution)
+    try:
+        if step.packed_core and step.graphs is not None:
+            if step.graphs.replay_packed_core(positions, execution):
+                return
+        graph = step.graphs is not None and step.graphs.replay_compact_core(positions.numel())
+        if not graph:
+            width, hidden = positions.numel(), execution.stack.shape[-1]
+            run_compact_layers(
+                model, execution.stack.new_empty((3, width, hidden)),
+                execution.stack.new_empty((width, hidden)),
+            )
+    finally:
+        _compact_core_execution.reset(token)
+
+
+def _execute_packed_core(adapter, step, positions, tau):
+    states = adapter._pop_core_states(step, step.ordered)
+    first = states[0]
+    live = sum(span.token_count for span in step.ordered)
+    stack = first.stack.new_empty((first.stack.shape[0], live, first.stack.shape[2]))
+    blocks = first.num_blocks + 1
+    torch.cat([state.stack[:blocks] for state in states], dim=1, out=stack[:blocks])
+    later_rows, row_routes = [], []
+    first_inputs, later_inputs, banks = [], [], []
+    offset = first_count = 0
+    for span, state in zip(step.ordered, states, strict=True):
+        end = offset + span.token_count
+        if state.bank is None:
+            row_routes.extend(range(-first_count - 1, -first_count - span.token_count - 1, -1))
+            first_count += span.token_count
+            first_inputs.append(state.inputs)
+        else:
+            row_routes.extend(range(len(later_rows), len(later_rows) + span.token_count))
+            later_rows.extend(range(offset, end))
+            later_inputs.append(state.inputs)
+            banks.append(state.bank)
+        offset = end
+    assert offset == live
+    rows = async_tensor_h2d(later_rows + row_routes, dtype=torch.long, device=positions.device)
+    execution = _PackedCoreExecution(
+        step.packed_core_metadata,
+        positions[:live],
+        None if tau is None else tau[:live],
+        stack,
+        first.num_blocks,
+        rows[:len(later_rows)] if later_rows else None,
+        torch.cat(first_inputs, dim=1) if first_inputs else None,
+        torch.cat(later_inputs, dim=1) if later_inputs else None,
+        torch.cat(banks, dim=1) if banks else None,
+        rows[len(later_rows):],
+    )
+    _run_compact_core(adapter.model, step, positions, execution)
+
+    offset = 0
+    for span, state in zip(step.ordered, states, strict=True):
+        end = offset + span.token_count
+        state.stack = stack[:, offset:end]
+        state.num_blocks = execution.blocks
+        if span.last_core:
+            state.bank = None
+            state.inputs = execution.coda_inputs[:, offset:end]
+        else:
+            previous_inputs = state.inputs if state.bank is not None else None
+            adapter._continue_core(state, previous_inputs)
+        adapter._store_span_state(step, span, state)
+        offset = end
+    return stack[execution.blocks]
 
 
 def execute_compact_core(adapter, step, positions, tau):
-    """Use each depth's real KV rows and run the shared weights before/after them."""
+    """Run shared CORE weights, using one packed attention and convolution when supported."""
+    if step.packed_core:
+        return _execute_packed_core(adapter, step, positions, tau)
     groups = []
     offset = 0
     variants = groupby(step.ordered, attrgetter("depth", "last_core"))
     for ((depth, final), spans), metadata in zip(variants, step.core_group_metadata, strict=True):
         spans = tuple(spans)
-        states = [step.state[span.request_id].pop(span.token_start) for span in spans]
+        states = adapter._pop_core_states(step, spans)
         state = type(states[0]).concatenate(states)
         end = offset + sum(span.token_count for span in spans)
         groups.append(_CompactCoreGroup(depth, final, spans, slice(offset, end), metadata, state))
         offset = end
-    assert offset == positions.numel()
+    assert offset == sum(span.token_count for span in step.ordered)
     stack = torch.cat([group.state.stack for group in groups], dim=1)
-    blocks = groups[0].state.num_blocks
-    for i in adapter.model.loop_core:
-        blocks = _compact_core_layer(adapter.model, i, positions, tau, stack, blocks, groups)
+    execution = _CompactCoreExecution(groups, positions, tau, stack, groups[0].state.num_blocks)
+    _run_compact_core(adapter.model, step, positions, execution)
+    blocks = execution.blocks
 
     for group in groups:
         state = group.state
@@ -376,5 +623,5 @@ def execute_compact_core(adapter, step, positions, tau):
         state.bank = None
         if not group.final:
             adapter._continue_core(state)
-        state.store_rows(group.spans, step.state, copy=False)
+        adapter._store_state_rows(step, state, group.spans, copy=False)
     return stack[blocks]

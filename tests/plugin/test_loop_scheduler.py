@@ -9,6 +9,7 @@ from vllm_rlt.core.loop import LoopOp
 @pytest.fixture
 def scheduler_factory():
     pytest.importorskip("vllm")
+    from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
     from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheGroup
 
@@ -19,37 +20,59 @@ def scheduler_factory():
         async_scheduling=False,
         *,
         prefix=False,
-        wavefront=False,
         ouro=False,
         speculate=False,
         pipeline=False,
         prefill_lookahead=False,
-        batch_decode_coda=False,
+        shared_kv=False,
         long_prefill_token_threshold=0,
-        finish_decode_token=False,
+        prefill_window=None,
+        policy="fcfs",
+        split_prefill_coda=False,
+        merge_decode_core=False,
+        decode_graph_sizes=(),
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
     ):
         text = SimpleNamespace(
-            model_type="inkling2_model", num_loop_passes=3, loop_config={"is_varloop": True}
+            model_type="inkling2_model", num_loop_passes=3, loop_config={"is_varloop": True},
+            loop_share_cache=shared_kv,
         )
         if ouro:
             text = SimpleNamespace(model_type="ouro", total_ut_steps=4)
         config = SimpleNamespace(
             scheduler_config=SimpleNamespace(
-                max_num_seqs=4,
-                max_num_batched_tokens=16,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
                 async_scheduling=async_scheduling,
+                policy=policy,
                 long_prefill_token_threshold=long_prefill_token_threshold,
             ),
             model_config=SimpleNamespace(hf_text_config=text, max_model_len=64),
             cache_config=SimpleNamespace(enable_prefix_caching=prefix),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                use_ubatching=False,
+            ),
+            kv_transfer_config=None,
+            lora_config=None,
+            speculative_config=None,
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+                decode_cudagraph_capture_request_sizes=decode_graph_sizes,
+                prefill_cudagraph_capture_token_sizes=(4, 8, 16),
+                max_cudagraph_capture_size=max(decode_graph_sizes, default=0),
+                max_decode_cudagraph_capture_tokens=None,
+            ),
             additional_config={
-                "rlt_wavefront_prefill": wavefront,
-                "rlt_prefill_chunk_size": 4,
+                **({"rlt_prefill_window": prefill_window} if prefill_window else {}),
                 "rlt_self_speculation": speculate,
                 "rlt_decode_pipeline": pipeline,
                 "rlt_async_prefill_lookahead": prefill_lookahead,
-                "rlt_batch_decode_coda": batch_decode_coda,
-                "rlt_finish_decode_token": finish_decode_token,
+                "rlt_merge_decode_core": merge_decode_core,
+                "rlt_split_prefill_coda": split_prefill_coda,
             },
         )
         spec = AttentionSpec(block_size=4, num_kv_heads=1, head_size=64, dtype=torch.float16)
@@ -69,6 +92,7 @@ def request(
     threshold=None,
     max_tokens=3,
     stop_token_ids=None,
+    priority=0,
 ):
     from vllm import SamplingParams
 
@@ -81,6 +105,7 @@ def request(
         extra_args["rlt_exit_threshold"] = threshold
     return LoopRequest(
         request_id=request_id,
+        priority=priority,
         prompt_token_ids=prompt or [1, 2, 3],
         sampling_params=SamplingParams(
             temperature=0,
@@ -162,130 +187,279 @@ def test_long_prefill_threshold_leaves_batch_capacity_for_other_requests(schedul
 
 
 @pytest.mark.parametrize("async_scheduling", (False, True))
-@pytest.mark.parametrize("longer_depth", (2, 3))
-def test_decode_coda_can_share_one_already_ready_terminal_core_plan(
-    scheduler_factory, async_scheduling, longer_depth
+def test_prelude_revisits_each_request_and_numbers_chunks_from_zero(
+    scheduler_factory, async_scheduling,
 ):
-    scheduler = scheduler_factory(async_scheduling, batch_decode_coda=True)
-    scheduler.add_request(request("a", loops=1))
-    scheduler.add_request(request("b", loops=longer_depth))
+    scheduler = scheduler_factory(async_scheduling, long_prefill_token_threshold=4, max_num_seqs=2)
+    for req_id in ("a", "b"):
+        scheduler.add_request(request(req_id, prompt=[1] * 20))
 
-    for op in (LoopOp.PRELUDE, LoopOp.CORE, LoopOp.CORE, LoopOp.CORE, LoopOp.CODA):
-        plan = scheduler.schedule()
-        assert plan.op is op and len(plan.spans) == 2
-        complete(scheduler, plan)
+    plan = scheduler.schedule()
 
-    prelude = scheduler.schedule()
-    assert prelude.op is LoopOp.PRELUDE and all(not span.prefill for span in prelude.spans)
-    complete(scheduler, prelude)
-    core = scheduler.schedule()
-    assert core.op is LoopOp.CORE
-    assert [span.last_core for span in core.spans] == [True, False]
-    complete(scheduler, core)
+    assert plan.op is LoopOp.PRELUDE
+    assert [(s.request_id, s.chunk_id, s.token_start, s.token_count) for s in plan.spans] == [
+        ("a", 0, 0, 4), ("b", 0, 0, 4), ("a", 1, 4, 4), ("b", 1, 4, 4),
+    ]
+    assert plan.num_scheduled_tokens == {"a": 8, "b": 8}
 
-    if longer_depth == 2:
-        terminal_core = scheduler.schedule()
-        assert terminal_core.op is LoopOp.CORE
-        assert [(span.request_id, span.last_core) for span in terminal_core.spans] == [("b", True)]
-        complete(scheduler, terminal_core)
-    coda = scheduler.schedule()
-    assert coda.op is LoopOp.CODA
-    assert {span.request_id for span in coda.spans} == ({"a", "b"} if longer_depth == 2 else {"a"})
-    assert all(span.sample for span in coda.spans)
-    complete(scheduler, coda)
+
+def test_prelude_uses_other_candidates_after_a_kv_allocation_fails(scheduler_factory, monkeypatch):
+    scheduler = scheduler_factory()
+    scheduler.add_request(request("blocked", prompt=[1] * 16))
+    scheduler.add_request(request("available", prompt=[2] * 4))
+    allocate = scheduler.kv.allocate_slots
+
+    def allocate_available(req, *args, **kwargs):
+        if req.request_id == "blocked":
+            return None
+        return allocate(req, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler.kv, "allocate_slots", allocate_available)
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.PRELUDE and plan.num_scheduled_tokens == {"available": 4}
+    assert scheduler._states["blocked"].entry_skips == 0
+
+
+def test_prefill_lookahead_cannot_preempt_to_extend_a_batch(scheduler_factory, monkeypatch):
+    scheduler = scheduler_factory(long_prefill_token_threshold=4)
+    scheduler.add_request(request("a", prompt=[1] * 20))
+    allocate = scheduler.kv.allocate_slots
+
+    def fit_first_chunk(req, reserve, **kwargs):
+        return allocate(req, reserve, **kwargs) if reserve <= 4 else None
+
+    monkeypatch.setattr(scheduler.kv, "allocate_slots", fit_first_chunk)
+    monkeypatch.setattr(scheduler, "_preempt_for", lambda *_: pytest.fail("lookahead preempted"))
+    plan = scheduler.schedule()
+    assert plan.num_scheduled_tokens == {"a": 4}
+    complete(scheduler, plan)
+    assert scheduler.schedule().op is LoopOp.CORE
+
+
+@pytest.mark.parametrize("head_rows", (12, 16))
+def test_core_fills_a_real_gap_and_preserves_an_existing_full_batch(scheduler_factory, head_rows):
+    scheduler = scheduler_factory()
+    for req_id, rows, depth in (("shallow", head_rows, 0), ("deep", 4, 2)):
+        req = request(req_id, prompt=[1] * rows)
+        scheduler.add_request(req)
+        work = scheduler._reserve_span(scheduler._states[req_id], rows, [])
+        work.next_op = LoopOp.CORE
+        work.next_depth, work.completed_depth = depth, depth - 1
+
+    plan = scheduler.schedule()
+
+    assert plan.op is LoopOp.CORE
+    assert plan.total_num_scheduled_tokens == 16
+    expected = [("shallow", 0)] if head_rows == 16 else [("deep", 2), ("shallow", 0)]
+    assert [(span.request_id, span.depth) for span in plan.spans] == expected
 
 
 @pytest.mark.parametrize("async_scheduling", (False, True))
-def test_ready_decode_core_finishes_the_same_token_before_coda(scheduler_factory, async_scheduling):
-    scheduler = scheduler_factory(async_scheduling, finish_decode_token=True)
-    scheduler.add_request(request("a", loops=1))
-    scheduler.add_request(request("b", loops=3))
-
-    for op in (LoopOp.PRELUDE, LoopOp.CORE, LoopOp.CORE, LoopOp.CORE, LoopOp.CODA):
-        plan = scheduler.schedule()
-        assert plan.op is op and len(plan.spans) == 2
-        complete(scheduler, plan)
-
-    plan = scheduler.schedule()
-    assert plan.op is LoopOp.PRELUDE and len(plan.spans) == 2
-    complete(scheduler, plan)
-
+def test_prefill_window_charges_inflight_and_pauses_admission_age(
+    scheduler_factory, async_scheduling,
+):
+    scheduler = scheduler_factory(async_scheduling, prefill_window=48)
+    scheduler.add_request(request("first", prompt=[1] * 16))
+    first = scheduler.schedule()
+    assert first.op is LoopOp.PRELUDE
+    assert scheduler._prefill_capacity() == 0
+    scheduler.add_request(request("waiting", prompt=[2] * 16))
+    complete(scheduler, first)
     for depth in range(3):
         plan = scheduler.schedule()
-        assert plan.op is LoopOp.CORE
-        assert [(span.request_id, span.depth) for span in plan.spans] == (
-            [("a", 0), ("b", 0)] if depth == 0 else [("b", depth)]
-        )
+        assert plan.op is LoopOp.CORE and plan.spans[0].depth == depth
+        assert scheduler._states["waiting"].entry_skips == 0
         complete(scheduler, plan)
+    assert scheduler._prefill_capacity() == 16
+    coda = scheduler.schedule()
+    assert coda.op is LoopOp.CODA and coda.spans[0].sample
+    complete(scheduler, coda)
+    assert any(span.request_id == "waiting" for span in scheduler.schedule().spans)
+
+
+@pytest.mark.parametrize("policy,expected", (("fcfs", "older"), ("priority", "higher")))
+def test_request_policy_orders_candidates_in_the_same_stage(scheduler_factory, policy, expected):
+    scheduler = scheduler_factory(policy=policy, max_num_seqs=1)
+    scheduler.add_request(request("older", priority=10))
+    scheduler.add_request(request("higher", priority=0))
+    assert scheduler.schedule().spans[0].request_id == expected
+
+
+def test_aged_admission_orders_by_wait_in_priority_mode(scheduler_factory):
+    scheduler = scheduler_factory(policy="priority", max_num_seqs=1)
+    scheduler.add_request(request("older", priority=10))
+    scheduler.add_request(request("higher", priority=0))
+    for since, request_id in enumerate(("older", "higher"), start=1):
+        state = scheduler._states[request_id]
+        state.entry_ready_since, state.entry_skips = since, 2
+    assert scheduler.schedule().spans[0].request_id == "older"
+
+
+@pytest.mark.parametrize("async_scheduling", (False, True))
+def test_prefill_is_promoted_after_two_ready_skips(scheduler_factory, async_scheduling):
+    scheduler = scheduler_factory(async_scheduling)
+    decoder = request("decode", max_tokens=8)
+    scheduler.add_request(decoder)
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    scheduler.add_request(request("prompt", prompt=[2] * 16))
+    work = scheduler._reserve_span(scheduler._states["prompt"], 16, [])
+    work.next_op = LoopOp.CORE
+    work.next_depth = 1
+    for skips in (1, 2):
+        plan = scheduler.schedule()
+        assert all(span.request_id == "decode" for span in plan.spans)
+        assert work.skips == skips
+        complete(scheduler, plan)
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.CORE and plan.spans[0].request_id == "prompt"
+    assert work.skips == 0
+
+
+@pytest.mark.parametrize("async_scheduling", (False, True))
+def test_decode_coda_precedes_ready_core_and_prefill_first_token(
+    scheduler_factory, async_scheduling,
+):
+    scheduler = scheduler_factory(async_scheduling)
+    scheduler.add_request(request("decode"))
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    scheduler.add_request(request("prompt", prompt=list(range(16))))
+    for request_id in ("decode", "prompt"):
+        work = scheduler._reserve_span(scheduler._states[request_id], 16, [])
+        work.next_op = LoopOp.CODA
+        work.next_depth = work.completed_depth = work.depth_limit - 1
 
     plan = scheduler.schedule()
     assert plan.op is LoopOp.CODA
-    assert {span.request_id for span in plan.spans} == {"a", "b"}
-    assert all(span.sample for span in plan.spans)
+    assert [(span.request_id, span.sample, span.token_count) for span in plan.spans] == [
+        ("decode", True, 1)
+    ]
 
 
 @pytest.mark.parametrize("async_scheduling", (False, True))
-def test_prefill_and_decode_can_catch_up_before_a_shared_core(scheduler_factory, async_scheduling):
-    scheduler = scheduler_factory(async_scheduling, finish_decode_token=True)
-    for request_id in ("ahead", "catch_up"):
-        scheduler.add_request(request(request_id, loops=3))
-    for op in (LoopOp.PRELUDE, LoopOp.CORE, LoopOp.CORE, LoopOp.CORE, LoopOp.CODA):
-        plan = scheduler.schedule()
-        assert plan.op is op
+@pytest.mark.parametrize("lag_depth,skips,can_join", ((2, 0, True), (1, 0, True), (1, 1, False)))
+def test_decode_batches_join_within_two_ready_opportunities(
+    scheduler_factory, async_scheduling, lag_depth, skips, can_join,
+):
+    scheduler = scheduler_factory(async_scheduling, max_num_seqs=4)
+    names = ("a", "b", "c", "d")
+    for name in names:
+        scheduler.add_request(request(name, max_tokens=8))
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    for name in names:
+        work = scheduler._reserve_span(scheduler._states[name], 1, [])
+        if name == "a":
+            work.next_op = LoopOp.CODA
+            work.next_depth = work.completed_depth = 2
+            work.skips = skips
+        else:
+            work.next_op = LoopOp.CORE
+            work.next_depth, work.completed_depth = lag_depth, lag_depth - 1
+
+    if can_join:
+        for depth in range(lag_depth, 3):
+            plan = scheduler.schedule()
+            assert plan.op is LoopOp.CORE
+            assert [(span.request_id, span.depth) for span in plan.spans] == [
+                (name, depth) for name in names[1:]
+            ]
+            complete(scheduler, plan)
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.CODA
+    assert set(plan.num_scheduled_tokens) == (set(names) if can_join else {"a"})
+    if can_join:
         complete(scheduler, plan)
+        for _ in range(10):
+            plan = scheduler.schedule()
+            assert set(plan.num_scheduled_tokens) == set(names)
+            complete(scheduler, plan)
 
-    scheduler.add_request(request("prompt"))
-    for request_id, depth in (("ahead", 2), ("catch_up", 1), ("prompt", 1)):
-        state = scheduler._states[request_id]
-        work = scheduler._reserve_span(state, 8, [])
-        work.next_op = LoopOp.CORE
-        work.next_depth = depth
-        work.completed_depth = depth - 1
 
-    catching_up = scheduler.schedule()
-    assert catching_up.op is LoopOp.CORE
-    assert {(span.request_id, span.depth, span.prefill) for span in catching_up.spans} == {
-        ("catch_up", 1, False),
-        ("prompt", 1, True),
-    }
-    complete(scheduler, catching_up)
+@pytest.mark.parametrize("async_scheduling", (False, True))
+@pytest.mark.parametrize("cancel_in_flight", (False, True))
+def test_prefill_coda_can_fill_seven_rows_and_preserve_the_final_token(
+    scheduler_factory, async_scheduling, cancel_in_flight,
+):
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import RequestStatus
 
-    shared = scheduler.schedule()
-    assert shared.op is LoopOp.CORE
-    assert {span.request_id for span in shared.spans} == {"ahead", "catch_up", "prompt"}
-    assert all(span.depth == 2 and span.last_core for span in shared.spans)
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+    scheduler = scheduler_factory(
+        async_scheduling,
+        prefix=True,
+        prefill_lookahead=True,
+        split_prefill_coda=True,
+        max_num_batched_tokens=8,
+    )
+    decoder = request("decode", max_tokens=2)
+    prompt = request("prompt", prompt=list(range(8)), block_hasher=hasher)
+    probe = request("probe", prompt=list(range(9)), block_hasher=hasher)
+    scheduler.add_request(decoder)
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    scheduler.add_request(prompt)
+    for req in (decoder, prompt):
+        work = scheduler._reserve_span(scheduler._states[req.request_id], 8, [])
+        work.next_op = LoopOp.CODA
+        work.next_depth = work.completed_depth = work.depth_limit - 1
+    blocks = scheduler.kv.get_block_ids("prompt")
+
+    prefix = scheduler.schedule()
+    assert prefix.op is LoopOp.CODA
+    assert prefix.total_num_scheduled_tokens == 8
+    assert [
+        (row.request_id, row.token_start, row.token_count, row.sample, row.coda_remainder)
+        for row in prefix.spans
+    ] == [("decode", 3, 1, True, 0), ("prompt", 0, 7, False, 1)]
+    assert not scheduler.schedule().spans
+    _, hit_before_ack, _ = scheduler.kv.get_computed_blocks(probe)
+    assert hit_before_ack == 0
+    if cancel_in_flight:
+        scheduler.finish_requests("prompt", RequestStatus.FINISHED_ABORTED)
+        assert scheduler.has_request("prompt")
+        complete(scheduler, prefix)
+        assert not scheduler.has_request("prompt")
+        assert "prompt" in scheduler.schedule().finished_req_ids
+        _, hit_after_abort, _ = scheduler.kv.get_computed_blocks(probe)
+        assert hit_after_abort == 0
+        return
+
+    complete(scheduler, prefix)
+    assert prompt.num_computed_tokens == 7
+    assert prompt.num_output_tokens == 0
+    assert scheduler.kv.get_block_ids("prompt") == blocks
+    _, hit_after_prefix, _ = scheduler.kv.get_computed_blocks(probe)
+    assert hit_after_prefix == 4
+
+    suffix = scheduler.schedule()
+    assert suffix.op is LoopOp.CODA
+    assert [(row.token_start, row.token_count, row.sample) for row in suffix.spans] == [
+        (7, 1, True),
+    ]
+    assert suffix.scheduled_cached_reqs.num_computed_tokens == [7]
+    assert suffix.scheduled_cached_reqs.new_block_ids == [None]
+    complete(scheduler, suffix)
+    assert prompt.num_computed_tokens == 8
+    assert prompt.num_output_tokens == 1
+    _, hit_after_suffix, _ = scheduler.kv.get_computed_blocks(probe)
+    assert hit_after_suffix == 8
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
-def test_running_requests_advance_before_new_prefill(scheduler_factory, async_scheduling):
+def test_full_prelude_does_not_starve_ready_core(scheduler_factory, async_scheduling):
     scheduler = scheduler_factory(async_scheduling)
-    scheduler.add_request(request("a", prompt=list(range(24))))
-    scheduler.add_request(request("b", prompt=list(range(12))))
-    scheduler.add_request(request("c", prompt=list(range(24))))
-
-    for op in (LoopOp.PRELUDE, LoopOp.CORE, LoopOp.CORE, LoopOp.CORE, LoopOp.CODA):
+    for name in ("a", "b", "c", "d"):
+        scheduler.add_request(request(name, prompt=list(range(16))))
+    for name in ("a", "b"):
         plan = scheduler.schedule()
-        assert plan.op is op
-        assert [(s.request_id, s.token_start, s.token_count) for s in plan.spans] == [("a", 0, 16)]
-        assert not complete(scheduler, plan)
-
-    second_chunk = scheduler.schedule()
-    assert second_chunk.op is LoopOp.PRELUDE
-    assert [(s.request_id, s.token_start, s.token_count) for s in second_chunk.spans] == [
-        ("a", 16, 8),
-        ("b", 0, 8),
-    ]
-    complete(scheduler, second_chunk)
-    for _ in range(4):
-        complete(scheduler, scheduler.schedule())
-
-    mixed = scheduler.schedule()
-    assert mixed.op is LoopOp.PRELUDE
-    assert [(s.request_id, s.prefill, s.token_count) for s in mixed.spans] == [
-        ("a", False, 1),
-        ("b", True, 4),
-        ("c", True, 11),
-    ]
+        assert plan.op is LoopOp.PRELUDE and plan.num_scheduled_tokens == {name: 16}
+        complete(scheduler, plan)
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.CORE and plan.num_scheduled_tokens == {"a": 16}
 
 
 def test_waiting_prefill_cannot_preempt_running_request(scheduler_factory, monkeypatch):
@@ -320,33 +494,23 @@ def test_waiting_prefill_cannot_preempt_running_request(scheduler_factory, monke
     assert not decode.finished_req_ids
 
 
-def test_reserved_prefill_coda_gets_budget_after_being_skipped(scheduler_factory):
+def test_prefill_coda_gets_budget_after_two_ready_skips(scheduler_factory):
     scheduler = scheduler_factory()
     scheduler.add_request(request("a", loops=1))
-    for _ in range(6):
+    for _ in range(7):
         complete(scheduler, scheduler.schedule())
-    a_core = scheduler.schedule()
-    assert a_core.op is LoopOp.CORE and a_core.spans[0].last_core
-
     scheduler.add_request(request("b", prompt=list(range(24))))
-    for _ in range(3):
-        complete(scheduler, scheduler.schedule())
-    b_core = scheduler.schedule()
-    assert b_core.op is LoopOp.CORE and b_core.spans[0].last_core
-    complete(scheduler, a_core)
-    complete(scheduler, b_core)
-
-    decode = scheduler.schedule()
-    assert decode.op is LoopOp.CODA
-    assert [(span.request_id, span.sample, span.token_count) for span in decode.spans] == [
-        ("a", True, 1)
-    ]
-    complete(scheduler, decode)
+    work = scheduler._reserve_span(scheduler._states["b"], 16, [])
+    work.next_op = LoopOp.CODA
+    work.next_depth = work.completed_depth = work.depth_limit - 1
+    for skips, op in enumerate((LoopOp.CODA, LoopOp.PRELUDE), start=1):
+        plan = scheduler.schedule()
+        assert plan.op is op and "a" in plan.num_scheduled_tokens
+        assert work.skips == skips
+        complete(scheduler, plan)
     prefill = scheduler.schedule()
     assert prefill.op is LoopOp.CODA
-    assert [(span.request_id, span.sample, span.token_count) for span in prefill.spans] == [
-        ("b", False, 16)
-    ]
+    assert prefill.num_scheduled_tokens == {"b": 16}
 
 
 def test_async_cancel_waits_for_every_inflight_core_step(scheduler_factory):
@@ -470,7 +634,9 @@ def test_async_prefill_stages_next_chunk_without_committing_pending_kv(
     init_none_hash(sha256)
     hasher = get_request_block_hasher(4, sha256)
     prompt = list(range(24))
-    scheduler = scheduler_factory(async_scheduling=True, prefix=True, prefill_lookahead=True)
+    scheduler = scheduler_factory(
+        async_scheduling=True, prefix=True, prefill_lookahead=True, shared_kv=True,
+    )
     requested = request("a", prompt=prompt, block_hasher=hasher)
     probe = request("prefix_probe", prompt=prompt, block_hasher=hasher)
     scheduler.add_request(requested)
@@ -527,25 +693,20 @@ def test_async_prefill_stages_next_chunk_without_committing_pending_kv(
     assert requested.num_computed_tokens == 24
 
 
-def test_wavefront_reads_only_completed_previous_depths(scheduler_factory):
-    scheduler = scheduler_factory(wavefront=True)
-    requested = request("wave", prompt=list(range(12)))
-    scheduler.add_request(requested)
-    written = set()
-    mixed_work = False
-    while not requested.num_output_tokens:
-        plan = scheduler.schedule()
-        assert plan.spans
-        if plan.op is LoopOp.CORE:
-            for span in plan.spans:
-                if span.token_start:
-                    assert (span.token_start - 4, span.depth) in written
-            mixed_work |= len({span.depth for span in plan.spans}) > 1
-            written.update((span.token_start, span.depth) for span in plan.spans)
-        complete(scheduler, plan)
-    assert mixed_work
-    assert written == {(position, depth) for position in (0, 4, 8) for depth in range(3)}
-    assert requested.num_computed_tokens == 12
+@pytest.mark.parametrize("async_scheduling", (False, True))
+def test_later_chunk_waits_for_previous_core_kv(scheduler_factory, async_scheduling):
+    scheduler = scheduler_factory(async_scheduling, long_prefill_token_threshold=4)
+    scheduler.add_request(request("a", prompt=[1] * 8))
+    prelude = scheduler.schedule()
+    complete(scheduler, prelude)
+    first = scheduler.schedule()
+    assert [(s.chunk_id, s.depth) for s in first.spans] == [(0, 0)]
+    pending = scheduler.schedule()
+    assert not any(s.chunk_id == 1 for s in pending.spans)
+    complete(scheduler, first)
+    if pending.spans:
+        complete(scheduler, pending)
+    assert any(s.chunk_id == 1 for s in scheduler.schedule().spans)
 
 
 def test_adaptive_decode_does_not_issue_a_deeper_step_before_exit(scheduler_factory):

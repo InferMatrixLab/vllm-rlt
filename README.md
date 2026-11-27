@@ -69,12 +69,14 @@ vllm-rlt serve /path/to/inkling-varloop \
 
 The vLLM worker warmup captures the selected Inkling shapes before serving.
 `FULL` captures uniform decode operations. `PIECEWISE` captures the stable
-parts of the operation and runs dynamic attention eagerly. Mixed-depth CORE
-and unmatched shapes use eager execution.
+parts of prefill and compatible mixed CORE operations with dynamic attention.
+The scheduler can prepare multiple chunks from a request and fill spare CORE
+capacity with ready work at other depths when the worker supports it. Use
+`--rlt-prefill-chunk-size` to cap one prompt chunk and `--rlt-prefill-window`
+to cap uncompleted prefill CORE rows. The default window holds two full
+prefill batches across all CORE rounds. Use `--scheduling-policy fcfs` or
+`--scheduling-policy priority` to select request ordering.
 
-Use `--rlt-mixed-core` to share CORE projections and MLP/MoE, and
-`--rlt-packed-prefill` to run ragged prompt chunks in the same CORE forward.
-The latter works with `--rlt-wavefront-prefill --rlt-prefill-chunk-size 16`.
 `--rlt-self-speculation --rlt-decode-pipeline` allows Inkling to start one
 tentative token before verifying the prior proposal. These flags are opt-in.
 The [development log](docs/plugin-development.md) records output comparisons,

@@ -3,6 +3,7 @@
 - 工作分支为 `vllm-rlt-plugin2`，起点为主仓 `4821d47`。
 - 设计目标为 vLLM `0.34.0rc1.dev1149+g3146a9df4`，本地实际验证使用同一 Git revision `3146a9df4140`。该构建环境的生成版本标签为 `0.26.1rc1.dev6849+g3146a9df4`。
 - 每轮记录本轮范围、复现命令、实际结果和待核实项。改动在当前工作区留为 unstaged，供 VS Code 审阅。
+- [Loop 调度策略规格](#loop-调度策略规格) 记录三阶段队列、优先级、合批规则和验收例子。
 
 ## 阶段一 功能实现
 
@@ -1183,7 +1184,7 @@ Decode pipeline。每边完整热身后无 profiler 各跑三波，取三波中�
 
 #### 已开始的 span 在后续调度中再切分
 
-记录一条待实现的调度优化。比如一个 8-token prefill span 已完成 CORE，正在等
+最初记录的调度优化。比如一个 8-token prefill span 已完成 CORE，正在等
 CODA，而下一次 CODA 还有 7 个空位。调度器可把它拆成 7 和 1，先让前 7 个进入
 这次提交。最后 1 个继续保有自己的起点、hidden state 和执行进度。
 
@@ -2342,6 +2343,1649 @@ TPOT、ITL 的分位数，按深度统计，以及首次 token 分歧位置。
 [72 波汇总与逐波原始数据路径](../artifacts/plugin2-perf.9pulvo/metadata-graph-opt/w1w7-depth/final-b3-matrix-20261127/summary.json) ·
 [运行计划与卡位](../artifacts/plugin2-perf.9pulvo/metadata-graph-opt/w1w7-depth/final-b3-matrix-20261127/plan.json)
 
+### W3 C16 调度优先级复测
+
+在 `rlt_finish_decode_token` 路径中，已就绪 CORE 连续因同轮对齐落选后进入已有
+等待优先级，触发次数为 `max(1, num_loops - 1)`。其次优先能交付首 token 的
+prefill CODA。普通 decode CODA 在已就绪的 CORE 能于剩余等待额度内补进同一批
+且预算放得下时短等。每次选定一个 op 后，继续合入兼容且预算放得下的请求。
+同步与异步调度回归覆盖两次轮次冲突后推进，以及等待额度不足时交付 CODA。
+插件测试 93 通过、2 跳过。
+
+W3 C16 使用原 1,024 token 预算、原图档和 80 GiB KV，32 个 4,096-token 请求
+各生成 128 token，动态组实际轮数为 8/8/16，P/D 同批开启。在 GPU 7 完整预热后
+分别跑三波。各正式波 GPU 独占，采样 SM 为 2,032 MHz。
+
+| 运行组 | 吞吐中位数（tok/s） | TTFT P95（ms） |
+| --- | ---: | ---: |
+| 原生固定三轮 | 1,015.85 | 1,228.46 |
+| b3 动态，原策略 | 1,019.69 | 1,230.09 |
+| 1→2→3 动态，首轮 | 919.28 | 1,422.07 |
+| 1→2→3 动态，原样复测 | 1,019.81 | 1,229.78 |
+| 3→2→1 动态，单独启动 | 1,016.59 | 1,232.40 |
+
+保留首轮回退数据。相同源码和参数的复测未重现回退，首轮慢因未定位。另做两组
+独立消融，等待上限加首 token 优先在 GPU 7 为 1,018.26 tok/s，等待上限加严格
+CODA 让行在 GPU 4 为 1,015.88 tok/s，同卡 b3 为 1,018.10。
+[首轮原始正式波](../artifacts/w3-scheduler-priority-20261127/comparison.json) ·
+[1→2→3 原样复测](../artifacts/w3-scheduler-priority-20261127/gpu7/candidate/combined-retake/summary.json) ·
+[3→2→1 独立正式波](../artifacts/w3-scheduler-priority-20261127/gpu7/candidate/reverse-321/summary.json)
+
+两个独立结构波均为 1,659 个逻辑计划与实际 forward，FULL/PIECEWISE 为
+1,004/655，32 条请求逐位置轮数通过。实际 P/D 的 PRELUDE/CORE/CODA 次数分别为
+126/360/122。分别对任一结构波中的相同就绪集合评估两种顺序，1,333 次判断仅
+一处有分歧。1→2→3 先跑已等待的 CORE，3→2→1 先发首 token CODA。第 3 项
+未在该波与前两项争抢同一步。
+[1→2→3 同就绪集合检查](../artifacts/w3-scheduler-priority-20261127/gpu4/candidate-structure/priority-123-shadow/priority-shadow.json) ·
+[3→2→1 同就绪集合检查](../artifacts/w3-scheduler-priority-20261127/gpu7/candidate-structure/reverse-321/priority-shadow.json)
+
+同一热服务内交替执行两种顺序，每种三波。正序和倒序的吞吐中位数分别为
+1,018.76 和 1,018.82 tok/s，三对吞吐差为 −0.007%、−0.003%、+0.134%，
+96 条完整输出全部一致。工作区保留正序及其防饥饿逻辑。
+[同一热服务六波数据](../artifacts/w3-scheduler-priority-20261127/gpu7/priority-interleaved/summary.json)
+
+#### 动态轮次的费用模型
+
+GPU 4 分别采集原生固定三轮、RLT 固定三轮和 RLT 动态轮次各一波。诊断波
+用 CUDA event 量区间，正式吞吐以无插桩波为准。两组 RLT 的逐位置轮数均通过。
+三组首 token 均为 32/32 一致；RLT 两组均为三轮的 16 条请求有 14 条完整输出一致。
+
+| RLT 诊断项 | 固定三轮 | 动态轮次 | 变化 |
+| --- | ---: | ---: | ---: |
+| 实际 decode CORE 行 | 12,192 | 9,144 | −25.0% |
+| 纯 decode CORE 提交 | 591 | 600 | +9 |
+| 纯 decode CORE 图宽合计 | 8,436 | 6,980 | −17.3% |
+| 含 prefill 的 CORE 提交 / 图宽合计 | 393 / 398,208 | 393 / 398,208 | 0 |
+| CORE 模型区间（ms） | 3,076.49 | 3,015.57 | −60.91 |
+| CODA 模型区间（ms） | 543.66 | 565.58 | +21.92 |
+| forward 内、模型外（ms） | 105.93 | 121.18 | +15.25 |
+| 采样区间（ms） | 72.61 | 77.75 | +5.14 |
+| 完整设备流跨度（ms） | 4,282.16 | 4,256.48 | −25.68 |
+
+到最后一个含 prefill 的 forward 为止，设备流为 3,467.54→3,470.59 ms。
+之后的纯 decode 尾部为 814.62→785.89 ms。动态组的净收益主要来自尾部。
+
+在这组长上下文纯 decode 中，先按 CUDA Graph 补齐宽度估计每次 CORE 的模型
+时间。用固定组各档的平均耗时和动态组各档的批数，预测动态组为 894.29 ms，
+实测 887.64 ms，误差 6.65 ms。固定组 B8 和 B16 平均分别为 1.369 和 1.649 ms。
+若两批 B8 在同一物理 CORE 路径上可合，合成 B16 估计节省 1.09 ms。动态组有
+145 个实际 12 行的纯 decode CORE 批仍执行 B16。按实际行数等比例折算耗时会
+高估收益。该模型以 W3 C16 的一对诊断波校验，其他长度、图模式和模型需要单独标定。
+
+调度比较同一就绪集合中的可执行组批方案。先满足数据依赖、首 token 和等待上限，
+在这些约束内，按可减少的物理提交及其图档费用排序。需等待的合批要计入因此
+增加的关键路径时间。CORE 只计入 Worker 能实际合入同一物理批的工作。
+[分段 Host/Device 时间轴](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/timeline.html) ·
+[图档模型和区间汇总](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/analysis.json) ·
+[原始采集校验](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/validation.json)
+
+#### 第三条补齐纯 decode CORE 合批
+
+此前等待合批的判断覆盖已就绪的 decode CODA。有 prefill CORE 时，调度可以按
+当前轮次对齐；纯 decode 的相邻两轮则可能一起进入一份调度计划，随后由 Worker
+拆为两次物理提交。只改变选首条请求的优先级无法把这两批合成一个。
+
+现有 `rlt_finish_decode_token` 与 `rlt_merge_decode_core` 同时开启时，在支持
+单 token FULL 合批的普通路径上检查相邻两轮的 CORE。如果较浅的一组执行一轮后
+能全部赶上，合批能落在配置的 FULL 图档，且补齐总行数和调度预算允许，就先发
+较浅一组。等候的请求进入现有等待优先级，避免再次为该下轮合批让行。已有
+CODA 能出 token 时优先使用原有 CODA 规则。同步和异步回归覆盖 4 条第 1 轮、
+12 条第 2 轮时先发 4 条、随后发 16 条，以及浅轮会直接结束时不等待。
+
+首次 GPU 启动的冻结副本缺少插件注册元数据，补齐后服务可用。另一次复测中，
+Worker 在 UniProc 内把 EngineCore 共享的图模式改成了 NONE，导致调度器无法
+开启这条规则。Worker 现在持有本地编译配置来关闭原生整模型图，调度器仍读取
+EngineCore 的原始图档配置。已测试 Worker 图模式和共享 KV 配置的所有权。
+插件测试 98 通过、2 跳过。
+
+上轮 W3 C16 的 993 个 CORE 调度计划均只含一个当前轮次。145 个 B12 中，
+141 个在第 2 轮，其中 130 个紧接同一批请求的第 1 轮 B16，少掉的四条均已
+达到请求指定的一轮上限。这类空位无法靠让同一批的请求赶上来补齐。
+[B12 成因与轮次校验](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/core-coalescing-opportunities.json)
+
+修复配置后，GPU 4 独立结构波确认调度器读取到 `1, 2, 4, 8, 16, 24, 32`，
+与 Worker 实际捕获一致。600 次纯 decode CORE 检查均只有一个当前轮次就绪，
+等待合批触发零次。32 条请求逐位置轮数校验通过，1,659 个物理 forward 均回放
+CUDA Graph，FULL/PIECEWISE 为 1,004/655。
+[第三条触发计数](../artifacts/w3-scheduler-priority-20261127/gpu4/core-coalescing-structure-worker-config/core-defer-counts.json) ·
+[结构验收](../artifacts/w3-scheduler-priority-20261127/gpu4/core-coalescing-structure-worker-config/structural-summary.json)
+
+GPU 7 使用同一热服务，原预算 1,024、原 FULL/PIECEWISE 图档及 80 GiB KV，
+交错测试开关各三波。正式波均 GPU 独占、SM 2,032 MHz，96 条完整输出一致。
+
+| 新增纯 decode CORE 等待合批 | 吞吐中位数（tok/s） | TTFT P95（ms） |
+| --- | ---: | ---: |
+| 关 | 1,020.41 | 1,230.51 |
+| 开 | 1,020.04 | 1,231.26 |
+
+三对的吞吐差为 −0.016%、+0.027%、−0.157%。这次 W3 没有验证到吞吐收益。
+[同服务交错六波数据](../artifacts/w3-scheduler-priority-20261127/gpu7/core-coalescing-interleaved-worker-config/summary.json)
+
+#### 普通 prefill CODA 按剩余预算再切分
+
+`--rlt-split-prefill-coda` 默认为关。开启后仅在普通 Inkling prefill 已完成全部
+CORE、没有在途操作、且本次 CODA 存在剩余预算时考虑切分。先选预算内放得下的
+完整段，仍有空位时再从一个超出剩余预算的段切出前缀。每个原段最多切一次，
+尾段在前缀 CODA 回执后才能入批。
+
+Scheduler 保留已预留的 KV 块，分别提交两段的 token 区间。Worker 在读取完成
+CORE 的中间状态时按行取前缀，并保留尾段的视图。已有 MRv2 请求进度和块表用于
+计划中的实际 token 位置。前缀不采样，每次 CODA 完成只提交对应的已计算前缀，
+只有含原 prompt 最后一个 token 的尾段能交付首 token。
+
+CPU 覆盖 1 个 decode token 加 7 个 prefill token、之后尾段 1 个 token 的执行次序，
+验证同步/异步的首 token、KV 复用、prefix cache 提交，以及取消时等在途 CODA
+返回后释放。Worker 状态测试验证尾段取到原位置的行。插件测试 103 通过、2 跳过。
+
+W3 C16 动态轮次固定原 1,024-token 预算、原图档、80 GiB KV。GPU 7 同一热服务
+做关闭和开启各三波。吞吐中位数 1,018.13→1,018.09 tok/s，TTFT P95
+1,229.85→1,229.67 ms。96 条输出逐 token 一致。GPU 4 独立自然诊断中未触发
+切分，仍有 1,659 个实际 forward。131 个含 prefill 的 CODA 中 124 个已经
+装满 1,024 行，4 个已有 1,023 行。
+[W3 正式六波](../artifacts/w3-scheduler-priority-20261127/gpu7/prefill-coda-split-interleaved/summary.json) ·
+[自然切分计数](../artifacts/w3-scheduler-priority-20261127/gpu4/prefill-coda-split-diagnostic-retry/normal-cuda.splits.json)
+
+定向 GPU 正确性把一拍的预算从 1,024 临时收紧到 1,023。B 的已就绪 prefill
+CODA 长 1,023，A 的 decode CODA 长 1。开启时把 B 的前 1,022 行与 A 合批，
+B 的最后一行随后单独回放 PIECEWISE。关闭时 A 先发，B 的 1,023 行整批随后发。
+两组各 1,660 个物理 forward，逐位置通过，32 条完整输出逐 token 一致。这个
+定向波用于验证真实切分和后续 KV 接续。
+[W3 定向 GPU 校验](../artifacts/w3-scheduler-priority-20261127/gpu4/prefill-coda-split-diagnostic-targeted/summary.json)
+
+W7 用原 ShareGPT 语料 64 条、C32、异步调度、动态轮次 16/16/32。输入 16–2,505
+token，中位数 84.5；每波输出均为 32,768 token，允许自然 EOS，实际均达到 512
+上限。GPU 7 用同一热服务交错开关各三波，原 1,024-token 预算和图档。吞吐
+中位数 3,922.27→3,911.80 tok/s，TTFT P50/P95 69.91/261.82→68.45/260.61 ms。
+TPOT P95 8.027→8.048 ms，ITL P95 8.008→8.024 ms。跨开关首 token 190/192
+一致、完整输出 150/192 一致。在开关各自的重复波内也发生了相当规模的输出差异。
+[W7 正式六波](../artifacts/w3-scheduler-priority-20261127/gpu7/prefill-coda-split-W7-interleaved/summary.json)
+
+GPU 4 的独立自然结构波触发一次切分，把一段 11 行的 CODA 分成 5 和 6。
+相邻三批的真实行从 1,019/794/235 变为 1,024/1,018/6，图档从
+1,024/1,024/256 变为 1,024/1,024/8，共少 248 个图档行。两臂仍各为
+23 个含 prefill 的 CODA、5,199 个物理 forward 和 1,040 次采样。两臂逐位置
+校验通过，64 条完整输出逐 token 一致。这个 W7 验证了自然负载能触发，吞吐
+测试没有显示收益，实验开关保持默认关闭。
+[W7 自然结构对照](../artifacts/w3-scheduler-priority-20261127/gpu4/prefill-coda-split-W7-structure/summary.json)
+
+#### 整波吞吐费用模型
+
+物理批按 op、当前 CORE 轮次、图模式和补齐后的图宽归档。用 GPU 4 固定三轮
+诊断波标定每档的平均模型区间和 forward 内模型外区间。整波模型以各档批数乘
+对应平均费用求和，再计入采样调用数乘平均采样费用及基准未覆盖的流区间。
+动态组 39 个档均有固定组标定样本，预测只使用动态组的批数和采样次数。
+
+| W3 C16 动态组诊断项 | 预测（ms） | 实测（ms） |
+| --- | ---: | ---: |
+| PRELUDE | 471.45 | 466.36 |
+| CORE | 3,028.57 | 3,015.57 |
+| CODA | 547.44 | 565.58 |
+| Forward 内模型外 | 106.24 | 121.18 |
+| 采样及未覆盖区间 | 88.47 | 87.79 |
+| 整波设备流 | 4,242.16 | 4,256.48 |
+
+整波偏差 −14.32 ms（−0.34%）。相对于固定组，预计设备流吞吐增益 +0.94%，
+实测 +0.60%。这是已知批计划条件下的一对诊断波校验，尚未验证跨负载的绝对
+时间和请求级 TTFT。CODA 和模型外区间的单项低估分别为 18.14 和 14.95 ms。
+
+等输出 token 数下，要提高吞吐比例 (g)，整波时间需少 (Tg/(1+g))。
+从无插桩基准计算，W3 C16 的 +3%/+5% 需要省 117/192 ms，W7 需要
+243/398 ms。W7 切分只改变三个相邻 CODA 批，CUDA event 区间合计
+6.71→5.85 ms。在其余开销相同的条件下，0.85 ms 对 W7 整波约 0.01%
+吞吐，远低于整波 1% 所需的 83 ms。
+[整波性能模型脚本](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/performance_model.py) ·
+[40 档标定批数、均值及逐项乘积](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/performance-bucket-costs.csv) ·
+[标定、校验和阈值](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/performance-model.json)
+
+对应 W3 动态诊断波，采样 77.75 ms，forward 内模型外 121.18 ms，未标记
+区间 10.04 ms。采样按真实产出量计，4,096 token 在 C16 至少需 256 次采样，
+实际 335 次，以当前每次平均 0.2321 ms 计，压到理论次数约省 18.34 ms。
+W7 的 32,768 token 在 C32 至少需 1,024 次，实际 1,040 次，按相同口径约省
+3.65 ms。W3 只有 8 次零产出采样，共 1.57 ms。
+
+W3 forward 内模型外的 121.18 ms 中，85.49 ms 属于 PRELUDE，其中
+70.28 ms 属于 P/D 混批。间隔 10.04 ms 仅是 CUDA event 标记之外的区间。
+含 prefill 的 CORE 模型区间为 2,127.93 ms，其中 387 批使用 PIECEWISE 1,024。
+同一诊断波上，吞吐提高 3% 需省约 124 ms。如果收益全来自这 387 批，
+每批平均需省 0.32 ms。实际可省的准备、重组和图 staging 时间仍需按组件测量。
+
+W3 C16 动态诊断波按 GPU 区间无重叠分解，总和为 4,256.48 ms。下表的吞吐敏感度
+假设该行耗时降低 10%、同波输出和其他区间保持相同。
+
+| 区间 | 纯 prefill（ms） | P/D（ms） | 纯 decode（ms） | 合计（ms） | 整波吞吐敏感度 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PRELUDE 模型 | 10.65 | 315.64 | 140.07 | 466.36 | +1.11% |
+| CORE 第 1 轮模型 | 19.62 | 571.10 | 262.72 | 853.44 | +2.05% |
+| CORE 第 2 轮模型 | 77.12 | 694.86 | 328.68 | 1,100.67 | +2.65% |
+| CORE 第 3 轮模型 | 77.98 | 687.25 | 296.24 | 1,061.46 | +2.56% |
+| CODA 模型 | 78.29 | 335.30 | 151.98 | 565.58 | +1.35% |
+| PRELUDE forward 内模型外 | 3.48 | 70.28 | 11.73 | 85.49 | +0.20% |
+| CORE forward 内模型外 | 0.71 | 10.14 | 14.41 | 25.27 | +0.06% |
+| CODA forward 内模型外 | 0.15 | 4.61 | 5.66 | 10.43 | +0.02% |
+| 有输出采样 | 0.19 | 28.70 | 47.30 | 76.18 | +0.18% |
+| 零输出采样 | 1.57 | 0 | 0 | 1.57 | +0.004% |
+| 标记外区间 | — | — | — | 10.04 | +0.02% |
+
+其中截至最后一个含 prefill 的 forward 为 3,470.59 ms，之后纯 decode 785.89 ms。
+Host 累计调度 262.41 ms，forward 提交 3,451.01 ms，采样 81.75 ms，回执更新
+29.49 ms。Host forward 包含模型区间，Host 与 Device 并行，不能叠到表内。
+
+同卡固定与动态诊断波的续入 16 条里，入队到首个计划中位数 38.82→107.68 ms，
+首次 Worker 提交到首 token CODA 回执 117.87→117.95 ms，客户端 TTFT
+161.39→230.74 ms。入队到首计划之间经过的已满 PRELUDE 批中位数由 1 增到 4。
+这将该波的 TTFT 差异定位到新请求取得首段调度预算之前。
+[三组完整分段表](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/performance-breakdown.csv) ·
+[Host 逐请求区间及图档分布](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/performance-breakdown.json)
+
+#### PIECEWISE 图档固定步长回算
+
+用已有物理批的真实行数选择能容纳该批的最小图档。只替换 PIECEWISE 档位，
+保持 FULL 请求数档、调度预算和每批成员。小档沿用原始列表，超过 128 或 256
+后分别每 128 或 256 取一档。原 1,024 预算的 PIECEWISE 档数由 12 增为
+16 或 13。与当前 pin 的 vLLM 原生 grid 同时回算。
+
+| 负载 | 原档物理行 | 每 128 档 | 每 256 档 | vLLM 原生 grid |
+| --- | ---: | ---: | ---: | ---: |
+| W3 C16 动态，预算 1,024 | 663,680 | 663,040 | 663,680 | 662,800 |
+| W7 C32 动态，预算 1,024 | 108,544 | 102,272 | 105,984 | 101,952 |
+| 历史 W3 C16，预算 8,192，按同一 trace 的稀疏图档作基线 | 766,208 | 659,072 | 662,528 | 662,440 |
+
+W3 原预算 655 个 PIECEWISE 批仅 5 个可通过 128 档缩小，固定与动态均少
+640 行。W7 基线 114 个 PIECEWISE 批中，128 档缩小 29 批，256 档缩小
+10 批。若模型时间与图宽成比例，W3/W7 的 128 档预计分别省约 2.63/25.69 ms。
+这是几何与时间敏感度回算，新档单批 CUDA 耗时和正式吞吐尚无实测。
+历史 8,192 预算的 128/256/vLLM 原生档数为 72/41/54。
+[图档回算脚本](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/project_prefill_grids.py) ·
+[逐负载档位、物理行和阶段计数](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/prefill-grid-projection.json)
+
+W3 C16 实测保留预算 1,024、80 GiB KV 和原来 7 个 FULL 图档。GPU 7
+启动时捕捉 128 步长的 16 档超集，在同一热服务内只切换可选的 PIECEWISE 档。
+三个档分别完整预热，在三轮平衡顺序中每组测三波，均采样为 GPU 独占和 2,032 MHz。
+早期 GPU 3 的一轮含外部进程，保留原记录，正式表采用 GPU 7 的完整重跑。
+
+| PIECEWISE 档 | 吞吐中位数（tok/s） | TTFT P50/P95（ms） | TPOT P95（ms） | ITL P95（ms） |
+| --- | ---: | ---: | ---: | ---: |
+| 原 12 档 | 1,020.52 | 219.24 / 1,227.99 | 13.321 | 22.124 |
+| 每 128，16 档 | 1,019.93 | 219.24 / 1,228.30 | 13.322 | 22.106 |
+| 每 256，13 档 | 1,020.41 | 219.17 / 1,227.70 | 13.323 | 22.096 |
+
+两种步长相对原档均逐 token 一致 96/96。GPU 4 独立结构波均为
+1,659 次物理 forward，1,004 次 FULL、655 次 PIECEWISE，32 条请求逐位置通过。
+128 的五个新档回放为 896，替代原来的 1,024，少 640 个物理行。这五批模型区间
+累计 21.05→20.55 ms，256 没有用到新增的 768 档。原预算下没有测到吞吐收益。
+GPU 7 的超集捕捉共 161 个 per-op 图，25.21 秒，capture 接口报告净增加约
+1.14 GiB，三组计时共享这些图。
+[W3 同服务九波](../artifacts/w3-scheduler-priority-20261127/gpu7/w3-piecewise-grid-interleaved/summary.json) ·
+[W3 独立图回放及正确性](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-piecewise-grid-structure/summary.json)
+
+#### KV 容量、分块与物理批成本
+
+按 PRELUDE 提交重建每条在途请求的最新预留 token 位置，按最后 decode CODA
+回执释放。W3 C16 的峰值为 16 条、67,092 个逻辑 token，W7 为 32 条、27,780
+个逻辑 token。若按每请求 64 token 向上对齐，峰值分别为 67,584 和 29,120。
+这是逻辑容量重建。Inkling 实际有 16-token、64-token 两类 KV group，实际占用
+需按 group 和滑窗统计。80 GiB 配置报告 291,018 token 的 group-aware 容量，
+两组逐位置检查通过，当前证据不支持 KV 容量把两组的并发限制在更低水平。
+
+容量估算按 KV group 统计仍保留的物理块数，再乘对应每块字节。改变块大小会同时
+改变尾块浪费、块表长度和访问路径。模型耗时另按 op、轮次、图档、实际行数和可见
+history 拟合。W7 第 1 轮纯 decode B32 有 1,003 个实际 32 行的批。按 batch 内
+逻辑 history 总长度切四分位，第一、第四组的 history 中位数为 11,906/23,946，
+CUDA event 模型区间中位数为 1.660/1.699 ms。它反映同图档内的观察相关性，
+还没有隔离各层滑窗、真实 KV 字节或 attention kernel 时间。
+
+研究按请求目标轮次保留 KV 时，prefill 依旧需要三轮；可估计普通固定目标轮次
+的请求进入 decode 后，不再访问的高轮次 KV group 有多少可释放或停止扩容。
+共享层、复用中的 prefix 和在途读写都应计入仍需保留的块。容量收益在现有分配
+开始限制入场或触发抢占的区间验证；block/布局收益在同 batch、同图档下比较
+attention 时间和块表准备。两类比较均保留 1,024-token 原调度预算。
+[W3 原始 trace](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/rlt-dynamic/dynamic-cuda.trace.json) ·
+[W7 原始 trace](../artifacts/w3-scheduler-priority-20261127/gpu4/prefill-coda-split-W7-structure/w7on-cuda.trace.json)
+
+进一步按 vLLM 的滑窗回收规则重放已观测的 PRELUDE 预留和 CODA 回执。
+按模型层类型重建为 1 个 full KV group、5 个滑窗 1,024 的 KV group 和 6 个短卷积
+状态 group，共享物理分配块为 2 MiB。80 GiB 对应 40,960 块，8,192 上限的
+单请求理论容量为 1,153 块，复算服务报告的 291,018 token。重放按已提交位置
+回收窗口外的完整块。
+
+| 负载 | 原 trace 峰值块数 | 等效 KV 池最低需求（GiB） | 理想轮次分离后的等效需求（GiB） | 峰值可省 |
+| --- | ---: | ---: | ---: | ---: |
+| W3 C16 | 3,764 | 7.35 | 6.49 | 11.8% |
+| W7 C32 | 2,507 | 4.90 | 4.43 | 9.6% |
+
+等效需求计入保留的空块。理想轮次分离假设 prefill 完成后能按层释放正式 decode
+不再访问的高轮 KV，且物理块没有分组浪费。这给出固定实测调度轨迹上的容量估算。
+实际按现有 group 释放、重新分组后的峰值以及小 KV 池下的吞吐，仍需用 allocator
+统计和实测校准。
+[分组容量重放脚本](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/kv_capacity_model.py) ·
+[重放结果](../artifacts/w3-scheduler-priority-20261127/gpu4/time-attribution/kv-capacity-model.json)
+
+### WCPB 独立验收
+
+同一 4829d2f 源码在 GPU 7 分别启动三臂。W3 C16 每波 32 条 4,096→128，
+动态 decode 轮数 8/8/16，预算 1,024、80 GiB KV、原 FULL/PIECEWISE 图档。
+每臂完整预热后测三个普通计时波。三臂保留异步、packed prefill、P/D mixed 等
+启动参数，关闭自投机、Decode pipeline 和 prefill CODA 切分。普通 512 单独用
+long_prefill_token_threshold=512，控制 chunk 上限的影响。
+
+| 运行组 | 吞吐中位数（tok/s） | TTFT P50/P95（ms） | TPOT P95（ms） | ITL P95（ms） |
+| --- | ---: | ---: | ---: | ---: |
+| 普通 prefill，原配置 | 1,018.51 | 219.35 / 1,229.69 | 13.34 | 22.11 |
+| 普通 prefill，chunk 上限 512 | 991.06 | 372.09 / 1,279.66 | 13.36 | 22.14 |
+| WCPB，chunk 上限 512 | 217.66 | 570.85 / 3,067.25 | 69.05 | 99.44 |
+
+WCPB 相对同为 512 的普通 prefill 吞吐降低 78.04%。九波均 GPU 独占、SM
+2,032 MHz，KV 容量 291,018 token，启动捕捉 133 个 per-op 图。WCPB 与普通
+512 对照首 token 96/96、完整输出 87/96 一致，所有请求均返回 128 token。
+只开 WCPB、自动 chunk 341 的 GPU 4 单波筛选为 179.05 tok/s、TTFT P95
+5,994.31 ms，该波没有纳入三臂同卡统计。
+[W3 同卡三臂计时](../artifacts/w3-scheduler-priority-20261127/gpu7/w3-wcpb-comparison/comparison.json) ·
+[自动 chunk 单波](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-auto-smoke/wcpb-auto/summary.json)
+
+GPU 4 独立 WCPB 512 结构波核对 32 条请求逐位置的循环。20 条请求共 135 次
+提前在前一段 CODA 提交前发下一段 PRELUDE，有 27 个 CORE 计划包含同一请求
+的多个 chunk。2,287 个逻辑计划拆成 3,358 个物理 forward，1,349 次 FULL、
+357 次 PIECEWISE、1,652 次 eager。eager 的图宽均不在对应捕捉档里，含纯
+decode 1,063 次、含 prefill 589 次。对照结构波为 1,659 次物理 forward，
+全部回放图。该快照在 WCPB 下关闭了普通输入复用和 padding，普通 decode 完成优先、
+CODA 合批、非采样 prefill 提前入队与 CODA 尾层优化也有 WCPB guard。
+[WCPB 交错与图回放](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-structure/wcpb512/summary.json) ·
+[eager 实际图宽归因](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-structure/wcpb512/eager-widths.json)
+
+#### WCPB 图回放补齐
+
+Worker 先按物理组执行现有 MRv2 位置更新，把请求槽游标指向本组对应的 chunk
+起点。按物理批核对每个请求唯一、起点和长度与 MRv2 一致后，使用现有
+FULL/PIECEWISE padding。WCPB 每个物理组仍独立准备输入和 metadata，
+保留原 CORE 分组、请求依赖和 KV 预留。
+
+初版同时启用批输入复用和同轮终/续合并，结构波 2,720 次全部图回放，但对原
+WCPB 首 token 31/32、完整输出 25/32 一致。该版本只作诊断保留。
+[初版诊断波](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-graph-replay-structure/wcpb512/summary.json)
+
+只补 padding 的版本已覆盖含 prefill 的批，仍有 1,083 个纯 decode 批回退到
+eager。这些批的输入张量已对齐到 FULL 档位，但 MRv2 原调用仍以 `NONE` 构造
+attention metadata，导致 metadata 的请求维度与录图时不同。现在物理批在
+`LoopExecution` 中携带 padding 选择的图模式，Inkling model state 据此调用 MRv2
+构造对齐的 metadata，WCPB 仍逐批准备输入和 metadata。
+[仅 padding 的结构波](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-graph-padding-structure/wcpb512/summary.json)
+
+CPU 测试覆盖 WCPB 下混批 PIECEWISE、纯 decode FULL、padding 尾部清零、
+真实位置保留、位置不匹配拒绝复用，以及独立构造 metadata 时沿用正确图模式，
+插件套件 105 通过、2 跳过。
+
+补齐 FULL 元数据模式的版本沿用原 W3 C16 预算 1,024 和 80 GiB KV，在两张卡
+独立检查物理执行路径。
+
+| WCPB chunk 上限 | 物理 forward | FULL | PIECEWISE | eager | 逐位置通过 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 512 | 3,409 | 2,454 | 955 | 0 | 32/32 |
+| 自动 341 | 3,490 | 2,295 | 1,195 | 0 | 32/32 |
+
+512 和 341 分别有 137 和 203 次在前一段 CODA 提交前发下一段 PRELUDE，
+36 和 104 个 CORE 计划容纳同一请求的多个 chunk，两波均返回 4,096 个 token。
+启动捕捉保持 133 个 per-op 图，含 prefill 的批回放 PIECEWISE，纯 decode 回放 FULL。
+[512 结构波](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-graph-metadata-structure/wcpb512/summary.json) ·
+[自动 341 结构波](../artifacts/w3-scheduler-priority-20261127/gpu3/w3-wcpb-graph-metadata-auto341/wcpb-auto/summary.json)
+
+同一服务内固定调度顺序、物理形状和 graph staging，在 wrapper 内切换图回放与
+逐算子执行。串行 7 条请求每条 128 token 均逐 token 相同，回放臂的 4,217 个
+物理步实际调用 3,937 次 FULL 和 280 次 PIECEWISE，逐算子臂的实际回放为 0。
+[同形状输出对照](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-c1-staged-replay-pair/summary.json)
+
+接连复测 W3 时观察到一次 CODA 没有为应出 token 的请求返回采样结果。检查到
+MRv2 接纳新请求和 RLT 恢复 chunk 位置共用 `num_computed_tokens` 的 UVA 写池。
+同一物理批可以轮转两次写槽，GPU 完成事件按每物理批一次退休。逐批位置更新现用
+独立的 MRv2 `UvaBufferPool` 暂存请求槽和位置，通过 `index_copy_` 更新同一个
+设备位置张量。原生接纳的写池留给 MRv2，两个写入路径各自最多每批轮转一次。
+[连续压测的异常日志](../artifacts/w3-scheduler-priority-20261127/gpu3/w3-wcpb-graph-metadata-clean/wcpb512/server.log)
+
+最终版在 GPU 1 的 512 结构波执行 3,358 个物理 forward，2,417 FULL、941
+PIECEWISE、0 eager。32 条请求逐位置通过，135 次提前启动下一 chunk。与修复前
+512 结构波相比，首 token 32/32、完整输出 31/32 一致。
+同卡默认 341 结构波直接记录了全部 3,459 次图回放，2,261 FULL、1,198 PIECEWISE、
+0 eager，其中 2,075 个批发生 padding。32 条请求逐位置通过，提前启动下一 chunk
+203 次。与旧默认 341 单波相比，首 token 32/32、完整输出 29/32 一致。
+[最终 512 结构波](../artifacts/w3-scheduler-priority-20261127/gpu1/w3-wcpb-graph-positions-structure/wcpb512/summary.json) ·
+[最终自动 341 结构波](../artifacts/w3-scheduler-priority-20261127/gpu1/w3-wcpb-graph-positions-auto341/wcpb-auto/summary.json)
+
+最终版 512 在 GPU 3 连续六个普通计时波全部返回 4,096 个 token，无漏采样。
+六波吞吐为 572.03 / 563.42 / 583.87 / 562.34 / 548.50 / 546.35 tok/s，
+中位数 562.88 tok/s，TTFT P95 1,976.87 ms，TPOT P95 30.55 ms，ITL P95 42.78 ms。
+对照修复前 GPU 7 的 WCPB512 第 2 波，首 token 192/192、完整序列 184/192 一致。
+两个配置的调度轨迹随请求到达顺序变化，GPU 3 六波和此前 GPU 7 基线均为测试进程
+独占，SM 2,032 MHz，KV 容量 291,018 token。
+[最终 512 六波吞吐](../artifacts/w3-scheduler-priority-20261127/gpu3/w3-wcpb-graph-positions/wcpb512/summary.json)
+
+位置写隔离后插件测试 106 通过、2 跳过。
+
+#### WCPB 开关的同卡时间分解
+
+最终源码在 GPU 1 分别跑普通 512 和 WCPB 512 的独立结构波。两波使用同一输入、
+动态 decode 深度、1,024-token 预算、80 GiB KV 与图档，SM 2,032 MHz，测试进程独占。
+两波都无 eager 回退，CORE 实算的 prefill 393,216 行和 decode 9,144 行完全相同。
+
+| GPU event 区间 | 普通 512（ms） | WCPB 512（ms） | 增量（ms） |
+| --- | ---: | ---: | ---: |
+| 纯 decode CORE | 909.70 | 2,165.31 | 1,255.61 |
+| 含 prefill 的 CORE | 2,227.19 | 2,931.21 | 704.02 |
+| PRELUDE 和 CODA 的模型区间 | 1,096.88 | 1,601.18 | 504.30 |
+| 采样 | 70.80 | 180.85 | 110.05 |
+| 模型和采样事件包络之间 | 311.28 | 1,371.87 | 1,060.58 |
+| 整波设备流跨度 | 4,615.86 | 8,250.42 | 3,634.56 |
+
+WCPB 使物理批由 1,701 增至 3,358。纯 decode CORE 由 618 增至 1,508 批，
+每批请求数中位数 11→4，纯 decode CODA 由 207 增至 651 批。普通路径启用了
+同轮 CORE 终轮/续轮合并、decode CODA 合批和输入/metadata 复用。当前 WCPB
+按不同轮次及终轮/续轮分别执行，关闭普通 decode 收尾策略，并独立准备每批输入。
+含 prefill 的 CORE 由 402 增至 599 批，padding 后由 403,200 增至 441,216 行。
+这两项 CORE 增量约占整波差距的 54%。
+
+WCPB 确实提前启动了 135 次后续 chunk。它新增的是可调度工作，设备仍在同一条流
+执行这些物理批。W3 中这部分提前量不足以抵消组批碎化和每批准备开销。模型和采样
+事件间有输入与 metadata 准备等未单列阶段，表中的时间差不能全部归为 GPU 空闲。
+Host 调度器区间累计 343.61→442.69 ms，单次中位数均约 80 µs。Host 提交区间
+合计 3,755.56→6,923.52 ms。每次提交扣去模型入口内的 Host 区间后，累计
+897.63→2,540.04 ms，均值 0.53→0.76 ms/物理批。这部分包含输入和 attention
+metadata 准备、位置更新及其他提交工作，当前对照没有单独测出输入复用的贡献。
+Host 和设备区间有重叠，不能相加。
+[同卡分解数据](../artifacts/w3-scheduler-priority-20261127/gpu1/w3-wcpb-vs-ordinary512-structure.json) ·
+[普通 512 结构波](../artifacts/w3-scheduler-priority-20261127/gpu1/w3-ordinary512-positions-structure/ordinary512/summary.json)
+
+#### WCPB 复用输入与 attention metadata
+
+Worker 比较相邻物理批的 MRv2 请求顺序、槽位、chunk 起点、真实长度、prefill 标记
+和图 descriptor。完全一致时复用 InputBatch、块表、slot mapping 和 attention
+metadata。同一请求切换 chunk、追加 KV 块、请求加入或退出以及 CODA 采样后的更新
+都会使旧输入失效。首次准备继续走原生 MRv2，模型中间状态仍按请求和 chunk 保存。
+这次保留 WCPB 原来的调度、终轮/续轮分组和逐批位置恢复。
+
+CPU 用例核对相同布局只准备一次，同一槽和长度换 chunk 时重新准备。插件套件
+107 通过、2 跳过。
+
+GPU 4 的 W3 C16 结构波使用 512 chunk、1,024-token 预算和 80 GiB KV。
+3,409 个物理批中，619 个同时命中 InputBatch、块表/slot mapping 与 attention
+metadata，命中率 18.16%。命中包括 540 次 CODA 和 79 次 CORE，MRv2 实际
+构造 metadata 2,790 次。2,454 批实际回放 FULL，955 批实际回放 PIECEWISE，
+无 eager。32 条请求逐位置通过，仍有 137 次提前启动后续 chunk。与改动前的独立
+结构波相比，32/32 首 token、31/32 完整输出一致。
+[真实复用计数](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-reuse-structure/wcpb512/wavefront-cuda.reuse.json) ·
+[图回放和逐位置校验](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-reuse-structure/wcpb512/summary.json)
+
+GPU 7 使用同一热服务交替关闭和开启复用，各测三个正式波，GPU 独占且均为
+2,032 MHz。保持 WCPB 512、输入、预算与 CUDA Graph 一致。关闭/开启的吞吐
+中位数为 659.91/665.55 tok/s，三对增幅 +0.87%/+0.89%/+0.74%。TTFT P95
+为 1,772.83/1,772.17 ms，TPOT P95 为 26.27/26.14 ms。96 条请求的完整 token
+序列逐条一致。该实验的增量以同服务 A/B 为准。
+[输入复用交替六波](../artifacts/w3-scheduler-priority-20261127/gpu7/w3-wcpb-reuse-interleaved/summary.json)
+
+逐计划核对同卡 WCPB 开关的结构波，增加的 1,657 次物理执行来自 586 个新增
+调度计划和 1,071 个计划内拆出的 CORE 批。586 个新增计划中，CODA 占 496、
+PRELUDE 占 74、CORE 占 16。CORE 拆出的 1,071 批中，654 次来自同一轮的终轮与
+续轮分组，417 次来自同一计划含不同轮次。输入复用开启后的独立结构波仍有 1,111 次
+计划内 CORE 拆批，拆批计数和每个物理批的执行耗时需要分别比较。
+
+例如，开启复用的计划 2,937 有 16 条 decode 请求处于第 1 轮。其中 12 条继续下一轮，
+4 条做 CODA。Worker 分别走补齐为 16 和 4 行的两个 FULL 图。普通路径已有能力
+对同轮的两种去向合批，WCPB 当前的 CORE 分组条件把该路径关闭。WCPB 的调度器
+也关闭了普通 decode 在有限等待内聚合就绪 CODA 的策略，导致更多小批进入采样。
+
+#### WCPB 适配现有调度
+
+WCPB 使用普通路径已有的首 token CODA 优先、decode 收尾等待上限、混合 CORE
+按轮次对齐和纯 decode 图档合批判断。WCPB 的预备工作仍由 `_ready_spans()` 按
+前段已完成轮次决定，CODA 保留同一请求的位置顺序。Worker 允许同一轮的终轮和
+续轮在同一个物理批执行后分流，每个轮次逐请求核对 MRv2 槽位唯一。同一请求的
+不同 chunk 仍可在不同轮次分别执行。现有输入复用和位置缓冲隔离继续生效。
+
+CPU 回归覆盖同步和异步下的 CODA 聚合、首 token 优先、重复跳过后的公平性、
+首段之后的 WCPB 交错、同轮 P/D 一起推进、短等后合用同一 FULL 图，以及同一请求
+两个 chunk 的 Worker 分组。插件套件 127 通过、2 跳过。
+
+GPU 4 的 W3 C16 两次独立结构波保留 512 chunk、1,024-token 预算、80 GiB KV 与
+不同请求的 1/2/3 轮 decode，两个进程各自独占，SM 都是 2,032 MHz。
+
+| 结构指标 | 适配前 | 适配后 |
+| --- | ---: | ---: |
+| 调度计划 | 2,298 | 1,671 |
+| 实际物理批 | 3,409 | 1,671 |
+| 纯 decode CORE 批 / 每批请求数中位 | 1,543 / 4 | 597 / 11 |
+| 纯 decode CODA 批 / 每批请求数中位 | 652 / 3 | 200 / 16 |
+| 采样调用 | 840 | 335 |
+| FULL / PIECEWISE / eager | 2,454 / 955 / 0 | 996 / 675 / 0 |
+| 先于前段 CODA 启动后段 PRELUDE | 137 | 30 |
+| 设备流跨度（ms） | 6,269.36 | 4,229.08 |
+
+两个结构波都执行 393,216 个实际 prefill CORE 行和 9,144 个实际 decode CORE
+行，32/32 条逐位置通过。适配后有 388 个纯 decode CORE 与 251 个 P/D CORE
+物理批同时有终轮和续轮，CORE 计划全部在同一轮。对照首 token 32/32、完整输出
+30/32 一致。提前启动次数随调度变化，适配后保留了跨 chunk 的提前推进。
+[适配前结构](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-reuse-structure/wcpb512/summary.json) ·
+[适配后结构](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-current-scheduling-structure/wcpb512/summary.json)
+
+GPU 7 同一热服务中交替切换是否适配普通调度及同轮合批，各测三波。两组均开启
+WCPB 512 和输入复用，维持 1,024-token 预算、80 GiB KV、原有图档与动态轮数。
+六波均独占 GPU，SM 2,032 MHz，均完成每波 4,096 输出 token。
+
+| 正式指标 | 适配前 | 适配后 |
+| --- | ---: | ---: |
+| 吞吐中位数（tok/s） | 663.74 | 975.65 |
+| TTFT P95（ms） | 1,774.04 | 1,305.14 |
+| TPOT P95（ms） | 26.20 | 13.78 |
+| ITL P95（ms） | 35.78 | 22.63 |
+
+吞吐提高 46.98%，三对的相对增益为 47.14%/46.98%/46.96%。两组首 token
+96/96、完整输出 90/96 一致。前后唯一切换的功能是普通调度策略和同轮合批，
+相对关闭 WCPB 的收益另外按同卡普通 512 路径计时比较。
+[同热六波 A/B](../artifacts/w3-scheduler-priority-20261127/gpu7/w3-wcpb-current-scheduling-interleaved/summary.json)
+
+同源码、同 GPU 7、相同 512 chunk 上限关闭 WCPB 后，三波吞吐为
+992.02/992.03/992.05 tok/s，TTFT P50/P95 为 371.71/1,278.94 ms。适配后 WCPB
+的吞吐低 1.65%，按每波 4,096 个输出 token 折合慢 69.34 ms；TTFT P50 低
+32.13%，P95 高 2.05%。两配置的首 token 96/96、完整序列 87/96 一致。
+[同卡同源码普通 512](../artifacts/w3-scheduler-priority-20261127/gpu7/w3-wcpb-current-scheduling-ordinary512/ordinary512/summary.json)
+
+默认 341 的 GPU 4 结构波实际回放 985 次 FULL、732 次 PIECEWISE，0 eager；
+339 个物理批同时命中输入、块表和 metadata 复用，45 次提前启动下一 chunk，
+32/32 条逐位置通过。该波只核对执行结构。
+[适配后默认 341 结构](../artifacts/w3-scheduler-priority-20261127/gpu4/w3-wcpb-current-scheduling-auto341/wcpb-auto/summary.json)
+
+#### WCPB 跨轮物理合批
+
+对照主线 `4821d47` 的 WCPB 语义，默认 chunk 改为 128，显式 chunk 上限可用于
+普通 split prefill 和 WCPB。每条请求在有效窗口内可以一次准备多段相邻 chunk；
+MRv2 用一个连续 PRELUDE query 处理相邻段，中间状态按真实 chunk 位置保存。每段
+CORE 只推进一轮，前段已完成的对应轮次限制后段可就绪的轮次。已有 decode CODA
+收尾、纯 decode 图档判断继续应用。
+
+同一次 CORE 物理执行内，MRv2 的基础请求槽仍由请求拥有，batch 输入按实际
+`(请求, chunk 起点, 轮次)` 构造。同一请求的多个区间可复用底层请求槽并拥有
+不同的 positions、query offsets 和序列长度。MRv2 的 block table 功能提供原始
+KV 映射，Inkling 按每组的轮次使用对应的 attention 和短卷积 KV。所有组共享本层
+QKV、输出投影与 MLP。PIECEWISE 启动捕捉按补齐后的总行数建图，运行时按本批
+的轮次和位置读取 KV 并分流中间状态。
+
+GPU 4 的 C1 定向样本在 2,048 token prompt、512 chunk 下出现 4 次跨轮回放；
+其中一批同时包括同一请求 `[512,1024)` 的第 1 轮与 `[0,512)` 的第 3 轮，
+12 个 CORE 层各有一次 1,024 行 QKV 和 MLP。逐轮核对设备位置及 KV 层名，
+8 个输出 token 在预热和诊断请求间完全一致。
+
+GPU 7 的 W3 C16 512 结构波共 1,861 个物理批。其中 1,055 FULL、418 常规
+PIECEWISE、388 跨轮 PIECEWISE，全部实回放。388 次跨轮 CORE 中，134 次把同一
+请求的不同 chunk 放进同一物理批；32 条请求逐位置通过。诊断与同源码预热相比，首
+token 32/32、完整输出 28/32 一致。正式吞吐采用关闭诊断探针的波次。
+[首版跨轮 C1](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-cross-depth-graphs-direct/structural-summary.json) ·
+[首版跨轮 W3](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-cross-depth-graphs-w3/structural-summary.json)
+
+最终版 PRELUDE 先给各就绪请求准备一段，再把剩余预算用于同一批请求的下一段。
+相邻 CORE 层合并上一层结束与下一层输入的图回调，每个跨轮图由 49 个记录段减至
+38 个。GPU 3 W3 C16 512 结构波全部 1,789 次物理执行实际回放，其中 1,004 FULL、
+430 常规 PIECEWISE、355 跨轮 PIECEWISE。62 个物理 CORE 合入同一请求的不同
+chunk/轮次，155 次下一段的 PRELUDE 在前段 CODA 之前在设备上开始，32/32 条
+逐位置通过，诊断与热身的完整输出 32/32 一致。355 批共享 4,260 次层级 QKV/MLP，
+实际分组调用 attention 11,400 次。
+[最终版跨轮执行和 replay 证据](../artifacts/w3-scheduler-priority-20261127/gpu3/wcpb-cross-depth-round-robin-w3/structural-summary.json)
+
+正式 W3 C16 每臂预热后三波，每波 32 条 4,096→128，仍是动态 decode 轮数、
+1,024-token 预算和 80 GiB KV。全部样本独占，SM 2,032 MHz。普通路径取同卡的
+早一版跨轮实验数据，最终提交的改动仅涉及 WCPB 和跨轮 CORE。
+
+| W3 C16 配置 | 卡 | 吞吐中位（tok/s） | TTFT P50 / P95（ms） |
+| --- | ---: | ---: | ---: |
+| 普通，原 1,024 预算 | 4 | 1,011.34 | 222.06 / 1,238.09 |
+| 普通，512 chunk | 4 | 989.93 | 371.72 / 1,279.48 |
+| WCPB，512 chunk | 4 | 545.91 | 587.14 / 2,770.57 |
+| 普通，128 chunk | 7 | 938.49 | 739.61 / 1,413.32 |
+| WCPB，默认 128 chunk | 7 | 453.36 | 1,856.94 / 3,434.96 |
+
+同 chunk 的两对开关各有 96/96 首 token 一致，完整输出分别 90/96 和 89/96。
+两种 WCPB 配置的吞吐分别是同卡对应普通路径的 55.15% 和 48.31%。共享权重的
+计算已经合批，attention 和短卷积仍调用每组的原生执行路径。当前使用固定 chunk
+上限和按请求位置保存的有界中间状态，原版的自适应 sizing 和预分配 hidden ring
+尚未接入。
+[WCPB 512 正式三波](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-cross-depth-round-robin-formal512/wcpb512/summary.json) ·
+[WCPB 128 正式三波](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-cross-depth-round-robin-formal128/wcpb-auto/summary.json) ·
+[普通 512/原 1,024](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-cross-depth-graphs-formal512/comparison.json) ·
+[普通 128](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-cross-depth-graphs-formal128/ordinary128/summary.json)
+
+插件套件 129 通过、2 跳过，包含重复请求槽的独立位置、原生描述符、窗口内 PRELUDE
+轮转和逐轮依赖。
+
+#### 跨轮 WCPB 的 W3 性能归因
+
+对照 512 chunk、1,024-token 预算下的普通 GPU 1 结构波和最终 WCPB GPU 3
+结构波。两边的实际 prefill CORE 均为 393,216 行，decode CORE 均为 9,144 行。
+含 prefill 的 CORE 物理批为 402→413，总真实行均值 985.19→959.46，补齐后的总行
+403,200→415,488。普通路径已经能填满大部分 1,024 档，这个 W3 没有通过跨轮进一步
+减少 CORE 提交。
+
+在最终 WCPB 的同一个 GPU 3 结构波内，取补齐宽度 1,024、至少 900 真实行的
+含 prefill CORE。40 个常规批平均 1,021 真实行，模型区间中位数 5.818 ms，13 次图
+段回放。318 个跨轮批平均 1,018.99 真实行，中位数 12.702 ms，38 次图段回放。
+355 个跨轮批的 12 层合计 4,260 次共享 QKV/MLP，并调用了 11,400 次分组
+attention。按深度切片、短卷积、混合与中间张量拷贝仍在 graph break 的回调内，
+图段的计数和模型区间无法单独给出每一种 kernel 的耗时。
+
+同一组宽度 1,024 的样本继续细分。P/D 批的常规路径为 28 批，平均 1,020.93
+行，模型区间中位数 6.058 ms。跨轮 2 组为 88 批，平均 1,017.06 行、中位
+12.174 ms；跨轮 3 组为 194 批，平均 1,020.58 行、中位 13.359 ms。纯 prefill
+的常规路径和跨轮 2 组分别为 5.763 与 8.584 ms，共 12 与 30 批，平均真实行
+1,021.17 与 1,022.70。跨轮分组键包含轮次及终轮/续轮，不能从组数推算实际轮次数。
+P/D 三行的 Host 模型区间中位数分别为 3.193、12.119 和 13.344 ms。
+Host 和设备事件区间并行，不能用两者的差或和分摊 kernel 耗时。
+
+跨卡独立结构波的含 prefill CORE 为 2,227.19→4,886.42 ms，占设备窗口增量
+3,149.04 ms 的约 84%。纯 decode CORE 反而为 909.70→885.22 ms。结构波用于
+分段归因，正式吞吐比较使用前面的同卡独占三波。
+[普通 512 结构波](../artifacts/w3-scheduler-priority-20261127/gpu1/w3-ordinary512-positions-structure/ordinary512/summary.json) ·
+[最终 WCPB 同波内的两类 CORE](../artifacts/w3-scheduler-priority-20261127/gpu3/wcpb-cross-depth-round-robin-w3/structural-summary.json)
+
+#### WCPB 低并发对照
+
+W3 保持 4,096→128、1,024-token 调度预算、80 GiB KV 和原图档。每波 8 条请求，
+显式 1/2/3 轮和默认各 2 条。C1、C4 各比较普通原配置、普通 128 chunk 和默认
+WCPB 128，在同一张卡运行该并发的各臂。C1 额外匹配 512 chunk。各臂完整预热后
+测三波，正式波禁用结构诊断探针。
+
+| 负载 | GPU | 配置 | 吞吐（tok/s） | TTFT P50 / P95（ms） | TPOT P50（ms） |
+| --- | ---: | --- | ---: | ---: | ---: |
+| W3 C1 | 7 | 普通原配置 | 279.73 | 79.57 / 81.12 | 3.26 |
+| W3 C1 | 7 | 普通 128 | 174.23 | 341.44 / 358.69 | 3.28 |
+| W3 C1 | 7 | WCPB 128 | 131.92 | 568.55 / 626.29 | 3.31 |
+| W3 C4 | 4 | 普通原配置 | 547.65 | 209.97 / 329.79 | 5.73 |
+| W3 C4 | 4 | 普通 128 | 455.16 | 492.58 / 498.68 | 4.92 |
+| W3 C4 | 4 | WCPB 128 | 300.24 | 989.79 / 993.18 | 5.94 |
+| W3 C1 | 3 | 普通 512 | 249.37 | 118.20 / 122.24 | 3.33 |
+| W3 C1 | 3 | WCPB 512 | 244.84 | 136.45 / 137.83 | 3.32 |
+
+24 个正式波均为测试进程独占，SM 2,032 MHz，每波 1,024 个输出 token。三项同
+chunk 对照的吞吐变化为 C1/128 −24.28%、C4/128 −34.04%、C1/512 −1.82%，
+跨开关的完整输出分别 24/24 一致。C1 的 TPOT P50 基本一致，差距主要在 TTFT。
+[C1 默认 128](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-low-concurrency-c1/comparison.json) ·
+[C4 默认 128](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-low-concurrency-c4/comparison.json) ·
+[C1 512](../artifacts/w3-scheduler-priority-20261127/gpu3/wcpb-low-concurrency-c1-chunk512/comparison.json)
+
+#### WCPB 低并发的执行流与首 token 时间
+
+按原版 wavefront 文档及 `main` 的 Inkling 路径，调度器把不同 chunk、不同轮次的
+就绪区间放进一批，每个区间只推进一轮。Worker 把每个区间要读取的 KV 块和新 KV
+的写入位置一次传给模型，attention 和短卷积在各层消费整批输入。中间 hidden
+state 写回请求的预分配环形缓冲，后续轮次按行读取。原版在终轮后由 Worker 补做
+中间区间所需的 CODA KV 写入；最后一个 prompt token 进入生成用的 CODA。
+[原版设计](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/docs/split-prefill-wavefront.md) ·
+[原版 KV 块表和写入位置](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/vllm_rlt/worker/metadata.py#L233-L314) ·
+[原版 Inkling 层循环](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/vllm_rlt/models/inkling2mini.py#L360-L439)
+
+当前插件复现了调度器跨轮组批和每段推进一轮的行为。Worker 按轮次、是否终轮分别
+构造 vLLM attention 元数据；共享 QKV、输出投影和 MLP 的部分在整批执行，attention
+和短卷积每层仍按组调用。中间 hidden state 从各区间取出后拼接，prefill CODA 仍由
+调度器提交。由此，同一个调度批在当前 Worker 内仍有多组层内执行。
+[当前 attention 输入](../vllm_rlt/models/inkling_plugin.py#L208) ·
+[当前层内分组](../vllm_rlt/models/inkling_mixed_core.py#L306) ·
+[当前中间状态拼接](../vllm_rlt/models/inkling_mixed_core.py#L423)
+
+128 chunk 的额外诊断逐并发在同一张卡上运行，两臂都处理 98,304 行真实 prefill
+CORE，首 token 和完整输出分别 8/8 一致。C1 的物理 CORE 提交从 768 降到 360，
+实际宽度从全部 128 行变为 32 批 128 行、248 批 256 行和 80 批 384 行，384 行的
+批补到图档 512。C1 全波没有 1,024 行的 CORE 批。C4 的含 prefill CORE 提交从
+213 降到 138，含同批 decode 的平均真实行从 462 升到 713，WCPB 有 64 批达到
+1,024 行；含 prefill CORE 的设备事件区间仍从 804.19 升至 1,387.49 ms。
+
+| C1 每条请求从首个设备提交到首采样结束的平均时间 | 普通 128（ms） | WCPB 128（ms） |
+| --- | ---: | ---: |
+| PRELUDE 模型区间 | 45.35 | 37.44 |
+| CORE 模型区间 | 248.22 | 419.15 |
+| CODA 模型区间 | 40.20 | 44.17 |
+| 采样 | 6.58 | 6.11 |
+| 提交内部除模型和采样之外 | 26.59 | 68.38 |
+| 提交和采样事件之间 | 13.42 | 9.91 |
+| 设备事件总窗口 | 380.35 | 585.17 |
+
+C1 首 token 设备窗口增加 204.81 ms，其中 CORE 增加 170.93 ms，提交内部除模型和
+采样之外增加 41.79 ms。328 批跨轮 CORE 都有图段回放。其中无需补齐的 248 批
+256 行 CORE 平均用 9.00 ms，普通路径处理同等行数的两批 128 行 CORE 平均共用
+5.17 ms。设备事件区间可以包含 Host 提交等待，现有探针无法进一步拆出 attention、
+短卷积和拼接各自的耗时。正式吞吐和 TTFT 使用前面的无探针结果。
+[C1 时间分解](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-low-c1-timeline128/timeline-summary.json) ·
+[C1 Host 和设备时间轴](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-low-c1-timeline128/first-token-timeline.html) ·
+[C4 时间分解](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-low-c4-timeline128/timeline-summary.json)
+
+#### WCPB 执行方案评审
+
+目标是把已就绪的不同 chunk、不同轮次带进同一个 CORE 批。每个 chunk 在该批只推进
+一轮。Inkling 每层的 attention 和短卷积分别处理整批，CORE 最后一层再把完成终轮
+的行交给 CODA、把续轮的行留给后续 CORE。PRELUDE、CORE 和 CODA 各自有独立的
+调度和执行入口。方案依据原版设计和下文对应的实现。
+[原版 wavefront 文档](https://github.com/InferMatrixLab/vllm-rlt/blob/main/docs/split-prefill-wavefront.md)
+
+**调度和就绪条件**。未命中的 prompt 从缓存前缀末尾切 chunk。PRELUDE 在请求的在途
+窗口内准备 chunk，先给每个可运行请求机会，再用剩余预算准备同请求的后续 chunk。
+一个 chunk 可以进入第 `d` 轮时，它自己的上一轮输出和本轮的因果 KV 前缀都已就绪。
+第一轮以 PRELUDE 的结果为输入。同一条请求的三段 A、B、C，在各轮都能放进预算时，
+CORE 可依次发 `A1`、`A2+B1`、`A3+B2+C1`、`B3+C2`、`C3`。每次提交后重新选批。
+在 MRv2 里，一个真实请求可以对应多个批内输入行。分别检查真实请求数、批内输入行数
+和 token 数，当前 `max_num_seqs` 对批内行容量的限制应显式计入。保持已有的等待公平性、
+首 token 优先和 decode 等待上限。先验证固定 chunk。原版可选的自适应模式随后按请求
+确定 chunk 大小，在各请求、各轮次获得第一份预算后，再用相邻已就绪的区间补余量。
+[原版选批](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/vllm_rlt/core/scheduler.py#L972-L1090)
+
+**批内输入和 KV 地址**。Worker 用 MRv2 的真实请求槽和每段绝对位置准备输入。同一
+请求可以在不同轮次各有一段。例中 `A2` 有 128 行、`B1` 有 64 行，传给 attention 的
+查询边界是 `query_start_loc=[0,128,192]`。每段另有因果末端 `seq_lens`、对应轮次的
+`block_table`，以及每行新 KV 的 `slot_mapping`。同请求同轮的相邻区间在因果依赖及
+地址约束满足时可合成一段。短卷积另用各自的块表、每行所属区间和区间起点。批描述
+每次 CORE 准备一次，各层复用序列边界和位置；全局 attention、滑窗 attention、
+短卷积各自使用对应的块表。保留 vLLM 的 KV 分配、滑窗裁剪、MRv2 块表和 slot mapping
+生成。在此基础上按 `(请求槽, 轮次, 绝对位置)` 取批内每段的地址。
+[原版地址生成](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/vllm_rlt/worker/metadata.py#L233-L314) ·
+[MRv2 块表](https://github.com/vllm-project/vllm/blob/3146a9df41403b8fc30234259444d205974982dd/vllm/v1/worker/gpu/block_table.py#L173-L277)
+
+**需要验证的 vLLM 接口**。Inkling 现有 `Inkling2Attention._attention` 用一个
+`pass_idx` 为整批选 KV 张量，`conv_mix` 同样用一个 `owner`。变长 FA4 接口已有查询
+边界、每段上下文长度和块表，但它接收一对 K/V 张量。先核对各轮已绑定 KV 和卷积缓存
+的底层存储、偏移和 page stride，验证能否构造统一分页视图，并把原块号映射到视图中
+的正确页。能映射时可直接复用现有 attention 和卷积内核。无法用同一视图表达的布局
+需要扩展对应内核的地址选择，使用每段的页地址。两个方向均复用原缓存、每段的因果
+和滑窗语义，避免在每层复制历史 KV。首轮与后续轮的模型分支用逐行信息表达，终轮与
+续轮的去向只在 CORE 末端分流。开启 WCPB 时，有 prefill 的跨轮 CORE 应进入相应的
+packed prefill 路径。现有 `rlt_packed_prefill` 的名称不足以证明这条路径已经生效。
+[vLLM Inkling attention](https://github.com/vllm-project/vllm/blob/3146a9df41403b8fc30234259444d205974982dd/vllm/models/inkling2/nvidia/attention.py#L410-L510) ·
+[vLLM Inkling 短卷积](https://github.com/vllm-project/vllm/blob/3146a9df41403b8fc30234259444d205974982dd/vllm/models/inkling2/nvidia/sconv.py#L151-L201) ·
+[原版 Inkling CORE](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/vllm_rlt/models/inkling2mini.py#L353-L493)
+
+**状态、CODA 和异步回收**。Scheduler 维护 PRELUDE 已完成位置、每轮已完成位置、
+可发布的连续 prompt 前缀。Worker 使用预分配的 hidden state 环形缓冲，按请求槽、
+chunk 槽和 chunk 内偏移读写。区间完成最后一轮时，Inkling 中间 prompt token 仍需
+CODA 写入边界 KV，只有 prompt 末 token 做产生首 token 的采样。原版在 Worker 内补做
+前一种 CODA。插件先通过现有 CODA 入口验证等价的写入、采样和完成语义，再比较中间
+CODA 合批的提交成本。发布前缀需保证相关 KV 写入对读者可见。hidden state 槽等 GPU
+最后一次读取完成后再回收。继续使用 MRv2/UVA 的缓冲及 stream/event 生命周期。
+取消或抢占时以已完成前缀为恢复点，未完成 chunk 重算。保持当前 Inkling 请求级轮数只作用于 decode 的
+语义。第一阶段验证当前单卡 Inkling 和每轮独立 KV，组合 PD、投机及并行配置分别
+通过兼容性测试后再作为支持范围。
+[原版进度与回收](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/vllm_rlt/core/scheduler.py#L1227-L1311) ·
+[原版 CODA follow-up](https://github.com/InferMatrixLab/vllm-rlt/blob/4821d47cec92aa1d7d2ec4be5f589d19b2794ae3/vllm_rlt/worker/model_runner.py#L680-L704)
+
+**Mixed batch 和 CUDA Graph**。启用 mixed batch 时，同一 op 可以有 prefill 和
+decode。原生 Inkling 可在一次层调用内按实际查询类型运行 prefill 和 decode 的计算
+路径。各路径处理自己的完整子批，轮次只影响 KV 地址。纯 decode 保留 FULL 执行；
+含 prefill 的 CORE 复用 PIECEWISE warmup、真实 token 数和 padding 档位。编译区的
+图按稳定形状捕获，实际的区间长度、轮次、块地址和终轮标记作为运行时输入。padding
+不参与 KV、卷积状态写入或采样。验收同时检查图命中和每层实际调用次数。
+
+**验收**。先比较同请求跨 chunk、跨请求、末段不足 chunk、prefix hit、抢占恢复、
+异步及 mixed 开关下的结果。核对每段的 KV 写入位置、因果依赖、采样和图回放。再做
+同设备同预算同 chunk 的普通 prefill 与 WCPB A/B，并保留普通默认配置为参照。用 W3
+C1/C4 验证提交减少后 CORE 时间也下降，用 C16 检查已接近满批时的额外成本，再用 W7
+检验不规则输入。正式跑吞吐、TTFT、TPOT 与 ITL，诊断同时记录实际行数、补齐行数、
+各层 attention/卷积的调用次数和 CORE、CODA 区间。固定三轮对 vLLM 同配置，动态
+轮数对 RLT 同请求轮数列表的开关两组。固定三轮的基础性能继续使用吞吐和 TTFT P95
+的 95% 门槛，目标约 97%。WCPB 收益由同 chunk 的正式开关 A/B 验证。
+
+#### 跨轮 packed prefill 接入
+
+锁定的 vLLM 在 Inkling2-mini 实机上使用 LBNHC。固定 80 GiB 的 40,960 个 KV
+物理块中，CORE 的 12 层各轮缓存共用一个底层分配，轮次间的地址差都是整页。
+attention 页步长为 262,144 字节，各层的页偏移与卷积缓存使用的 KV group 分别解析。
+统一分页视图只改变寻址，原始块的分配、回收、前缀和滑窗仍由 vLLM 管理。同一组
+块表和写入映射在一次 CORE 内复用。实机页偏移下的合成数据验证覆盖了原生 FA4 的
+全局 attention、滑窗 attention 及跨页短卷积，输出与分轮调用逐元素一致。
+[实机缓存布局](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-native-kv-layout/kv-layout.json) ·
+[原生算子对照](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-native-kv-layout/native-paged-kernel-smoke.json)
+
+跨轮含 prefill 的 CORE 复用 MRv2 变长元数据及 PIECEWISE 图，整体提交 attention、
+两处短卷积和 MLP。首次和后续轮的归一化及消息混合仍按各自行计算。终轮在 CORE
+末尾路由给 CODA，续轮的消息状态写回环形缓冲。环形缓冲在启动的内存评估期间分配，
+预留空间计入自动 KV 容量评估。Worker 在 CODA 入队最后一次读取后归还槽，后续写入
+沿同一条计算流排队。CODA 拆分时保留剩余区间，结束与抢占清理请求的状态。当前以
+TP=1、各轮缓存为同一底层分配且页对齐的 Inkling 为 packed 路径，其他布局沿用分组。
+
+GPU 诊断用 2,048 和 2,051 token 的单请求各生成 8 个 token。两组 WCPB 开关的输出
+逐 token 一致，核对了输入位置。开关开启时分别有 20 和 21 个跨轮 CORE，均实际回放
+PIECEWISE。共计 240/252 次层内 attention、240/252 次 FA4、480/504 次短卷积调用，
+每层每批分别为 1、1、2 次。环形缓冲峰值为同请求 3 个 chunk，生成后均归零。
+[开启结构诊断](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-packed-ring-live-on/summary.json) ·
+[关闭结构诊断](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-packed-ring-live-off/summary.json)
+
+原预算 `max_num_batched_tokens=1024`、chunk 128、80 GiB KV 下，W3 C1 各组完成同样
+98,304 行实际 prefill CORE。下表为 GPU 7 的 CUDA event 诊断数据，三组均为独占结构
+波，正式吞吐另外测量。
+
+| 指标 | 普通 prefill | 旧 WCPB | 新 packed WCPB |
+| --- | ---: | ---: | ---: |
+| 含 prefill 的 CORE 提交次数 | 768 | 360 | 360 |
+| 每请求首采样前 CORE 时间（ms） | 248.22 | 419.15 | 290.77 |
+| 每请求提交内除模型和采样之外（ms） | 26.59 | 68.38 | 62.54 |
+| 每请求提交与采样区间之间（ms） | 13.42 | 9.91 | 10.26 |
+| 每请求首个设备提交到首采样结束（ms） | 380.35 | 585.17 | 451.55 |
+
+完全无需补齐的 256 行跨轮 CORE，模型事件平均从 9.003 ms 降到 6.665 ms。384 行
+补到 512 的批从 12.992 ms 降到 7.390 ms。相比普通关闭组，新版的首采样设备窗口仍
+多 71.20 ms，主要来自 CORE 的 42.55 ms 和提交内模型外的 35.95 ms。两边都使用
+异步调度，提交之间的区间减少了 3.16 ms。设备事件区间可能包含 GPU 等待 Host
+继续提交。C4 在 GPU 4 观测到 125 个 packed CORE 批，其中
+35 批确实同时带有 prefill 和 decode，全部走 PIECEWISE。
+[普通与旧 WCPB 时间轴](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-low-c1-timeline128/timeline-summary.json) ·
+[新版 C1 时间轴](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-packed-ring-live-c1-timeline/wcpb-auto/phase-data.json) ·
+[新版 C4 混合执行](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-packed-ring-live-c4-structure/wcpb-auto/phase-data.json)
+
+W3 正式波每波 8 条 4,096→128 token 请求，显式 1/2/3 轮和默认各两条，禁用诊断探针。
+同并发的各组使用同一 GPU、相同 128 chunk、1,024 token 预算和 80 GiB KV。
+新版在 C1 和 C4 都已补齐同快照、同卡的开关对照，每组独占三波。两个旧 WCPB 组
+来自此前各自同卡的独占对照。测量期间发现其他进程的波均剔除。新版两个并发档的
+开关对照均为 24/24 条完整输出一致。
+
+| 负载 | 指标 | 普通 prefill | 旧 WCPB | 新 packed WCPB |
+| --- | --- | ---: | ---: | ---: |
+| W3 C1 | 吞吐（tok/s） | 186.71 | 131.92 | 139.30 |
+| W3 C1 | TTFT P95（ms） | 314.49 | 626.29 | 540.80 |
+| W3 C4 | 吞吐（tok/s） | 466.32 | 300.24 | 359.40 |
+| W3 C4 | TTFT P95（ms） | 492.41 | 993.18 | 737.97 |
+
+新版 C1 三波为 134.01、139.30、139.57 tok/s，C4 三波为 363.55、359.40、305.62
+tok/s。新版追回了一部分 WCPB 的损失，开启后相对同 chunk 的关闭组仍存在吞吐和
+TTFT 差距。
+[新版 C1 同卡六波](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-packed-ring-live-c1-clean/matched-comparison.json) ·
+[新版 C4 同卡六波](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-packed-ring-live-c4/matched-comparison.json)
+
+在 GPU 4 对三个无需补齐的 256 行 packed CORE 增加了层内范围及 CUDA event。每个
+样本都有 12 次 attention、12 次 QKV 准备、12 次 MLP 准备和 38 个图段。三次模型
+Host 平均 10.89 ms，其中 QKV 准备 2.75 ms，native attention 3.21 ms，MLP 准备
+2.90 ms，层尾除下一层 QKV 外 0.74 ms，图段提交 0.88 ms，批首尾状态搬运合计
+0.24 ms。MLP 准备包含第一处短卷积、首轮归一化、续轮消息控制及结果写回。模型外
+MRv2 metadata 的 Host 区间平均 0.52 ms，其中页号和 slot 路由 0.35 ms。内层事件
+明显提高了绝对耗时。该探针用于找位置，批宽与性能差距比较使用上面的轻量时间轴。
+[跨轮 CORE 组件时间](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-packed-ring-live-components/component-summary.json)
+
+#### WCPB 的 Nsight Systems 对照
+
+GPU 4 上分别完整预热普通 128 和 packed WCPB 128，用同一 4,096-token prompt 生成
+8 个 token，逐 token 一致。两臂为同一源码快照，保留 1,024 token 预算、80 GiB KV、
+异步调度及原图档。采集 CUDA Graph 节点、CUDA API 和 NVTX。捕捉前后仅可见本臂
+EngineCore。以下表格只统计有 prefill 的 CORE。
+
+| 指标 | 普通 128 | Packed WCPB 128 |
+| --- | ---: | ---: |
+| 实际 CORE 批 | 96 | 45（41 个跨轮） |
+| CUDA kernel 数 | 26,528 | 19,508 |
+| 各批 kernel 活跃时间合计（ms） | 214.50 | 152.11 |
+| 各批首末 kernel 跨度合计（ms） | 239.47 | 429.41 |
+| 各批内无 kernel 的区间合计（ms） | 24.97 | 277.30 |
+| Host 模型区间合计（ms） | 218.76 | 395.70 |
+| Host attention/卷积 metadata（ms） | 0.14 | 20.83 |
+| `cudaGraphLaunch` 调用数 / Host 时间（ms） | 1,248 / 13.76 | 1,610 / 14.32 |
+| `cudaEventSynchronize` Host 时间（ms） | 0.42 | 0.20 |
+
+GPU kernel 活跃时间按同一个 CORE 批内所有已关联 kernel 的区间并集计算，批内空档
+取该批从第一到最后一个 kernel 的跨度减去活跃时间，不包括批间排队。采集节点和
+层内 NVTX 会放大绝对时长，轻量时间轴和无 profiler 的六波分别用于估计差距和验收。
+
+Packed WCPB 确实减少了设备计算，主要的增量在批内继续提交。普通 CORE 每批回放
+13 个图段，跨轮批为 38。图启动本身的 Host 时间变化约 0.56 ms。更大的变化是
+各个图段之间的 eager 工作。Packed CORE 的 QKV 准备累计 106.76 ms，MLP 准备
+112.11 ms，attention 范围 110.71 ms。层尾范围包含下一层 QKV 的嵌套，统计时需去重。
+新模型在 CORE 启动 `index_elementwise_kernel` 1,533 次、`vectorized_gather_kernel`
+1,302 次、独立 `_rms_norm_kernel` 837 次。设备上的 `convMixKernel` 缩短了约 3.90 ms。
+模型外 metadata 增量主要是按轮次准备块表及写入位置，新增页路由的 Host 区间为
+13.72 ms。现有数据优先支持把归一化、消息混合和短卷积参数准备搬回可回放的图里，
+以及减少按批的页路由提交。
+
+[普通128 Nsight](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-packed-nsys-retake/ordinary128/prefill.nsys-rep) ·
+[Packed WCPB Nsight](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-packed-nsys-retake/wcpb128/prefill.nsys-rep) ·
+[CUDA/NVTX 解析](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-packed-nsys-retake/prefill-profile-summary.json)
+
+#### WCPB 扩大 PIECEWISE 图覆盖
+
+跨轮 CORE 在启动时按现有 token 图档捕获固定形状的输入和状态。Worker 在回放前更新
+真实位置、首轮和续轮的标记、状态、短卷积块表和写入槽位。块表和槽位按相同物理
+布局共享，native attention 仍读取实际批的变长输入。卷积、归一化、消息控制与线性层
+在可回放段内。首轮输入的 BF16 值暂存在 FP32 缓冲中，续轮隐状态保持原 FP32。
+补齐行在卷积的写入槽位标记为 `-1`，输出只取实际行。
+
+原有取行、归一化、写回及清理 padding 的操作合为一个逐行 Triton kernel，复用
+vLLM 的 RMSNorm 数学。首轮、续轮张量的行数和 stride 作为运行时参数，回放前的
+BF16/FP32 输入整理在启动时预热。混合 dtype 及输出 padding 有单独的 GPU 用例。
+随机算子对照在一个布局发现归一化输出有一个 BF16 舍入档的差异。真实模型 2,051
+token 请求的 8 个输出 token 与旧 packed 及普通 prefill 完全一致。21 个跨轮 CORE
+均实际回放 13 个图段、12 个 attention 切点，覆盖 `131→256` 和 `384→512`。
+[逐行处理 GPU 对照](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-fused-row-native-parity/result.json) ·
+[真实图回放和补齐验证](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-expanded-graph-fp32-smoke2051/summary.json)
+
+GPU 7 的 W3 C1 保持输入 4,096、输出 128、chunk 128、预算 1,024、KV 80 GiB、
+异步调度及原图档。新图路径的三次正式波均独占，SM 为 2,032 MHz，吞吐分别为
+202.34、190.97、193.06 tok/s。与同卡旧 WCPB 及此前普通 128 分别逐序列核对，
+均为 24/24 完整输出一致。
+
+| W3 C1 | 旧 WCPB | 新图 WCPB | 此前普通 128 |
+| --- | ---: | ---: | ---: |
+| 吞吐（tok/s） | 139.30 | 193.06 | 186.71 |
+| TTFT P95（ms） | 540.80 | 290.14 | 314.49 |
+
+新图 WCPB 比旧 WCPB 提升 38.6% 吞吐。相对历史同卡普通 128，新图 WCPB 吞吐
+提升 3.4%，TTFT P95 降低 7.7%。
+[C1 三臂对照及输出校验](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-expanded-graph-fp32-c1/matched-graph-comparison.json)
+
+同一冻结源码 `ae73562` 的 W3 C4 在 GPU 1 各测三波，SM 均为 2,032 MHz，完整
+输出 24/24 一致。普通 128 的吞吐为 451.94、443.85、449.99 tok/s，新图 WCPB
+为 467.73、386.45、457.59 tok/s。中位吞吐为 449.99→457.59（+1.7%），本次波动
+幅度大于中位差值。TTFT P95 为 583.54→478.49 ms（−18.0%），TPOT P50 为
+4.78→5.18 ms。
+[C4 同源码同卡对照](../artifacts/w3-scheduler-priority-20261127/gpu1/wcpb-expanded-graph-fp32-c4-fresh-pair/comparison.json)
+
+随后在 GPU 3 对 `ae73562` 做了同源码的 W3 C1 开关配对。普通 128 吞吐
+187.51→193.97 tok/s（+3.45%），TTFT P50/P95 从 304.46/312.42 ms 降到
+267.34/301.09 ms。三波均独占，24/24 条输出完全一致。
+[C1 同源码同卡对照](../artifacts/w3-scheduler-priority-20261127/gpu3/wcpb-expanded-graph-fp32-c1-fresh-pair/comparison.json)
+
+#### WCPB 从调度到 GPU 的逐拍复盘
+
+取冻结源码 `ae73562` 上 GPU 7 的一条真实请求。输入 2,051 token，输出 8 token，
+prefill 每段最多 128 token，三轮，异步调度，预算 1,024，KV 80 GiB。窗口允许同一
+请求最多三段在途。完整记录共 92 个物理 forward，含 prefill 的 PRELUDE、CORE、
+CODA 分别为 15、25、17 次，另有纯 decode FULL 35 次。接下来用其中连续六拍展示
+交错执行。A、B、C 是同一请求从位置 896、1,024、1,152 开始的三段，各 128 token。
+
+| 第几拍 | 这一拍 GPU 做什么 | 真实行 → 图档行 | Host 调度（ms） | Host Worker 模型前准备（ms） | Host Worker 整个提交（ms） | GPU 模型事件起止（ms） |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 26 | CORE，A 第 2 轮、B 第 1 轮 | 256 → 256 | 0.031 | 0.668 | 2.986 | 220.041–223.547 |
+| 27 | PRELUDE，提前准备 C | 128 → 128 | 0.097 | 0.616 | 1.707 | 223.603–224.588 |
+| 28 | CORE，A 第 3 轮、B 第 2 轮、C 第 1 轮 | 384 → 512 | 0.034 | 0.693 | 3.062 | 225.098–229.294 |
+| 29 | CODA，A 收尾 | 128 → 128 | 0.037 | 0.477 | 1.544 | 229.333–230.452 |
+| 30 | CORE，B 第 3 轮、C 第 2 轮 | 256 → 256 | 0.032 | 0.670 | 2.845 | 230.689–233.883 |
+| 31 | CODA，B 收尾 | 128 → 128 | 0.025 | 0.481 | 1.537 | 233.925–235.064 |
+
+第 27 拍为 C 预留 KV 并做 PRELUDE。第 28 拍前，A 的第 2 轮与 B 的第 1 轮已经
+完成，后段可读前段对应轮次的 KV。此时三段进入同一个物理 CORE，共 384 个真实行。
+其中一份稠密 hidden 缓冲形状为 `[512, 2304]`，128 个 padding 行不产生新的实际 KV
+写入。Attention 处理三个 128 行的真实 query 区间，各自的上下文终点为 1,024、
+1,152、1,280。12 层 CORE 共享这一次物理 forward，实测回放 13 个图段，中间有
+12 个原生 attention 调用点。A 已到终轮，下一拍进入 CODA；B 和 C 的中间状态入环形
+缓冲，继续各自下一轮。A、B 的 CODA 提交中间结果，最后的 3-token 段才在第 57 拍
+由 CODA 出首 token。那一拍走 `3→4`，模型事件 1.025 ms，随后采样 0.252 ms。
+
+Host 的整次提交包含模型前准备，两列有包含关系。模型前准备覆盖位置、输入及相关
+metadata 的处理，当前记录没有单独的 KV 分配和逐算子区间。这个例子中 Host 在本请求
+入场后 235.893 ms 完成第 28 拍排程，第 27 拍的回执在 239.039 ms 才开始处理，排程
+比上一拍回执早约 3.15 ms。GPU 模型事件在这六拍依次执行，第 27 拍结束到第 28 拍
+开始隔约 0.51 ms。GPU 事件与 Host 绝对时间各有原点。这里可以直接核对 Host 提前
+排程、同批三段并入一次 CORE 和相邻 GPU 模型事件的间隔。实际 kernel 忙闲使用
+Nsight 数据。此诊断有首次形状长尾，表内这六拍是实测切片，正式 TTFT 另以无探针
+结果为准。
+
+[全 92 拍 Host/Device 明细 CSV](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-expanded-graph-fp32-smoke2051/wcpb-per-forward.csv) ·
+[原始时间轴](../artifacts/w3-scheduler-priority-20261127/gpu7/wcpb-expanded-graph-fp32-smoke2051/packed2051-cuda.trace.json)
+
+对窗口决策有用的两份历史对照分别测到了合批成本和下游等待。
+
+- 较早的同卡 Nsight 对照里，WCPB 开启把 prefill CORE 物理批从 96 降到 45，
+  kernel 活跃时间从 214.50 降到 152.11 ms，但各批内部没有 kernel 的区间从
+  24.97 变为 277.30 ms。那一版跨轮批仍用 38 个图段，现在上述样本回放 13 个段。
+  收益要按减少的物理批和批内实际提交开销一起核算。
+- W3 C16 有一组历史 A/B 两边都开 WCPB 512。接入已有调度和同轮合批后，提前发
+  后段 PRELUDE 的次数从 137 降到 30，物理 forward 从 3,409 降到 1,671，纯
+  decode CORE 批从 1,543 降到 597，正式吞吐从 663.74 升到 975.65 tok/s。
+  这组同时改了 CORE/CODA 选择和 Worker 合批，差值不能单独归到窗口开段数。
+
+[Kernel 及批内空档对照](../artifacts/w3-scheduler-priority-20261127/gpu4/wcpb-packed-nsys-retake/prefill-profile-summary.json) ·
+[两边都开 WCPB 的同热正式波](../artifacts/w3-scheduler-priority-20261127/gpu7/w3-wcpb-current-scheduling-interleaved/summary.json)
+
+窗口策略的独立对照尚待采集。双方保留同一 WCPB Worker、图档、chunk 大小和 KV 配置，
+只切换当前固定窗口与按批决定是否多开一段。在 W3 C1 检查少发了哪些真实 CORE，
+在 W4 C32 检查原本同批的 decode 是否被拆出、首 token 和下一 token 各多等多少。
+两臂需记录每次开段前的候选集合、PRELUDE 新增 KV 页、实际物理拆批和输出回执。
+同卡正式波再对照吞吐、TTFT 和 ITL，量化前移一个 chunk 的净收益。
+
+#### W3 C16 放大 WCPB 批预算
+
+在冻结源码 `ae73562` 对照 `max_num_batched_tokens=1024/2048/4096`，每档配对 WCPB 关/开。
+每波 32 条 4,096→128，C16，动态 decode 轮数 8/8/16，共 4,096 个输出 token。
+均使用 128-token chunk、异步、P/D 混批、TP1 和 80 GiB KV。大预算组加入相应的
+PIECEWISE 图档，FULL decode 的请求数档不变。正式波使用独占 GPU，每臂先完整预热，
+再跑三波。独立结构波核对真实 CORE 行、packed 图档和 P/D 分布。
+
+先用同源码调度器重放，保留相同请求和轮数、两个在途提交，回执使用固定输出。
+两档各行均执行 393,216 行真实 prefill CORE 和 9,144 行真实 decode CORE。
+
+| 预算 | WCPB | 含 prefill CORE 计划 | 每计划真实行均值 | 纯 decode CORE 计划 | 全部调度计划 | 含 prefill CORE 图档真实行占比 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 关 | 414 | 955 | 663 | 1,797 | 98.04% |
+| 1,024 | 开 | 445 | 889 | 650 | 1,951 | 93.29% |
+| 2,048 | 关 | 192 | 2,048 | 762 | 1,590 | 100.00% |
+| 2,048 | 开 | 245 | 1,607 | 744 | 1,691 | 88.81% |
+| 4,096 | 关 | 192 | 2,048 | 762 | 1,590 | 100.00% |
+| 4,096 | 开 | 110 | 3,575 | 762 | 1,506 | 100.00% |
+
+2,048 WCPB 有 197 个含 prefill CORE 计划超过 1,024 行，132 个达到 2,048。
+含 prefill CORE 比 1,024 WCPB 少 200 次，纯 decode CORE 多 94 次。P/D CORE
+计划数由 340 降到 81。普通路径也会从扩大预算受益，2,048 的含 prefill CORE 计划
+均达到预算，同时 P/D CORE 计划由 315 降到零。更多 prefill 和 decode 分开执行
+会改变整波成本，CPU 重放的逻辑计划数与投影图档需要用物理 forward 校验。
+
+4,096 更适合检验 WCPB 独有的额外组批空间。普通路径每拍通常每条请求只能提供一段，
+16 × 128 是 2,048 行。4,096 WCPB 在模拟中有 82 批达到 4,096、另有 28 批
+达到 2,048，普通仍为 192 个 2,048 行批。两边的纯 decode CORE 都为 762 批。
+如果两个路径的 2,048 行 CORE 耗时相同，那么含 prefill CORE 要有收益，WCPB 的
+4,096 行实际耗时需低于普通 2,048 行批的两倍。GPU 对照增加 4,096 预算，保留
+2,048 和 4,096 图档，验证这 82 次潜在合并是否出现在实际执行中。
+
+两条历史 W3 C16 trace 的首批都先到一条，另外 15 条在第一次调度之后集中到达。
+按同样的到达顺序重放，4,096 档普通和 WCPB 的含 prefill CORE 分别为 213 和
+131 个计划。WCPB 仍有 84 个超过 2,048，其中 67 个达到 4,096，真实行均值
+1,847→3,003。该重放只复现开头的到达顺序，续入仍由合成回执驱动。
+
+2,048 WCPB 在原档+2,048 的含 prefill CORE 投影 padding 为 49,614 行，加入
+1,536 档后回算到 25,550，加入 1,280/1,536/1,792 后为 19,406。图尺寸的收益仍需
+验证。同一波对照需要同时看两种路径的吞吐变化和各预算下 WCPB 开关的差值。
+
+固定 128 只用于隔离开关的作用。CPU 另跑了普通路径无额外 chunk 上限的原配置。
+4,096 预算下，它有 105 个含 prefill CORE，平均真实 3,752 行，另有 726 个纯 decode
+CORE。比较 WCPB 的工程收益时还要以该路径为参照。WCPB 的价值要看保持小 chunk 时
+是否仍能得到大批的效率，以及首 token 和生成延迟的变化。
+
+确认 2,048 与 4,096 的跨轮图在启动阶段均捕获为 13 个段。首轮检查错误地把 vLLM
+按满 8,192-token 请求折算的容量要求固定为 291,018 token。固定 80 GiB 后，预算
+2,048/4,096 的日志折算值为 161,241/87,131。重新测试改为检查保留字节及实际物理
+块池，并要求同预算开关两侧物理配置一致。
+
+GPU 启动验证三档均为 85,899,345,920 字节、40,960 个物理 KV 块。GPU 0 独占的
+4,096 WCPB 结构波共有 1,553 个物理 forward，32 条请求的逐位置轮次全部通过。
+127 个跨轮 CORE 都实际回放了 expanded packed 图，其中 83 个通过 B4096 回放，
+均有超过 2,048 个真实行并跨不同轮次。64 个为 `4096→4096`，平均模型事件
+16.43 ms；16 个全满的 `2048→2048` 跨轮批平均 9.64 ms。用这两个形状的观察均值
+归一到每行，前者低约 15%。这两类批的 KV 历史和成员组成存在差异。135 个含 prefill
+CORE 的平均真实行 2,914，padding 为 16,952 行，全部物理 forward 均有图回放。
+[4,096 WCPB 物理结构](../artifacts/wcpb-budget-20261127/structure-retake/gpu0/4096/wcpb128/structural-summary.json)
+
+| 预算 | 正式计时 GPU | 普通 128 吞吐（tok/s） | WCPB 128 吞吐（tok/s） | WCPB TTFT P95（ms） |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 2 | 935.56 | 790.33 | 1,748.38 |
+| 2,048 | 3 | — | 916.51 | 1,324.18 |
+| 4,096 | 1 | — | 1,029.82 | 1,105.54 |
+
+1,024 的同卡吞吐对照下降 15.52%，TTFT P95 为 1,417.14→1,748.38 ms，首 token
+96/96、完整输出 90/96 一致。2,048 WCPB 三波为 916.51、918.62、845.58 tok/s。
+4,096 WCPB 三波为 1,029.82、1,029.99、1,013.32 tok/s。上述预算间为不同 GPU 的
+趋势。这三组为动态轮次 WCPB 预算趋势。后续对照以原生 vLLM 与 WCPB 的固定三轮
+为主，停止大预算的普通 RLT 补测。
+[1,024 普通正式波](../artifacts/wcpb-budget-20261127/formal/gpu2/1024/ordinary128/summary.json) ·
+[1,024 WCPB 正式波](../artifacts/wcpb-budget-20261127/formal-retake/gpu2/1024/wcpb128/summary.json) ·
+[2,048 WCPB 正式波](../artifacts/wcpb-budget-20261127/formal-retake/gpu3/2048/wcpb128/summary.json) ·
+[4,096 WCPB 正式波](../artifacts/wcpb-budget-20261127/formal-retake/gpu1/4096/wcpb128/summary.json)
+
+[调度重放与图档回算](../artifacts/wcpb-budget-20261127/scheduler-replay.json) ·
+[首条请求先到的重放](../artifacts/wcpb-budget-20261127/scheduler-replay-first-request-alone.json) ·
+[普通路径无额外上限重放](../artifacts/wcpb-budget-20261127/scheduler-replay-ordinary-uncapped.json)
+
+##### 对照 vLLM 在 4,096 预算下的实际批大小
+
+原生 vLLM 保持自己的无额外 chunk 上限入口，WCPB 使用 128-token chunk。两个正式臂
+均固定三轮、同模型、TP1、80 GiB KV、C16，并对齐 4,096 预算和 FULL/PIECEWISE 图档。
+每个请求都生成 128 token。在结构波中比较实际行、图回放和时间。原生一拍执行完整
+模型三轮，RLT 一次 CORE 只推进各段一轮，因此原生 forward 数和 RLT CORE 数分别报告。
+
+同一个 W3 C16 语料在原生 AsyncScheduler 的 CPU 重放中，35 个含 prefill 批有
+32 个达到 4,096 行，实际输入总数 131,072。原生有 4,096-token 的请求就能直接填满。
+固定三轮的 WCPB 重放有 110 个含 prefill CORE，82 个达到 4,096。它证明小 chunk 能
+通过跨轮合出 B4096。W3 C16 这份原生配置也有足够工作凑满。旧同模型、预算 4,096
+的原生 GPU 4 计时是 1,233.68 tok/s、TTFT P95 802.25 ms，作为历史参照单列。
+
+[原生与 WCPB 固定三轮的 CPU 结构重放](../artifacts/wcpb-budget-20261127/native-scheduler-replay.json) ·
+[历史 vLLM 4,096 正式波](/home/zjy/code/david/b_workspace/vllm-rlt-review/artifacts/plugin2-perf.9pulvo/metadata-graph-opt/variable-graph-ab/decode-optimizations/w3-1000-gate/gpu4/compact-mixed-core-filtered-same-budget-native/native-fixed3-4096/summary.json)
+
+| W3 C16，4,096 固定三轮 | 原生 vLLM | RLT WCPB128 |
+| --- | ---: | ---: |
+| GPU | 0 | 3 |
+| 吞吐（tok/s） | 1,232.49 | 941.53 |
+| TTFT P50/P95（ms） | 210.52 / 805.95 | 1,113.33 / 1,308.74 |
+| TPOT P50（ms） | 11.12 | 7.49 |
+
+两个 GPU 均为独占 B300。表中取各臂前三波中位数。原生六个独占波在
+1,231.40–1,233.83 tok/s，时钟采样为 1,995–2,032 MHz。WCPB 三波为
+918.83、1,003.54、941.53 tok/s，时钟采样为 2,032 MHz。每波均生成 4,096 token，
+配对首 token 一致 96/96、完整序列一致 91/96。WCPB 吞吐为原生的 76.39%。
+原生固定三轮的运行期批宽结构波和同卡复测遇到外部进程，均未纳入对照。现有
+固定三轮吞吐来自跨卡独占计时，原生可打满 B4096 的形状结论来自实际调度器重放。
+[4,096 固定三轮实测及原始波索引](../artifacts/wcpb-budget-20261127/native-fixed3-4096-cross-gpu.json)
+
+##### 普通路径优先的自适应 WCPB 设计
+
+每一拍先按普通规则选择同一阶段的工作。使用普通路径自己的 chunk 上限和已有的
+首 token、decode、防饥饿优先级。若能够形成达到真实 token 预算的物理批，或请求槽
+已经用完，本拍停止新增 WCPB chunk。若还有余量，检查现有可运行的 prefill、当前
+及后续 CORE 的物理合批形状、空闲 KV 页及中间状态槽。优先利用现有图档的空位，
+需要升图档时比较两种排法总耗时。调度只用当前已知的请求与依赖。
+
+例如预算 1,024，普通路径能提交一个有 768 个真实行的 B1024 CORE。假如本次已有的
+PRELUDE 能顺手准备两个 128-token 段，它们随后能赶上这类 CORE，原本会单独发的
+B256 可以省掉，值得尝试开段。若本来就有 1,024 个兼容行，额外准备两段可能只是
+换掉已有成员，把别人的最后一段或下一个 decode token 挪后。纯 decode 的 16 条
+已就绪请求可以走 B16 FULL，不能从 1,024 总预算倒推出这个批需要填 1,008 行。
+
+决策与执行分开。Scheduler 只在本拍选的是 PRELUDE 时增加新段，在提交计划前检查
+既有请求可加入、连续位置和后续读写依赖。只计算一次普通计划，利用其剩余预算，
+避免反复试排导致修改 CODA 等待计数或重复申请 KV。增量候选分配失败时提交原批，
+额外开段沿用 vLLM 的 KV 分配器、滑窗回收和 prefix 生命周期，同时避免为试探开段
+抢占就绪请求。已发出的段继续按该请求自己的位置和轮次跑完，后段 CORE 仍要等前段
+对应轮次完成，CODA 仍按位置提交。
+
+已有 WCPB 与普通路径的不同状态布局需要保留。启动时启用 WCPB 能力、预热两类图，
+以每个 chunk 创建时的状态归属和实际物理批布局选择 Worker 路径。第一个版本从
+状态已排空的请求边界启用 WCPB 窗口，保留普通 chunk 的原尺寸。普通 chunk 仍走
+普通位置处理、输入/状态复用及可用的 CODA 快路径。该窗口已经在跑时，即使负载
+变满，也只收紧新段准入，原段的 KV、隐藏状态和图布局随其运行到已有的回执边界。
+没有在途段以后即可恢复普通准入。这避免把已执行一半的普通大 chunk 搬入按小 chunk
+分配的 WCPB 环形缓冲。需要多次实际提交才能执行的逻辑批，按 Worker 的实际分组
+与图覆盖计费。跨路径合批只在已有 Worker 兼容能力覆盖时使用。预热的额外图和环形
+缓冲会占显存，应记录其开销及两臂实际的 KV 容量。
+
+先交付只利用原有 PRELUDE 拍的保守策略。允许的额外段数先限为一段；检查候选的真实
+行能在后续一个或两个 CORE 步内合并，且预估可以减少物理提交。未来合并仍以实际
+就绪、图档和执行路径为准。较小的批也可能没有可提前推进的工作，例如 prompt 尾部
+已经全部入批、依赖还在途，或者纯 decode。碰到这些条件直接按原节奏提交。若保守
+策略的正式数据表明窗口更大有收益，再评估允许第三段或升档。
+
+用一个能自然填满的场景和一个有真实 prefill 空位且存在可提前推进的段的场景验收。
+W3 C16 的 4,096 档用于确认避免退化，因为 vLLM 的普通调度已经能做大批。低负载的
+受控小 chunk 实验可用于检查开窗和排空是否有效，与默认原生 vLLM 的性能比较仍用其
+正常配置。结构波记录每次普通物理批的真实行、开段原因、KV 与图档，以及少掉的
+CORE、增加的纯 decode 提交和首 token/下一 token 延迟。正式计时限定到代表负载，
+同波工作量与正确性通过后比较吞吐、TTFT 和 ITL。
+
+##### 自适应 WCPB 实现和 W7 验收
+
+使用 `--rlt-adaptive-wavefront-prefill` 开启自适应模式。`--rlt-prefill-chunk-size`
+为 WCPB 单段上限，未设置时取 `min(128, max_num_batched_tokens)`。原普通
+prefill 的 `long_prefill_token_threshold` 不受 WCPB 上限影响。两种 WCPB 模式单独启用。
+
+Scheduler 先组普通批，只在该 PRELUDE 尚有真实余量和调度槽时尝试给一条新段加一个
+连续后段。前段已在该批被选中、请求在该段前没有其他在途操作，并且前段可以放进
+WCPB 中间状态缓冲。后段按剩余预算、剩余 prompt 和单段上限裁剪。已有 decode 时
+只填当前 PIECEWISE 图档内的空行。可选后段的 KV 申请失败时保留原计划。两段一同
+标记为 WCPB，沿用逐轮 KV 依赖，按请求位置完成 CODA。先组同轮 CORE，有余量再检查
+已就绪的 WCPB 跨轮段。Worker 普通批保留普通输入和状态复用、正常 decode 槽及
+CODA 尾部优化，WCPB 所有权按实际段保存在环形缓冲。两类图在启动时捕获。
+
+普通路径不设单段额外上限时，所选长段可以消耗本拍剩余预算，留下的未满批可能只剩
+已经全部入批的 prompt 尾部。在 W7 直接比较 vLLM 与自适应 RLT 时，两边均明确设
+`long_prefill_token_threshold=128`，以同配置观察满批和可提前推进的未满批。
+另外保留原生默认无额外上限的 W7 数据作为参照。W7 使用相同 ShareGPT 64 条请求、
+C32、固定三轮、预算 1,024、80 GiB KV、TP1、异步和相同图档。
+
+CPU 插件测试 138 通过、3 跳过。覆盖满批保留普通路径、开出一个短段、同批运行两条
+依赖就绪的 CORE、异步排空、KV 不足回落，以及有 decode 时图档保持不变。
+
+W7 在同一张独占 GPU 4 上运行。vLLM cap128 的结构波中，含 prefill 的物理批有 7 个
+达到 1,024 个真实行，37 个未达到。自适应结构波中，7 个普通 PRELUDE 已占满 1,024 个
+真实 token 行，全部保持普通执行。52 个未满的决策点里有 10 个能开新段，共补入 843 个
+真实行。其余 42 个没有满足条件的请求，其中 33 个已选请求只剩 prompt 尾段。实测
+976 行的混合批补了 48 行，继续复用 1,024 档。10 个跨轮 CORE 物理批均重放了 256
+档的 packed CUDA Graph。64 个请求通过逐位置的 PRELUDE、三轮 CORE、CODA 执行
+计数检查。这次实现以实际预算、就绪依赖、预留 KV 和图档为准，尚未接入上文提议的
+后续 CORE 合批成本预测。
+
+[W7 自适应调度证据](../artifacts/w7-adaptive-wcpb-20261127/adaptive-v2-cap128-structure/adaptive-evidence.json) ·
+[W7 自适应执行统计](../artifacts/w7-adaptive-wcpb-20261127/adaptive-v2-cap128-structure/structural-summary.json) ·
+[W7 vLLM 执行统计](../artifacts/w7-adaptive-wcpb-20261127/native-cap128-structure/1024/native/structural-summary.json)
+
+W7 正式数据为每组三波无计时插桩的中位数，均使用 GPU 4，记录到的 SM 时钟为
+2,032 MHz。每波 64 个请求均输出 512 token，合计 32,768 token。
+
+| W7 C32，普通 prefill 上限 128 | 吞吐（tok/s） | TTFT P95（ms） | TPOT P95（ms） | ITL P95（ms） |
+| --- | ---: | ---: | ---: | ---: |
+| vLLM | 3,683.61 | 263.28 | 8.51 | 8.50 |
+| RLT，自适应关闭 | 3,646.82 | 275.62 | 8.61 | 8.64 |
+| RLT，自适应开启 | 3,605.85 | 297.52 | 8.74 | 8.46 |
+
+自适应吞吐达到同配置 vLLM 的 97.89%，相对 RLT 关闭自适应下降 1.12%，三波均低于
+关闭侧的各波。开启后 TTFT P95 较关闭增加 21.89 ms。启动时图分配量增加 270 MiB，
+KV 仍为相同的 40,960 物理块。vLLM 第一波为 2,781.72 tok/s、TTFT P95 2,937.76 ms，
+保留在中位数计算内。原生 vLLM 无普通段上限的参考中位数为 3,721.39 tok/s。
+
+RLT 的两次独立结构波各处理 58,338 个真实 prefill CORE 行，即 19,446 个 prompt token
+各跑三轮。含 prefill 的物理 CORE 提交从 129 增至 155。其中纯 prefill 从 9 增至 32，
+含 decode 的混合批从 120 增至 123。两波请求到达时机有差异。这是整波结构实测，
+可确认开启侧虽然发生了跨轮合批，整波的物理提交数仍未减少，不能从中分离每次开段的成本。
+
+逐 token 比较中，三波 RLT 开启交叉对三波关闭，64 个请求完全相同的中位数为 12，
+RLT 关闭侧重复波之间为 22，vLLM 重复波之间为 20。输出长度与阶段执行计数均校验
+通过。输出内容仍有差异，逐 token 一致性尚未通过。该特性保持显式启用。
+
+[同配置 vLLM 对比](../artifacts/w7-adaptive-wcpb-20261127/cap128-comparison.json) ·
+[RLT 关闭自适应正式结果](../artifacts/w7-adaptive-wcpb-20261127/adaptive-v2-cap128-off-formal/summary.json) ·
+[RLT 开关结构波对比](../artifacts/w7-adaptive-wcpb-20261127/cap128-structure-comparison.json) ·
+[输出前缀对比](../artifacts/w7-adaptive-wcpb-20261127/prefix-parity.json)
+
+##### 未满批恢复 WCPB 轮转组批
+
+普通调度先选批。普通批用完 token 预算后直接提交。有余量时，PRELUDE 复用固定 WCPB
+的轮转组批，给每个可入选的请求补一段，再回到仍有空间的请求，直到耗尽 token、请求槽、
+KV 或中间状态槽。单段长度受 `rlt-prefill-chunk-size` 上限约束。已有 decode 时，从
+含 prefill 的 PRELUDE 补段只填当前图档内的空位，纯 decode 的 PRELUDE 保留 FULL 路径。
+PRELUDE 中相邻的多个段由 MRv2 合成同一请求的查询，仍分别保存中间状态。只有额外
+KV 申请成功后才切换普通前段的状态归属。
+
+已进入 WCPB 的窗口可以在已有段完成后滚动补段。CORE 先尊重普通调度的优先级和同轮
+组批。仍有空位且有就绪 WCPB 段时，可合入其他请求和轮次的兼容工作。当前 CORE 的物理
+元数据保留每请求每轮一条查询及总查询数上限，并继续检查前段同一轮的 KV 是否已就绪。
+无必须先执行的工作且本拍仅有少量 prefill CORE 时，允许先补已有窗口，随后再按实际
+就绪情况组成 CORE。CODA 仍按请求位置完成。
+
+CPU 插件测试通过 142 项、跳过 3 项。新增覆盖多个请求轮转、连续多轮补段、旧段完成后
+滚动补段、WCPB CORE 合入普通请求，以及纯 decode 保留原批。
+
+初次结构波 `source-round-robin-v1` 观察到 459 次为 31 行纯 decode 的批补入 1 个
+prefill token。实际执行因此从 FULL 的 decode 路径切到 PIECEWISE，混合 CORE 提交由
+关闭侧的 120 增到 1,501 次。该版唯一正式数据波吞吐 2,814.49 tok/s。修复后重新冻结
+`source-round-robin-v2`，保留这次数据用于归因。
+
+修复后的 W7 结构波中，5 个普通 PRELUDE 原本就满，占用 1,024 个真实行，均保持普通
+执行。未满时开了 8 个窗口，另有 29 次给已打开的窗口补段。纯 decode 批补段次数为零。
+一次 635 行的 PRELUDE 在同一批中按顺序为两个请求补了 112 和 128 行。57 个跨轮
+CORE 物理批均重放 packed CUDA Graph，每批真实行数中位数为 256。64 个请求的逐位置
+阶段执行计数全部通过。
+
+含 prefill 的 CORE 在两次独立结构波中共处理相同的 58,338 个真实 prefill 行。关闭侧
+提交 129 批，物理行数 77,568。轮转版提交 167 批，物理行数 73,920。物理行数包括
+同批 decode 和 padding，两波请求到达时机不同。实测物理行数降低，提交数仍增加。
+
+正式计时使用同一张 GPU 4、同一 W7 C32 语料和上述阈值 128 配置。vLLM、RLT 关闭、
+单段版保留已完成的同配置三波数据。轮转版另跑三次预热后的正式波。
+
+| W7 C32 | 吞吐（tok/s） | TTFT P95（ms） | TPOT P95（ms） | ITL P95（ms） |
+| --- | ---: | ---: | ---: | ---: |
+| vLLM | 3,683.61 | 263.28 | 8.51 | 8.50 |
+| RLT，自适应关闭 | 3,646.82 | 275.62 | 8.61 | 8.64 |
+| RLT，单段版 | 3,605.85 | 297.52 | 8.74 | 8.46 |
+| RLT，轮转版 | 3,528.49 | 347.73 | 8.72 | 8.72 |
+
+轮转版吞吐为同配置 vLLM 的 95.79%，比 RLT 关闭低 3.24%，比单段版低 2.15%。
+轮转版第一波输出 32,768 token，吞吐 3,543.68 tok/s。其余两波各输出 32,516 token，
+同一请求在 260 token 时自然结束。所有组均允许 EOS。逐位置阶段计数通过，输出内容
+一致性仍待验证。三轮轮转版与三轮关闭版两两比较，每 64 个请求的首 token 相同数中位为
+63，完整序列相同数中位为 8。关闭版自身重复波完整序列相同数中位为 22。
+
+[首次轮转结构记录](../artifacts/w7-adaptive-wcpb-round-robin-20261127/round-robin-evidence.json) ·
+[修复后轮转结构记录](../artifacts/w7-adaptive-wcpb-round-robin-20261127/round-robin-v2-evidence.json) ·
+[轮转版同配置对比](../artifacts/w7-adaptive-wcpb-round-robin-20261127/three-arm-comparison.json) ·
+[轮转版输出比对](../artifacts/w7-adaptive-wcpb-round-robin-20261127/prefix-parity.json)
+
+###### W7 提交次数增加的调度归因
+
+两个结构波的 Scheduler 计划数均与 Worker 实际 forward 数一一对应。含 prefill 的
+PRELUDE、CORE、CODA 分别从 43、129、43 次增加到 60、167、72 次。CORE 增量中纯
+prefill 从 9 到 39 次，P/D 混合从 120 到 128 次。含 prefill 的 CORE CUDA Graph
+分段重放次数从 1,677 到 2,171。结构波记录的是物理 forward 与图段，逐个 GPU kernel
+的启动数需由设备时间轴另行测量。
+
+轮转版第一条 2,505-token 请求先进入 WCPB。其余 31 条在约 6.2 ms 内已抵达
+Scheduler，此后该请求仍单独占用 29 个 CORE，直到约 177 ms 才首次让其他请求进入
+PRELUDE。中间 17 次从零基础行启动的 PRELUDE 补段均服务同一个已打开窗口。关闭版
+同样先单独推进该请求，3 个 CORE 后在约 13 ms 组成了含其他请求的 1,024 行 PRELUDE。
+
+普通批选择先扫描运行请求，选定 CORE 后，本轮跳过需要 PRELUDE 的等待请求。
+WCPB 随后可以把一个有余量的纯 prefill CORE 换成 PRELUDE，但传入的是空候选，
+补段列表只包含已开启窗口的请求。普通模式每段 CODA 后有重新配批的机会，窗口滚动
+期间持续出现的 CORE 加上仅回填旧窗口的 PRELUDE，让这个机会一直推迟。当前是否
+开启或继续窗口的判定关注本拍空行，没有比较同一批已到达请求在普通 PRELUDE 和
+WCPB 路径中的组批机会。
+
+固定到达顺序的 CPU 调度复现使用 A 的 20 个 prompt token、B/C/D 各 12 个、单段上限
+4、总预算 16。B/C/D 都在 A 首次 PRELUDE 提交后加入。同步与异步结果一致。关闭版让
+A 单独提交 3 个 CORE、完成前 4 个 token 后，下一批是 A/B/C/D 各 4 个 token。轮转版
+先让 A 独占 7 个 CORE、5 个 CODA 和 2 个补段 PRELUDE，完成全部 20 个 token 后才
+给 B/C/D 首轮调度。这一序列固定了到达顺序，复现了请求准入饥饿。
+
+下一版设计应在每次窗口补段之前考虑已到达请求的首段，保持 CODA、decode 和防饥饿
+优先级，并在候选间比较实际 CORE 提交数、图档和阶段开销。预估使用实际可入选请求与
+同轮 KV 就绪条件，选定后再申请额外 KV。固定顺序复现可作为请求准入回归用例，W7
+则比较各阶段物理提交与图段重放次数。
+
+###### WCPB 续批补入其他请求
+
+当有余量的纯 prefill CORE 允许先补 WCPB 窗口时，先为一个已开启的窗口预留确实能
+推进的段。成功后才决定发 PRELUDE。其他已到达请求可以加入这个 PRELUDE，依据现有候选
+顺序、活跃请求上限、prefill 限流和异步就绪规则，补进首段或下一段。剩余预算交给原
+WCPB 轮转。只申请可用 KV；旧窗口无空位或无法预留时继续执行已就绪的 CORE。被让过
+一次的 CORE 从现有等待最久优先级重新参与下一拍。
+
+同步与异步回归验证，A 的 WCPB 窗口已满时，单个短请求到达后 A 的 CORE 按原计划执行。
+A 的旧段完成并需要补段时，B 可以和 A 共用一个 PRELUDE。插件测试通过 145 项，
+跳过 3 项。
+
+中间版 `source-admission-v1` 会先以普通候选决定能否发 PRELUDE。CPU 复现中，B/C/D
+均是单 token 请求，B 到达便能单独占一个 PRELUDE。`source-admission-v2` 把是否换拍
+交回 WCPB 窗口续批。普通调度本来选中 PRELUDE 时继续按普通规则组批。
+
+中间版的同配置 W7 结构波中，首个含其他请求的 PRELUDE 在约 5.7 ms 提交，给 14 个请求分配
+了 1,024 个有效行。前一个轮转版约 177 ms，期间第一条请求单跑 29 次 CORE；本版
+单跑为零。含 prefill 的 PRELUDE、CORE、CODA 物理提交为 37、125、54 次。前一轮转版
+为 60、167、72 次，关闭版为 43、129、43 次。三次独立结构波均处理 58,338 个真实
+prefill CORE 行。49 个跨轮 packed CORE 均重放图，64 条请求通过逐位置阶段计数。
+
+最终版 `source-admission-v2` 的 W7 结构波有 7 次真实 WCPB 窗口补段，其中 2 个满批、
+5 个未满批。另外 5 次判断因为窗口没有可预留段，继续执行已就绪的 CORE。首个含其他
+请求的 PRELUDE 在 18.36 ms 提交，实际由第一条请求的 128-token 后段和 13 个新请求
+的首段组成，合计 1,024 个有效行。此前第一条请求独占 CORE 的次数由 29 降为 4。
+含 prefill 的 PRELUDE、CORE、CODA 提交分别为 45、153、65 次，63 个跨轮 packed CORE
+均重放图，64 条请求通过逐位置阶段计数。提交数较上一轮转版减少，含 prefill 的 CORE
+仍高于关闭版的 129 次。结构波的到达时机与批次分布有差异。
+
+正式计时沿用同卡同配置、每组三波的中位数。最终版为 3,548.93 tok/s、TTFT P95
+317.42 ms。吞吐较上一轮转版增加 0.58%，比关闭版低 2.68%，达到同配置 vLLM 的
+96.34%。TTFT P95 低于此前轮转版的 347.73 ms，高于关闭版的 275.62 ms 和 vLLM 的
+263.28 ms。最终版每波实际输出 32,588 token，同一请求在 332 token 时自然结束。
+关闭版与 vLLM 每波输出 32,768 token。各组均启用 EOS。最终版与关闭版的首 token、
+完整序列逐请求一致数中位分别为 60/64 和 7/64，输出一致性仍未通过。
+
+[中间版 W7 记录](../artifacts/w7-adaptive-wcpb-admission-20261127/report-v1-interim.md) ·
+[最终版 W7 结构证据](../artifacts/w7-adaptive-wcpb-admission-20261127/admission-v2-evidence.json) ·
+[最终版同配置性能](../artifacts/w7-adaptive-wcpb-admission-20261127/four-arm-comparison-v2.json) ·
+[最终版输出对比](../artifacts/w7-adaptive-wcpb-admission-20261127/prefix-parity-v2.json)
+
+###### WCPB 最终版 W7 的耗时归因
+
+正式三波关闭与开启中位耗时分别为 8.985、9.182 秒。即使开启波的输出少 180 token，
+整波仍多用约 197 ms。以下来自独立插桩波，按每个物理 forward 的 CUDA event 区间
+累加，只统计带 prefill 的批，混合批包含其中的 decode 行。
+
+| 含 prefill 的阶段 | 关闭批数 | 开启批数 | 关闭（ms） | 开启（ms） | 差值（ms） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PRELUDE | 43 | 45 | 90.53 | 93.99 | +3.45 |
+| CORE | 129 | 153 | 549.14 | 665.77 | +116.63 |
+| CODA | 43 | 65 | 152.84 | 178.78 | +25.94 |
+
+含 prefill 的 CORE 实际 prompt 计算量均为 58,338 行。物理图行数从 77,568 降到
+72,576，每批真实 prefill 行从平均 452 降到 381。物理图档 ≤256 的批从 39 增到 91，
+≥512 的批从 90 降到 62。切段后总 PRELUDE prompt 段数 192 → 199，小于 128 token 的
+段数 69 → 89。例如第 63 条的 696-token prompt 从 5 个 128 加 1 个 56 改为 3 个 128、
+3 个 97 加 1 个 21。含 prefill 的 CORE CUDA Graph 分段重放由 1,677 增到 1,989，
+两边均有图覆盖。
+
+首个含新请求的满 PRELUDE 提交后，关闭版的 1,024 行第 1 轮 CORE 一次提交。开启版
+计划 5326 也准备了 1,024 行；紧接着 5327 只执行其中 765 行第 1 轮，另有 256 行由
+之前准备好的段在第 2、3 轮占用。剩余 259 行第 1 轮在 5328 单独发，使用 512 图档。
+两次独立波的首个满批含同样数量的请求和相同的段长度分布，旧段所在位置不同。这一
+例说明旧就绪工作与刚准备的一轮在同一个预算争抢行数时，跨轮合批可以打散新同轮批。
+
+确定性 CPU 调度复现固定请求到达拍、输出长度和回执顺序。预算 16、段上限 4，输入
+按（到达拍、prompt 长度、输出长度）为 `(0,20,8)`、`(1,12,4)`、`(1,28,2)`、
+`(8,17,2)`、`(25,17,8)`。开关两边实际 prefill CORE 都是 282 行，decode CORE 都是
+57 行。含 prefill 的 PRELUDE、CORE、CODA 调度计划从 10、30、10 变成 10、31、21，
+其中只含 1–8 个 prefill 行的 CORE 从 12 变成 19。该复现只调用 Scheduler，已能看到
+更多小批和计划，证实执行端的 CUDA Graph 与异步到达抖动无需参与这一机制。
+
+用关闭版同图档的常规 CORE 均值乘开启版的各档次数估算。关闭版没有 64 档样本，取
+开启波常规路径的 64 档均值。关闭版实测 549.14 ms，套用开启版批次分布得到 602.61 ms，
+开启版实测 665.77 ms。约 53.46 ms 与批次数和图档分布变化相关，余下 63.16 ms 混有
+执行路径与实际批内容变化。用同一开启波常规路径的各档均值替代其中 packed CORE 的
+计时，估算差 35.27 ms。在该波 512 和 1,024 档，packed CORE 均值分别为 4.74 与
+6.19 ms，普通路径为 4.22 与 5.48 ms。相同图档仍可能有不同的段长与上下文组合。
+
+调度开段依赖当前 PRELUDE 余量、槽、KV 与图档，CORE 只在同轮普通候选选完后加入
+当前已就绪的跨轮段。这个决策缺少对后续物理批能否合并的判断。执行端 packed CORE
+每次准备独立位置、拼接隐藏状态、生成并上传路由、回写每个段的状态。现有 CUDA Graph
+只覆盖其中的执行片段。CODA 当前每个请求按最早的位置推进，后段不会随前段 CODA 入批；
+带 WCPB 的 CODA 计划还停用末层 MoE 尾部裁剪。上述实现点均有独立代码路径，分项
+耗时仍需单独 A/B。去掉两边各一个超过 60 ms 的 CODA 事件后，CODA 仍多约 23.8 ms。
+
+两次插桩波的物理设备时间轴相差 +218 ms。模型和采样记录区间合计缩短约 84 ms，
+未覆盖区间多约 302 ms，其中长于 5 ms 的少数间隔多出约 250 ms，主要邻接纯 decode。
+两波输出长度和到达时机不同。这些间隔无法从现有 trace 归因给 WCPB 或精确分摊到正式
+吞吐差。约 146 ms 的带 prefill 阶段增量仍可用来定位应优先检查的路径。
+
+[关闭结构波](../artifacts/w7-adaptive-wcpb-20261127/adaptive-v2-cap128-off-structure/structural-summary.json) ·
+[开启结构波](../artifacts/w7-adaptive-wcpb-admission-20261127/admission-v2-structure/structural-summary.json)
+
+#### WCPB W1–W7 开关矩阵
+
+矩阵用冻结的 `ae73562`，保持 Inkling2-mini、TP1、1,024 token 预算、80 GiB KV、
+异步调度和原 CUDA Graph 档。使用现有的 W1–W7 标准语料、并发、请求数与输出上限。
+每个 case 跑固定三轮和请求级动态轮次，动态请求按既有 1/2/3/默认各占四分之一的分配。
+每组完整预热，保留三波同卡独占且 SM 2,032 MHz 的正式数据。
+
+对每个 case 和轮次配置，在 P/D mixed batch 开、关下分别对比普通 128 与 WCPB 128。
+关闭 P/D mixed batch 的独立测量源码仍允许 prefill 不同轮次互相合批。关闭组在 Worker
+按 prefill 和 decode 分开执行，保留调度优先级、逻辑计划和异步 CODA 回执。期望覆盖
+28 个同卡 WCPB 开关对照。这一轮保持自投机和 Decode pipeline 关闭。已有低并发 8
+请求的 WCPB 对照独立保留，标准 W3 使用 64 请求，其他历史结果也需要完全匹配方可复用。
+
+[矩阵汇总](../artifacts/w3-scheduler-priority-20261127/wcpb-matrix-20261127/matrix-summary.json) ·
+[后续自投机参考](https://github.com/InferMatrixLab/vllm-rlt/blob/main/docs/async-speculative.md)
+
+##### 暂停时的结果与归因
+
+暂停时保留 101 波原始记录。99 波属于各自做完三次重复的组，其中 66 波组成 11 个
+完整的同卡 WCPB 开关对照。下表只列允许 prefill 和 decode 合批的完整对照，吞吐取
+各组三波中位数。
+
+| 负载 | 固定三轮，关闭 → 开启（tok/s） | 请求级动态轮次，关闭 → 开启（tok/s） |
+| --- | ---: | ---: |
+| W1 C1 | 258.06 → 249.98（−3.13%） | 326.92 → 304.78（−6.77%） |
+| W3 C1 | 142.96 → 166.98（+16.80%） | 180.29 → 174.54（−3.19%） |
+| W4 C32 | 1,044.24 → 801.06（−23.29%） | 956.61 → 771.52（−19.35%） |
+| W7 C32 | 3,459.53 → 2,740.94（−20.77%） | 2,469.01 → 3,563.91（+44.35%） |
+
+- W1 每个 prompt 正好 128 token，单请求只有一个 prefill chunk，无法靠同一请求内
+  跨 chunk 合批省掉 CORE 提交。当前开关仍改变输入位置准备和中间状态复用。分开
+  执行 prefill 和 decode 时，固定三轮的 +1.09% 落在波间波动内，动态轮次下降 2.95%。
+- W3 每个 prompt 有 32 个 chunk，之前的 C1 诊断中，同样的 98,304 行实际 prefill
+  CORE 从 768 次提交合成了 360 次。这次 64 请求对照的固定三轮吞吐区间分别为
+  137.84–160.82 和 136.00–169.16 tok/s，动态轮次区间同样重叠。分开执行时，固定
+  三轮为 161.44 → 154.24 tok/s（−4.46%）。现有数据证实了合批能力，W3 吞吐差值
+  的大小和方向仍受波间波动影响。
+- W4 的普通路径只需同时有八个就绪的 128-token chunk 即可填满 1,024 token 预算。
+  WCPB 改变同一请求可并行推进的 chunk 数以及每批选中的工作，并关闭普通路径对
+  大 prefill CODA 批的最后一层 MoE 跳算优化。固定和动态轮次的 WCPB 三波吞吐都
+  低于各自所有普通波，TTFT P95 和 TPOT P50 同时上升。当前没有同批次时间轴可把
+  W4 的损失分摊到实际组批、MoE 和输入准备。
+- W7 动态轮次每波都生成 32,768 token，允许合批时 TPOT P50 从 12.07 降到 8.72 ms，
+  TTFT P50 从 103.59 降到 95.25 ms。分开执行的普通路径已经达到 3,740.03 tok/s，
+  相应的 WCPB 开启侧还没有成对数据。允许合批时两臂完整输出逐 token 一致的请求为
+  18/192，生成长度一致，生成内容的差异仍需定位。+44.35% 是相对本次允许合批的
+  普通路径的结果，现有数据无法量化跨轮次 prefill 合批自身贡献了多少。
+
+[暂停覆盖记录](../artifacts/w3-scheduler-priority-20261127/wcpb-matrix-20261127/paused-coverage.json) ·
+[同卡对照及原始记录索引](../artifacts/w3-scheduler-priority-20261127/wcpb-matrix-20261127/matrix-summary.json)
+
+### 自适应批量的成本与调度实验
+
+调度比较的是同样的有效工作最终需要多少次物理 forward，以及每次占用设备多久。
+以 `op × CORE 轮次 × 执行路径 × 实际图档` 为成本表的键。图档预测线性层等固定形状
+算子的工作量。attention 还取决于每个请求的真实 query 行和各 KV group 的有效历史。
+对一个 group，可用每个 query 的 `min(实际历史长度, 滑窗)` 之和作工作量特征。
+块表与状态重排按实际准备和复用情况计费。Host 与设备重叠的区间只计入关键路径
+上暴露的部分。Worker 若把一个计划拆成两次物理 forward，应分别计费。
+
+对两种排法，先校验数据依赖、KV 页、图覆盖和首 token/已有 decode 的等待风险，再
+比较本次与受影响的后续物理批的总耗时。一个 160 行的批已经用 B256 图，加 80 个
+真实行仍用 B256，但 attention 会处理新增的 80 行。填入这些行能否省一次提交，取决于
+这些行原本会单独跑，还是能进入后续已有的批。
+
+| 历史证据 | 实际观察 | 对调度的含义 |
+| --- | --- | --- |
+| W3 C1，长 prompt | 普通 128 cap → 无额外上限，吞吐 174.23 → 279.73 tok/s，TTFT P95 358.69 → 81.12 ms | 单条 4,096-token prompt 由 32 个 chunk 降到 4 个，逐 chunk 的 PRELUDE、3 次 CORE、CODA 计划合计 160 → 20 |
+| W3 C1，历史 CUDA event | 普通 128 与普通 512 两条各 8 请求的结构波有同样 163,840 行 prefill，图均无 padding；物理 prefill forward 为 1,280 与 320，模型事件累计 2,670.18 与 1,347.05 ms | 两条结构波来自不同卡。图内利用率均为 100%，减少提交次数仍有明显空间，正式收益以同卡计时为准 |
+| W3 C16，原预算 | 655 个带 prefill 的 PIECEWISE 批，645 个用 B1024，真实 661,108 / 物理 663,680 行（99.61%） | 可继续填充的总行数很少。继续合批须减少实际提交，或让单批本身更便宜 |
+| W7 C32，原预算 | 带 prefill 的 114 批行利用率 90.97%，但模型事件合计 521.51 ms，约占设备模型首末事件跨度的 5.9%。纯 decode FULL CORE 有 3,014/3,051 批已经达到图档宽度 | 仅优化这部分 prefill 直接成本，空间有限。缩减 decode 的阶段和提交开销，需要单独用实测验证 |
+
+W3 C16 旧表将一次普通 prefill chunk 的五段模型事件相加，B128、B512、B1024
+分别为 12.72、16.96、21.98 ms。若两个 B512 的工作可合法合成同路径 B1024，
+估计模型区间节省 `2 × 16.96 − 21.98 = 11.94 ms`。B512 各段只有一份历史
+样本。短上下文、不同 KV 分布及不同 Worker 路径应使用各自的实测定价。
+
+KV 容量和 KV 读取成本在模型里各自约束。历史 W3 C16/W7 C32 的峰值重放为
+3,764/2,507 块，对应 80 GiB 池中的 40,960 块，容量空间充足。W7 同一个 B32
+第 1 轮图档中，batch 逻辑历史中位数 11,906 和 23,946 的两组，模型区间中位数
+为 1.660 和 1.699 ms。当前候选用 vLLM 的实际空闲页数给申请新 chunk 和已运行
+decode 下一 token 留余量。已有 `KVCacheManager.allocate_slots()` 继续负责真分配，
+图的 padding 不申请 KV。
+
+首个实验候选在普通路径上借鉴 vLLM 按输入预算公平放大 chunk 上限的做法。基准上限
+为 128，按本拍能开始的 prefill 的剩余长度计算共同上限。仅一个就绪长请求且没有
+在途 decode 时，上限可到 1,024；四个等长请求可到约 256；八个 128 已打满则保留
+原上限。比较两种对在途 decode 的处理。保守臂只填入根据当前可提交行数估计的原图
+档，允许升档的臂按就绪请求填向现有最大图档。Worker 的真实图档和混批组成由独立
+结构波核对。等候策略、请求轮次、真实 token 预算和 FULL/PIECEWISE 捕捉表沿用原
+配置。实验通过测量入口启用。
+
+用冻结 scheduler 和相同请求语料做 CPU 重放。按并发补请求，最多两份计划在途；用
+固定输出回执驱动调度器，使用 vLLM 分配器与重建的 12 个 KV group。投影图档来自原
+捕捉表。W7 无额外上限的重放复现历史 GPU 结构波的 114 批和 9,803 行 padding。
+
+| 负载 | 固定 128 | 固定 512 | 无额外上限 | 自适应只填原档 | 自适应允许升档 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| W3 C1，含 prefill 计划 / padding 行 | 10,240 / 0 | 2,560 / 0 | 1,280 / 0 | 1,280 / 0 | 1,280 / 0 |
+| W4 C32，含 prefill 计划 / padding 行 | 1,430 / 21,276 | 1,335 / 22,293 | 1,315 / 7,134 | 1,365 / 4,236 | 1,310 / 7,814 |
+| W7 C32，含 prefill 计划 / padding 行 | 205 / 31,601 | 125 / 15,935 | 114 / 9,803 | 140 / 869 | 115 / 1,161 |
+
+严格保住原图档可能推迟有用行而增加整波提交。W7 允许升档从 140 降到 115 个计划，
+只增加 292 行 padding。相对无额外上限，它以一个额外计划换掉 8,642 行 padding。
+用历史 W3 的 B512、B1024 五段平均值做一阶估算，每次提交的截距为 2.3883 ms，
+每物理行为 0.001960 ms。W7 无额外上限有 108,544 物理行，严格原档 100,768 行，
+允许升档 100,448 行。相对无额外上限，严格原档的模型区间差估为
+`26 × 2.3883 − 7,776 × 0.001960 = +46.86 ms`，允许升档为
+`1 × 2.3883 − 8,096 × 0.001960 = −13.48 ms`。这是套用 W3 大图档定价的
+敏感度，不含 decode 排队、混批构成或 KV 访问的变化。适合排序候选，无法直接预测
+正式吞吐。W4 允许升档在重放里同时减少五个计划和 4,352 个物理行。
+
+同一重放还检查从请求入场到首 token 之间实际经过的计划数。W4 无额外上限的
+P50/P95 为 60/594，允许升档为 170/640。W7 对应为 15/64 与 10/45。不同计划的
+实际时间不同，这些计数只标识队列与进度变化。W4 的长 prompt 都在同时推进时，
+让更多请求较早开始可能会推迟前一批首 token，需要同时比吞吐和 TTFT。
+
+自适应候选最初在每次调度前扫描就绪工作，W7 允许升档的整波策略 CPU 时间约
+73.6 ms。增加纯 decode 早退后，同一重放约 18.4 ms。三种负载的计划数、padding
+与逐位置检查结果一致。CPU 时间会与设备运行重叠，使用正式对照确认对吞吐的影响。
+
+W4 在 40,960 块正常池和 6,144 块压缩池的重放都无抢占。压缩池的无额外上限峰值为
+6,129 块，两个自适应均为 5,945 块。允许升档在压缩池因页余量回退，含 prefill 计划
+由正常池中的 1,310 增至 1,355。CPU 重放校验调度、位置、预算及分配行为，吞吐和
+尾延迟由 GPU 对照测定。
+
+GPU 对照使用冻结的 `ae73562`，对比普通固定 128 / 512 / 无额外 chunk 上限，以及
+上述自适应策略。每个同服务交错测量保留原 1,024 预算、80 GiB KV、异步和 P/D 混批。
+首先用 W3 C1 检验填满和减少提交，用 W4 C32 检验长 prompt 争用下的吞吐与尾延迟，
+用 W7 C32 检验真实输入及生成阶段影响。正式比较吞吐、TTFT、TPOT 和逐 token 输出，
+独立结构波用于核对物理提交与图档。
+
+| 正式计时，均为请求级动态轮次 | GPU | 配置 | 吞吐中位数（tok/s） | TTFT P50/P95（ms） | TPOT P50（ms） |
+| --- | ---: | --- | ---: | ---: | ---: |
+| W3 C1 | 3 | 固定 128 | 176.25 | 336.99 / 391.33 | 3.31 |
+| W3 C1 | 3 | 固定 512 | 257.46 | 116.87 / 119.84 | 3.27 |
+| W3 C1 | 3 | 无额外上限 | 268.48 | 82.46 / 86.33 | 3.27 |
+| W3 C1 | 1 | 无额外上限 | 270.92 | 82.00 / 84.59 | 3.27 |
+| W3 C1 | 1 | 自适应允许升档 | 265.21 | 81.92 / 88.03 | 3.27 |
+| W4 C32 | 1 | 固定 128 | 1,069.93 | 798.24 / 2,928.18 | 20.51 |
+| W4 C32 | 1 | 固定 512 | 1,176.88 | 441.37 / 2,632.24 | 21.25 |
+| W4 C32 | 1 | 无额外上限 | 1,201.12 | 301.39 / 2,583.22 | 21.48 |
+| W4 C32 | 6 | 无额外上限 | 1,212.84 | 274.23 / 2,554.60 | 21.46 |
+| W4 C32 | 6 | 自适应允许升档 | 1,134.73 | 908.42 / 2,923.01 | 19.32 |
+| W4 C32 | 5 | 无额外上限 | 1,212.47 | 274.84 / 2,547.57 | 21.48 |
+| W4 C32 | 5 | 自适应下限 512、允许升档 | 1,192.99 | 461.46 / 2,609.51 | 20.95 |
+| W7 C32 | 1 | 固定 128 | 3,795.28 | 60.96 / 289.36 | 8.19 |
+| W7 C32 | 1 | 固定 512 | 3,896.67 | 63.44 / 211.46 | 8.00 |
+| W7 C32 | 1 | 无额外上限 | 3,920.34 | 73.93 / 266.51 | 7.92 |
+| W7 C32 | 5 | 无额外上限 | 3,911.99 | 70.41 / 262.96 | 7.94 |
+| W7 C32 | 5 | 自适应只填原档 | 3,874.99 | 64.12 / 209.91 | 8.06 |
+| W7 C32 | 5 | 自适应允许升档 | 3,906.34 | 60.88 / 220.24 | 8.03 |
+
+W7 用 GPU 5 做独立同服务四臂复测。
+
+| 配置 | 吞吐三波中位数（tok/s） | TTFT P50/P95（ms） | 相对无额外上限同轮吞吐比中位数 |
+| --- | ---: | ---: | ---: |
+| 无额外上限 | 3,910.82 | 72.30 / 265.36 | 基线 |
+| 固定 512 | 3,891.43 | 66.91 / 211.38 | −0.45% |
+| 自适应下限 128、允许升档 | 3,908.19 | 62.21 / 218.77 | −0.08% |
+| 自适应下限 512、允许升档 | 3,917.43 | 62.94 / 222.38 | +0.03% |
+
+自适应下限 512 的三波为 3,917.43、3,921.26、3,854.37 tok/s。同轮中位差很小，
+整波吞吐尚无可重复的提升证据。四臂的 P95 以固定 512 最低。相对无额外上限的三
+个其他臂，各自首 token 一致 192/192，完整输出一致分别为 24、33、40 /192。
+
+W4 的三次允许升档均低于同卡无额外上限的最慢波，TTFT P50 更高。W7 允许升档的
+吞吐相对同卡无额外上限约 −0.14%，首 token P95 低 16.2%；严格原档吞吐约 −0.95%，
+首 token P95 低 20.2%。W7 三臂每波均生成 32,768 token。分别和无额外上限比，
+严格原档/允许升档首 token 都一致 192/192，完整输出一致 24/192、33/192。
+W4 下限提高到 512 后，同轮吞吐比中位降幅收窄到 1.85%，三对仍均低于无额外上限。
+
+[W3 静态三臂](../artifacts/adaptive-batch-20261127/static/gpu3/W3/comparison.json) ·
+[W3 自适应同卡复测](../artifacts/adaptive-batch-20261127/adaptive-w3/gpu1/W3/comparison.json) ·
+[W4 静态三臂](../artifacts/adaptive-batch-20261127/static/gpu1/W4/comparison.json) ·
+[W4 自适应同卡](../artifacts/adaptive-batch-20261127/adaptive/gpu6/W4/comparison.json) ·
+[W4 下限 512 同卡](../artifacts/adaptive-batch-20261127/adaptive-w4-floor512/gpu5/W4/comparison.json) ·
+[W7 静态三臂](../artifacts/adaptive-batch-20261127/static/gpu1/W7/comparison.json) ·
+[W7 自适应同卡](../artifacts/adaptive-batch-20261127/adaptive/gpu5/W7/comparison.json) ·
+[W7 同卡四臂复测](../artifacts/adaptive-batch-20261127/adaptive-w7-four-way/gpu5/W7/comparison.json)
+
+W4 同服务结构波复现 CPU 的含 prefill 计划数 1,315→1,310，并测出了整波代价。
+两臂 64 条请求的逐位置与轮次校验通过，全部物理 forward 回放 CUDA Graph。
+
+| W4 结构波 | 无额外上限 | 自适应允许升档 |
+| --- | ---: | ---: |
+| 纯 prefill 物理 forward | 47 | 167 |
+| prefill/decode 混批物理 forward | 1,268 | 1,143 |
+| 纯 decode 物理 forward | 679 | 822 |
+| 物理 forward 合计 | 1,994 | 2,132 |
+| CUDA 图启动数 | 14,618 | 14,708 |
+| 纯 decode CORE 实际行 | 5,121 | 8,101 |
+| PURE + mixed 的 decode CORE 实际总行 | 18,288 | 18,288 |
+| 纯 decode 模型事件时间（ms） | 856.03 | 1,165.32 |
+| 整波设备流跨度（ms） | 7,790.77 | 8,099.59 |
+
+较小的请求级 chunk 更均匀地推进许多长 prompt。首条请求从第 20 个 forward 的
+CODA 采出首 token 改为第 125 个。纯 prefill 批增加 120，P/D 混批减少 125，
+多出的 143 个纯 decode 提交构成净增的 138 个物理 forward。纯 decode 的 CORE
+执行行增加 2,980，全部来自原先与 prefill 同批的行。含 prefill 的物理行和 padding
+下降，算子阶段之间的混批机会变化决定了这次整波成本。
+[W4 无额外上限执行结构](../artifacts/adaptive-batch-20261127/structure/gpu6/W4/uncapped/structural-summary.json) ·
+[W4 允许升档执行结构](../artifacts/adaptive-batch-20261127/structure/gpu6/W4/adaptive-grow/structural-summary.json)
+
+W4 的 64 个 prompt 从 323 段变成 2,017 段。续入 32 条的入队至首 PRELUDE
+中位数相近，147.02→141.88 ms，首 PRELUDE 至首采样 CODA 的设备区间中位数
+133.78→866.61 ms。纯公平分配让同一请求反复跨批等待，影响首次交付。对同一个
+B1024 混合 CORE 图档，prefill 请求数平均从 1.23 到 7.74，full-attention 的
+真实 query-key 对数均值从 213 万到 217 万，模型事件均值从 5.76 到 5.99 ms。
+同图宽的成员组成和有效 KV 历史变化可改变实耗。用原配置按 `op × 轮次 × 路径 × 图档`
+的中位成本回算候选，预测整波模型事件 +132.0 ms，实测 +404.3 ms。方向正确，幅度
+低估集中在混批路径。该回算的候选只有 5 批缺同档样本，对用时影响取最近档近似。
+[W4 逐请求时间](../artifacts/adaptive-batch-20261127/structure/gpu6/W4/request-timing.json) ·
+[分路径定价与同 B1024 的组成](../artifacts/adaptive-batch-20261127/historical-costs.json)
+
+W7 同卡结构波中，允许升档的含 prefill forward 为 114→110，padding 为
+9,803→1,131 行。两臂均有 5,085 个纯 decode forward，占全波提交的约 98%。
+含 prefill 的模型事件为 522.45→450.65 ms，纯 decode 模型事件为
+7,548.88→7,566.72 ms。模型事件合计少约 54 ms，但同一 forward 内模型之外的设备
+事件区间多约 78 ms，整波设备流为 8,755.47→8,784.44 ms。因此少量 prefill 提交和
+padding 可以改善首 token，整波设备吞吐仍受生成阶段和提交准备约束。
+首批 32 条的入队至首次 PRELUDE 中位数 171.05→39.17 ms，TTFT P95 342.74→281.84 ms；
+续入 32 条的 TTFT P95 为 92.58→136.64 ms。首批短请求获得较早处理机会，但最长
+的首条 2,505-token 请求从 3 段增到 10 段，TTFT 135.22→241.87 ms。
+[W7 无额外上限执行结构](../artifacts/adaptive-batch-20261127/structure-w7/gpu6/W7/uncapped/structural-summary.json) ·
+[W7 允许升档执行结构](../artifacts/adaptive-batch-20261127/structure-w7/gpu6/W7/adaptive-grow/structural-summary.json) ·
+[W7 逐请求时间](../artifacts/adaptive-batch-20261127/structure-w7/gpu6/W7/request-timing.json)
+
+#### 调度策略选择
+
+当前可验证的默认候选沿用无额外 chunk 上限。W3 与 W4 的正式数据均支持这个选择。
+在 W7 追求 TTFT P95 时，固定 512 是同卡测试的最低值，吞吐只少约 0.45%。自适应仍
+保留在实验入口。以同卡原策略为参照，未达到整波吞吐可重复提升，W7 还需定位跨批
+输出差异。实验收齐 69 个正式计时波、4 个独立结构波。
+
+下一版的比较对象应包括原配置生成的批。只在实际存在填充和减少提交机会时，再看
+一个按当前图补齐的批以及一个允许升档的批。比较本次和紧随其后的 PRELUDE、CORE、
+CODA 的物理提交，含后续独立的 decode。要求请求的首 token 和下一个生成 token 的
+等待可接受，再按实测成本选批。对同图档里的批，给将完成 prompt 或能继续原有 P/D
+物理合批的工作优先权。相同形状的成本用历史长度、请求数和 metadata 复用进一步区分。
+Worker 暖机后报告各 op 实际捕获的图和可执行路径，Scheduler 通过已有 KV 分配器
+约束真实新增行，预算保留给在途请求继续生成。
+
+[历史物理批重算](../artifacts/adaptive-batch-20261127/historical-costs.json) ·
+[调度重放](../artifacts/adaptive-batch-20261127/scheduler-replay.json) ·
+[压缩 KV 池重放](../artifacts/adaptive-batch-20261127/scheduler-replay-kv-pressure.json) ·
+[vLLM pin 的公平上限实现](/home/zjy/code/david/tmp/inkling2-mini-perf-20261123/vllm-source/vllm/v1/core/sched/scheduler.py#L761) ·
+[自适应实验候选](../artifacts/adaptive-batch-20261127/adaptive_prefill.py) ·
+[同服务测试入口](../artifacts/adaptive-batch-20261127/measure_chunks.py)
+
 ## KV 代码入口
 
 - `core/loop_scheduler.py` 的 `_reserve_span()` 调用 vLLM `KVCacheManager` 分配块，
@@ -2355,3 +3999,244 @@ TPOT、ITL 的分位数，按深度统计，以及首次 token 分歧位置。
   CORE 的分组和每组可更新的 slot。
 - `models/ouro_plugin.py` 决定早退后需要补写的 pass，`worker/kv_updates.py`
   调用 vLLM 的 update op 写入目标 slot，并提供供 Ouro 混深度调用的 slot 掩码。
+
+## Loop 调度策略规格
+
+这是下一版 Scheduler 的设计。每条请求按输入位置划分为多块，每一块称为一个
+chunk。调度器用就绪队列决定这一拍做什么，从队列中选出能在 Worker 上一次执行的
+工作，在可用容量内尽量打满。首 token、生成中的 token 和等待过久的工作都有明确的
+优先级。同步和异步调度共用这套选批规则。
+
+### 请求、chunk 和队列
+
+请求持有到达顺序、请求优先级、已提交的 token 位置、输出进度和 KV 生命周期。每个
+chunk 记录 `request_id`、本请求内从 `0` 开始递增的 `chunk_id`、token 位置和长度、下一阶段、
+下一轮、已完成的轮次，以及进入就绪状态的时间和跳过次数。跨请求比较用 FCFS 或
+请求优先级。同一请求内，能执行的工作优先取 `chunk_id` 较小的块。
+
+例如一条 300-token 请求，单段上限为 128，可以依次准备第 1–128、129–256、257–300
+个 token，对应的 `chunk_id` 为 `0`、`1`、`2`。实际段长按剩余输入和本拍可分配容量确定。
+生成阶段，每个已确定可继续计算的 token 提供自己的下一阶段工作。Prefill 的最后
+一块在交付首 token 前仍属于 prefill。
+
+| 就绪队列 | 入队条件 | 执行后怎么推进 |
+| --- | --- | --- |
+| `PRELUDE` | 新请求能准入，或已有请求有下一块可准备。Prefill 准入同时检查下游窗口、KV、中间状态槽和前置依赖。 | 准备输入。满足第 1 轮依赖的块进入 `CORE[1]`，其余块等对应 KV 就绪。 |
+| `CORE[轮次]` | 这块的输入或上一轮输出已就绪，同一请求中更早位置所需的本轮 KV 已就绪。 | 结果进入下一轮候选。达到该请求的目标轮数或模型确定早退后，进入可提交位置的检查。 |
+| `CODA` | 这一块做完实际需要的 CORE，且它的起点已轮到该请求提交。 | 按 token 位置推进请求的提交进度。到采样边界时交付 token，随后暴露下一块或下一个 decode token 的候选。 |
+
+队列是请求进度的索引。同一块的同一步工作只占一个就绪位置，提交后移入在途状态。
+异步调度可使用执行器已经保证的顺序暴露后续候选。跨块 KV 读取和早退结果仍须满足
+各自的就绪条件。在途回执按请求和提交归属更新。请求结束、取消或抢占时，按现有
+生命周期回收资源，从有效的已提交位置恢复排队。模型只执行自身支持的阶段。Ouro
+从 CORE 开始，达到采样边界时按模型的 CORE 输出契约交付。
+
+### PRELUDE 准入窗口
+
+用一个全局窗口限制**已经提交 PRELUDE、后续 CORE 还没有完成的 prefill 工作量**。
+新请求的首块和已有请求的后续块共用窗口。提交 PRELUDE 时按 `真实行数 × 剩余轮数`
+占用额度，在途 PRELUDE 也计入。每完成一轮 CORE，归还实际完成的行数额度。确认
+早退、取消或抢占后，归还已取消的剩余工作额度。按提交归属更新，每份额度归还一次。
+CODA 继续在可以安全回收时释放中间状态槽。新增 prefill 块同时满足窗口、KV 和状态槽
+约束，同批 decode 按自身的执行容量检查。
+
+**先检查准入，再应用优先级。** 窗口满时，新的 prefill PRELUDE 留在等待队列，选择
+已就绪的 CORE、CODA 或 decode 继续执行。受窗口限制的块暂停累计跳过次数，保留原来
+的请求顺序和计数。额度足以准备一批时，按 FCFS 或 priority 恢复批量准入。下游暂时
+没有可推进的工作且仍有额度时，可以用可准入的块组较小的 PRELUDE，继续推动依赖。
+
+用两批满 PRELUDE 演示。每批 1,024 行，固定三轮，窗口示例为 6,144 行待执行 CORE。
+两批 PRELUDE 提交后窗口占满。即使同时来了大量请求，也先消化下游。CORE 累计完成
+3,072 行后，窗口又能容纳一批 1,024 行的三轮 prefill，仍需检查 KV 和状态槽。窗口
+大小按 W7 的满批率、待执行 CORE 行数和 TTFT 测量确定，6,144 是示例值。
+
+### 决策顺序和防饥饿
+
+每一拍按下表从上往下，找到第一个有可执行工作的级别。该级别决定本拍必须推进的
+工作，后续组批可以用剩余容量加入兼容的其他工作。
+
+| 级别 | 工作 | 同级的选法 |
+| --- | --- | --- |
+| 1 | 累计被跳过两次的就绪工作，覆盖所有阶段及 decode、prefill | 谁等得最久谁先。若等待时间相同，按请求到达顺序和请求内 `chunk_id` 排。 |
+| 2 | 能交付下一个 token 的 decode CODA | 先交付已完成计算的生成 token。 |
+| 3 | 就绪的 decode CORE | 给生成中的请求推进一轮，根据 CORE 的批容量和轮次规则选批。 |
+| 4 | 就绪的 decode PRELUDE | 准备下一个可计算的生成 token。 |
+| 5 | 能交付首 token 的 prefill CODA | 把完成输入计算的请求送到首 token 交付。 |
+| 6 | 其余 prefill PRELUDE、CORE、CODA | 优先可直接发的满批。都无法发满时推进已就绪的工作。 |
+
+`fcfs` 用请求到达顺序排列同级候选。`priority` 先选请求配置的更高优先级，同优先级
+再按到达顺序。两种模式共用阶段和防饥饿优先级。`priority` 模式在相同请求优先级内
+比较满批，选定本拍操作后仍可用其他优先级的兼容候选补空位。
+
+在同一级别、同等请求优先级内，先找可直接发满的候选，其次找跨轮补完后能一次发满
+的 CORE，最后选可执行的未满批。多个 CORE 在同一档时选轮次更靠后的。同操作、
+同轮次按队列顺序选。多个不同阶段给出同一档候选时，以候选队首的等待时间破平。
+等待时间相同，按 CODA、CORE、PRELUDE 排。
+
+Decode 选中的批还有空位时，可以先推进一批能在现有等待额度内追到同一阶段的 decode，
+随后合成一次提交。合批判断受真实槽位容量约束，已满的批和已经提权的工作按表中规则
+执行。
+
+**防饥饿上限为两次可调度机会。** 一块输入通过准入检查、具备执行条件，而且能放进
+一个合法的物理批，本拍因为选择了别的阶段或预算分给其他工作而没入批，记一次。每个
+调度决策最多记一次。等依赖、KV、状态槽或 PRELUDE 窗口时暂停计数。第二次被跳过
+后，从下一拍进入级别 1。提交的部分清零；如果一次只提交块的一部分，尚未提交的
+位置继承原等待顺序和次数。多个不同阶段同时到上限，由最老的就绪工作决定本拍，
+其余到上限的工作继续保留最高级别。`2` 是初始策略值，按后续数据验证。
+
+### 同一拍怎样打满
+
+每拍只选一种操作。选批按同一份就绪状态计算候选，同时检查真实 token 行数、Worker
+查询槽位、活跃请求数、可用 KV 和中间状态槽。满批按实际执行容量判断。纯 decode
+使用其 FULL 图和查询槽位，prefill 与混合批使用实际支持的执行路径和图档。Padding
+行只计成本。多个 Worker 提交分别计批。确定候选后再预留需要新增的资源，提交多少
+就推进多少。暂时放不下的工作保留原队列位置和等待状态。
+
+**PRELUDE 按准入顺序准备足。** 先让每个符合条件的请求拿到一块，继续按同样的顺序
+轮转补可准备的块，直到实际批容量、准入额度用完或候选耗尽。已开始 CORE 的请求可以
+在窗口、状态槽和 KV 允许时准备下一块。短请求到达后排队，通过准入后随选中的
+PRELUDE 与其他块一起准备。当其他操作已按优先级选中时，短请求继续等自己的机会。
+
+**CORE 先保住已经能一次发出的同轮满批。** 如果没有更高优先级的工作，先从能发满的
+同轮队列选批，其中轮次靠后的优先。选中的同轮批有余量时，用其他轮次的就绪块补，
+前提是 Worker 支持这组请求和轮次在一次物理提交中执行。已经能发满的另一轮保留自己的
+整批。需要先服务更紧迫的工作时，先选它，再从可用候选补，必要时提交小批。队首块
+放不下时继续扫描后面的就绪块，把放得下的补进来，队首保留等待次数。若要利用最后
+一小段空位，可在 Worker 已支持正确切分和回执的路径上拆块。余下的位置保留就绪状态
+与 KV 依赖，并把切分后的 CORE 和 CODA 次数一起算入收益。
+
+**CODA 只从每个请求当前可提交的位置取工作。** 先选本拍最应该交付的 token，再把同
+阶段、相容的其他请求合入。长输入的中间块完成 CODA 会推进提交位置，并释放可以
+安全回收的中间状态。它可以随已有 CODA 补批，也可以靠满批或等待上限取得一拍。
+普通 prefill CODA 仍遵循这两条规则。合入 prefill 前要按 Worker 实际路径核算容量，
+已经选中的满 FULL decode 批保持整批执行。
+
+同一个请求允许多块输入同时就绪，跨轮工作按 CORE 规则补入真实空位。这两项就是
+WCPB 在调度上的能力。它们使用相同的三阶段队列、优先级和计数。Worker 根据选批结果
+选择同轮、跨轮、PURE decode 或混合执行。已经准备好的 chunk 保留输入状态，只在
+自身依赖满足后进入相应 CORE 队列。
+
+### 逐拍例子
+
+以下 CORE 例子用 1,024 行预算，除特别说明外，候选都已就绪、优先级相同，Worker
+可以把所选成员一次执行。
+
+| 当前候选 | 本拍选择 | 留到后面 |
+| --- | --- | --- |
+| CORE 第 1 轮 1,024 行，第 3 轮 256 行 | 第 1 轮一次发满 1,024 行。 | 第 3 轮的 256 行保留原进度，记录一次跳过。 |
+| CORE 第 1 轮 768 行，第 3 轮 256 行 | 先取第 3 轮，用第 1 轮补到 1,024 行。 | 本批取走的块按各自轮次更新。 |
+| CORE 已选 896 行，队首块 192 行，后面有兼容的 128 行 | 用后面的 128 行打满。 | 192 行的块保留原位置，记录一次跳过。 |
+| 有一个满 CORE 批，一条新的 8-token 请求可以准入 | 发满 CORE。 | 8-token 请求进 PRELUDE 队列，在后续机会补入。当它累计被跳过两次后，升到最高级别。 |
+| A 的后续 128 行已选中 PRELUDE，同时有 B 的 8 行、C 的 64 行能入批 | A、B、C 的 200 行共用一次 PRELUDE，继续按准入顺序填剩余容量。 | 各块根据实际 KV 依赖进入 CORE 队列。 |
+| B 能通过 decode CODA 交 token，A 只有中间块 CODA，C 有满 prefill CORE | 先发 B 的 CODA。A 能进实际同批时可以补入。 | C 保留在 CORE 队列。A 和 C 若具备执行条件却被跳过，分别记一次。 |
+| A 的 prefill chunk 累计已被跳过两次，还有 decode CORE 就绪 | A 取得最高级别，选它所在的阶段，再补同阶段的兼容工作。 | 仍有其他到上限的工作时，保留其最高级别，后续按等待时间推进。 |
+| A 先到，B 后到但请求优先级更高，两者都在同轮，且本拍只能选一块 | `fcfs` 选 A，`priority` 选 B。 | 落选的块保留等待次数，累计两次后两种模式都将它提权。 |
+| 两批三轮 prefill 已占满示例窗口，又同时到达大量请求 | 继续消化已就绪的 CORE 和 CODA，照常按优先级处理 decode。 | 新请求保留队列顺序，受窗口限制时暂停计数。腾出一批额度后批量补入。 |
+
+### 验收
+
+先固定请求到达顺序、预算、KV 和回执顺序，逐拍检查单轮满批、高轮优先、跨轮填空、
+首 token 和 decode CODA、短请求续入、头部大块放不下，以及恰好两次跳过后提权。
+同一输入在 FCFS 和 priority 下验证预期顺序，分别跑同步和异步。校验每个 token
+位置完成正确的阶段和轮数，提交进度连续，取消、抢占和晚到回执的资源归属正确。
+
+再在同配置 W7 中观察满 prefill 批、确有余量的 prefill 批、纯 decode 满批、持续到达
+和集中到达。检查在途 PRELUDE 的额度已经占用，突发时待执行 CORE 行数维持在窗口内，
+窗口满后的跳过计数暂停，完成 CORE 和释放状态槽后能够恢复批量准入。
+同时记录调度计划、实际物理 PRELUDE/CORE/CODA 提交、图档、真实行与 padding、首
+token 等待以及两次跳过的提权情况。性能以无插桩的吞吐和 TTFT/TPOT/ITL 为准。结构
+验收重点看跨轮补批吸收了哪些原本需要单独提交的工作，以及总提交是否下降。正确性
+验收记录输出长度、结束原因、逐 token 差异及对照组自身重复波的差异。
+
+### 统一调度的实现与验证
+
+`LoopScheduler` 在同一份请求进度上生成 PRELUDE、分轮 CORE 和 CODA 的就绪队列。
+首段和续段共用同一次选批，Worker 按实际位置与轮次决定执行布局。`LoopAsyncScheduler`
+继续继承选批流程，沿用可安全提前提交的回执规则。原 WCPB 两个启动选项已移除，
+多块预备和跨轮补批由统一调度及设备执行能力共同决定。原有的 decode 抢先执行和
+延迟采样开关由固定优先级替代。显式自投机流水保留其 draft 后继与当前 token 的依赖。
+
+沿用 `--scheduling-policy fcfs` 或 `--scheduling-policy priority`。`--rlt-prefill-chunk-size`
+可设单段上限，与 vLLM 的 `long_prefill_token_threshold` 一起取有效上限。初始准入窗口
+取两批等值的 CORE 行数，`--rlt-prefill-window` 可覆盖。W1、W3、W7 对照统一使用
+1,024 行预算且普通 prefill 阈值不额外限制，此时固定三轮、RLT 默认窗口为 6,144 行。
+
+固定 128 条同时到达的 CPU 回放覆盖同步与异步、FCFS 与 priority 四种组合，混用请求
+级 1、2、3 轮和不同输入输出长度。四组均完整结束。在 96 行待执行 CORE 的测试窗口下，
+峰值分别为 87、88、96、96 行，异步组也包含已提交未回执的工作。
+
+首次 W7 预热在混合跨轮 CORE 遇到普通 decode 的 GPU 状态槽。该状态在单轮 decode
+里按请求槽位保存，混合 CORE 原先只接受独立的张量状态。现通过模型适配器取出状态槽
+对应行，复制到独立生命周期后再执行，避免后续 decode 复用槽位覆盖仍需保留的输入。
+CPU 回归用同一个混合计划验证读出的 decode 行独立于槽复用，并保留原 prefill 状态。
+
+插件测试 112 项通过、3 项跳过。GPU 7 上使用 Inkling2-mini、固定三轮、TP1、FCFS、
+异步、1,024 行预算、80 GiB KV，FULL 与 PIECEWISE 捕捉档一致。W1 和 W3 按标准
+C1 执行，W7 为 C32。每组预热后跑三轮正式波，表中取中位数。
+
+| 场景 | vLLM（tok/s） | RLT（tok/s） | RLT/vLLM | TTFT P95，vLLM → RLT（ms） | TPOT P95，vLLM → RLT（ms） | ITL P95，vLLM → RLT（ms） |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| W1 C1 | 261.31 | 258.60 | 98.96% | 21.68 → 14.95 | 3.75 → 3.80 | 3.84 → 3.87 |
+| W3 C1 | 229.00 | 226.06 | 98.72% | 83.81 → 84.66 | 3.77 → 3.82 | 3.86 → 3.90 |
+| W7 C32 | 3,738.68 | 2,331.65 | 62.37% | 256.84 → 226.07 | 8.42 → 14.12 | 8.58 → 13.99 |
+
+W1、W3 正式波使用 `source-unified-v3`，W7 使用修正混合 CORE decode 槽后的
+`source-unified-v4`。W1 三轮整体逐 token 一致。W3 的三轮与原生配对时，完整一致为
+54、53、55 /64，首 token 一致为 61、60、60 /64。W7 完整一致为 4、6、2 /64，首
+token 一致为 57、59、59 /64。原生 W3 重复波完整一致，RLT W3 重复波在 54–56 /64。
+W7 原生重复波为 55–60 /64，RLT 为 2–4 /64。W7 RLT 第三波有一个请求在 495 token
+结束，该波生成 32,751 token，其余两波与原生均为 32,768。原生 W7 第二波的慢点保留
+在中位数统计中，其吞吐为 2,768.84 tok/s。W3 和 W7 的输出逐 token 一致性未通过。
+
+独立 W7 结构波通过全部 64 条请求的各阶段、轮次 token 计数。Worker 实际提交 PRELUDE
+2,072 次、CORE 6,200 次、CODA 2,070 次。其中纯 decode CORE 有 6,113 批，平均
+15.98 个真实行，中位数 9 行；纯 decode CODA 有 2,040 批，同样中位数 9 行。纯 decode
+CORE 的主要真实批大小为 1、9、23、31 行，各出现约 1,520 次。小批持续到了生成阶段，
+与正式波 TPOT 和 ITL 劣化一致。结构波有 4,210 次计划选入提权工作，单波记录无法分开
+提权和阶段优先级各自对小批的影响。14 个跨轮 CORE 批全部实际重放了对应 CUDA Graph。
+
+修复版的独立 W3 结构波验证 8 条请求。观察到 24 次提前准备下一块，跨轮 CORE、packed
+CORE 和对应图重放均为零。这 8 条请求没有经过 W7 需要修复的混合 CORE 路径。
+W1、W3 的正式性能和 W7 的新修复版结构波仍按各自的冻结源码记录。
+
+[GPU 7 同卡完整对比](../artifacts/unified-scheduler-20261127/comparison.md) ·
+[vLLM 与 RLT 的 W1/W3 原始记录](../artifacts/unified-scheduler-20261127/formal-gpu7) ·
+[修复后的 W7 原始记录](../artifacts/unified-scheduler-20261127/formal-v4-gpu7/rlt-basic) ·
+[修复版 W7 结构](../artifacts/unified-scheduler-20261127/structure-v4-gpu7/W7-summary.json) ·
+[修复版 W3 结构](../artifacts/unified-scheduler-20261127/structure-v4-gpu7/W3-summary.json)
+
+### 防止 W7 生成阶段长期拆批
+
+上一版按当前阶段的优先级立即发送就绪 decode。若少量请求先进入 CODA，便先完成并
+开始各自的下一 token。另一组仍在 CORE，两组在不同阶段循环，后面的批持续拆开。
+W7 结构波的纯 decode CORE 中，1、9、23、31 行的批各重复约 1,520 次。
+
+当选中的 decode 批有空位时，检查同轮数、单 token 的另一组就绪 decode。从其当前阶段
+到同一目标阶段若只需一到两拍，并且等待的队列成员都还有对应的跳过额度，先推进能
+追上的批。到达同一阶段后一起提交。满批、已经累计跳过两次的工作，以及自投机的
+独立依赖继续按各自规则执行。单批上限仍来自真实 token 预算和 Worker 查询槽。
+在 `priority` 模式下，只允许同级或更高请求优先级的候选触发追齐。
+
+回归用例以 1 条即将交付 token 的请求和 3 条还差一轮或两轮的请求构造。剩余等待额度
+足够时，两组在两次内汇成一个 CODA 批，随后连续保持同批。额度不足时当拍交付。
+同步和异步均覆盖。
+
+同配置 GPU 7 的 W7 C32 结构波，每条请求的 PRELUDE、逐轮 CORE 和 CODA token 数
+均通过检查。纯 decode CORE 提交由 6,113 降到 3,067，真实批大小中位数从 9 回到 32，
+其中 3,044 批有 32 个真实行。纯 decode CODA 由 2,040 降到 1,022。带有提权工作的
+计划由 4,210 降到 127。两次结构波独立运行，统计 Worker 的实际物理提交。
+
+| W7 C32，中位数 | 原生 vLLM | 修复前 | 修复后 |
+| --- | ---: | ---: | ---: |
+| 吞吐（tok/s） | 3,738.68 | 2,331.65 | 3,610.90 |
+| TTFT P95（ms） | 256.84 | 226.07 | 383.10 |
+| TPOT P95（ms） | 8.42 | 14.12 | 8.84 |
+
+修复后三轮分别为 2,856.83、3,693.10、3,610.90 tok/s，吞吐中位数达到原生的 96.58%，
+较修复前提高 54.86%。RLT 和原生各有一次观测到 GPU 长间隔的慢波，均保留在统计中。
+修复后第一波比其余两波少输出 4 个 token。输出全序列与原生逐波完全一致为 5、5、4
+/64，首 token 一致为 60、58、59 /64。逐 token 一致性仍未通过。插件测试通过 118 项，
+跳过 3 项。
+
+[W7 修复后正式对比](../artifacts/w7-decode-realign-20261127/comparison.json) ·
+[W7 修复后结构波](../artifacts/w7-decode-realign-20261127/tagged/W7-summary.json)

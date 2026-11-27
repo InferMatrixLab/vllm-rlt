@@ -3,6 +3,7 @@
 from collections import defaultdict, deque
 from dataclasses import replace
 
+import numpy as np
 import torch
 from vllm import envs
 from vllm.config.compilation import CUDAGraphMode
@@ -10,10 +11,11 @@ from vllm.logger import init_logger
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.buffer_utils import UvaBufferPool
+from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 from vllm.v1.worker.workspace import lock_workspace
 
-from vllm_rlt.config import LoopRuntimeConfig
+from vllm_rlt.config import LoopRuntimeConfig, supports_prefill_pipeline
 from vllm_rlt.core.loop import LoopLayout, LoopOp, LoopSpan
 from vllm_rlt.core.output import LoopModelRunnerOutput, LoopSchedulerOutput
 from vllm_rlt.worker.loop_graph import LoopCudaGraphs
@@ -52,17 +54,26 @@ class LoopModelRunner(GPUModelRunner):
             and self._early_uva_release
             and not vllm_config.cache_config.enable_prefix_caching
             and not getattr(self.model_config, "enable_return_routed_experts", False)
-            and not options.wavefront_prefill
             and not options.decode_pipeline
         )
         self._trace_steps = options.trace_steps
-        self._wavefront_prefill = options.wavefront_prefill
         self._mixed_core = options.mixed_core
         self._compact_mixed_core = options.compact_mixed_core
         self._packed_prefill = options.packed_prefill
         self._decode_pipeline = options.decode_pipeline
+        self._prefill_pipeline = supports_prefill_pipeline(vllm_config, options)
+        if self._prefill_pipeline or self._decode_pipeline:
+            # MRv2 already uses its own write pool when admitting requests.
+            # These pools rotate at most once per physical forward, matching
+            # the lifetime tracked by _submit_forward.
+            self._loop_position_slots = UvaBufferPool(
+                self.max_num_reqs, torch.int64, self._uva_capacity
+            )
+            self._loop_positions = UvaBufferPool(
+                self.max_num_reqs, torch.int32, self._uva_capacity
+            )
         self._merge_decode_core = options.merge_decode_core
-        self._merge_prefill_core = options.merge_prefill_core
+        self._merge_prefill_core = options.merge_prefill_core or self._prefill_pipeline
         self._decode_state_slots = options.decode_state_slots
         if (self._mixed_core or self._packed_prefill) and (
             self.parallel_config.tensor_parallel_size != 1
@@ -105,6 +116,8 @@ class LoopModelRunner(GPUModelRunner):
                 if profile_only:
                     # vLLM releases the temporary KV cache and graph pool next.
                     self._loop_graphs.entries.clear()
+                    self._loop_graphs.compact_core_graphs.clear()
+                    self._loop_graphs.packed_core_graphs.clear()
         if not profile_only:
             lock_workspace()
         return memory
@@ -112,24 +125,101 @@ class LoopModelRunner(GPUModelRunner):
     def update_requests(self, scheduler_output):
         super().update_requests(scheduler_output)
         step = loop_execution.get()
-        if step is None or not (self._wavefront_prefill or self._decode_pipeline):
+        if step is None or not (step.explicit_positions or self._decode_pipeline):
             return
         req_states = self.req_states
-        seen = set()
+        starts = {}
         for span in step.spans:
-            if span.request_id in seen:
-                continue
-            seen.add(span.request_id)
-            slot = req_states.req_id_to_index[span.request_id]
-            req_states.num_computed_tokens_np[slot] = span.token_start
+            # Gather shared block tables with the earliest live position for
+            # each request. A packed CORE uses a separate start for every row.
+            starts[span.request_id] = min(starts.get(span.request_id, span.token_start),
+                                          span.token_start)
+        slots = []
+        positions = []
+        for request_id, start in starts.items():
+            slot = req_states.req_id_to_index[request_id]
+            req_states.num_computed_tokens_np[slot] = start
             req_states.num_computed_prefill_tokens[slot] = min(
-                span.token_start, req_states.prefill_len.np[slot]
+                start, req_states.prefill_len.np[slot]
             )
-            req_states.num_computed_tokens.stage_write_elem(slot, span.token_start)
-        req_states.num_computed_tokens.apply_write()
+            slots.append(slot)
+            positions.append(start)
+        req_states.num_computed_tokens.gpu.index_copy_(
+            0,
+            self._loop_position_slots.copy_to_uva(slots),
+            self._loop_positions.copy_to_uva(positions),
+        )
+
+    def gather_batch_req_state(self, scheduler_output, dummy_run):
+        step = loop_execution.get()
+        if (
+            dummy_run or step is None or not step.compact_core
+            or not step.explicit_positions
+        ):
+            return super().gather_batch_req_state(scheduler_output, dummy_run)
+
+        model_state = getattr(self, "model_state", None)
+        can_pack = getattr(model_state, "can_pack_core", None)
+        step.packed_core = can_pack is not None and can_pack()
+        if step.packed_core:
+            # Inkling's native metadata expects one-token and prefill queries
+            # in this order. Pass selection is independent of query ordering.
+            step.ordered = tuple(sorted(step.spans, key=lambda span: span.token_count))
+        else:
+            step.ordered = tuple(sorted(step.spans, key=lambda span: (
+                span.depth, span.last_core, span.token_count != self.decode_query_len,
+                span.token_count,
+            )))
+        req_ids = [span.request_id for span in step.ordered]
+        states = self.req_states
+        mapping = np.asarray([states.req_id_to_index[req_id] for req_id in req_ids], dtype=np.intp)
+        counts = np.asarray([span.token_count for span in step.ordered], dtype=np.int32)
+        positions = np.asarray([span.token_start for span in step.ordered], dtype=np.int32)
+        prefill_lens = states.prefill_len.np[mapping]
+        prefilling = positions < prefill_lens
+        return BatchReqState(
+            req_ids=req_ids,
+            num_scheduled_tokens=counts,
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_draft_tokens_np=None,
+            idx_mapping_np=mapping,
+            prefill_len_np=prefill_lens,
+            num_computed_prefill_tokens_np=np.minimum(positions, prefill_lens),
+            is_prefilling_np=prefilling,
+            max_seq_len_np=None,
+            has_prefill=bool(prefilling.any()),
+            prefill_runs_as_decode_np=prefilling & (counts == 1) & (positions > 0),
+            decode_graph_eligible=False,
+        ), None
+
+    def _input_builder(self):
+        builder = getattr(self, "_ordinary_inputs", None)
+        if builder is None:
+            builder = self._ordinary_inputs = OrdinaryInputBuilder(
+                self.input_buffers, self.req_states, self.block_tables
+            )
+        return builder
 
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc, num_active_loras):
         step = loop_execution.get()
+        explicit_positions = step is not None and step.explicit_positions
+        if step is not None and step.compact_core and explicit_positions:
+            self._clear_prepared_batch()
+            positions = np.asarray([span.token_start for span in step.ordered], dtype=np.int32)
+            real_tokens = batch_req_state.num_tokens
+            graphs = self._loop_graphs
+            width = graphs.padded_piecewise_size(real_tokens) if graphs is not None else None
+            if width is not None and graphs.has_compact_core_graph(width, step.packed_core):
+                if width > real_tokens:
+                    step.padded_tokens = width
+            else:
+                width = real_tokens
+            # The upstream descriptor counts unique request IDs. A packed
+            # batch owns one query row per span, including repeated IDs.
+            batch_desc = replace(batch_desc, num_reqs=None, num_tokens=width)
+            return self._input_builder().prepare(
+                scheduler_output, batch_req_state, batch_desc, positions=positions
+            )
         if step is not None and step.compact_core:
             # Preserve MRv2's decode/prefill ordering within each variant. Its
             # native slot and block tables then have contiguous sub-batch views.
@@ -174,6 +264,7 @@ class LoopModelRunner(GPUModelRunner):
                 tokens = None
             if tokens is not None and tokens > real_tokens:
                 step.padded_tokens = tokens
+                step.padded_graph_mode = mode
                 batch_desc = replace(
                     batch_desc,
                     cg_mode=mode,
@@ -187,9 +278,10 @@ class LoopModelRunner(GPUModelRunner):
             rows is not None
             and prepared is not None
             and (prepared.rows == rows and prepared.descriptor == batch_desc)
+            and prepared.keep_model_state == (not explicit_positions)
         ):
-            by_id = {span.request_id: span for span in step.spans}
-            step.ordered = tuple(by_id[req_id] for req_id in prepared.inputs.req_ids)
+            order = {req_id: index for index, req_id in enumerate(prepared.inputs.req_ids)}
+            step.ordered = tuple(sorted(step.spans, key=lambda span: order[span.request_id]))
             step.prepared_batch = prepared
             return prepared.inputs
 
@@ -197,6 +289,7 @@ class LoopModelRunner(GPUModelRunner):
         prepare_decode_slots = False
         if (
             rows is not None
+            and not explicit_positions
             and getattr(self, "_early_uva_release", False)
             and self.parallel_config.world_size == 1
             and self.fast_prefill is None
@@ -204,11 +297,6 @@ class LoopModelRunner(GPUModelRunner):
             and self.model_state.num_new_sampled_tokens_per_step == 1
             and self._ordinary_input_spans(rows, batch_req_state)
         ):
-            builder = getattr(self, "_ordinary_inputs", None)
-            if builder is None:
-                builder = self._ordinary_inputs = OrdinaryInputBuilder(
-                    self.input_buffers, self.req_states, self.block_tables
-                )
             prepare_decode_slots = (
                 step.uniform_decode is True
                 and not batch_req_state.has_prefill
@@ -216,7 +304,7 @@ class LoopModelRunner(GPUModelRunner):
                 and self.block_tables.cp_size == 1
                 and self.block_tables.num_kv_cache_groups > 0
             )
-            batch = builder.prepare(
+            batch = self._input_builder().prepare(
                 scheduler_output,
                 batch_req_state,
                 batch_desc,
@@ -230,7 +318,15 @@ class LoopModelRunner(GPUModelRunner):
                 batch.input_ids[batch.num_tokens :].zero_()
                 batch.positions[batch.num_tokens :].zero_()
         self._prepared_batch = (
-            PreparedBatch(rows, batch_desc, batch, decode_slots_prepared=prepare_decode_slots)
+            PreparedBatch(
+                rows,
+                batch_desc,
+                batch,
+                decode_slots_prepared=prepare_decode_slots,
+                # Overlapping chunks keep activations by request and token position while
+                # borrowing inputs only for an identical physical batch.
+                keep_model_state=not explicit_positions,
+            )
             if rows is not None
             else None
         )
@@ -256,10 +352,9 @@ class LoopModelRunner(GPUModelRunner):
             )
         )
 
-    def _can_reuse_inputs(self, spans):
+    def _supports_input_layout(self, spans):
         return (
-            not self._wavefront_prefill
-            and not self._decode_pipeline
+            not self._decode_pipeline
             and not getattr(self.model, "rlt_core_samples", False)
             and self.pcp_manager is None
             and self.dcp_size == 1
@@ -278,8 +373,7 @@ class LoopModelRunner(GPUModelRunner):
             or num_active_loras
             or batch_req_state.num_draft_tokens_np is not None
             or (batch_req_state.has_prefill and self.fast_prefill is not None)
-            or len(step.spans) != len(batch_req_state.req_ids)
-            or not self._can_reuse_inputs(step.spans)
+            or not self._supports_input_layout(step.spans)
             or (
                 step.op is LoopOp.CORE
                 and not step.merged_core
@@ -287,9 +381,21 @@ class LoopModelRunner(GPUModelRunner):
             )
         ):
             return None
-        # MRv2 owns the positions, request-slot ordering and physical shape.
-        # Match them before reusing both its input batch and downstream metadata.
-        by_id = {span.request_id: span for span in step.spans}
+        # MRv2 uses one input row for a contiguous prelude, when the
+        # scheduler prepares several independently scheduled chunks.
+        prelude = step.explicit_positions and step.op is LoopOp.PRELUDE
+        by_id = {}
+        for span in step.spans:
+            previous = by_id.get(span.request_id)
+            if previous is not None:
+                if not (prelude and previous.prefill and span.prefill):
+                    return None
+                if previous.token_end != span.token_start:
+                    return None
+                span = replace(previous, token_count=previous.token_count + span.token_count)
+            by_id[span.request_id] = span
+        if len(by_id) != len(batch_req_state.req_ids):
+            return None
         computed_tokens = self.req_states.num_computed_tokens_np
         rows = []
         for req_id, slot, count, prefilling in zip(
@@ -299,8 +405,12 @@ class LoopModelRunner(GPUModelRunner):
             batch_req_state.is_prefilling_np,
             strict=True,
         ):
-            span = by_id[req_id]
-            if span.token_start != computed_tokens[slot] or span.token_count != count:
+            span = by_id.get(req_id)
+            if (
+                span is None
+                or span.token_start != computed_tokens[slot]
+                or span.token_count != count
+            ):
                 return None
             rows.append((req_id, int(slot), span.token_start, span.token_count, bool(prefilling)))
         return tuple(rows)
@@ -406,20 +516,29 @@ class LoopModelRunner(GPUModelRunner):
         groups: dict[tuple[int, bool, bool] | int | str, list[LoopSpan]] = defaultdict(list)
         request_lanes: dict[str, int] = defaultdict(int)
         contains_prefill = any(span.prefill for span in scheduler_output.spans)
+        mixed_prefill = (
+            op is LoopOp.CORE and contains_prefill and self._prefill_pipeline
+            and len({span.depth for span in scheduler_output.spans}) > 1
+        )
+        variants = {
+            (span.depth, mixed_prefill and span.last_core) for span in scheduler_output.spans
+        }
         compact_core = (
             op is LoopOp.CORE
-            and self._mixed_core
-            and self._compact_mixed_core
+            and (mixed_prefill or (
+                self._mixed_core and self._compact_mixed_core
+            ))
             and getattr(self.model, "rlt_partition_core_variants", False)
+            and self.parallel_config.tensor_parallel_size == 1
             and self.vllm_config.kv_transfer_config is None
             and self.vllm_config.lora_config is None
-            and not self._decode_state_slots
+            and (mixed_prefill or not self._decode_state_slots)
             and self.fast_prefill is None
             and not scheduler_output.scheduled_spec_decode_tokens
-            and self._can_reuse_inputs(scheduler_output.spans)
-            and len({span.request_id for span in scheduler_output.spans})
-            == len(scheduler_output.spans)
-            and len({span.depth for span in scheduler_output.spans}) > 1
+            and self._supports_input_layout(scheduler_output.spans)
+            and (mixed_prefill or len(scheduler_output.num_scheduled_tokens)
+                 == len(scheduler_output.spans))
+            and len(variants) > 1
         )
         pack_core = self._mixed_core or (self._packed_prefill and contains_prefill)
         if (
@@ -435,7 +554,7 @@ class LoopModelRunner(GPUModelRunner):
             and self.parallel_config.tensor_parallel_size == 1
             and self.vllm_config.kv_transfer_config is None
             and self.vllm_config.lora_config is None
-            and self._can_reuse_inputs(scheduler_output.spans)
+            and self._supports_input_layout(scheduler_output.spans)
         )
         ordinary_decode = (
             ordinary_core
@@ -446,8 +565,15 @@ class LoopModelRunner(GPUModelRunner):
             (self._merge_decode_core and ordinary_decode)
             or (self._merge_prefill_core and ordinary_core and contains_prefill)
         )
+        if merge_core and mixed_prefill:
+            # The same request can appear at several depths with different
+            # chunks. Each depth still needs one unique MRv2 row per request.
+            requests_by_depth = {(span.depth, span.request_id) for span in scheduler_output.spans}
+            merge_core = len(requests_by_depth) == len(scheduler_output.spans)
         for span in scheduler_output.spans:
             if compact_core:
+                key = 0
+            elif op is LoopOp.PRELUDE:
                 key = 0
             elif core_samples and not self._mixed_core:
                 key = span.request_id
@@ -503,6 +629,7 @@ class LoopModelRunner(GPUModelRunner):
             step = LoopExecution(
                 op, tuple(spans), self._loop_states, self._draft_states, self._loop_graphs
             )
+            step.explicit_positions = mixed_prefill or any(span.explicit_position for span in spans)
             step.context_limit = getattr(self, "max_model_len", None)
             step.coda_tail_moe = op is LoopOp.CODA and self._coda_tail_moe
             step.compact_core = compact_core

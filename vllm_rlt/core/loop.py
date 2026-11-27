@@ -49,10 +49,15 @@ class LoopSpan:
     propose_draft: bool = False
     draft_coda: bool = False
     input_token: int | None = None
+    coda_remainder: int = 0
+    chunk_id: int = 0
+    explicit_position: bool = False
 
     def __post_init__(self) -> None:
         if self.token_start < 0 or self.token_count < 1 or self.depth < 0:
             raise ValueError("loop span needs a nonnegative start and depth and positive count")
+        if self.coda_remainder < 0 or (self.coda_remainder and (not self.prefill or self.sample)):
+            raise ValueError("a CODA remainder requires a nonsampling prefill prefix")
 
     @property
     def token_end(self) -> int:

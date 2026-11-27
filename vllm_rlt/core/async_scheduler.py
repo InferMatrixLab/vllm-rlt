@@ -16,7 +16,6 @@ class LoopAsyncScheduler(LoopScheduler):
             # A fixed prompt can supply its next input while CODA is in flight.
             if (
                 self.async_prefill_lookahead
-                and not self.wavefront_prefill
                 and not self.decode_pipeline
                 and not work.produces_token
                 and not request.num_output_tokens

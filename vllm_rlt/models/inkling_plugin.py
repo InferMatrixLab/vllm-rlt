@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.inkling.nvidia.sconv_swa_attn import (
     InklingSconvMetadata,
     InklingSconvMetadataBuilder,
@@ -28,10 +29,12 @@ from vllm.v1.worker.utils import groups_with_metadata_builders
 from vllm_rlt.core.loop import LoopLayout, LoopOp, LoopSpan
 from vllm_rlt.models.inkling_core_routes import prepare_routes, route_live_rows
 from vllm_rlt.models.inkling_mixed_core import execute_compact_core, execute_mixed_core
+from vllm_rlt.models.inkling_packed_cache import PackedInklingCache
 from vllm_rlt.worker.loop_state import LoopExecution, loop_execution
 
 _coda_tail_padding = ContextVar("rlt_coda_tail_padding", default=None)
 _sconv_sequence_metadata = ContextVar("rlt_sconv_sequence_metadata", default=None)
+logger = init_logger(__name__)
 
 
 def _share_sconv_sequence_metadata(builder):
@@ -92,6 +95,14 @@ def _bind_uniform_decode_plan(layer):
 
 
 class LoopInklingModelState(DefaultModelState):
+    def can_pack_core(self):
+        cache = getattr(self, "_packed_loop_cache", None)
+        if cache is None:
+            cache = self._packed_loop_cache = PackedInklingCache(self.model.model)
+            if not cache.available:
+                logger.warning("WCPB uses grouped CORE for this KV cache layout")
+        return cache.available
+
     def prepare_inputs(self, input_batch, req_states):
         model_inputs = super().prepare_inputs(input_batch, req_states)
         step = loop_execution.get()
@@ -113,13 +124,15 @@ class LoopInklingModelState(DefaultModelState):
         model_specific_attn_metadata=None,
     ):
         step = loop_execution.get()
-        if step is not None and step.compact_core:
+        if step is not None and step.compact_core and not step.packed_core:
             return self._prepare_compact_core(
                 step, input_batch, block_tables, slot_mappings, attn_groups, kv_cache_config
             )
         prepared = step.prepared_batch if step is not None else None
-        if prepared is not None and step.padded_tokens is not None:
-            cudagraph_mode = prepared.descriptor.cg_mode
+        if step is not None and step.padded_graph_mode is not None:
+            # MRv2 passes its original descriptor's mode. FULL metadata must
+            # use the padding chosen for this loop op, even with fresh inputs.
+            cudagraph_mode = step.padded_graph_mode
         eligible = (
             prepared is not None
             and prepared.inputs is input_batch
@@ -160,6 +173,10 @@ class LoopInklingModelState(DefaultModelState):
             )
         finally:
             _sconv_sequence_metadata.reset(sequence_cache)
+        if step is not None and step.packed_core:
+            step.packed_core_metadata = self._packed_loop_cache.prepare(
+                step.ordered, metadata, input_batch
+            )
         if eligible:
             prepared.metadata = metadata
         return metadata
@@ -342,6 +359,9 @@ class _InklingStateSlot:
     state: _InklingState
     index: int
 
+    def rows(self, *, copy=True):
+        return self.state.rows(self.index, self.index + 1, copy=copy)
+
 
 class _InklingDecodeStatePool:
     """Own decode rows at MRv2 request slots for each intermediate state layout."""
@@ -480,6 +500,8 @@ class LoopInklingForConditionalGeneration(Inkling2LoopForConditionalGeneration):
             plan = workspace.plan(positions.numel())
 
         prepared = step.prepared_batch
+        if prepared is not None and not prepared.keep_model_state:
+            prepared = None
         if step.op is LoopOp.PRELUDE:
             if prepared is not None:
                 prepared.unpack_state()
@@ -584,7 +606,7 @@ class LoopInklingForConditionalGeneration(Inkling2LoopForConditionalGeneration):
                 self._continue_core(state, prelude_dests)
 
         if prepared is None:
-            state.store_rows(step.ordered, step.state)
+            self._store_state_rows(step, state, step.ordered)
         else:
             if step.graphs is not None and (step.op is LoopOp.PRELUDE or step.ordered[0].last_core):
                 # These outputs can alias a replay buffer that the next use of the graph overwrites.
@@ -605,13 +627,31 @@ class LoopInklingForConditionalGeneration(Inkling2LoopForConditionalGeneration):
                 )
         return state.stack[state.num_blocks]
 
+    @staticmethod
+    def _store_span_state(step, span, state):
+        step.state.setdefault(span.request_id, {})[span.token_start] = state
+
+    def _store_state_rows(self, step, state, spans, *, copy=True, keep_frame=False):
+        state.store_rows(spans, step.state, copy=copy, keep_frame=keep_frame)
+
+    @staticmethod
+    def _pop_core_states(step, spans):
+        states = [step.state[span.request_id].pop(span.token_start) for span in spans]
+        # Mixed CORE can retain an input row after the decode slot is reused.
+        return [state.rows() if isinstance(state, _InklingStateSlot) else state for state in states]
+
     def _take_state(self, step):
-        states = [
-            (step.draft_state if span.draft_coda else step.state)[span.request_id].pop(
-                span.token_start
-            )
-            for span in step.ordered
-        ]
+        states = []
+        for span in step.ordered:
+            positions = (step.draft_state if span.draft_coda else step.state)[span.request_id]
+            state = positions.pop(span.token_start)
+            if span.coda_remainder:
+                assert step.op is LoopOp.CODA and isinstance(state, _InklingState)
+                end = span.token_count + span.coda_remainder
+                assert state.prelude.shape[0] == end
+                positions[span.token_end] = state.rows(span.token_count, end, copy=False)
+                state = state.rows(0, span.token_count, copy=False)
+            states.append(state)
         prepared = step.prepared_batch
         first = states[0]
         if isinstance(first, _InklingState) and first.frame is not None:
@@ -649,7 +689,7 @@ class LoopInklingForConditionalGeneration(Inkling2LoopForConditionalGeneration):
             zero_storage = self._state_padding = {}
         return _InklingState.concatenate(
             [
-                item.state.rows(item.index, item.index + 1, copy=len(states) == 1)
+                item.rows(copy=len(states) == 1)
                 if isinstance(item, _InklingStateSlot)
                 else item
                 for item in states
@@ -746,8 +786,8 @@ class LoopInklingForConditionalGeneration(Inkling2LoopForConditionalGeneration):
             continuing.inputs = torch.nn.functional.pad(
                 continuing.inputs, (0, 0, 0, continue_width - continuing_rows)
             )
-        continuing.store_rows(routes.spans[0], step.state, copy=False, keep_frame=True)
-        terminal.store_rows(routes.spans[1], step.state, copy=False)
+        self._store_state_rows(step, continuing, routes.spans[0], copy=False, keep_frame=True)
+        self._store_state_rows(step, terminal, routes.spans[1], copy=False)
 
     def _store_merged_core(self, step, state, blocks, inputs, routes):
         # The last layer writes the same stack for both routes. Its Coda mix is
@@ -769,7 +809,7 @@ class LoopInklingForConditionalGeneration(Inkling2LoopForConditionalGeneration):
                 )
                 self._continue_core(child, prelude_dests)
             if pool is None:
-                child.store_rows(spans, step.state, copy=False)
+                self._store_state_rows(step, child, spans, copy=False)
             else:
                 prepared = step.prepared_batch
                 assert prepared is not None

@@ -15,12 +15,12 @@ def test_cli_explicit_flags_overlay_additional_config():
     args = parser.parse_args(
         [
             "--no-rlt-self-speculation",
-            "--rlt-wavefront-prefill",
+            "--rlt-prefill-window",
+            "96",
             "--rlt-prefill-chunk-size",
             "16",
             "--rlt-merge-decode-core",
             "--rlt-decode-state-slots",
-            "--rlt-batch-decode-coda",
         ]
     )
     apply_runtime_args(args)
@@ -28,11 +28,10 @@ def test_cli_explicit_flags_overlay_additional_config():
     assert args.additional_config == {
         "rlt_self_speculation": False,
         "rlt_trace_steps": True,
-        "rlt_wavefront_prefill": True,
+        "rlt_prefill_window": 96,
         "rlt_prefill_chunk_size": 16,
         "rlt_merge_decode_core": True,
         "rlt_decode_state_slots": True,
-        "rlt_batch_decode_coda": True,
     }
     assert args.scheduler_cls == "vllm_rlt.core.loop_scheduler.LoopScheduler"
     assert args.worker_cls == "vllm_rlt.worker.loop_worker.LoopWorker"

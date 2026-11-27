@@ -43,6 +43,7 @@ def _prepare_rows(
     slot_stride: tl.constexpr,
     slot_capacity: tl.constexpr,
     pad_slot: tl.constexpr,
+    span_positions: tl.constexpr,
 ):
     row = tl.program_id(0)
     chunk = tl.program_id(1)
@@ -72,7 +73,7 @@ def _prepare_rows(
     if start + chunk * tile >= end:
         return
     slot = tl.load(Idx + row).to(tl.int32)
-    position = tl.load(Computed + slot).to(tl.int32)
+    position = tl.load(Computed + (row if span_positions else slot)).to(tl.int32)
     prompt_end = tl.load(Prefill + slot)
     if chunk == 0:
         tl.store(SeqLens + row, position + end - start)
@@ -98,7 +99,7 @@ def _prepare_rows(
     if position < prompt_end:
         history = TokenIds + slot.to(tl.int64) * history_stride
         tokens = tl.load(history + qpos, valid, other=0)
-        if chunk == 0:
+        if not span_positions and chunk == 0:
             next_rows = tl.arange(0, next_block)
             next_pos = position + end - start + next_rows
             next_token = tl.load(
@@ -125,7 +126,7 @@ class OrdinaryInputBuilder:
         self.local_pos = torch.zeros(size, device=device, dtype=torch.int32)
         self.cpu_counts = np.arange(size + 1, dtype=np.int32)
 
-    def prepare(self, output, state, descriptor, *, prepare_decode_slots=False):
+    def prepare(self, output, state, descriptor, *, prepare_decode_slots=False, positions=None):
         num_reqs = len(state.req_ids)
         num_tokens = state.num_tokens
         padded = max(num_tokens, descriptor.num_tokens)
@@ -139,11 +140,14 @@ class OrdinaryInputBuilder:
         cpu_offsets[0] = 0
         np.cumsum(counts, out=cpu_offsets[1 : num_reqs + 1])
         cpu_offsets[num_reqs + 1 :] = num_tokens
-        pack = np.empty((2, buf.max_num_reqs + 1), dtype=np.int64)
+        pack = np.empty((2 if positions is None else 3, buf.max_num_reqs + 1), dtype=np.int64)
         pack[0, :num_reqs] = mapping
         pack[0, num_reqs:] = 0
         pack[1] = cpu_offsets
-        indices, offsets = async_tensor_h2d(pack, device=buf.device).unbind()
+        if positions is not None:
+            pack[2, :num_reqs] = positions
+        staged = async_tensor_h2d(pack, device=buf.device)
+        indices, offsets = staged[0], staged[1]
         token_tile = 256
         max_length = max(int(counts.max()), padded - num_tokens)
         tables = self.block_tables
@@ -162,7 +166,7 @@ class OrdinaryInputBuilder:
         _prepare_rows[(num_reqs + 1, triton.cdiv(max_length, token_tile))](
             indices,
             offsets,
-            req.num_computed_tokens.gpu,
+            req.num_computed_tokens.gpu if positions is None else staged[2],
             req.prefill_len.gpu,
             req.all_token_ids.gpu,
             req.last_sampled_tokens,
@@ -189,9 +193,10 @@ class OrdinaryInputBuilder:
             tables.slot_mappings.stride(0) if groups else 0,
             tables.slot_mappings.shape[1] if groups else 0,
             PAD_SLOT_ID,
+            positions is not None,
         )
 
-        computed = req.num_computed_tokens_np[mapping]
+        computed = req.num_computed_tokens_np[mapping] if positions is None else positions
         seq_lens_cpu = np.zeros(num_reqs_padded, dtype=np.int32)
         np.add(computed, counts, out=seq_lens_cpu[:num_reqs])
         indices = indices[:num_reqs]

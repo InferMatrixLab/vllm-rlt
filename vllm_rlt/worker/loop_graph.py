@@ -3,6 +3,7 @@
 from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import fields, replace
+from functools import partial
 
 import torch
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
@@ -353,6 +354,8 @@ class LoopCudaGraphs:
             self.decode_sizes = ()
         self.sizes = frozenset(self.prefill_sizes + self.decode_sizes)
         self.entries = {}
+        self.compact_core_graphs = {}
+        self.packed_core_graphs = {}
         self.capture_stream = torch.cuda.Stream()
         self._capture_metadata: _FullGraphMetadata | None = None
         self._capture_piecewise: _PiecewiseGraphMetadata | None = None
@@ -377,7 +380,23 @@ class LoopCudaGraphs:
             if full_decode and not getattr(runner, "_merge_prefill_core", False)
             else decode_targets
         )
+        prefill_pipeline = getattr(runner, "_prefill_pipeline", False)
         try:
+            packed_cache = None
+            if (
+                prefill_pipeline
+                and self.prefill_sizes
+                and runner.parallel_config.tensor_parallel_size == 1
+                and self.config.kv_transfer_config is None
+                and self.config.lora_config is None
+                and runner.fast_prefill is None
+                and runner._supports_input_layout(())
+            ):
+                from vllm_rlt.models.inkling_packed_cache import PackedInklingCache
+
+                candidate = PackedInklingCache(runner.get_model().model)
+                if candidate.available:
+                    packed_cache = candidate
             for tokens in reversed(self.decode_sizes):
                 before = len(self.entries)
                 self._warm_shape(runner, tokens, tokens, False, decode_targets)
@@ -400,6 +419,11 @@ class LoopCudaGraphs:
                 )
                 if captured >= depth + 1 + len(piecewise_targets):
                     captured_piecewise_sizes.append(tokens)
+                if prefill_pipeline:
+                    if packed_cache is None:
+                        self._warm_compact_core(runner, tokens)
+                    else:
+                        self._warm_packed_core(runner, tokens, packed_cache)
             logger.info(
                 "RLT CUDA Graph %s complete: %d per-op graphs, "
                 "FULL decode batches=%s with %d graphs per batch, "
@@ -429,6 +453,80 @@ class LoopCudaGraphs:
         if index >= len(self.piecewise_sizes):
             return None
         return self.piecewise_sizes[index]
+
+    def has_compact_core_graph(self, width, packed):
+        return width in self.compact_core_graphs or (packed and width in self.packed_core_graphs)
+
+    def _warm_packed_core(self, runner, tokens, cache):
+        from vllm_rlt.models.inkling_packed_graph import PackedCoreGraphInputs
+
+        inputs = PackedCoreGraphInputs(runner, runner.get_model().model, cache, tokens)
+        inputs.warm_initial_inputs()
+        graph = self._capture_core_graph(runner, tokens, inputs.forward)
+        self.packed_core_graphs[tokens] = graph, inputs
+
+    def replay_packed_core(self, positions, execution):
+        tokens = positions.numel()
+        captured = self.packed_core_graphs.get(tokens)
+        if captured is None:
+            return False
+        graph, inputs = captured
+        if not inputs.stage(positions, execution):
+            return False
+        self._replay_core_graph(tokens, graph)
+        inputs.finish(execution)
+        return True
+
+    def _warm_compact_core(self, runner, tokens):
+        from vllm_rlt.models.inkling_mixed_core import run_compact_layers
+
+        model = runner.get_model().model
+        prototype = model.layers[model.loop_core.start].attn_norm.weight
+        hidden = prototype.shape[-1]
+        workspaces = (
+            prototype.new_empty((3, tokens, hidden), dtype=runner.model_config.dtype),
+            prototype.new_empty((tokens, hidden), dtype=runner.model_config.dtype),
+        )
+        runnable = partial(run_compact_layers, model)
+        entry = self._capture_core_graph(runner, tokens, runnable, *workspaces)
+        self.compact_core_graphs[tokens] = entry, workspaces
+
+    def _capture_core_graph(self, runner, tokens, runnable, *workspaces):
+        mode = CUDAGraphMode.PIECEWISE
+        entry = BreakableCUDAGraphWrapper(runnable, self.config, mode)
+        padding = runner.input_buffers.is_padding[:tokens]
+        padding.fill_(False)
+        with set_forward_context(
+            {}, self.config, num_tokens=tokens, is_padding=padding,
+            batch_descriptor=BatchDescriptor(num_tokens=tokens),
+        ):
+            entry(*workspaces)
+            get_forward_context().cudagraph_runtime_mode = mode
+            current = torch.cuda.current_stream()
+            self.capture_stream.wait_stream(current)
+            with torch.cuda.stream(self.capture_stream):
+                entry(*workspaces)
+            current.wait_stream(self.capture_stream)
+        return entry
+
+    def replay_compact_core(self, tokens):
+        captured = self.compact_core_graphs.get(tokens)
+        if captured is None:
+            return False
+        entry, workspaces = captured
+        self._replay_core_graph(tokens, entry, *workspaces)
+        return True
+
+    @staticmethod
+    def _replay_core_graph(tokens, entry, *workspaces):
+        context = get_forward_context()
+        previous = context.cudagraph_runtime_mode, context.batch_descriptor
+        context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+        context.batch_descriptor = BatchDescriptor(num_tokens=tokens)
+        try:
+            entry(*workspaces)
+        finally:
+            context.cudagraph_runtime_mode, context.batch_descriptor = previous
 
     def _warm_shape(self, runner, requests, tokens, prefill, targets):
         model = runner.get_model()
@@ -486,7 +584,9 @@ class LoopCudaGraphs:
                 slot_mapping=attn.slot_mappings,
                 is_padding=inputs.is_padding[:tokens],
             ):
+                tail_moe = getattr(runner, "_coda_tail_moe", False)
                 for num_loops in targets:
+                    coda_tail_moe = tail_moe
                     states = {}
                     plan = (
                         [(LoopOp.PRELUDE, 0)]
@@ -504,7 +604,7 @@ class LoopCudaGraphs:
                         )
                         step = LoopExecution(op, spans, states, {}, self)
                         step.context_limit = self.config.model_config.max_model_len
-                        step.coda_tail_moe = getattr(runner, "_coda_tail_moe", False)
+                        step.coda_tail_moe = coda_tail_moe
                         step.ordered = spans
                         context = loop_execution.set(step)
                         try:
@@ -617,7 +717,7 @@ class LoopCudaGraphs:
             context.cudagraph_runtime_mode = mode
             output = entry.forward(*entry.inputs)
             if stack_output_blocks:
-                if step.prepared_batch is not None:
+                if prepared is not None and prepared.keep_model_state:
                     # A batch change unpacks live state before another replay
                     # can overwrite this shared stack on the same stream.
                     step.graph_stack = entry.inputs[0]

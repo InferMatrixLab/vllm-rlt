@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -16,7 +16,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
-from vllm_rlt.config import LoopRuntimeConfig
+from vllm_rlt.config import LoopRuntimeConfig, supports_prefill_pipeline
 from vllm_rlt.core.loop import LoopLayout, LoopOp, LoopSpan
 from vllm_rlt.core.output import LoopModelRunnerOutput, LoopSchedulerOutput
 from vllm_rlt.core.request import LoopRequest
@@ -40,9 +40,10 @@ class _SpanProgress:
     input_token: int | None = None
     tentative: bool = False
     awaiting_coda_at: int | None = None
-    budget_skipped_at: int | None = None
-    coda_waited: bool = False
-    coda_deferrals: int = 0
+    coda_tail: bool = False
+    chunk_id: int = 0
+    ready_since: int = 0
+    skips: int = 0
 
 
 @dataclass(slots=True)
@@ -52,6 +53,30 @@ class _RequestState:
     known_to_worker: bool = False
     in_flight: int = 0
     newly_allocated: tuple[list[int], ...] | None = None
+    next_chunk_id: int = 0
+    entry_ready_since: int = 0
+    entry_skips: int = 0
+
+
+@dataclass(slots=True)
+class _ReadyWork:
+    state: _RequestState
+    progress: _SpanProgress | None
+    op: LoopOp
+    depth: int
+    rows: int
+    prefill: bool
+    rank: tuple[int, int]
+    since: int
+
+
+@dataclass(slots=True)
+class _Batch:
+    op: LoopOp
+    depth: int
+    work: list[_ReadyWork]
+    fullness: int
+    entry_candidates: list[_ReadyWork] | None = None
 
 
 @dataclass(slots=True)
@@ -87,20 +112,28 @@ class LoopScheduler(SchedulerInterface):
             getattr(config, "max_num_scheduled_tokens", None) or self.max_num_batched_tokens,
             self.max_num_batched_tokens,
         )
-        self.long_prefill_token_threshold = getattr(config, "long_prefill_token_threshold", 0)
         options = LoopRuntimeConfig.from_additional_config(vllm_config.additional_config)
-        self.wavefront_prefill = options.wavefront_prefill
+        self.prefill_chunk_size = min(
+            self.max_num_scheduled_tokens,
+            options.prefill_chunk_size or self.max_num_scheduled_tokens,
+            getattr(config, "long_prefill_token_threshold", 0) or self.max_num_scheduled_tokens,
+        )
+        self.prefill_window = options.prefill_window or (
+            2 * self.max_num_scheduled_tokens * self.layout.num_loops
+        )
+        if self.prefill_window < self.prefill_chunk_size * self.layout.num_loops:
+            raise ValueError("RLT prefill window must fit a full chunk through all CORE rounds")
+        self._prefill_window_blocked = False
+        self._priority_policy = getattr(config, "policy", "fcfs") == "priority"
         self.self_speculation = options.self_speculation
         self.trace_steps = options.trace_steps
         self.decode_pipeline = options.decode_pipeline
         self.async_prefill_lookahead = options.async_prefill_lookahead
-        ordinary_tokens = not (
-            self.wavefront_prefill or self.self_speculation or self.decode_pipeline
+        ordinary_tokens = not (self.self_speculation or self.decode_pipeline)
+        self.split_prefill_coda = (
+            options.split_prefill_coda and ordinary_tokens and self.layout.has_coda
         )
-        self.batch_decode_coda = options.batch_decode_coda and ordinary_tokens
-        self.finish_decode_token = (
-            options.finish_decode_token and ordinary_tokens and self.layout.has_coda
-        )
+        self._mixed_prefill_core = supports_prefill_pipeline(vllm_config, options)
         if self.decode_pipeline and (
             not self.self_speculation
             or not config.async_scheduling
@@ -111,15 +144,6 @@ class LoopScheduler(SchedulerInterface):
             raise ValueError("rlt self-speculation requires Inkling's Coda")
         if options.silu_and_mul and not self.layout.early_exit:
             raise ValueError("rlt_silu_and_mul requires an Ouro model")
-        self.prefill_chunk_size = options.prefill_chunk_size or max(
-            1, self.max_num_batched_tokens // self.layout.num_loops
-        )
-        if self.wavefront_prefill and (
-            not self.layout.has_prelude
-            or getattr(vllm_config.model_config.hf_text_config, "loop_share_cache", False)
-            or not 1 <= self.prefill_chunk_size <= self.max_num_batched_tokens
-        ):
-            raise ValueError("rlt wavefront prefill requires per-pass Inkling KV and a valid chunk")
         self.log_stats = log_stats
         self.kv = KVCacheManager(
             kv_cache_config,
@@ -189,63 +213,16 @@ class LoopScheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> LoopSchedulerOutput:
         self._schedule_step += 1
-        selected: list[tuple[_RequestState, LoopSpan]] = []
-        selected_op = None
-        selected_depth = None
-        budget = self.max_num_scheduled_tokens
-        ready = self._ready_reserved_spans()
-        align_core_depth = self.finish_decode_token and any(
-            work.prefill and work.next_op is LoopOp.CORE for _, work in ready
-        )
-        first = self._choose_first_span(ready)
-        if first is not None:
-            state, work = first
-            selected_op = work.next_op
-            selected_depth = work.next_depth
-            selected.append((state, self._make_span(state.request, work, selected_op)))
-            budget -= work.count
-
-        for state in self._schedule_candidates(throttle_prefills):
-            if budget == 0 or len(selected) == self.max_num_seqs:
+        capacity = self._prefill_capacity()
+        ready = self._ready_work(throttle_prefills, capacity)
+        selected, selected_op = [], None
+        failed = set()
+        for batch in self._batches(ready, capacity):
+            selected = self._reserve_batch(batch, capacity, failed)
+            if selected:
+                selected_op = batch.op
+                self._remember_skips(ready, selected, failed)
                 break
-            if self.decode_pipeline and state.in_flight:
-                continue
-            picked_depths = (
-                {first[1].next_depth} if first is not None and state is first[0] else set()
-            )
-            for work in self._ready_spans(state):
-                op = work.next_op if work is not None else self.layout.first_op
-                depth = work.next_depth if work is not None else 0
-                if (
-                    op is None
-                    or (selected_op is not None and selected_op is not op)
-                    or (
-                        align_core_depth
-                        and op is LoopOp.CORE
-                        and selected_depth is not None
-                        and depth != selected_depth
-                    )
-                    or depth in picked_depths
-                ):
-                    continue
-                if work is None:
-                    work = self._reserve_span(state, budget, selected)
-                    if work is None:
-                        continue
-                if work.count > budget:
-                    continue
-
-                span = self._make_span(state.request, work, op)
-                selected.append((state, span))
-                selected_op = op
-                selected_depth = depth
-                picked_depths.add(span.depth)
-                budget -= work.count
-                if budget == 0 or len(selected) == self.max_num_seqs:
-                    break
-
-        if selected:
-            self._remember_budget_skips(ready, selected, selected_op, budget)
 
         output = (
             LoopSchedulerOutput.for_step(selected_op, (span for _, span in selected))
@@ -285,7 +262,8 @@ class LoopScheduler(SchedulerInterface):
                 context_tokens += span.token_count
             state.in_flight += 1
             assert selected_op is not None
-            work.budget_skipped_at = None
+            work.ready_since = 0
+            work.skips = 0
             advanced = self._on_submit(state, work, selected_op, span)
             submissions.append(_Submission(state, work, span, advanced))
         if submissions:
@@ -311,103 +289,318 @@ class LoopScheduler(SchedulerInterface):
             if work is not None and work.next_op is not None
         ]
 
-    def _choose_first_span(self, ready):
-        first = first_priority = None
-        for state, work in ready:
-            if work.budget_skipped_at is not None:
-                priority = (0, work.budget_skipped_at)
-            elif (work.next_op is LoopOp.CODA and not work.draft_coda) or (
-                work.next_op is LoopOp.CORE
-                and not self.layout.has_coda
-                and work.next_depth + 1 == work.depth_limit
-            ):
-                priority = (1 if work.produces_token else 2, 0)
-            else:
-                continue
-            if first_priority is None or priority < first_priority:
-                first = (state, work)
-                first_priority = priority
-        if self.finish_decode_token and first_priority in (None, (1, 0)):
-            return self._advance_ready_decode_core(first, ready)
-        if self.batch_decode_coda and first_priority == (1, 0):
-            return self._batch_ready_decode_coda(first, ready)
-        return first
-
-    def _advance_ready_decode_core(self, first, ready):
-        if first is not None and any(
-            work.prefill and work.next_op is LoopOp.CODA for _, work in ready
-        ):
-            return first
-
-        core = [(state, work) for state, work in ready if work.next_op is LoopOp.CORE]
-        decode = [pair for pair in core if not pair[1].prefill]
-        align = 0 < len(decode) < len(core)
-        candidate = min(
-            core if align else decode,
-            key=lambda pair: (pair[1].next_depth, pair[1].prefill),
-            default=None,
+    def _prefill_capacity(self):
+        outstanding = sum(
+            work.count * (work.depth_limit - work.completed_depth - 1)
+            for state in self._states.values()
+            for work in state.spans.values()
+            if work.prefill
         )
-        if align and candidate is not None:
-            depth = candidate[1].next_depth
-            core = [pair for pair in core if pair[1].next_depth == depth]
-        if (
-            len(core) > self.max_num_seqs
-            or sum(work.count for _, work in core) > self.max_num_scheduled_tokens
+        loops = self.layout.num_loops
+        available = (self.prefill_window - outstanding) // loops
+        refill = min(self.max_num_scheduled_tokens, self.prefill_window // loops)
+        if available <= 0:
+            self._prefill_window_blocked = True
+        elif available >= refill:
+            self._prefill_window_blocked = False
+        return max(available, 0)
+
+    def _rank(self, state, work, op, prefill, since, skips):
+        if skips >= 2:
+            return 0, since
+        if not prefill:
+            tier = {LoopOp.CODA: 1, LoopOp.CORE: 3, LoopOp.PRELUDE: 4}[op]
+        elif work is not None and work.produces_token and (
+            op is LoopOp.CODA
+            or not self.layout.has_coda and work.next_depth + 1 == work.depth_limit
         ):
-            return first
-        if candidate is None:
-            return first
+            tier = 5
+        else:
+            tier = 6
+        return tier, state.request.priority if self._priority_policy else 0
 
-        if first is not None:
-            waiting = [
-                work
-                for _, work in ready
-                if work.next_op is LoopOp.CODA and not work.prefill and work.produces_token
-            ]
-            if not waiting or any(
-                work.coda_deferrals >= self.layout.num_loops - 1 for work in waiting
-            ):
-                return first
-            for work in waiting:
-                work.coda_deferrals += 1
-        return candidate
+    def _ready_work(self, throttle_prefills, prefill_capacity):
+        ready, entries = [], []
+        for state in self._schedule_candidates(throttle_prefills):
+            if self.decode_pipeline and state.in_flight:
+                continue
+            for work in self._ready_spans(state):
+                if work is None:
+                    entry = self._entry_work(state, prefill_capacity)
+                    if entry is not None:
+                        entries.append(entry)
+                elif work.next_op is not None:
+                    if not work.ready_since:
+                        work.ready_since = self._schedule_step
+                    ready.append(_ReadyWork(
+                        state, work, work.next_op, work.next_depth, work.count, work.prefill,
+                        self._rank(state, work, work.next_op, work.prefill,
+                                   work.ready_since, work.skips), work.ready_since,
+                    ))
+        if self._prefill_window_blocked and ready:
+            entries = [entry for entry in entries if not entry.prefill]
+        ready.extend(entries)
+        # FCFS is request arrival order, including across stages and CORE depths.
+        ready.sort(key=lambda item: (
+            item.rank, item.state.request.arrival_time,
+            item.progress.chunk_id if item.progress is not None else item.state.next_chunk_id,
+        ))
+        return ready
 
-    def _batch_ready_decode_coda(self, first, ready):
-        if first[1].next_op is not LoopOp.CODA or any(work.prefill for _, work in ready):
-            return first
-        waiting = []
-        final_core = []
-        core_tokens = 0
+    def _entry_work(self, state, prefill_capacity):
+        request = state.request
+        last = next(reversed(state.spans.values()), None)
+        start = request.num_computed_tokens if last is None else last.start + last.count
+        prefill = start < request.num_prompt_tokens or not state.known_to_worker
+        available = request.num_tokens - start
+        pipeline_entry = (
+            not prefill and self.decode_pipeline and len(state.spans) == 1
+            and start >= request.num_tokens
+            and self._lookahead_token(state) is not None
+        )
+        if not prefill and (self._pending_coda(state) is not None or pipeline_entry):
+            available = 1
+        rows = min(available, self.max_num_scheduled_tokens)
+        if prefill:
+            rows = min(rows, self.prefill_chunk_size, prefill_capacity)
+        if rows <= 0:
+            return None
+        if not state.entry_ready_since:
+            state.entry_ready_since = self._schedule_step
+        op = self.layout.first_op
+        rank = self._rank(state, None, op, prefill, state.entry_ready_since, state.entry_skips)
+        if pipeline_entry and rank[0] > 0:
+            # An explicit decode pipeline prepares the draft successor before
+            # validating it with the current token's deeper CORE.
+            rank = 2, rank[1]
+        return _ReadyWork(
+            state, None, op, 0, rows, prefill, rank, state.entry_ready_since,
+        )
+
+    def _take_work(self, candidates, prefill_capacity, initial=()):
+        chosen = list(initial)
+        budget = self.max_num_scheduled_tokens - sum(item.rows for item in chosen)
+        keys = {(item.state.request.request_id, item.depth) for item in chosen}
+        for item in candidates:
+            if not budget or len(chosen) == self.max_num_seqs:
+                break
+            key = item.state.request.request_id, item.depth
+            if key in keys:
+                continue
+            rows = item.rows
+            if item.progress is None:
+                rows = min(rows, budget, prefill_capacity) if item.prefill else min(rows, budget)
+            if not 0 < rows <= budget:
+                continue
+            keys.add(key)
+            chosen.append(item if rows == item.rows else replace(item, rows=rows))
+            budget -= rows
+            if item.progress is None and item.prefill:
+                prefill_capacity -= rows
+        return chosen, budget == 0 or len(chosen) == self.max_num_seqs
+
+    def _batches(self, ready, prefill_capacity):
+        queues = defaultdict(list)
+        for item in ready:
+            queues[item.op, item.depth].append(item)
+        direct = {}
+        for (op, depth), queue in queues.items():
+            items, full = self._take_work(queue, prefill_capacity)
+            if op is LoopOp.PRELUDE and not full and self._mixed_prefill_core:
+                extra_rows = 0
+                for item in items:
+                    if not item.prefill:
+                        continue
+                    state, request = item.state, item.state.request
+                    last = next(reversed(state.spans.values()), None)
+                    start = request.num_computed_tokens if last is None else last.start + last.count
+                    slots = max(0, self.layout.num_loops - len(state.spans) - 1)
+                    extra_rows += min(
+                        slots * self.prefill_chunk_size,
+                        max(0, request.num_prompt_tokens - start - item.rows),
+                    )
+                prefill_rows = sum(item.rows for item in items if item.prefill)
+                extra_rows = min(extra_rows, prefill_capacity - prefill_rows)
+                full = (
+                    sum(item.rows for item in items) + extra_rows >= self.max_num_scheduled_tokens
+                )
+            entries = queue if op is LoopOp.PRELUDE else None
+            direct[op, depth] = _Batch(op, depth, items, 0 if full else 2, entries)
+        if self._mixed_prefill_core or self.decode_pipeline:
+            for (op, depth), batch in direct.items():
+                if op is not LoopOp.CORE or batch.fullness == 0:
+                    continue
+                other = [
+                    item for item in ready
+                    if item.op is op and item.depth != depth
+                    and direct[op, item.depth].fullness != 0
+                    and item.progress is not None
+                    and not item.progress.draft_coda
+                ]
+                if self.decode_pipeline:
+                    # The opt-in draft pipeline submits its tentative successor
+                    # with the current token. The worker orders the two reads.
+                    owner_ids = {item.state.request.request_id for item in batch.work}
+                    other = [
+                        item for item in other if item.progress.tentative
+                        and item.state.request.request_id in owner_ids
+                    ]
+                packed, full = self._take_work(other, prefill_capacity, batch.work)
+                if self.decode_pipeline or any(item.prefill for item in packed):
+                    batch.work = packed
+                    batch.fullness = 1 if full else 2
+
+        def rank(batch):
+            head = batch.work[0]
+            # Core depths only break ties between CORE plans. Across stages,
+            # compare the oldest ready work at the same service priority.
+            return head.rank, batch.fullness, head.since, {
+                LoopOp.CODA: 0, LoopOp.CORE: 1, LoopOp.PRELUDE: 2,
+            }[batch.op]
+
+        core = sorted(
+            (b for b in direct.values() if b.op is LoopOp.CORE),
+            key=lambda b: (b.work[0].rank, b.fullness, -b.depth),
+        )
+        while direct:
+            options = [b for b in direct.values() if b.op is not LoopOp.CORE]
+            if core:
+                options.append(core[0])
+            batch = min(options, key=rank)
+            batch = self._join_decode_batches(batch, direct.values())
+            del direct[batch.op, batch.depth]
+            if batch.op is LoopOp.CORE:
+                core.remove(batch)
+            yield batch
+
+    def _join_decode_batches(self, leading, candidates):
+        """Let compatible decode rows reach one stage within the skip budget."""
+        if not self.layout.has_coda or self.self_speculation:
+            return leading
+        head = leading.work[0]
+        coordinate = self._decode_coordinate(head)
+        if coordinate is None or head.rank[0] == 0:
+            return leading
+        loops, destination = coordinate
+        held = [item for item in leading.work if self._decode_coordinate(item) == coordinate]
+        remaining = 2 - max(self._skip_count(item) for item in held)
         capacity = min(self.max_num_seqs, self.max_num_scheduled_tokens)
-        for state, work in ready:
-            if work.next_op is LoopOp.CODA:
-                if work.coda_waited or not work.produces_token or work.draft_coda:
-                    return first
-                waiting.append(work)
-            elif work.next_op is LoopOp.CORE:
-                core_tokens += work.count
-                if work.next_depth + 1 == work.depth_limit and not work.adaptive:
-                    final_core.append((state, work))
-        if not final_core or core_tokens > capacity or len(waiting) + len(final_core) > capacity:
-            return first
-        # One useful CORE plan can make more rows ready to sample. A waiting
-        # Coda gets its usual priority on the next scheduling decision.
-        for work in waiting:
-            work.coda_waited = True
-        return final_core[0]
+        if not remaining or len(held) >= capacity:
+            return leading
 
-    def _remember_budget_skips(self, ready, selected, op, budget):
-        selected_positions = {(span.request_id, span.token_start) for _, span in selected}
-        slots_full = len(selected) == self.max_num_seqs
-        for state, work in ready:
-            if (
-                work.next_op is op
-                and work.budget_skipped_at is None
-                and state.request.status == RequestStatus.RUNNING
-                and (slots_full or work.count > budget)
-                and (state.request.request_id, work.start) not in selected_positions
-            ):
-                work.budget_skipped_at = self._schedule_step
+        best = leading
+        score = (0, 0)
+        for batch in candidates:
+            if batch is leading:
+                continue
+            source = self._decode_coordinate(batch.work[0])
+            if source is None or source[0] != loops:
+                continue
+            if self._priority_policy and batch.work[0].rank[1] > head.rank[1]:
+                continue
+            distance = (destination - source[1]) % (loops + 2)
+            if not 0 < distance <= remaining:
+                continue
+            joining = [item for item in batch.work if self._decode_coordinate(item) == source]
+            if source[1] > destination:
+                # A token crossing CODA may finish instead of joining the next batch.
+                joining = [
+                    item for item in joining
+                    if item.state.request.num_output_tokens + 1 < item.state.request.max_tokens
+                    and item.state.request.num_tokens + 1 < self.max_model_len
+                ]
+            joined = len(held) + len(joining)
+            if len(joining) and joined <= capacity and (joined, -distance) > score:
+                best, score = batch, (joined, -distance)
+        return best
+
+    def _decode_coordinate(self, item):
+        if item.prefill or item.rows != 1:
+            return None
+        work = item.progress
+        if work is not None and (work.adaptive or work.tentative or work.draft_coda):
+            return None
+        if work is None:
+            params = item.state.request.loop_params
+            loops = params.target_loops or params.max_loops or self.layout.num_loops
+        else:
+            loops = work.depth_limit
+        if item.op is LoopOp.CODA:
+            return loops, loops + 1
+        return loops, item.depth + 1 if item.op is LoopOp.CORE else 0
+
+    @staticmethod
+    def _skip_count(item):
+        return item.state.entry_skips if item.progress is None else item.progress.skips
+
+    def _reserve_batch(self, batch, prefill_capacity, failed):
+        selected = []
+        budget = self.max_num_scheduled_tokens
+        for item in batch.entry_candidates or batch.work:
+            if not budget or len(selected) == self.max_num_seqs:
+                break
+            state, work = item.state, item.progress
+            if work is not None and state.spans.get(work.start) is not work:
+                continue
+            if work is None:
+                rows = min(item.rows, budget, prefill_capacity) if item.prefill else item.rows
+                if not rows:
+                    continue
+                work = self._reserve_span(
+                    state, rows, selected, allow_preemption=not (item.prefill and state.spans),
+                )
+                if work is None:
+                    failed.add(state.request.request_id)
+                    continue
+                if work.prefill:
+                    prefill_capacity -= work.count
+            selected.append((state, self._make_span(state.request, work, batch.op)))
+            budget -= work.count
+        if batch.op is LoopOp.PRELUDE and self._mixed_prefill_core:
+            owners = [state for state, span in selected if span.prefill]
+            while owners and budget and prefill_capacity:
+                remaining = []
+                for state in owners:
+                    if not budget or not prefill_capacity:
+                        break
+                    if not self._prefill_window_open(state):
+                        continue
+                    limit = min(budget, prefill_capacity)
+                    work = self._reserve_span(state, limit, selected, allow_preemption=False)
+                    if work is None:
+                        continue
+                    selected.append((state, self._make_span(state.request, work, batch.op)))
+                    budget -= work.count
+                    prefill_capacity -= work.count
+                    remaining.append(state)
+                owners = remaining
+        if batch.op is LoopOp.CODA and self.split_prefill_coda and (
+            budget and len(selected) < self.max_num_seqs
+        ):
+            picked = {span.request_id for _, span in selected}
+            for item in batch.work:
+                picked.add(item.state.request.request_id)
+            for item in self._ready_reserved_spans():
+                state, work = item
+                if (
+                    work.next_op is LoopOp.CODA and work.count > budget
+                    and state.request.request_id not in picked
+                    and self._can_split_prefill_coda(state, work)
+                ):
+                    selected.append((state, self._split_prefill_coda(state, work, budget)))
+                    break
+        return selected
+
+    def _remember_skips(self, ready, selected, failed):
+        positions = {(span.request_id, span.token_start) for _, span in selected}
+        for item in ready:
+            state, work = item.state, item.progress
+            request_id = state.request.request_id
+            if work is None:
+                if state.entry_ready_since and request_id not in failed:
+                    state.entry_skips = min(state.entry_skips + 1, 2)
+            elif (request_id, work.start) not in positions:
+                work.skips = min(work.skips + 1, 2)
 
     def _schedule_candidates(self, throttle_prefills):
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -426,24 +619,28 @@ class LoopScheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_NEW:
             return
         num_running = sum(state.request.status == RequestStatus.RUNNING for state in running)
-        for state in waiting:
-            if num_running >= self.max_num_active_seqs or (throttle_prefills and num_running):
-                break
-            yield state
-            num_running += state.request.status == RequestStatus.RUNNING
+        if throttle_prefills and num_running:
+            return
+        if self._priority_policy:
+            waiting.sort(key=lambda state: (
+                state.entry_skips < 2,
+                state.entry_ready_since if state.entry_skips >= 2 else state.request.priority,
+                state.request.arrival_time,
+            ))
+        yield from waiting[:max(0, self.max_num_active_seqs - num_running)]
+
+    def _prefill_window_open(self, state):
+        if len(state.spans) >= self.layout.num_loops:
+            return False
+        last = next(reversed(state.spans.values()))
+        return last.start + last.count < state.request.num_prompt_tokens
 
     def _ready_spans(self, state):
         if not state.spans:
             yield None
             return
         active = tuple(state.spans.values())
-        last = active[-1]
-        if (
-            self.wavefront_prefill
-            and len(active) < self.layout.num_loops
-            and last.completed_depth >= 0
-            and last.start + last.count < state.request.num_prompt_tokens
-        ):
+        if self._mixed_prefill_core and self._prefill_window_open(state):
             yield None
         elif self.decode_pipeline and len(active) == 1 and self._lookahead_token(state) is not None:
             yield None
@@ -484,6 +681,36 @@ class LoopScheduler(SchedulerInterface):
             ),
             draft_coda=work.draft_coda,
             input_token=work.input_token,
+            chunk_id=work.chunk_id,
+            explicit_position=work.prefill and work.start != request.num_computed_tokens,
+        )
+
+    @staticmethod
+    def _can_split_prefill_coda(state, work) -> bool:
+        return (
+            work.prefill
+            and not work.coda_tail
+            and state.in_flight == 0
+            and len(state.spans) == 1
+            and work.start == state.request.num_computed_tokens
+            and work.start + work.count <= state.request.num_prompt_tokens
+            and work.completed_depth + 1 == work.depth_limit
+        )
+
+    def _split_prefill_coda(self, state, work, count: int) -> LoopSpan:
+        tail = replace(
+            work,
+            start=work.start + count,
+            count=work.count - count,
+            awaiting_coda_at=work.start,
+            coda_tail=True,
+        )
+        state.spans[tail.start] = tail
+        work.count = count
+        work.produces_token = False
+        return replace(
+            self._make_span(state.request, work, LoopOp.CODA),
+            coda_remainder=tail.count,
         )
 
     def _lookahead_token(self, state):
@@ -501,7 +728,7 @@ class LoopScheduler(SchedulerInterface):
     def _pending_coda(self, state) -> _SpanProgress | None:
         return None
 
-    def _reserve_span(self, state, budget, selected):
+    def _reserve_span(self, state, budget, selected, *, allow_preemption=True):
         request = state.request
         start = request.num_computed_tokens
         hit_blocks, hit_count = self.kv.empty_kv_cache_blocks, 0
@@ -520,13 +747,7 @@ class LoopScheduler(SchedulerInterface):
         produces_token = input_token is not None or (pending is not None and not pending.prefill)
         count = 1 if produces_token else min(budget, request.num_tokens - start)
         if start < request.num_prompt_tokens:
-            prefill_limit = (
-                self.prefill_chunk_size
-                if self.wavefront_prefill
-                else self.long_prefill_token_threshold
-            )
-            if prefill_limit:
-                count = min(count, prefill_limit)
+            count = min(count, self.prefill_chunk_size)
         if count < 1:
             return None
         reserve = start + count - request.num_computed_tokens - hit_count
@@ -539,6 +760,7 @@ class LoopScheduler(SchedulerInterface):
         )
         if (
             blocks is None
+            and allow_preemption
             and pending is None
             and request.status == RequestStatus.RUNNING
             and self._preempt_for(state, selected)
@@ -555,7 +777,12 @@ class LoopScheduler(SchedulerInterface):
 
         request.num_computed_tokens += hit_count
         request.status = RequestStatus.RUNNING
-        state.newly_allocated = blocks.get_block_ids()
+        new_blocks = blocks.get_block_ids()
+        if state.newly_allocated is not None:
+            new_blocks = tuple(
+                old + new for old, new in zip(state.newly_allocated, new_blocks, strict=True)
+            )
+        state.newly_allocated = new_blocks
         prefill = start < request.num_prompt_tokens or not state.known_to_worker
         params = request.loop_params
         depth_limit = self.layout.num_loops
@@ -574,7 +801,11 @@ class LoopScheduler(SchedulerInterface):
             input_token=input_token,
             tentative=input_token is not None,
             awaiting_coda_at=pending.start if pending is not None else None,
+            chunk_id=state.next_chunk_id,
         )
+        state.next_chunk_id += 1
+        state.entry_ready_since = 0
+        state.entry_skips = 0
         return state.spans[start]
 
     def _preempt_for(self, waiting, selected) -> bool:
@@ -604,6 +835,7 @@ class LoopScheduler(SchedulerInterface):
             self._finished.add(request.request_id)
         state.known_to_worker = False
         state.spans.clear()
+        state.next_chunk_id = 0
         request.num_computed_tokens = 0
         request.status = RequestStatus.PREEMPTED
         request.num_preemptions += 1

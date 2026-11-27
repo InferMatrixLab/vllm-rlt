@@ -3,8 +3,63 @@
 from dataclasses import dataclass
 
 import torch
+from vllm.models.inkling2.nvidia.ops.norm import rsqrt
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
+
+
+@triton.jit(do_not_specialize=[
+    "live", "first_tokens_stride", "first_stream_stride", "later_tokens_stride",
+    "later_stream_stride", "out_stream_stride",
+])
+def _pack_core_inputs(
+    First, Later, Routes, Weight, Out,
+    live,
+    first_tokens_stride,
+    first_stream_stride,
+    later_tokens_stride,
+    later_stream_stride,
+    out_stream_stride,
+    norm_stride: tl.constexpr,
+    hidden: tl.constexpr,
+    eps: tl.constexpr,
+    normalize_first: tl.constexpr,
+    first_is_full: tl.constexpr,
+    tile: tl.constexpr,
+):
+    row = tl.program_id(0)
+    stream = tl.program_id(1)
+    cols = tl.arange(0, tile)
+    values = tl.full((tile,), 0, tl.float32)
+    if row < live:
+        route = tl.load(Routes + row)
+        if route >= 0:
+            later_src = Later + stream * later_stream_stride + route * later_tokens_stride
+            values = tl.load(later_src + cols, cols < hidden, other=0).to(tl.float32)
+        else:
+            first_row = row if first_is_full else -route - 1
+            first_src = First + stream * first_stream_stride + first_row * first_tokens_stride
+            values = tl.load(first_src + cols, cols < hidden, other=0).to(tl.float32)
+            if normalize_first:
+                norm = tl.load(Weight + stream * norm_stride + cols, cols < hidden, other=0)
+                inv_rms = rsqrt(tl.div_rn(tl.sum(values * values), hidden) + eps)
+                values = (values * inv_rms) * norm
+    tl.store(Out + stream * out_stream_stride + row * hidden + cols, values, cols < hidden)
+
+
+def pack_core_inputs(out, first, later, routes, live, norm, *, normalize_first, first_is_full):
+    """Place the first and later pass inputs in the physical batch order."""
+    streams, width, hidden = out.shape
+    first = out if first is None else first.expand(streams, -1, -1)
+    later = out if later is None else later
+    tile = triton.next_power_of_2(hidden)
+    _pack_core_inputs[(width, streams)](
+        first, later, routes, norm.weight, out, live,
+        first.stride(1), first.stride(0), later.stride(1), later.stride(0), out.stride(0),
+        norm.weight.stride(0) if norm.weight.shape[0] > 1 else 0,
+        hidden, norm.eps, normalize_first, first_is_full, tile,
+        num_warps=min(max(tile // 512, 1), 16),
+    )
 
 
 @dataclass(slots=True)

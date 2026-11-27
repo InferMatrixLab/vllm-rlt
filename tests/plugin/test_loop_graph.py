@@ -9,6 +9,30 @@ import torch
 from vllm_rlt.core.loop import LoopLayout, LoopOp, LoopSpan
 
 
+def test_prefill_coda_keeps_the_exact_suffix_of_the_worker_state():
+    pytest.importorskip("vllm")
+    from vllm_rlt.models.inkling_plugin import LoopInklingForConditionalGeneration, _InklingState
+    from vllm_rlt.worker.loop_state import LoopExecution
+
+    stack = torch.arange(16).reshape(2, 8, 1)
+    original = _InklingState(stack, stack[0], stack[:1], None, 0, 1)
+    prefix = LoopSpan("prompt", 10, 7, 2, prefill=True, coda_remainder=1)
+    states = {"prompt": {10: original}}
+    step = LoopExecution(LoopOp.CODA, (prefix,), states, {})
+    step.ordered = step.spans
+    actual = LoopInklingForConditionalGeneration._take_state(SimpleNamespace(), step)
+    assert torch.equal(actual.stack, stack[:, :7])
+    assert tuple(states["prompt"]) == (17,)
+    assert torch.equal(states["prompt"][17].stack, stack[:, 7:])
+
+    suffix = LoopSpan("prompt", 17, 1, 2, prefill=True, sample=True)
+    step = LoopExecution(LoopOp.CODA, (suffix,), states, {})
+    step.ordered = step.spans
+    actual = LoopInklingForConditionalGeneration._take_state(SimpleNamespace(), step)
+    assert torch.equal(actual.inputs, stack[:1, 7:])
+    assert not states["prompt"]
+
+
 def test_full_op_graphs_refresh_shared_metadata_once(monkeypatch):
     pytest.importorskip("vllm")
     from vllm_rlt.worker import loop_graph
@@ -167,7 +191,10 @@ def test_full_graph_rejects_changed_positions_or_padding_address(monkeypatch):
     assert not entry.matches_borrowed_inputs(changed, padding)
 
 
-def test_mixed_batch_reuses_mrv2_inputs_and_metadata_until_batch_changes(monkeypatch):
+@pytest.mark.parametrize("explicit_positions", (False, True))
+def test_mixed_batch_reuses_mrv2_inputs_and_metadata_until_batch_changes(
+    monkeypatch, explicit_positions,
+):
     pytest.importorskip("vllm")
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -201,7 +228,7 @@ def test_mixed_batch_reuses_mrv2_inputs_and_metadata_until_batch_changes(monkeyp
     runner = object.__new__(LoopModelRunner)
     runner._prepared_batch = None
     runner._loop_graphs = None
-    runner._wavefront_prefill = runner._decode_pipeline = False
+    runner._decode_pipeline = False
     runner.model = object()
     runner.pcp_manager = runner.ubatch_runner = runner.speculator = runner.fast_prefill = None
     runner.dcp_size = 1
@@ -219,13 +246,19 @@ def test_mixed_batch_reuses_mrv2_inputs_and_metadata_until_batch_changes(monkeyp
     state_store = {}
     old_spans = (LoopSpan("decode", 8, 1, 0), LoopSpan("prefill", 0, 7, 0, prefill=True))
 
-    def prepare(op, prefill_count):
+    def prepare(op, prefill_start, prefill_count):
+        runner.req_states.num_computed_tokens_np[1] = prefill_start
+        batch.num_scheduled_tokens[1] = prefill_count
         step = LoopExecution(
             op,
-            (LoopSpan("decode", 8, 1, 0), LoopSpan("prefill", 0, prefill_count, 0, prefill=True)),
+            (
+                LoopSpan("decode", 8, 1, 0),
+                LoopSpan("prefill", prefill_start, prefill_count, 0, prefill=True),
+            ),
             state_store,
             {},
         )
+        step.explicit_positions = explicit_positions
         token = loop_execution.set(step)
         try:
             inputs = runner.prepare_inputs(None, batch, descriptor, 0)
@@ -236,29 +269,37 @@ def test_mixed_batch_reuses_mrv2_inputs_and_metadata_until_batch_changes(monkeyp
         finally:
             loop_execution.reset(token)
 
-    first_inputs, first_metadata = prepare(LoopOp.PRELUDE, 7)
+    first_inputs, first_metadata = prepare(LoopOp.PRELUDE, 0, 7)
+    assert runner._prepared_batch.keep_model_state is not explicit_positions
     stack = torch.arange(10).view(1, 10, 1)
     packed = _InklingBatchState(
         _InklingState(stack, stack[0], stack, None, 0, 0), old_spans, state_store
     )
-    runner._prepared_batch.packed_state = packed
-    next_inputs, next_metadata = prepare(LoopOp.CORE, 7)
+    if not explicit_positions:
+        runner._prepared_batch.packed_state = packed
+    next_inputs, next_metadata = prepare(LoopOp.CORE, 0, 7)
     assert next_inputs is first_inputs and next_metadata is first_metadata
-    assert runner._prepared_batch.packed_state is packed and not state_store
+    assert runner._prepared_batch.packed_state is (None if explicit_positions else packed)
+    assert not state_store
     assert calls == ["inputs", "block tables", "builder"]
 
-    batch.num_scheduled_tokens[1] = 6
-    changed_inputs, changed_metadata = prepare(LoopOp.CORE, 6)
+    changed_inputs, changed_metadata = prepare(LoopOp.CORE, 0, 6)
     assert changed_inputs is not first_inputs and changed_metadata is not first_metadata
     assert runner._prepared_batch.packed_state is None
-    stack.fill_(-1)
-    assert state_store["decode"][8].stack.flatten().tolist() == [0]
-    assert state_store["prefill"][0].stack.flatten().tolist() == list(range(1, 8))
+    if not explicit_positions:
+        stack.fill_(-1)
+        assert state_store["decode"][8].stack.flatten().tolist() == [0]
+        assert state_store["prefill"][0].stack.flatten().tolist() == list(range(1, 8))
     assert calls == ["inputs", "block tables", "builder"] * 2
 
     spans = (old_spans[0], LoopSpan("prefill", 0, 6, 2, prefill=True))
     assert runner._input_rows(LoopExecution(LoopOp.CORE, spans, {}, {}), batch, 0) is None
     assert runner._input_rows(LoopExecution(LoopOp.CODA, spans, {}, {}), batch, 0) is not None
+
+    # The same slot and graph width can belong to the next WCPB chunk.
+    moved_inputs, moved_metadata = prepare(LoopOp.PRELUDE, 6, 6)
+    assert moved_inputs is not changed_inputs and moved_metadata is not changed_metadata
+    assert calls == ["inputs", "block tables", "builder"] * 3
 
 
 @pytest.mark.parametrize(("rows", "expected"), ((1, 1), (3, 4), (15, 16), (16, 16), (17, None)))
@@ -270,6 +311,40 @@ def test_decode_padding_chooses_smallest_captured_bucket(rows, expected):
     graphs.full_decode_sizes = (1, 2, 4, 8, 16)
 
     assert graphs.padded_decode_size(rows) == expected
+
+
+def test_worker_preserves_engine_graph_mode_for_scheduler(monkeypatch):
+    pytest.importorskip("vllm")
+    from vllm.config import get_current_vllm_config
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_rlt.worker import loop_model_runner
+    from vllm_rlt.worker.loop_worker import LoopWorker
+
+    selected_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=selected_mode),
+        parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=1),
+        cache_config=object(),
+    )
+
+    def runner(worker_config, device, mode):
+        assert get_current_vllm_config() is worker_config
+        assert worker_config.compilation_config.cudagraph_mode is CUDAGraphMode.NONE
+        assert worker_config.cache_config is config.cache_config
+        assert mode is selected_mode
+        return worker_config
+
+    monkeypatch.setattr(loop_model_runner, "LoopModelRunner", runner)
+    worker = object.__new__(LoopWorker)
+    worker.vllm_config = config
+    worker.compilation_config = config.compilation_config
+    worker.parallel_config = config.parallel_config
+    worker.device = None
+
+    assert worker._make_model_runner() is worker.vllm_config
+    assert worker.compilation_config is worker.vllm_config.compilation_config
+    assert config.compilation_config.cudagraph_mode is selected_mode
 
 
 def test_graph_input_layout_ignores_only_singleton_strides():
@@ -375,12 +450,102 @@ def test_piecewise_capture_matches_native_dummy_rows(monkeypatch):
     assert calls == [LoopOp.PRELUDE, LoopOp.CORE, LoopOp.CORE, LoopOp.CODA]
 
 
-def test_piecewise_pads_only_the_physical_token_count(monkeypatch):
+def test_explicit_position_update_preserves_mrv2_admission_staging(monkeypatch):
+    pytest.importorskip("vllm")
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    from vllm_rlt.worker.loop_model_runner import LoopModelRunner
+    from vllm_rlt.worker.loop_state import LoopExecution, loop_execution
+
+    def keep_native_request_updates(self, output):
+        self.req_states.num_computed_tokens_np[0] = 7
+
+    def position_pool(dtype):
+        return SimpleNamespace(copy_to_uva=lambda values: torch.tensor(values, dtype=dtype))
+
+    monkeypatch.setattr(GPUModelRunner, "update_requests", keep_native_request_updates)
+    runner = object.__new__(LoopModelRunner)
+    runner._loop_position_slots = position_pool(torch.int64)
+    runner._loop_positions = position_pool(torch.int32)
+    # The native add_requests path owns the staging methods on this writer.
+    gpu = torch.tensor([7, 0, 123], dtype=torch.int32)
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={"existing": 0, "admitted": 1},
+        num_computed_tokens=SimpleNamespace(gpu=gpu),
+        num_computed_tokens_np=[0, 0, 123],
+        num_computed_prefill_tokens=[0, 0, 0],
+        prefill_len=SimpleNamespace(np=[32, 64, 256]),
+    )
+    spans = (LoopSpan("existing", 39, 1, 0), LoopSpan("admitted", 0, 7, 0, prefill=True))
+    step = LoopExecution(LoopOp.PRELUDE, spans, {}, {})
+    step.explicit_positions = True
+    token = loop_execution.set(step)
+    try:
+        runner.update_requests(None)
+    finally:
+        loop_execution.reset(token)
+
+    assert runner.req_states.num_computed_tokens_np == [39, 0, 123]
+    assert runner.req_states.num_computed_prefill_tokens == [32, 0, 0]
+    assert gpu.tolist() == [39, 0, 123]
+
+
+@pytest.mark.parametrize("packed", (False, True))
+def test_cross_round_core_uses_distinct_positions_for_a_repeated_request_slot(monkeypatch, packed):
+    pytest.importorskip("vllm")
+    import numpy as np
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    from vllm_rlt.core.output import LoopSchedulerOutput
+    from vllm_rlt.worker.loop_model_runner import LoopModelRunner
+    from vllm_rlt.worker.loop_state import LoopExecution, loop_execution
+
+    spans = (LoopSpan("prompt", 0, 4, 1, prefill=True),
+             LoopSpan("prompt", 4, 4, 0, prefill=True))
+    runner = object.__new__(LoopModelRunner)
+    runner._loop_graphs = runner._prepared_batch = None
+    runner.model_state = SimpleNamespace(can_pack_core=lambda: packed)
+    runner.decode_query_len = 1
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={"prompt": 3}, prefill_len=SimpleNamespace(np=np.array([0, 0, 0, 8]))
+    )
+    step = LoopExecution(LoopOp.CORE, spans, {}, {})
+    step.compact_core = True
+    output = LoopSchedulerOutput.for_step(step.op, spans)
+    native_descriptor = BatchExecutionDescriptor(CUDAGraphMode.NONE, 8, 1)
+
+    def prepare(plan, batch, descriptor, *, positions):
+        assert plan is output
+        assert batch.idx_mapping_np.tolist() == [3, 3]
+        assert batch.num_scheduled_tokens.tolist() == [4, 4]
+        assert positions.tolist() == ([0, 4] if packed else [4, 0])
+        assert descriptor.num_reqs is None and descriptor.num_tokens == 8
+        return batch
+
+    runner._ordinary_inputs = SimpleNamespace(prepare=prepare)
+    step.explicit_positions = True
+    token = loop_execution.set(step)
+    try:
+        batch, uniform = runner.gather_batch_req_state(output, False)
+        assert uniform is None and step.ordered == (spans if packed else spans[::-1])
+        assert step.packed_core is packed
+        assert runner.prepare_inputs(output, batch, native_descriptor, 0) is batch
+    finally:
+        loop_execution.reset(token)
+
+
+@pytest.mark.parametrize(
+    ("explicit_positions", "prefill"), ((False, True), (True, True), (True, False)),
+)
+def test_graph_padding_preserves_actual_token_positions(monkeypatch, explicit_positions, prefill):
     pytest.importorskip("vllm")
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
+    from vllm_rlt.models.inkling_plugin import LoopInklingModelState
     from vllm_rlt.worker.loop_graph import LoopCudaGraphs
     from vllm_rlt.worker.loop_model_runner import LoopModelRunner
     from vllm_rlt.worker.loop_state import LoopExecution, loop_execution
@@ -388,51 +553,89 @@ def test_piecewise_pads_only_the_physical_token_count(monkeypatch):
     runner = object.__new__(LoopModelRunner)
     runner._prepared_batch = None
     runner.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    runner._decode_pipeline = False
+    runner.model = object()
+    runner.fast_prefill = runner.pcp_manager = runner.ubatch_runner = runner.speculator = None
+    runner.dcp_size = 1
     runner._loop_graphs = object.__new__(LoopCudaGraphs)
     runner._loop_graphs.mode = CUDAGraphMode.FULL_AND_PIECEWISE
     runner._loop_graphs.piecewise_sizes = (8, 16, 32)
-    monkeypatch.setattr(
-        runner, "_input_rows", lambda *args: (("a", 0, 8, 1, False), ("b", 1, 0, 14, True))
+    runner._loop_graphs.full_decode_sizes = (1, 2, 4)
+    spans = (
+        (LoopSpan("a", 8, 1, 0), LoopSpan("b", 32, 14, 0, prefill=True))
+        if prefill
+        else (LoopSpan("a", 8, 1, 0), LoopSpan("b", 9, 1, 0), LoopSpan("c", 10, 1, 0))
+    )
+    real_positions = [
+        position for span in spans for position in range(span.token_start, span.token_end)
+    ]
+    runner.req_states = SimpleNamespace(num_computed_tokens_np=[span.token_start for span in spans])
+    state = SimpleNamespace(
+        req_ids=[span.request_id for span in spans],
+        idx_mapping_np=list(range(len(spans))),
+        num_scheduled_tokens=[span.token_count for span in spans],
+        is_prefilling_np=[span.prefill for span in spans],
+        has_prefill=prefill,
+        num_draft_tokens_np=None,
+        num_tokens=len(real_positions),
+    )
+    expected = (
+        BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 16, None)
+        if prefill
+        else BatchExecutionDescriptor(CUDAGraphMode.FULL, 4, 4, 1, 1)
     )
 
     def prepare_upstream(self, output, batch, descriptor, loras):
-        assert descriptor == BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 16, None)
+        assert descriptor == expected
         return SimpleNamespace(
-            req_ids=["a", "b"],
+            req_ids=state.req_ids,
             num_tokens=batch.num_tokens,
-            input_ids=torch.ones(16),
-            positions=torch.ones(16),
+            input_ids=torch.ones(expected.num_tokens),
+            positions=torch.tensor([*real_positions, -1]),
         )
 
+    def prepare_metadata(self, input_batch, cudagraph_mode, *args):
+        assert cudagraph_mode is expected.cg_mode
+        return {}
+
     monkeypatch.setattr(GPUModelRunner, "prepare_inputs", prepare_upstream)
-    spans = (LoopSpan("a", 8, 1, 0), LoopSpan("b", 0, 14, 0, prefill=True))
+    monkeypatch.setattr(DefaultModelState, "prepare_attn", prepare_metadata)
+    model_state = object.__new__(LoopInklingModelState)
     step = LoopExecution(LoopOp.CORE, spans, {}, {})
+    step.explicit_positions = explicit_positions
     token = loop_execution.set(step)
     try:
-        batch = SimpleNamespace(num_tokens=15, has_prefill=True)
-        desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, 15, 2)
-        inputs = runner.prepare_inputs(None, batch, desc, 0)
+        desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, state.num_tokens, len(spans))
+        inputs = runner.prepare_inputs(None, state, desc, 0)
+        model_state.prepare_attn(inputs, desc.cg_mode, (), None, [], None)
     finally:
         loop_execution.reset(token)
 
-    assert step.ordered == spans and step.padded_tokens == 16
-    assert inputs.num_tokens == 15
-    assert inputs.input_ids.tolist() == inputs.positions.tolist() == [1] * 15 + [0]
+    assert step.ordered == spans and step.padded_tokens == expected.num_tokens
+    assert step.prepared_batch is not None
+    assert step.prepared_batch.keep_model_state is not explicit_positions
+    assert inputs.num_tokens == state.num_tokens
+    assert inputs.positions.tolist() == [*real_positions, 0]
+    assert inputs.input_ids.tolist() == [1] * state.num_tokens + [0]
+    runner.req_states.num_computed_tokens_np[-1] -= 1
+    assert runner._input_rows(step, state, 0) is None
 
 
 @pytest.mark.parametrize(
-    ("has_prefill", "merge", "compact", "merge_prefill"),
+    ("has_prefill", "merge", "compact", "merge_prefill", "prefill_pipeline"),
     (
-        (False, False, False, False),
-        (True, True, False, False),
-        (False, True, False, False),
-        (False, True, True, False),
-        (True, True, True, False),
-        (True, True, False, True),
+        (False, False, False, False, False),
+        (True, True, False, False, False),
+        (False, True, False, False, False),
+        (False, True, True, False, False),
+        (True, True, True, False, False),
+        (True, True, False, True, False),
+        (False, True, False, False, True),
+        (True, True, False, True, True),
     ),
 )
 def test_mixed_core_uses_variant_groups_with_one_logical_receipt(
-    monkeypatch, has_prefill, merge, compact, merge_prefill
+    monkeypatch, has_prefill, merge, compact, merge_prefill, prefill_pipeline
 ):
     pytest.importorskip("vllm")
     from vllm_rlt.core.output import LoopSchedulerOutput
@@ -446,7 +649,8 @@ def test_mixed_core_uses_variant_groups_with_one_logical_receipt(
     runner._prepared_batch = runner._loop_completion = None
     runner._loop_states = {}
     runner._draft_states = {}
-    runner._wavefront_prefill = runner._decode_pipeline = runner._trace_steps = False
+    runner._prefill_pipeline = prefill_pipeline
+    runner._decode_pipeline = runner._trace_steps = False
     runner._mixed_core = runner._packed_prefill = True
     runner._compact_mixed_core = compact
     runner._merge_decode_core = merge
@@ -458,10 +662,11 @@ def test_mixed_core_uses_variant_groups_with_one_logical_receipt(
     runner._loop_graphs = None  # Partition even in eager mode.
     submissions = []
     merged = []
+    packed = compact or (prefill_pipeline and has_prefill)
 
     def submit(output):
         assert loop_execution.get().spans == output.spans
-        assert loop_execution.get().compact_core is compact
+        assert loop_execution.get().compact_core is packed
         merged.append(loop_execution.get().merged_core)
         submissions.append(output)
 
@@ -473,27 +678,97 @@ def test_mixed_core_uses_variant_groups_with_one_logical_receipt(
         LoopSpan("d", 41, 1, 0, last_core=True),
     )
     if has_prefill:
-        spans += (LoopSpan("e", 0, 14, 0, prefill=True),)
+        spans += (LoopSpan("e", 14 if prefill_pipeline else 0, 14, 0, prefill=True),)
+    if prefill_pipeline and has_prefill:
+        spans += (LoopSpan("e", 0, 14, 1, prefill=True),)
     output = LoopSchedulerOutput.for_step(LoopOp.CORE, spans)
     output.new_block_ids_to_zero = [11]
     runner.execute_model(output)
 
     groups = [tuple(step.num_scheduled_tokens) for step in submissions]
-    if compact:
-        assert groups == [tuple(span.request_id for span in spans)]
+    if packed:
+        assert groups == [tuple(dict.fromkeys(span.request_id for span in spans))]
         assert not any(merged)
     elif merge_prefill or (merge and not has_prefill):
         merged_ids = ("a", "b", "d", "e") if has_prefill else ("a", "b", "d")
-        assert groups == [merged_ids, ("c",)]
-        assert merged == [True, False]
+        other_chunk = prefill_pipeline and has_prefill
+        assert groups == [merged_ids, ("c", "e") if other_chunk else ("c",)]
+        assert merged == [True, other_chunk]
     else:
         assert groups == [("a", "d"), ("b", "e") if has_prefill else ("b",), ("c",)]
         assert not any(merged)
     assert [step.new_block_ids_to_zero for step in submissions] == (
         [[11]] + [None] * (len(groups) - 1)
     )
-    expected_req_ids = [span.request_id for span in spans]
+    expected_req_ids = list(dict.fromkeys(span.request_id for span in spans))
     assert runner.sample_tokens(None).req_ids == expected_req_ids
+
+
+def test_packed_inkling_cache_pages_alias_original_pass_storage():
+    pytest.importorskip("vllm")
+    from vllm_rlt.models.inkling_packed_cache import _PagedView
+
+    storage = torch.zeros((6, 2, 2, 4))
+    passes = (storage[4:], storage[:2], storage[2:4])
+    view = _PagedView.from_passes(passes)
+    assert view.first_pages == (4, 0, 2)
+    view.cache[view.first_pages[0] + 1].fill_(7)
+    assert passes[0][1].eq(7).all()
+    assert passes[1].eq(0).all() and passes[2].eq(0).all()
+    misaligned = storage.as_strided(passes[1].shape, passes[1].stride(), 1)
+    assert _PagedView.from_passes((passes[1], misaligned)) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
+def test_packed_core_inputs_blend_dtypes_and_zero_capture_padding():
+    pytest.importorskip("vllm")
+    from vllm.models.inkling2.nvidia.ops.norm import rms_norm
+
+    from vllm_rlt.models.inkling_core_routes import pack_core_inputs
+
+    width, hidden = 5, 1024
+    first = torch.randn((1, 2, hidden), device="cuda")
+    later = torch.randn((3, 1, hidden), device="cuda", dtype=torch.bfloat16)
+    routes = torch.tensor([-1, 0, -2], dtype=torch.int64, device="cuda")
+    weight = torch.ones((1, hidden), device="cuda")
+    norm = SimpleNamespace(weight=weight, eps=1e-6)
+    out = torch.empty((3, width, hidden), device="cuda", dtype=torch.bfloat16)
+
+    pack_core_inputs(
+        out, first, later, routes, 3, norm, normalize_first=True, first_is_full=False
+    )
+
+    first_expected = rms_norm(first[0], weight[0], norm.eps, torch.bfloat16)
+    torch.testing.assert_close(out[:, 0], first_expected[0].expand(3, -1), rtol=1 / 128, atol=0)
+    assert torch.equal(out[:, 1], later[:, 0])
+    torch.testing.assert_close(out[:, 2], first_expected[1].expand(3, -1), rtol=1 / 128, atol=0)
+    assert torch.count_nonzero(out[:, 3:]).item() == 0
+
+
+def test_mixed_core_retains_owned_rows_from_a_decode_slot():
+    pytest.importorskip("vllm")
+    from vllm_rlt.models.inkling_plugin import (
+        LoopInklingForConditionalGeneration,
+        _InklingState,
+        _InklingStateSlot,
+    )
+
+    rows = torch.arange(12).reshape(3, 4, 1)
+    backing = _InklingState(rows, rows[0], rows[:1], rows[1:2], 0, 2)
+    prefill = backing.rows(0, 2)
+    spans = (LoopSpan("decode", 8, 1, 1), LoopSpan("prompt", 0, 2, 0, prefill=True))
+    step = SimpleNamespace(state={
+        "decode": {8: _InklingStateSlot(backing, 2)}, "prompt": {0: prefill},
+    })
+
+    decode, prompt = LoopInklingForConditionalGeneration._pop_core_states(step, spans)
+    rows.zero_()
+
+    assert decode.stack[:, 0, 0].tolist() == [2, 6, 10]
+    assert decode.inputs.flatten().tolist() == [2]
+    assert decode.bank.flatten().tolist() == [6]
+    assert prompt is prefill
+    assert not any(step.state.values())
 
 
 def test_decode_state_slots_gather_by_mrv2_order_and_preserve_live_positions():
