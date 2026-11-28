@@ -386,7 +386,7 @@ def test_coda_is_the_next_submission_after_one_terminal_core(scheduler_factory, 
 
 
 @pytest.mark.parametrize("case", (
-    "nonterminal", "aged", "token_limit", "sequence_limit", "lower_priority", "same_target",
+    "aged", "token_limit", "sequence_limit", "lower_priority", "same_target",
     "same_graph_width",
 ))
 def test_coda_reordering_depends_on_forward_count_and_fairness(scheduler_factory, case):
@@ -403,9 +403,7 @@ def test_coda_reordering_depends_on_forward_count_and_fairness(scheduler_factory
     for name in "abcd":
         work = scheduler._reserve_span(scheduler._states[name], 1, [])
         work.next_op = LoopOp.CODA if name in waiting else LoopOp.CORE
-        work.next_depth = (
-            1 if case == "nonterminal" and name not in waiting else work.depth_limit - 1
-        )
+        work.next_depth = work.depth_limit - 1
         if name in waiting and case == "aged":
             work.skips = 2
     if case == "token_limit":
@@ -421,6 +419,42 @@ def test_coda_reordering_depends_on_forward_count_and_fairness(scheduler_factory
         assert plan.op is LoopOp.CODA and set(plan.num_scheduled_tokens) == set("abcd")
     else:
         assert plan.op is LoopOp.CODA and set(plan.num_scheduled_tokens) == {"a"}
+
+
+@pytest.mark.parametrize("async_scheduling", (False, True))
+@pytest.mark.parametrize("aged_outsider", (False, True))
+def test_terminal_core_drain_is_bounded_by_original_tokens(
+    scheduler_factory, async_scheduling, aged_outsider,
+):
+    scheduler = scheduler_factory(async_scheduling)
+    for name, loops in zip("abc", (1, 2, 3), strict=True):
+        scheduler.add_request(request(name, loops=loops))
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    for name in "abc":
+        work = scheduler._reserve_span(scheduler._states[name], 1, [])
+        work.next_op = LoopOp.CODA if name == "a" else LoopOp.CORE
+        work.next_depth = 0 if name == "a" else 1
+
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.CORE and set(plan.num_scheduled_tokens) == {"b", "c"}
+    complete(scheduler, plan)
+
+    scheduler.add_request(request("outsider"))
+    if aged_outsider:
+        newcomer = scheduler._states["outsider"]
+        newcomer.entry_ready_since = 1
+        newcomer.entry_skips = 2
+
+    plan = scheduler.schedule()
+    if not aged_outsider:
+        assert plan.op is LoopOp.CORE and set(plan.num_scheduled_tokens) == {"c"}
+        assert plan.spans[0].depth == 2
+        complete(scheduler, plan)
+        plan = scheduler.schedule()
+    assert plan.op is LoopOp.CODA
+    assert set(plan.num_scheduled_tokens) == ({"a", "b"} if aged_outsider else {"a", "b", "c"})
+    assert scheduler._pending_aggregation is None
 
 
 def test_pending_coda_never_waits_for_an_outstanding_producer(scheduler_factory):

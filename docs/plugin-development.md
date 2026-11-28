@@ -4577,3 +4577,50 @@ GPU 0 上沿用上一版 W7 C32 配置，每组各三波。恢复 Joining 后，
 [Joining CPU 回放](../artifacts/varloop-physical-batch-20261128/runs-one-step/cpu-joining-replay.json) ·
 [固定三轮逐步调度](../artifacts/varloop-physical-batch-20261128/runs-one-step/cpu-joining-timeline.json) ·
 [W7 GPU 数据](../artifacts/varloop-physical-batch-20261128/runs-one-step/summary.json)
+
+### CORE 连续执行与单步 CODA 对照
+
+以 `1db572e` 为基线，仅修改普通单 token Decode 的阶段顺序。默认下一批应当发 CODA 时，
+如果当前 CORE 候选结束后的 CODA 与现有 CODA 能一次合批，且包含不同目标轮数，允许把该
+CORE 批中的原始请求及 token 位置记录下来。之后每次只推进这批里仍需 CORE 的 token，
+完成的 token 留给同一次 CODA。连续执行的上限来自这批已提交 token 的剩余轮次。
+
+原始批外有已提权工作、批内有尚未就绪的后继，或当前 CODA 的原始请求均已失效时，停止
+连续推进。能提交的 CODA 立即提交。若整批 CORE 的后继不能一起装入 CODA，仍使用原有
+单步判断。此次对照保留现有 CORE 选批及 Worker 分流，并且未引入时间阈值和新的启动项。
+新请求继续由正常调度接纳，暂不加入一次已开始的 CORE 连续执行。CPU 插件测试 128 项
+通过、3 项跳过。
+
+用 W7 C32 同一语料模拟 64 条请求各生成 512 token，固定三轮的两种策略逐批一致。动态组
+的纯 Decode CODA 从 2045 降为 1029 批，CORE 从 3054 变为 3056 批。1018 次 CORE 连续
+执行中，1014 次按计划合到同一次 CODA，4 次提前结束。两组输出均为 32768 token，均无
+抢占。这组计数来自调度回放，设备侧另外记录物理 Forward 和 GPU 时间。
+
+正式波使用 GPU 0、W7 C32、相同 64 条请求、TP1、异步调度、1024 token/批、80 GiB KV
+及 FULL_AND_PIECEWISE。两种策略依次启动，各自在服务内交错提交固定三轮和动态 1/2/3 轮
+各三波。动态组三波均生成 32768 token，每种策略每组均完成 192/192 条请求。
+
+| 策略 | 固定 output tok/s | 动态 output tok/s | 动态 TTFT P95（ms） | 动态 ITL P50/P95（ms） |
+| --- | ---: | ---: | ---: | ---: |
+| 单步 CODA | 3693.92 | 3361.26 | 228.86 | 9.00 / 9.48 |
+| CORE 连续执行 | 3447.28 | 3690.67 | 246.79 | 8.00 / 9.96 |
+
+动态吞吐中位数增长 9.80%，三波为 3757.03、3690.67、3083.86 tok/s。固定三轮的 CPU
+回放逐批一致，但 GPU 三波中位数低 6.68%，候选为 2834.24、3601.53、3447.28 tok/s。
+当前动态组吞吐与原固定组基线接近，尚未证明能稳定超过固定三轮。
+
+独占 GPU 4 上各取一波动态请求做 CUDA event 诊断。每条请求按阶段和轮次的实际 token 数
+均符合预期。纯 Decode 的实际 CORE Forward 为 3053→3054，CODA 为 2038→1021。
+CODA 平均真实行数为 15.95→31.82，事件区间累计为 1719.76→1112.31 ms，每次中位数
+为 0.844→1.092 ms。纯 Decode CORE 事件区间累计为 6269.32→5884.84 ms，普通 FULL
+图各重放 3051 次，跨轮分段图分别命中 2 和 3 次。两臂均未观察到 CORE 或 CODA 回退 eager。
+事件区间可能包含流等待和提交空档。该对照验证动态组的 CODA 合批收益，固定组的波次差异
+并未由这个诊断定位。
+
+GPU 4 的两次诊断波首 token 一致为 61/64，完整序列一致为 20/64。GPU 0 正式波中，动态
+基线前两波之间的完整序列一致为 6/64，候选前两波之间为 19/64。在这组异步负载下，同版本
+重复也存在输出差异，现有数据未建立逐 token 等价。
+
+[CPU 调度回放](../artifacts/varloop-physical-batch-20261128/runs-core-wavefront/cpu-replay.json) ·
+[W7 正式结果](../artifacts/varloop-physical-batch-20261128/runs-core-wavefront/summary.json) ·
+[W7 动态 GPU 诊断](../artifacts/varloop-physical-batch-20261128/w7-dynamic-gpu-events-20261128/comparison.json)

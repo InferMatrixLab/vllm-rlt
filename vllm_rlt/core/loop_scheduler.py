@@ -78,6 +78,7 @@ class _ReadyWork:
 class _CodaAggregation:
     waiting: tuple[_ReadyWork, ...]
     incoming: tuple[_ReadyWork, ...]
+    drain_core: bool = False
 
 
 @dataclass(slots=True)
@@ -239,13 +240,16 @@ class LoopScheduler(SchedulerInterface):
                 self._remember_skips(ready, selected, failed)
                 self._pending_aggregation = None
                 if followup := batch.coda_followup:
-                    submitted = {(span.request_id, span.token_start) for _, span in selected}
-                    incoming = tuple(
-                        item for item in followup.incoming
-                        if (item.state.request.request_id, item.progress.start) in submitted
-                    )
-                    if incoming:
-                        self._pending_aggregation = replace(followup, incoming=incoming)
+                    if followup is pending:
+                        self._pending_aggregation = followup
+                    else:
+                        submitted = {(span.request_id, span.token_start) for _, span in selected}
+                        incoming = tuple(
+                            item for item in followup.incoming
+                            if (item.state.request.request_id, item.progress.start) in submitted
+                        )
+                        if incoming:
+                            self._pending_aggregation = replace(followup, incoming=incoming)
                 break
 
         output = (
@@ -425,6 +429,10 @@ class LoopScheduler(SchedulerInterface):
 
     def _batches(self, ready, prefill_capacity, pending):
         if pending is not None:
+            if pending.drain_core:
+                continuation = self._continue_core_drain(ready, pending, prefill_capacity)
+                if continuation is not None:
+                    yield continuation
             followup = self._fulfill_coda_aggregation(ready, pending, prefill_capacity)
             if followup is not None:
                 yield followup
@@ -529,6 +537,13 @@ class LoopScheduler(SchedulerInterface):
         if not all(self._ordinary_decode(item) for item in core.work):
             return None
         incoming = tuple(item for item in core.work if item.depth + 1 == item.progress.depth_limit)
+        if len(incoming) < len(core.work):
+            drain = self._build_coda_aggregation(coda, tuple(core.work), drain_core=True)
+            if drain is not None:
+                return drain
+        return self._build_coda_aggregation(coda, incoming)
+
+    def _build_coda_aggregation(self, coda, incoming, *, drain_core=False):
         if not incoming:
             return None
         combined = (*coda.work, *incoming)
@@ -542,7 +557,30 @@ class LoopScheduler(SchedulerInterface):
         requests = {item.state.request.request_id for item in combined}
         if len(combined) > capacity or len(requests) != len(combined):
             return None
-        return _CodaAggregation(tuple(coda.work), incoming)
+        return _CodaAggregation(tuple(coda.work), incoming, drain_core)
+
+    def _continue_core_drain(self, ready, pending, prefill_capacity):
+        members = {id(item.progress) for item in pending.incoming}
+        waiting = {id(item.progress) for item in pending.waiting}
+        allowed = members | waiting
+        present = set()
+        core = []
+        for item in ready:
+            identity = id(item.progress)
+            if identity not in allowed and item.rank[0] == 0:
+                return None
+            if identity in members and item.op in (LoopOp.CORE, LoopOp.CODA):
+                present.add(identity)
+                if item.op is LoopOp.CORE:
+                    core.append(item)
+        # The members keep their original token positions and depth limits.
+        # Never wait for a missing member or let new work extend the drain.
+        if not core or members != present or not any(
+            id(item.progress) in waiting and item.op is LoopOp.CODA for item in ready
+        ):
+            return None
+        work, full = self._take_work(core, prefill_capacity)
+        return _Batch(LoopOp.CORE, work[0].depth, work, 0 if full else 2, coda_followup=pending)
 
     def _fulfill_coda_aggregation(self, ready, pending, prefill_capacity):
         coda = [item for item in ready if item.op is LoopOp.CODA and self._ordinary_decode(item)]
