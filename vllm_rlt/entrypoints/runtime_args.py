@@ -14,6 +14,8 @@ _BOOL_OPTIONS = {
     "merge-decode-core": "Run terminal and continuing Inkling decode rows together at each depth.",
     "merge-prefill-core": "Share each CORE with terminal rows and rows that continue past it.",
     "decode-state-slots": "Keep Inkling decode state in GPU buffers indexed by MRv2 request slot.",
+    "unified-coda": "Batch Inkling CODA rows after different final CORE passes.",
+    "cross-depth-decode": "Batch compatible Inkling decode CORE rows across pass depths.",
     "split-prefill-coda": "Use spare CODA capacity for part of a ready Inkling prompt chunk.",
     "silu-and-mul": "Use the compiled RLT SiLU-and-Mul kernel in Ouro.",
 }

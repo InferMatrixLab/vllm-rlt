@@ -543,7 +543,9 @@ def _run_compact_core(model, step, positions, execution):
 
 
 def _execute_packed_core(adapter, step, positions, tau):
-    states = adapter._pop_core_states(step, step.ordered)
+    pool = adapter._decode_pool_for(step)
+    # The packed inputs are copied before any of the request slots are written.
+    states = adapter._pop_core_states(step, step.ordered, copy_slots=pool is None)
     first = states[0]
     live = sum(span.token_count for span in step.ordered)
     stack = first.stack.new_empty((first.stack.shape[0], live, first.stack.shape[2]))
@@ -579,12 +581,19 @@ def _execute_packed_core(adapter, step, positions, tau):
         rows[len(later_rows):],
     )
     _run_compact_core(adapter.model, step, positions, execution)
+    if pool is not None:
+        adapter._store_packed_decode(step, pool, states, execution)
+        return stack[execution.blocks]
 
     offset = 0
     for span, state in zip(step.ordered, states, strict=True):
         end = offset + span.token_count
         state.stack = stack[:, offset:end]
         state.num_blocks = execution.blocks
+        # This row no longer belongs to the shared state from the previous pass.
+        state.frame = None
+        state.frame_start = 0
+        state.live_tokens = None
         if span.last_core:
             state.bank = None
             state.inputs = execution.coda_inputs[:, offset:end]

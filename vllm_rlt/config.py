@@ -18,6 +18,8 @@ class LoopRuntimeConfig:
     merge_decode_core: bool = False
     merge_prefill_core: bool = False
     decode_state_slots: bool = False
+    unified_coda: bool = True
+    cross_depth_decode: bool = True
     split_prefill_coda: bool = False
     silu_and_mul: bool = False
 
@@ -56,4 +58,11 @@ def supports_prefill_pipeline(config, options):
         and parallel.decode_context_parallel_size == 1
         and not parallel.use_ubatching
         and not getattr(model, "enable_return_routed_experts", False)
+    )
+
+
+def supports_cross_depth_decode(config, options):
+    return (
+        options.cross_depth_decode and options.mixed_core
+        and supports_prefill_pipeline(config, options)
     )

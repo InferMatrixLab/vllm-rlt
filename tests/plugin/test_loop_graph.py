@@ -793,6 +793,51 @@ def test_decode_state_slots_gather_by_mrv2_order_and_preserve_live_positions():
     assert slab.stack[:, 2, 0].tolist() == [15, 15, 15]
 
 
+def test_packed_decode_writes_terminal_and_continuing_slots_in_request_order(monkeypatch):
+    pytest.importorskip("vllm")
+    from vllm_rlt.models import inkling_plugin
+
+    state_cls = inkling_plugin._InklingState
+    scheduler_state = {}
+    slots = (2, 0, 3, 1)
+    spans = (
+        LoopSpan("a", 8, 1, 1, last_core=True), LoopSpan("b", 11, 1, 0),
+        LoopSpan("c", 7, 1, 1), LoopSpan("d", 13, 1, 2, last_core=True),
+    )
+    step = SimpleNamespace(
+        ordered=spans, state=scheduler_state,
+        prepared_batch=SimpleNamespace(
+            rows=tuple((span.request_id, slot) for span, slot in zip(spans, slots, strict=True)),
+            inputs=SimpleNamespace(idx_mapping=torch.tensor(slots)),
+        ),
+    )
+    stack = torch.arange(12).reshape(3, 4, 1)
+    execution = SimpleNamespace(stack=stack, blocks=2, coda_inputs=stack[:1] + 100)
+    states = []
+    for index, span in enumerate(spans):
+        row = stack[:, index:index + 1]
+        states.append(state_cls(row, row[0], row[:1] + 20, row[1:2] if span.depth else None, 0, 0))
+    monkeypatch.setattr(
+        inkling_plugin, "async_tensor_h2d",
+        lambda values, *, device, dtype: torch.tensor(values, device=device, dtype=dtype),
+    )
+
+    def continue_core(state, previous):
+        state.inputs = previous if previous is not None else state.prelude.unsqueeze(0)
+        state.bank = state.stack[1:2].clone()
+        state.num_blocks = 0
+
+    pool = inkling_plugin._InklingDecodeStatePool(4)
+    adapter = SimpleNamespace(_continue_core=continue_core)
+    inkling_plugin.LoopInklingForConditionalGeneration._store_packed_decode(
+        adapter, step, pool, states, execution,
+    )
+    for span, slot, expected in zip(spans, slots, (100, 1, 22, 103), strict=True):
+        stored = scheduler_state[span.request_id][span.token_start]
+        assert stored.index == slot
+        assert stored.rows().inputs.item() == expected
+
+
 @pytest.mark.parametrize("prefill_count", (1, 4))
 def test_merged_core_stages_both_routes_in_one_transfer(monkeypatch, prefill_count):
     pytest.importorskip("vllm")

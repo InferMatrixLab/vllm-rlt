@@ -15,7 +15,11 @@ from vllm.v1.worker.gpu.buffer_utils import UvaBufferPool
 from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 from vllm.v1.worker.workspace import lock_workspace
 
-from vllm_rlt.config import LoopRuntimeConfig, supports_prefill_pipeline
+from vllm_rlt.config import (
+    LoopRuntimeConfig,
+    supports_cross_depth_decode,
+    supports_prefill_pipeline,
+)
 from vllm_rlt.core.loop import LoopLayout, LoopOp, LoopSpan
 from vllm_rlt.core.output import LoopModelRunnerOutput, LoopSchedulerOutput
 from vllm_rlt.worker.loop_graph import LoopCudaGraphs
@@ -62,6 +66,7 @@ class LoopModelRunner(GPUModelRunner):
         self._packed_prefill = options.packed_prefill
         self._decode_pipeline = options.decode_pipeline
         self._prefill_pipeline = supports_prefill_pipeline(vllm_config, options)
+        self._cross_depth_decode = supports_cross_depth_decode(vllm_config, options)
         if self._prefill_pipeline or self._decode_pipeline:
             # MRv2 already uses its own write pool when admitting requests.
             # These pools rotate at most once per physical forward, matching
@@ -217,9 +222,18 @@ class LoopModelRunner(GPUModelRunner):
             # The upstream descriptor counts unique request IDs. A packed
             # batch owns one query row per span, including repeated IDs.
             batch_desc = replace(batch_desc, num_reqs=None, num_tokens=width)
-            return self._input_builder().prepare(
+            inputs = self._input_builder().prepare(
                 scheduler_output, batch_req_state, batch_desc, positions=positions
             )
+            if step.packed_core and step.decode_slot_capacity:
+                rows = tuple(
+                    (span.request_id, int(slot), span.token_start, 1, False)
+                    for span, slot in zip(step.ordered, batch_req_state.idx_mapping_np, strict=True)
+                )
+                step.prepared_batch = PreparedBatch(
+                    rows, batch_desc, inputs, keep_model_state=False
+                )
+            return inputs
         if step is not None and step.compact_core:
             # Preserve MRv2's decode/prefill ordering within each variant. Its
             # native slot and block tables then have contiguous sub-batch views.
@@ -516,23 +530,32 @@ class LoopModelRunner(GPUModelRunner):
         groups: dict[tuple[int, bool, bool] | int | str, list[LoopSpan]] = defaultdict(list)
         request_lanes: dict[str, int] = defaultdict(int)
         contains_prefill = any(span.prefill for span in scheduler_output.spans)
+        mixed_depth = len({span.depth for span in scheduler_output.spans}) > 1
         mixed_prefill = (
             op is LoopOp.CORE and contains_prefill and self._prefill_pipeline
-            and len({span.depth for span in scheduler_output.spans}) > 1
+            and mixed_depth
+        )
+        mixed_decode = (
+            op is LoopOp.CORE and not contains_prefill and mixed_depth
+            and getattr(self, "_cross_depth_decode", False)
+            and all(
+                span.token_count == 1 and not span.check_exit for span in scheduler_output.spans
+            )
+            and len(scheduler_output.num_scheduled_tokens) == len(scheduler_output.spans)
         )
         variants = {
             (span.depth, mixed_prefill and span.last_core) for span in scheduler_output.spans
         }
         compact_core = (
             op is LoopOp.CORE
-            and (mixed_prefill or (
+            and (mixed_prefill or mixed_decode or (
                 self._mixed_core and self._compact_mixed_core
             ))
             and getattr(self.model, "rlt_partition_core_variants", False)
             and self.parallel_config.tensor_parallel_size == 1
             and self.vllm_config.kv_transfer_config is None
             and self.vllm_config.lora_config is None
-            and (mixed_prefill or not self._decode_state_slots)
+            and (mixed_prefill or mixed_decode or not self._decode_state_slots)
             and self.fast_prefill is None
             and not scheduler_output.scheduled_spec_decode_tokens
             and self._supports_input_layout(scheduler_output.spans)
@@ -629,7 +652,9 @@ class LoopModelRunner(GPUModelRunner):
             step = LoopExecution(
                 op, tuple(spans), self._loop_states, self._draft_states, self._loop_graphs
             )
-            step.explicit_positions = mixed_prefill or any(span.explicit_position for span in spans)
+            step.explicit_positions = mixed_prefill or (compact_core and mixed_decode) or any(
+                span.explicit_position for span in spans
+            )
             step.context_limit = getattr(self, "max_model_len", None)
             step.coda_tail_moe = op is LoopOp.CODA and self._coda_tail_moe
             step.compact_core = compact_core

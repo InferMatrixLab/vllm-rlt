@@ -1,5 +1,6 @@
 """Resume Inkling's upstream layer loop at Prelude, CORE, and Coda boundaries."""
 
+from collections import defaultdict
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from itertools import groupby
@@ -635,10 +636,13 @@ class LoopInklingForConditionalGeneration(Inkling2LoopForConditionalGeneration):
         state.store_rows(spans, step.state, copy=copy, keep_frame=keep_frame)
 
     @staticmethod
-    def _pop_core_states(step, spans):
+    def _pop_core_states(step, spans, *, copy_slots=True):
         states = [step.state[span.request_id].pop(span.token_start) for span in spans]
         # Mixed CORE can retain an input row after the decode slot is reused.
-        return [state.rows() if isinstance(state, _InklingStateSlot) else state for state in states]
+        return [
+            state.rows(copy=copy_slots) if isinstance(state, _InklingStateSlot) else state
+            for state in states
+        ]
 
     def _take_state(self, step):
         states = []
@@ -705,6 +709,44 @@ class LoopInklingForConditionalGeneration(Inkling2LoopForConditionalGeneration):
         if pool is None:
             pool = self._decode_state_pool = _InklingDecodeStatePool(step.decode_slot_capacity)
         return pool
+
+    def _store_packed_decode(self, step, pool, states, execution):
+        prepared = step.prepared_batch
+        assert prepared is not None
+        routed = defaultdict(list)
+        for index, (span, state) in enumerate(zip(step.ordered, states, strict=True)):
+            routed[span.last_core, not span.last_core and state.bank is not None].append(index)
+        order = async_tensor_h2d(
+            [index for indices in routed.values() for index in indices],
+            device=execution.stack.device,
+            dtype=torch.long,
+        )
+        offset = 0
+        for (terminal, reuse_inputs), indices in routed.items():
+            end = offset + len(indices)
+            rows = order[offset:end]
+            offset = end
+            source = _InklingState(
+                execution.stack.index_select(1, rows),
+                torch.cat([states[index].prelude for index in indices], dim=0),
+                execution.coda_inputs.index_select(1, rows) if terminal else None,
+                None,
+                states[0].prelude_blocks,
+                execution.blocks,
+            )
+            if not terminal:
+                previous = (
+                    torch.cat([states[index].inputs for index in indices], dim=1)
+                    if reuse_inputs else None
+                )
+                self._continue_core(source, previous)
+            pool.store(
+                source,
+                tuple(step.ordered[index] for index in indices),
+                step.state,
+                tuple(prepared.rows[index][1] for index in indices),
+                prepared.inputs.idx_mapping.index_select(0, rows),
+            )
 
     def _continue_core(self, state, prelude_dests=None):
         model = self.model

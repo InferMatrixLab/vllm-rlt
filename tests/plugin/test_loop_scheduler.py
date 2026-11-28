@@ -33,6 +33,7 @@ def scheduler_factory():
         decode_graph_sizes=(),
         max_num_seqs=4,
         max_num_batched_tokens=16,
+        additional_config=None,
     ):
         text = SimpleNamespace(
             model_type="inkling2_model", num_loop_passes=3, loop_config={"is_varloop": True},
@@ -73,6 +74,7 @@ def scheduler_factory():
                 "rlt_async_prefill_lookahead": prefill_lookahead,
                 "rlt_merge_decode_core": merge_decode_core,
                 "rlt_split_prefill_coda": split_prefill_coda,
+                **(additional_config or {}),
             },
         )
         spec = AttentionSpec(block_size=4, num_kv_heads=1, head_size=64, dtype=torch.float16)
@@ -337,44 +339,124 @@ def test_decode_coda_precedes_ready_core_and_prefill_first_token(
     ]
 
 
-@pytest.mark.parametrize("async_scheduling", (False, True))
-@pytest.mark.parametrize("lag_depth,skips,can_join", ((2, 0, True), (1, 0, True), (1, 1, False)))
-def test_decode_batches_join_within_two_ready_opportunities(
-    scheduler_factory, async_scheduling, lag_depth, skips, can_join,
-):
-    scheduler = scheduler_factory(async_scheduling, max_num_seqs=4)
-    names = ("a", "b", "c", "d")
-    for name in names:
-        scheduler.add_request(request(name, max_tokens=8))
+def test_coda_batches_rows_from_each_final_depth(scheduler_factory):
+    scheduler = scheduler_factory()
+    for name, loops in zip("abc", (1, 2, 3), strict=True):
+        scheduler.add_request(request(name, loops=loops))
     for _ in range(5):
         complete(scheduler, scheduler.schedule())
-    for name in names:
+    for name in "abc":
         work = scheduler._reserve_span(scheduler._states[name], 1, [])
-        if name == "a":
-            work.next_op = LoopOp.CODA
-            work.next_depth = work.completed_depth = 2
-            work.skips = skips
-        else:
-            work.next_op = LoopOp.CORE
-            work.next_depth, work.completed_depth = lag_depth, lag_depth - 1
+        work.next_op = LoopOp.CODA
+        work.next_depth = work.completed_depth = work.depth_limit - 1
 
-    if can_join:
-        for depth in range(lag_depth, 3):
-            plan = scheduler.schedule()
-            assert plan.op is LoopOp.CORE
-            assert [(span.request_id, span.depth) for span in plan.spans] == [
-                (name, depth) for name in names[1:]
-            ]
-            complete(scheduler, plan)
     plan = scheduler.schedule()
     assert plan.op is LoopOp.CODA
-    assert set(plan.num_scheduled_tokens) == (set(names) if can_join else {"a"})
-    if can_join:
+    assert {(span.request_id, span.depth) for span in plan.spans} == {("a", 0), ("b", 1), ("c", 2)}
+
+
+@pytest.mark.parametrize("async_scheduling", (False, True))
+def test_coda_is_the_next_submission_after_one_terminal_core(scheduler_factory, async_scheduling):
+    scheduler = scheduler_factory(async_scheduling)
+    for name, loops in zip("abc", (1, 2, 1), strict=True):
+        scheduler.add_request(request(name, loops=loops))
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    for name in "abc":
+        work = scheduler._reserve_span(scheduler._states[name], 1, [])
+        work.next_op = LoopOp.CODA if name == "a" else LoopOp.CORE
+        work.next_depth = work.depth_limit - 1
+
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.CORE
+    assert set(plan.num_scheduled_tokens) == {"b"}
+    complete(scheduler, plan)
+
+    scheduler.add_request(request("prompt"))
+    prompt = scheduler._states["prompt"]
+    prompt.entry_ready_since = 1
+    prompt.entry_skips = 2
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.CODA
+    assert set(plan.num_scheduled_tokens) == {"a", "b"}
+    complete(scheduler, plan)
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.PRELUDE
+    assert "prompt" in plan.num_scheduled_tokens
+
+
+@pytest.mark.parametrize("case", (
+    "nonterminal", "aged", "token_limit", "sequence_limit", "lower_priority", "same_target",
+    "same_graph_width",
+))
+def test_coda_reordering_depends_on_forward_count_and_fairness(scheduler_factory, case):
+    scheduler = scheduler_factory(
+        decode_graph_sizes=(1, 2, 4), policy="priority" if case == "lower_priority" else "fcfs",
+    )
+    for name in "abcd":
+        loops = 1 if name == "a" and case != "same_target" else 3
+        priority = int(case == "lower_priority" and name != "a")
+        scheduler.add_request(request(name, loops=loops, priority=priority))
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    waiting = "abc" if case == "same_graph_width" else "a"
+    for name in "abcd":
+        work = scheduler._reserve_span(scheduler._states[name], 1, [])
+        work.next_op = LoopOp.CODA if name in waiting else LoopOp.CORE
+        work.next_depth = (
+            1 if case == "nonterminal" and name not in waiting else work.depth_limit - 1
+        )
+        if name in waiting and case == "aged":
+            work.skips = 2
+    if case == "token_limit":
+        scheduler.max_num_scheduled_tokens = 2
+    if case == "sequence_limit":
+        scheduler.max_num_seqs = 2
+
+    plan = scheduler.schedule()
+    if case == "same_graph_width":
+        assert plan.op is LoopOp.CORE and set(plan.num_scheduled_tokens) == {"d"}
         complete(scheduler, plan)
-        for _ in range(10):
-            plan = scheduler.schedule()
-            assert set(plan.num_scheduled_tokens) == set(names)
-            complete(scheduler, plan)
+        plan = scheduler.schedule()
+        assert plan.op is LoopOp.CODA and set(plan.num_scheduled_tokens) == set("abcd")
+    else:
+        assert plan.op is LoopOp.CODA and set(plan.num_scheduled_tokens) == {"a"}
+
+
+def test_pending_coda_never_waits_for_an_outstanding_producer(scheduler_factory):
+    scheduler = scheduler_factory()
+    scheduler.add_request(request("a", loops=1))
+    scheduler.add_request(request("b", loops=3))
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    for name in "ab":
+        work = scheduler._reserve_span(scheduler._states[name], 1, [])
+        work.next_op = LoopOp.CODA if name == "a" else LoopOp.CORE
+        work.next_depth = work.depth_limit - 1
+
+    producer = scheduler.schedule()
+    assert producer.op is LoopOp.CORE
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.CODA and set(plan.num_scheduled_tokens) == {"a"}
+    assert scheduler._pending_aggregation is None
+    complete(scheduler, producer)
+    complete(scheduler, plan)
+
+
+def test_pure_decode_core_packs_ready_rows_from_multiple_depths(scheduler_factory):
+    scheduler = scheduler_factory(additional_config={"rlt_mixed_core": True})
+    for name in "abc":
+        scheduler.add_request(request(name))
+    for _ in range(5):
+        complete(scheduler, scheduler.schedule())
+    for depth, name in enumerate("abc"):
+        work = scheduler._reserve_span(scheduler._states[name], 1, [])
+        work.next_op = LoopOp.CORE
+        work.next_depth, work.completed_depth = depth, depth - 1
+
+    plan = scheduler.schedule()
+    assert plan.op is LoopOp.CORE
+    assert {(span.request_id, span.depth) for span in plan.spans} == {("a", 0), ("b", 1), ("c", 2)}
 
 
 @pytest.mark.parametrize("async_scheduling", (False, True))
