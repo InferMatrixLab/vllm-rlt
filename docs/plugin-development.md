@@ -4624,3 +4624,63 @@ GPU 4 的两次诊断波首 token 一致为 61/64，完整序列一致为 20/64�
 [CPU 调度回放](../artifacts/varloop-physical-batch-20261128/runs-core-wavefront/cpu-replay.json) ·
 [W7 正式结果](../artifacts/varloop-physical-batch-20261128/runs-core-wavefront/summary.json) ·
 [W7 动态 GPU 诊断](../artifacts/varloop-physical-batch-20261128/w7-dynamic-gpu-events-20261128/comparison.json)
+
+### W7 CORE 执行效率三组诊断
+
+对照 `1db572e` 固定三轮、`b63eb95` 固定三轮及 `b63eb95` 请求级动态轮数。两提交间
+只有调度器生产代码变化。固定组的普通 Decode 工作目标深度均为三，连续推进判断不会
+通过目标深度不同的条件，之前的 CPU 回放也验证两份源码逐批一致。独立 GPU 诊断用来
+量化实际批分布和各阶段绝对耗时。
+
+动态组 CPU 回放的 1014 次继续提交 CORE 中，有 997 次是 16 条跑 CORE、16 条已在 CODA。
+按原请求数及 token 上限计算，合计有 16315 个空位。在这 1014 次调度中，批外没有已就绪
+的 Decode CORE、Prefill CORE 或 PRELUDE 可以供给额外任务。这些是当前阶段顺序下的
+可补充量，变更阶段顺序后的供给需要重新测量。
+
+[CORE 补充机会回放](../artifacts/varloop-physical-batch-20261128/runs-core-wavefront/cpu-core-refill-opportunities.json)
+
+三组 GPU 诊断已停止，只完成上一版固定三轮的单波诊断。候选固定和动态均未采集，不能据此
+对比两份源码的设备耗时。[已完成的固定组诊断](../artifacts/varloop-physical-batch-20261128/w7-full-stage-events-20261128/one-step-fixed-gpu1/fixed-event-summary.json)
+
+### 按物理阶段重新选批
+
+每次从现有依赖和 KV 就绪条件收集任务，按 PRELUDE、CORE、CODA 分成三组，各构建一个
+候选批。CORE 从同一个就绪队列取任务。队首所在轮次可填满时直接提交，否则使用当前执行
+路径兼容的任务补批，实际轮次随请求交给 Worker。跨轮能力受限的模型仍执行兼容的同轮批。
+PRELUDE 继续保留多段 Prefill 供给，CODA 继续合并兼容的不同来源轮次。
+
+保留两次跳过后的提权和原有 FCFS / priority。通常已就绪 CODA 先交付，满载 Decode CORE
+可优先执行。没有已就绪 PRELUDE 和已提权任务时，只在当前 CORE 能直接产生兼容的 CODA、
+合并后还能一次提交时才可让 CORE 先跑。CORE 未满且有可先处理的 Decode PRELUDE 时，
+允许先补供给。发出每个批次后重新看全局就绪队列。已移除锁定请求成员的状态和多层轮次
+候选排序。同步后继未就绪时照常执行其他已就绪任务。
+
+W7 C32 CPU 回放仍使用 64 条请求各生成 512 token。两组均完成 32768 token，无抢占。
+下表为纯 Decode 调度计划，GPU 的物理 Forward 和实际运行时间另计。
+
+| 调度版本 | Fixed PRELUDE / CORE / CODA | VarLoop PRELUDE / CORE / CODA |
+| --- | ---: | ---: |
+| 有界 CORE 连续执行 | 1535 / 4082 / 1533 | 1032 / 3056 / 1029 |
+| 按物理阶段重新选批 | 1032 / 3057 / 1020 | 1032 / 3038 / 1025 |
+
+新策略的 Fixed 和 VarLoop CORE 平均有效行分别为 31.86 和 23.84。由调度计划可确认
+新就绪 CORE 能参加下一批。
+
+[W7 重新选批回放](../artifacts/varloop-physical-batch-20261128/runs-core-wavefront/cpu-unified-stages-replay.json)
+
+W7 C32 正式测量继续用 GPU 0、同一语料、TP1、异步调度、1024 token/批、80 GiB KV 和
+FULL_AND_PIECEWISE，预热后交错运行固定和动态各三波，关闭插桩。以下每项为三波中位数。
+
+| 版本 / 请求 | Output tok/s | TTFT P95 (ms) | TPOT P95 (ms) | ITL P95 (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| `b63eb95` 固定三轮 | 3447.28 | 343.00 | 9.11 | 9.88 |
+| 重新选批固定三轮 | 3680.80 | 246.62 | 8.57 | 8.41 |
+| `b63eb95` 动态轮数 | 3690.67 | 246.79 | 8.64 | 9.96 |
+| 重新选批动态轮数 | 3748.68 | 252.25 | 8.51 | 8.26 |
+
+固定组三波分别为 3669.64、3680.80、3707.22 tok/s，动态组为 2877.24、3748.68、
+3749.21 tok/s。动态组首波有 7 个续入请求的 TTFT 约 2.56–2.60 s，波级 TTFT P95
+为 2565.10 ms，保留在统计中。两组均完成 192/192 条请求。GPU 0 的 206 次采样未见外部
+计算进程。固定组较 `b63eb95` 中位数高 6.77%，动态组高 1.57%。这是同卡先后运行的对照。
+
+[W7 正式结果](../artifacts/varloop-physical-batch-20261128/runs-unified-stage/summary.json)

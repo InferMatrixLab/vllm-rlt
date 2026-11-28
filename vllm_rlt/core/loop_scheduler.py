@@ -75,20 +75,11 @@ class _ReadyWork:
 
 
 @dataclass(slots=True)
-class _CodaAggregation:
-    waiting: tuple[_ReadyWork, ...]
-    incoming: tuple[_ReadyWork, ...]
-    drain_core: bool = False
-
-
-@dataclass(slots=True)
 class _Batch:
     op: LoopOp
-    depth: int
     work: list[_ReadyWork]
-    fullness: int
+    full: bool
     entry_candidates: list[_ReadyWork] | None = None
-    coda_followup: _CodaAggregation | None = None
 
 
 @dataclass(slots=True)
@@ -148,7 +139,6 @@ class LoopScheduler(SchedulerInterface):
         self._mixed_prefill_core = supports_prefill_pipeline(vllm_config, options)
         self._cross_depth_decode = supports_cross_depth_decode(vllm_config, options)
         self._unified_coda = options.unified_coda and self._mixed_prefill_core
-        self._pending_aggregation: _CodaAggregation | None = None
         if self.decode_pipeline and (
             not self.self_speculation
             or not config.async_scheduling
@@ -232,24 +222,11 @@ class LoopScheduler(SchedulerInterface):
         ready = self._ready_work(throttle_prefills, capacity)
         selected, selected_op = [], None
         failed = set()
-        pending = self._pending_aggregation
-        for batch in self._batches(ready, capacity, pending):
+        for batch in self._batches(ready, capacity):
             selected = self._reserve_batch(batch, capacity, failed)
             if selected:
                 selected_op = batch.op
                 self._remember_skips(ready, selected, failed)
-                self._pending_aggregation = None
-                if followup := batch.coda_followup:
-                    if followup is pending:
-                        self._pending_aggregation = followup
-                    else:
-                        submitted = {(span.request_id, span.token_start) for _, span in selected}
-                        incoming = tuple(
-                            item for item in followup.incoming
-                            if (item.state.request.request_id, item.progress.start) in submitted
-                        )
-                        if incoming:
-                            self._pending_aggregation = replace(followup, incoming=incoming)
                 break
 
         output = (
@@ -427,97 +404,69 @@ class LoopScheduler(SchedulerInterface):
                 prefill_capacity -= rows
         return chosen, budget == 0 or len(chosen) == self.max_num_seqs
 
-    def _batches(self, ready, prefill_capacity, pending):
-        if pending is not None:
-            if pending.drain_core:
-                continuation = self._continue_core_drain(ready, pending, prefill_capacity)
-                if continuation is not None:
-                    yield continuation
-            followup = self._fulfill_coda_aggregation(ready, pending, prefill_capacity)
-            if followup is not None:
-                yield followup
-
+    def _batches(self, ready, prefill_capacity):
         queues = defaultdict(list)
         for item in ready:
-            depth = 0 if self._unified_coda and item.op is LoopOp.CODA else item.depth
-            queues[item.op, depth].append(item)
-        direct = {}
-        for (op, depth), queue in queues.items():
-            items, full = self._take_work(queue, prefill_capacity)
-            if op is LoopOp.PRELUDE and not full and self._mixed_prefill_core:
-                extra_rows = 0
-                for item in items:
-                    if not item.prefill:
-                        continue
-                    state, request = item.state, item.state.request
-                    last = next(reversed(state.spans.values()), None)
-                    start = request.num_computed_tokens if last is None else last.start + last.count
-                    slots = max(0, self.layout.num_loops - len(state.spans) - 1)
-                    extra_rows += min(
-                        slots * self.prefill_chunk_size,
-                        max(0, request.num_prompt_tokens - start - item.rows),
-                    )
-                prefill_rows = sum(item.rows for item in items if item.prefill)
-                extra_rows = min(extra_rows, prefill_capacity - prefill_rows)
-                full = (
-                    sum(item.rows for item in items) + extra_rows >= self.max_num_scheduled_tokens
-                )
-            entries = queue if op is LoopOp.PRELUDE else None
-            direct[op, depth] = _Batch(op, depth, items, 0 if full else 2, entries)
-        if self._mixed_prefill_core or self.decode_pipeline:
-            for (op, depth), batch in direct.items():
-                if op is not LoopOp.CORE or batch.fullness == 0:
-                    continue
-                other = [
-                    item for item in ready
-                    if item.op is op and item.depth != depth
-                    and direct[op, item.depth].fullness != 0
-                    and item.progress is not None
-                    and not item.progress.draft_coda
-                ]
-                if self.decode_pipeline:
-                    # The opt-in draft pipeline submits its tentative successor
-                    # with the current token. The worker orders the two reads.
-                    owner_ids = {item.state.request.request_id for item in batch.work}
-                    other = [
-                        item for item in other if item.progress.tentative
-                        and item.state.request.request_id in owner_ids
-                    ]
-                packed, full = self._take_work(other, prefill_capacity, batch.work)
-                if self.decode_pipeline or any(item.prefill for item in packed) or (
-                    self._cross_depth_decode and all(self._ordinary_decode(item) for item in packed)
-                ):
-                    batch.work = packed
-                    batch.fullness = 1 if full else 2
+            queues[item.op].append(item)
 
-        def rank(batch):
-            head = batch.work[0]
-            # Core depths only break ties between CORE plans. Across stages,
-            # compare the oldest ready work at the same service priority.
-            return head.rank, batch.fullness, head.since, {
-                LoopOp.CODA: 0, LoopOp.CORE: 1, LoopOp.PRELUDE: 2,
-            }[batch.op]
+        batches = []
+        for op, queue in queues.items():
+            if op is LoopOp.CORE:
+                work, full = self._pack_core(queue, prefill_capacity)
+            else:
+                candidates = queue
+                if op is LoopOp.CODA and not self._unified_coda:
+                    candidates = [item for item in queue if item.depth == queue[0].depth]
+                work, full = self._take_work(candidates, prefill_capacity)
+            if work:
+                entries = queue if op is LoopOp.PRELUDE else None
+                batches.append(_Batch(op, work, full, entries))
 
-        def core_rank(batch):
-            pure_decode = not any(item.prefill for item in batch.work)
-            rows = len(batch.work) if self._cross_depth_decode and pure_decode else 0
-            return batch.work[0].rank, batch.fullness, -rows, -batch.depth
+        if not batches:
+            return
+        batches.sort(key=lambda batch: (batch.work[0].rank, batch.work[0].since))
+        stage = self._select_stage(batches)
+        yield stage
+        yield from (batch for batch in batches if batch is not stage)
 
-        core = sorted((b for b in direct.values() if b.op is LoopOp.CORE), key=core_rank)
-        while direct:
-            options = [b for b in direct.values() if b.op is not LoopOp.CORE]
-            if core:
-                options.append(core[0])
-            batch = min(options, key=rank)
-            if self._unified_coda and pending is None and batch.op is LoopOp.CODA:
-                for producer in core:
-                    if followup := self._plan_coda_aggregation(batch, producer):
-                        yield replace(producer, coda_followup=followup)
-                        break
-            del direct[batch.op, batch.depth]
-            if batch.op is LoopOp.CORE:
-                core.remove(batch)
-            yield batch
+    def _pack_core(self, queue, prefill_capacity):
+        depth = queue[0].depth
+        same_depth = [item for item in queue if item.depth == depth]
+        direct, full = self._take_work(same_depth, prefill_capacity)
+        if full or len(same_depth) == len(queue):
+            return direct, full
+
+        if self.decode_pipeline:
+            # The tentative successor may share the validation batch of its own request.
+            owners = {item.state.request.request_id for item in direct}
+            successors = [
+                item for item in queue if item.depth != depth and item.progress is not None
+                and item.progress.tentative and item.state.request.request_id in owners
+            ]
+            return self._take_work(successors, prefill_capacity, direct)
+        if not self._mixed_prefill_core:
+            return direct, full
+
+        compatible = [
+            item for item in queue if item.depth == depth
+            or (item.progress is not None and not item.progress.draft_coda)
+        ]
+        work, packed_full = self._take_work(compatible, prefill_capacity)
+        if any(item.prefill for item in work) or (
+            self._cross_depth_decode and all(self._ordinary_decode(item) for item in work)
+        ):
+            return work, packed_full
+
+        # A prefill row can make cross-depth execution compatible even when
+        # the first pass filled the remaining capacity with pure decode.
+        with_prefill, full = self._take_work(
+            (item for item in compatible if item.depth != depth and item.prefill),
+            prefill_capacity,
+            direct,
+        )
+        if not full and len(with_prefill) > len(direct):
+            return self._take_work(compatible, prefill_capacity, with_prefill)
+        return with_prefill, full
 
     @staticmethod
     def _ordinary_decode(item):
@@ -527,88 +476,48 @@ class LoopScheduler(SchedulerInterface):
             and not (work.adaptive or work.tentative or work.draft_coda)
         )
 
-    def _plan_coda_aggregation(self, coda, core):
-        if coda.work[0].rank[0] == 0 or not all(self._ordinary_decode(item) for item in coda.work):
-            return None
-        if self._priority_policy and (
-            core.work[0].state.request.priority > coda.work[0].state.request.priority
-        ):
-            return None
-        if not all(self._ordinary_decode(item) for item in core.work):
-            return None
-        incoming = tuple(item for item in core.work if item.depth + 1 == item.progress.depth_limit)
-        if len(incoming) < len(core.work):
-            drain = self._build_coda_aggregation(coda, tuple(core.work), drain_core=True)
-            if drain is not None:
-                return drain
-        return self._build_coda_aggregation(coda, incoming)
+    def _select_stage(self, batches):
+        first = batches[0]
+        if first.work[0].rank[0] == 0 or not self._mixed_prefill_core:
+            return first
 
-    def _build_coda_aggregation(self, coda, incoming, *, drain_core=False):
+        by_op = {batch.op: batch for batch in batches}
+        core = by_op.get(LoopOp.CORE)
+        if core is None:
+            return first
+
+        if first.op is LoopOp.CODA and self._unified_coda:
+            if self._priority_policy and (
+                core.work[0].state.request.priority > first.work[0].state.request.priority
+            ):
+                return first
+            if (core.full and not core.work[0].prefill) or (
+                LoopOp.PRELUDE not in by_op and self._can_merge_coda(first, core)
+            ):
+                return core
+        elif first.op is LoopOp.CORE and not core.full:
+            prelude = by_op.get(LoopOp.PRELUDE)
+            if prelude is not None and prelude.work[0].rank[0] == 4 and (
+                not self._priority_policy
+                or prelude.work[0].state.request.priority <= core.work[0].state.request.priority
+            ):
+                return prelude
+        return first
+
+    def _can_merge_coda(self, coda, core):
+        if not all(self._ordinary_decode(item) for item in coda.work):
+            return False
+        incoming = [
+            item for item in core.work if self._ordinary_decode(item)
+            and item.depth + 1 == item.progress.depth_limit
+        ]
         if not incoming:
-            return None
+            return False
         combined = (*coda.work, *incoming)
-        # Keep the established execution order for a single decode cycle length.
-        depth_limit = combined[0].progress.depth_limit
-        if all(item.progress.depth_limit == depth_limit for item in combined):
-            return None
         capacity = min(self.max_num_seqs, self.max_num_scheduled_tokens)
-        # Both sets fit alone. The worker can replace two forwards with one
-        # only if the combined single-token rows fit and have unique lanes.
-        requests = {item.state.request.request_id for item in combined}
-        if len(combined) > capacity or len(requests) != len(combined):
-            return None
-        return _CodaAggregation(tuple(coda.work), incoming, drain_core)
-
-    def _continue_core_drain(self, ready, pending, prefill_capacity):
-        members = {id(item.progress) for item in pending.incoming}
-        waiting = {id(item.progress) for item in pending.waiting}
-        allowed = members | waiting
-        present = set()
-        core = []
-        for item in ready:
-            identity = id(item.progress)
-            if identity not in allowed and item.rank[0] == 0:
-                return None
-            if identity in members and item.op in (LoopOp.CORE, LoopOp.CODA):
-                present.add(identity)
-                if item.op is LoopOp.CORE:
-                    core.append(item)
-        # The members keep their original token positions and depth limits.
-        # Never wait for a missing member or let new work extend the drain.
-        if not core or members != present or not any(
-            id(item.progress) in waiting and item.op is LoopOp.CODA for item in ready
-        ):
-            return None
-        work, full = self._take_work(core, prefill_capacity)
-        return _Batch(LoopOp.CORE, work[0].depth, work, 0 if full else 2, coda_followup=pending)
-
-    def _fulfill_coda_aggregation(self, ready, pending, prefill_capacity):
-        coda = [item for item in ready if item.op is LoopOp.CODA and self._ordinary_decode(item)]
-        by_position = {
-            (item.state.request.request_id, item.progress.start): item for item in coda
-        }
-
-        def matched(items):
-            for item in items:
-                live = by_position.get((item.state.request.request_id, item.progress.start))
-                if live is not None and live.progress is item.progress:
-                    yield live
-
-        waiting = list(matched(pending.waiting))
-        if not waiting:
-            return None
-        combined = [*waiting, *matched(pending.incoming)]
-        # If the producer has not made its successors ready, submit the rows
-        # that are ready anyway. An outstanding merge never idles the device.
-        requests = {item.state.request.request_id for item in combined}
-        extra = []
-        for item in coda:
-            request_id = item.state.request.request_id
-            if request_id not in requests:
-                extra.append(item)
-                requests.add(request_id)
-        work, full = self._take_work(extra, prefill_capacity, combined)
-        return _Batch(LoopOp.CODA, 0, work, 0 if full else 2)
+        return len(combined) <= capacity and len({
+            item.state.request.request_id for item in combined
+        }) == len(combined)
 
     def _reserve_batch(self, batch, prefill_capacity, failed):
         selected = []
